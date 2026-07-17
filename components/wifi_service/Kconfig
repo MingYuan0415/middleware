@@ -1,0 +1,28 @@
+menu "MicroTech WiFi service"
+
+config WIFI_SERVICE_TASK_STACK
+    int "Worker stack depth"
+    default 4096
+    range 3072 8192
+
+config WIFI_SERVICE_TASK_PRIORITY
+    int "Worker task priority"
+    default 4
+    range 1 20
+
+config WIFI_SERVICE_QUEUE_DEPTH
+    int "Async command/event queue depth"
+    default 16
+    range 8 32
+
+config WIFI_SERVICE_WORKER_POLL_MS
+    int "Worker urgent-command polling interval (ms)"
+    default 20
+    range 5 100
+
+config WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS
+    int "Default event-loop drain timeout (ms)"
+    default 1000
+    range 100 5000
+
+endmenu

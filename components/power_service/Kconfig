@@ -1,0 +1,18 @@
+menu "Power service"
+
+    config POWER_SERVICE_TASK_STACK
+        int "Power worker stack size"
+        range 2048 8192
+        default 3072
+
+    config POWER_SERVICE_TASK_PRIORITY
+        int "Power worker priority"
+        range 1 24
+        default 4
+
+    config POWER_SERVICE_POLL_INTERVAL_MS
+        int "PMU poll interval (milliseconds)"
+        range 1000 60000
+        default 5000
+
+endmenu

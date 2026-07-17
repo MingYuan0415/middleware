@@ -1,0 +1,4 @@
+version: "0.1.0"
+description: "MicroTech middleware components collection"
+dependencies:
+  idf: ">=5.0"

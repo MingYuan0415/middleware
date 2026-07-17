@@ -1,0 +1,4 @@
+version: "0.1.0"
+description: "Power service component for microtech middleware"
+dependencies:
+  idf: ">=5.0"
