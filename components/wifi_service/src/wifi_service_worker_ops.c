@@ -83,28 +83,28 @@ void wifi_service_worker_retry_publications(wifi_worker_context_t *context)
     if (runtime_state == WIFI_RUNTIME_OFFLINE)
     {
         wifi_service_worker_clear_pending_publications(context);
-        goto exit;
+        return;
     }
     if (runtime_state != WIFI_RUNTIME_READY &&
             runtime_state != WIFI_RUNTIME_SUSPENDED &&
             runtime_state != WIFI_RUNTIME_CLEANUP_PENDING)
     {
-        goto exit;
+        return;
     }
     if (!context->status_publish_pending && !context->scan_publish_pending)
     {
         context->publish_retry_scheduled = false;
-        goto exit;
+        return;
     }
     if (!context->publish_retry_scheduled)
     {
         _wifi_service_schedule_publication_retry(context);
-        goto exit;
+        return;
     }
     if (!wifi_service_worker_tick_reached(xTaskGetTickCount(),
                                           context->publish_retry_deadline))
     {
-        goto exit;
+        return;
     }
 
     (void)_wifi_service_try_publish_status(context);
@@ -117,9 +117,6 @@ void wifi_service_worker_retry_publications(wifi_worker_context_t *context)
     {
         context->publish_retry_scheduled = false;
     }
-
-exit:
-    return;
 }
 
 void wifi_service_worker_publish_status(wifi_worker_context_t *context)
@@ -347,21 +344,17 @@ static bool _wifi_service_command_current(const wifi_queue_item_t *item,
 static bool _wifi_service_context_operation_stale(
     const wifi_worker_context_t *context, bool *canceled)
 {
-    bool stale = false;
     *canceled = false;
     if (context->operation_kind == WIFI_OPERATION_NONE)
     {
-        goto exit;
+        return false;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     bool session_stale = g_wifi_service.current_session != context->operation_session;
     *canceled = g_wifi_service.cancel_session == context->operation_session &&
                 g_wifi_service.cancel_operation == context->operation_id;
     xSemaphoreGive(g_wifi_service.state_mutex);
-    stale = session_stale || *canceled;
-
-exit:
-    return stale;
+    return session_stale || *canceled;
 }
 
 static void _wifi_service_context_set_operation(
@@ -458,7 +451,7 @@ esp_err_t wifi_service_worker_restart_radio(wifi_worker_context_t *context)
         {
             context->radio_ready = true;
         }
-        goto exit;
+        return result;
     }
     context->radio_ready = false;
     context->scan_id_known = false;
@@ -468,15 +461,13 @@ esp_err_t wifi_service_worker_restart_radio(wifi_worker_context_t *context)
             WIFI_SERVICE_PORT_STATE_STARTED)
     {
         context->radio_ready = true;
-        goto exit;
+        return result;
     }
     if (result == ESP_OK)
     {
         result = ESP_ERR_INVALID_STATE;
     }
     wifi_service_worker_enter_cleanup_pending(context, result);
-
-exit:
     return result;
 }
 
@@ -499,12 +490,11 @@ static void _wifi_service_set_status_idle(
 esp_err_t wifi_service_worker_connect_driver(
     wifi_worker_context_t *context)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (!context->has_credentials || !context->radio_ready)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
-    result = wifi_service_port_set_credentials(&context->credentials);
+    esp_err_t result = wifi_service_port_set_credentials(&context->credentials);
     if (result == ESP_OK)
     {
         result = wifi_service_port_connect();
@@ -517,8 +507,6 @@ esp_err_t wifi_service_worker_connect_driver(
         context->status.ipv4_address = 0;
         wifi_service_worker_publish_status(context);
     }
-
-exit:
     return result;
 }
 
@@ -560,7 +548,7 @@ void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
         {
             wifi_service_worker_publish_status(context);
         }
-        goto exit;
+        return;
     }
 
     uint8_t index = context->status.retry_count;
@@ -570,9 +558,6 @@ void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
     context->retry_pending = true;
     context->status.state = WIFI_SERVICE_STATE_RETRY_WAIT;
     wifi_service_worker_publish_status(context);
-
-exit:
-    return;
 }
 
 static void _wifi_service_finish_scan(wifi_worker_context_t *context,
@@ -719,7 +704,7 @@ static void _wifi_service_cancel_connect(wifi_worker_context_t *context,
         context->status.ipv4_address = 0;
         wifi_service_worker_complete_operation(context);
         wifi_service_worker_publish_status(context);
-        goto exit;
+        return;
     }
     esp_err_t clear_result = wifi_service_port_clear_credentials();
     esp_err_t result = wifi_service_worker_restart_radio(context);
@@ -740,9 +725,6 @@ static void _wifi_service_cancel_connect(wifi_worker_context_t *context,
     {
         wifi_service_worker_publish_status(context);
     }
-
-exit:
-    return;
 }
 
 void wifi_service_worker_cancel_stale_operation(
@@ -897,7 +879,7 @@ static void _wifi_service_begin_disconnect(wifi_worker_context_t *context,
                                      ESP_ERR_INVALID_STATE : ESP_ERR_NOT_FOUND;
         wifi_service_worker_complete_operation(context);
         wifi_service_worker_publish_status(context);
-        goto exit;
+        return;
     }
     context->status.desired_connected = false;
     context->retry_pending = false;
@@ -924,9 +906,6 @@ static void _wifi_service_begin_disconnect(wifi_worker_context_t *context,
     {
         wifi_service_worker_publish_status(context);
     }
-
-exit:
-    return;
 }
 
 static bool _wifi_service_disconnect_event_relevant(
@@ -987,7 +966,7 @@ static void _wifi_service_process_got_ip(
             (context->status.state != WIFI_SERVICE_STATE_CONNECTING &&
              context->status.state != WIFI_SERVICE_STATE_WAITING_IP))
     {
-        goto exit;
+        return;
     }
     if (context->operation_kind == WIFI_OPERATION_CONNECT)
     {
@@ -998,7 +977,7 @@ static void _wifi_service_process_got_ip(
             _wifi_service_cancel_connect(
                 context, claim == WIFI_TERMINAL_CANCELED ?
                 ESP_ERR_INVALID_STATE : ESP_ERR_NOT_FOUND);
-            goto exit;
+            return;
         }
     }
     context->retry_pending = false;
@@ -1011,9 +990,6 @@ static void _wifi_service_process_got_ip(
         _wifi_service_context_forget_operation(context);
     }
     wifi_service_worker_publish_status(context);
-
-exit:
-    return;
 }
 
 static void _wifi_service_process_link_loss(
@@ -1049,7 +1025,7 @@ static void _wifi_service_process_port_event(
 {
     if (event->epoch != context->port_epoch)
     {
-        goto exit;
+        return;
     }
     switch (event->type)
     {
@@ -1069,9 +1045,6 @@ static void _wifi_service_process_port_event(
         _wifi_service_process_link_loss(context, event, true);
         break;
     }
-
-exit:
-    return;
 }
 
 void wifi_service_worker_process_item(wifi_worker_context_t *context,
@@ -1087,7 +1060,7 @@ void wifi_service_worker_process_item(wifi_worker_context_t *context,
         if (!_wifi_service_command_current(item, &canceled) || canceled)
         {
             _wifi_service_reject_item(context, item, canceled);
-            goto exit;
+            return;
         }
         switch (item->type)
         {
@@ -1104,9 +1077,6 @@ void wifi_service_worker_process_item(wifi_worker_context_t *context,
             break;
         }
     }
-
-exit:
-    return;
 }
 
 static void _wifi_service_reconcile_inactive_overflow(
@@ -1174,7 +1144,7 @@ void wifi_service_worker_reconcile_overflow(wifi_worker_context_t *context)
     if (!atomic_exchange_explicit(&g_wifi_service.event_overflow, false,
                                   memory_order_acq_rel))
     {
-        goto exit;
+        return;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     bool runtime_ready = g_wifi_service.runtime_state == WIFI_RUNTIME_READY &&
@@ -1182,7 +1152,7 @@ void wifi_service_worker_reconcile_overflow(wifi_worker_context_t *context)
     xSemaphoreGive(g_wifi_service.state_mutex);
     if (!runtime_ready)
     {
-        goto exit;
+        return;
     }
     bool publish_scan_terminal = false;
     if (context->scan_active)
@@ -1203,7 +1173,4 @@ void wifi_service_worker_reconcile_overflow(wifi_worker_context_t *context)
         _wifi_service_reconcile_active_overflow(context,
                                                 publish_scan_terminal);
     }
-
-exit:
-    return;
 }

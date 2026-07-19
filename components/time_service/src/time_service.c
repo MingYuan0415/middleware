@@ -77,21 +77,16 @@ static esp_err_t _get_system_epoch(int64_t *epoch)
 
 static esp_err_t _write_rtc_epoch(int64_t epoch)
 {
-    esp_err_t result = ESP_ERR_NOT_SUPPORTED;
     if (!_rtc_available() || s_rtc_ops.write == NULL)
     {
-        goto exit;
+        return ESP_ERR_NOT_SUPPORTED;
     }
     struct tm utc_time;
     if (!time_service_core_epoch_to_utc(epoch, &utc_time))
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
-    result = s_rtc_ops.write(&utc_time);
-
-exit:
-    return result;
+    return s_rtc_ops.write(&utc_time);
 }
 
 static uint32_t _next_generation_locked(void)
@@ -287,12 +282,10 @@ static esp_err_t _create_service_mutexes(void)
 
 static esp_err_t _restore_initial_clock(void)
 {
-    esp_err_t result = ESP_OK;
     int64_t initial_epoch = 0;
     if (setenv("TZ", "CST-8", 1) != 0)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     tzset();
 
@@ -316,31 +309,24 @@ static esp_err_t _restore_initial_clock(void)
             LOG_W("RTC is available but its UTC time is invalid");
         }
     }
-    result = _set_system_epoch(initial_epoch);
-
-exit:
-    return result;
+    return _set_system_epoch(initial_epoch);
 }
 
 static esp_err_t _create_sync_worker(void)
 {
-    esp_err_t result = ESP_OK;
     s_sync_events = xEventGroupCreate();
     if (s_sync_events == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
     if (xTaskCreate(_sync_worker, "time_ntp", TIME_SERVICE_SYNC_WORKER_STACK,
                     NULL, TIME_SERVICE_SYNC_WORKER_PRIO, &s_sync_worker) != pdPASS)
     {
-        result = ESP_ERR_NO_MEM;
+        return ESP_ERR_NO_MEM;
     }
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static void _activate_time_service(void)
@@ -358,22 +344,17 @@ static void _activate_time_service(void)
 
 esp_err_t time_service_register_rtc_ops(const time_service_rtc_ops_t *ops)
 {
-    esp_err_t result = ESP_OK;
     if (ops == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (s_initialized || s_state_mutex != NULL)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     s_rtc_ops = *ops;
     s_rtc_ops_registered = true;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t time_service_init(void)
@@ -381,7 +362,7 @@ esp_err_t time_service_init(void)
     esp_err_t result = ESP_OK;
     if (s_initialized)
     {
-        goto exit;
+        return ESP_OK;
     }
 
     result = _create_service_mutexes();
@@ -402,7 +383,7 @@ esp_err_t time_service_init(void)
 
     _activate_time_service();
     LOG_I("initialized with quality=%d", (int)s_quality);
-    goto exit;
+    return ESP_OK;
 
 cleanup:
     atomic_store_explicit(&s_worker_event_tail_complete, true,
@@ -413,8 +394,6 @@ cleanup:
         s_sync_events = NULL;
     }
     _delete_service_mutexes();
-
-exit:
     return result;
 }
 
@@ -427,15 +406,14 @@ esp_err_t time_service_deinit(void)
         _clear_rtc_registration();
         s_quality = TIME_SERVICE_QUALITY_INVALID;
         s_last_rtc_error = ESP_ERR_NOT_SUPPORTED;
-        goto exit;
+        return ESP_OK;
     }
     if (s_state_mutex == NULL || s_control_mutex == NULL ||
             s_update_mutex == NULL || s_sync_events == NULL ||
             s_sync_worker == NULL ||
             xTaskGetCurrentTaskHandle() == s_sync_worker)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
@@ -483,59 +461,46 @@ exit:
 
 esp_err_t time_service_get_utc(struct tm *utc_time)
 {
-    esp_err_t result = ESP_OK;
     if (utc_time == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!s_initialized)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     int64_t epoch;
-    result = _get_system_epoch(&epoch);
+    esp_err_t result = _get_system_epoch(&epoch);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
-    result = time_service_core_epoch_to_utc(epoch, utc_time) ?
-             ESP_OK : ESP_ERR_INVALID_RESPONSE;
-
-exit:
-    return result;
+    return time_service_core_epoch_to_utc(epoch, utc_time) ?
+           ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 esp_err_t time_service_get_local(struct tm *local_time)
 {
-    esp_err_t result = ESP_OK;
     if (local_time == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!s_initialized)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     int64_t epoch;
-    result = _get_system_epoch(&epoch);
+    esp_err_t result = _get_system_epoch(&epoch);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     const time_t native_epoch = (time_t)epoch;
     if ((int64_t)native_epoch != epoch)
     {
-        result = ESP_ERR_INVALID_SIZE;
-        goto exit;
+        return ESP_ERR_INVALID_SIZE;
     }
-    result = localtime_r(&native_epoch, local_time) != NULL ? ESP_OK : ESP_FAIL;
-
-exit:
-    return result;
+    return localtime_r(&native_epoch, local_time) != NULL ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t _cancel_active_sync(void)
@@ -592,14 +557,12 @@ esp_err_t time_service_set_local(const struct tm *local_time)
     bool control_owned = false;
     if (local_time == NULL || !time_service_core_tm_valid(local_time))
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!s_initialized || s_control_mutex == NULL || s_state_mutex == NULL ||
             s_update_mutex == NULL)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
@@ -631,31 +594,25 @@ exit:
 
 time_service_quality_t time_service_get_quality(void)
 {
-    time_service_quality_t quality = TIME_SERVICE_QUALITY_INVALID;
     if (s_state_mutex == NULL)
     {
-        goto exit;
+        return TIME_SERVICE_QUALITY_INVALID;
     }
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    quality = s_quality;
+    time_service_quality_t quality = s_quality;
     xSemaphoreGive(s_state_mutex);
-
-exit:
     return quality;
 }
 
 esp_err_t time_service_get_last_rtc_error(void)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (s_state_mutex == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    result = s_last_rtc_error;
+    esp_err_t result = s_last_rtc_error;
     xSemaphoreGive(s_state_mutex);
-
-exit:
     return result;
 }
 
@@ -667,7 +624,7 @@ esp_err_t time_service_request_sync(void)
     if (!s_initialized || s_state_mutex == NULL || s_control_mutex == NULL ||
             s_sync_events == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
@@ -739,7 +696,7 @@ esp_err_t time_service_cancel_sync(void)
     bool state_owned = false;
     if (!s_initialized || s_state_mutex == NULL || s_control_mutex == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     control_owned = true;
@@ -754,7 +711,6 @@ esp_err_t time_service_cancel_sync(void)
     }
     _next_generation_locked();
 
-exit:
     if (state_owned)
     {
         xSemaphoreGive(s_state_mutex);
@@ -774,7 +730,7 @@ esp_err_t time_service_wait_sync(uint32_t timeout_ms)
     if (!s_initialized || s_state_mutex == NULL || s_control_mutex == NULL ||
             s_sync_events == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
@@ -788,7 +744,7 @@ esp_err_t time_service_wait_sync(uint32_t timeout_ms)
     state_owned = false;
     if (!pending)
     {
-        goto exit;
+        return result;
     }
 
     const EventBits_t bits = xEventGroupWaitBits(

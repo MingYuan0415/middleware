@@ -131,22 +131,18 @@ static event_bus_sub_handle_t _event_bus_make_handle(uint8_t slot, uint64_t gene
 static bool _event_bus_decode_handle(event_bus_sub_handle_t handle,
                                      uint8_t *slot, uint64_t *generation)
 {
-    bool valid = false;
     uint64_t encoded_slot = handle & HANDLE_SLOT_MASK;
     uint64_t encoded_generation = handle >> HANDLE_SLOT_BITS;
 
     if (encoded_slot == 0 || encoded_slot > EVENT_BUS_MAX_SUBSCRIBERS
             || encoded_generation == 0)
     {
-        goto exit;
+        return false;
     }
 
     *slot = (uint8_t)(encoded_slot - UINT64_C(1));
     *generation = encoded_generation;
-    valid = true;
-
-exit:
-    return valid;
+    return true;
 }
 
 /* All pool helpers below require s_mutex. */
@@ -197,7 +193,7 @@ static void _event_bus_release_envelope_ref(uint8_t slot)
 
     if (!envelope->in_use || envelope->ref_count == 0)
     {
-        goto exit;
+        return;
     }
 
     --envelope->ref_count;
@@ -205,9 +201,6 @@ static void _event_bus_release_envelope_ref(uint8_t slot)
     {
         _event_bus_clear_envelope(envelope);
     }
-
-exit:
-    return;
 }
 
 static void _event_bus_release_dispatch_item(event_bus_dispatch_item_t *item)
@@ -235,13 +228,12 @@ static bool _event_bus_envelope_matches_snapshot(
     uint32_t sub_type, const event_bus_snapshot_entry_t *snapshot,
     size_t snapshot_count, size_t ui_count)
 {
-    bool matches = false;
     if (!envelope->in_use || !envelope->latest_only
             || envelope->state != EVENT_BUS_BATCH_ADMITTED
             || envelope->msg_id != msg_id || envelope->sub_type != sub_type
             || envelope->subscriber_count != ui_count)
     {
-        goto exit;
+        return false;
     }
 
     const event_bus_dispatch_item_t *item = envelope->head;
@@ -255,15 +247,12 @@ static bool _event_bus_envelope_matches_snapshot(
         if (item == NULL || item->sub_slot != snapshot[i].slot
                 || item->sub_generation != snapshot[i].generation)
         {
-            goto exit;
+            return false;
         }
         item = item->next;
         ++matched_count;
     }
-    matches = matched_count == ui_count && item == NULL;
-
-exit:
-    return matches;
+    return matched_count == ui_count && item == NULL;
 }
 
 static bool _event_bus_replace_pending_latest(
@@ -404,15 +393,14 @@ static esp_err_t _event_bus_prepare_ui_batch_locked(
                                snapshot->ui_count, payload, payload_size);
         if (batch->coalesced)
         {
-            goto exit;
+            return ESP_OK;
         }
     }
 
     batch->envelope_index = _event_bus_alloc_envelope();
     if (batch->envelope_index < 0)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     result = _event_bus_build_ui_items_locked(
                  snapshot, batch->envelope_index, msg_id, sub_type, &batch->head);
@@ -420,7 +408,7 @@ static esp_err_t _event_bus_prepare_ui_batch_locked(
     {
         _event_bus_clear_envelope(&s_envelopes[batch->envelope_index]);
         batch->envelope_index = -1;
-        goto exit;
+        return result;
     }
 
     event_bus_envelope_t *envelope = &s_envelopes[batch->envelope_index];
@@ -437,9 +425,7 @@ static esp_err_t _event_bus_prepare_ui_batch_locked(
         memcpy(envelope->payload.bytes, payload, payload_size);
     }
     batch->allocation_generation = envelope->allocation_generation;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static void _event_bus_complete_ui_admission_locked(
@@ -562,14 +548,13 @@ esp_err_t event_bus_init(void)
     SemaphoreHandle_t ui_admission_mutex = NULL;
     if (s_initialized)
     {
-        goto exit;
+        return ESP_OK;
     }
 
     mutex = xSemaphoreCreateMutex();
     if (mutex == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     ui_admission_mutex = xSemaphoreCreateMutex();
     if (ui_admission_mutex == NULL)
@@ -597,12 +582,10 @@ esp_err_t event_bus_init(void)
           (unsigned)EVENT_BUS_MAX_PENDING_UI_PAYLOADS,
           (unsigned)EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
           (unsigned)EVENT_BUS_MAX_PENDING_UI_CALLBACKS);
-    goto exit;
+    return ESP_OK;
 
 cleanup:
     vSemaphoreDelete(mutex);
-
-exit:
     return result;
 }
 
@@ -615,14 +598,13 @@ esp_err_t event_bus_subscribe(event_bus_msg_id_t msg_id, uint32_t sub_type,
     bool lock_owned = false;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (msg_id == NULL || cb == NULL || out_handle == NULL
             || (context != EVENT_BUS_DISPATCH_PUBLISHER
                 && context != EVENT_BUS_DISPATCH_UI))
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     *out_handle = EVENT_BUS_SUB_HANDLE_INVALID;
@@ -677,12 +659,11 @@ esp_err_t event_bus_unsubscribe(event_bus_sub_handle_t handle)
 
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (!_event_bus_decode_handle(handle, &slot_index, &generation))
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -715,17 +696,15 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
                             const void *payload, size_t payload_size,
                             uint32_t flags)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (msg_id == NULL || (payload == NULL && payload_size != 0) ||
             (flags & ~(EVENT_BUS_PUBLISH_FLAG_WAKE_REQUEST |
                        EVENT_BUS_PUBLISH_FLAG_UI_LATEST)) != 0)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     event_bus_publish_snapshot_t snapshot;
@@ -735,19 +714,18 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
     {
         if (payload_size > EVENT_BUS_MAX_UI_PAYLOAD_SIZE)
         {
-            result = ESP_ERR_INVALID_SIZE;
-            goto exit;
+            return ESP_ERR_INVALID_SIZE;
         }
         if (snapshot.ui_dispatch == NULL)
         {
             /* The dispatcher may be removed after subscriptions are admitted. */
-            goto exit;
+            return ESP_ERR_INVALID_STATE;
         }
-        result = _event_bus_admit_ui_batch(
-                     msg_id, sub_type, payload, payload_size, flags, &snapshot);
+        esp_err_t result = _event_bus_admit_ui_batch(
+                               msg_id, sub_type, payload, payload_size, flags, &snapshot);
         if (result != ESP_OK)
         {
-            goto exit;
+            return result;
         }
     }
 
@@ -770,33 +748,24 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
             entry->cb(msg_id, sub_type, payload, payload_size, entry->user_data);
         }
     }
-
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t event_bus_register_ui_dispatch(event_bus_ui_dispatch_fn dispatch)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (dispatch == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_ui_dispatch = dispatch;
     xSemaphoreGive(s_mutex);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t event_bus_unregister_ui_dispatch(
@@ -806,12 +775,11 @@ esp_err_t event_bus_unregister_ui_dispatch(
     bool lock_owned = false;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (expected_dispatch == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -834,24 +802,19 @@ exit:
 
 esp_err_t event_bus_register_wake_requester(event_bus_wake_request_fn request_wake)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (request_wake == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_wake_request = request_wake;
     xSemaphoreGive(s_mutex);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t event_bus_unregister_wake_requester(
@@ -861,12 +824,11 @@ esp_err_t event_bus_unregister_wake_requester(
     bool lock_owned = false;
     if (!s_initialized)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (expected_request_wake == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);

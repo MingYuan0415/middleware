@@ -72,35 +72,27 @@ esp_err_t time_service_port_clock_set(int64_t epoch)
 
 esp_err_t time_service_port_clock_get(int64_t *epoch)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (epoch == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     (void)pthread_mutex_lock(&s_port.lock);
     *epoch = s_port.epoch;
     (void)pthread_mutex_unlock(&s_port.lock);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t time_service_port_sntp_start(time_service_port_sync_cb_t callback)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (callback == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     (void)pthread_mutex_lock(&s_port.lock);
     s_port.callback = callback;
     s_port.running = true;
     (void)pthread_mutex_unlock(&s_port.lock);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t time_service_port_sntp_restart(void)

@@ -133,7 +133,7 @@ esp_err_t nv_storage_init(void)
     bool cleanup_owned = !atomic_flag_test_and_set(&s_cleanup_busy);
     if (!cleanup_owned)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     unsigned lifecycle = atomic_load(&s_lifecycle);
@@ -189,7 +189,7 @@ esp_err_t nv_storage_deinit(void)
     bool cleanup_owned = !atomic_flag_test_and_set(&s_cleanup_busy);
     if (!cleanup_owned)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     unsigned lifecycle = atomic_load(&s_lifecycle);
@@ -265,23 +265,19 @@ static esp_err_t _nv_storage_open(nvs_handle_t *handle)
 
 static esp_err_t _nv_storage_begin(const char *key, nvs_handle_t *handle)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (!nv_storage_internal_key_is_valid(key))
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!nv_storage_internal_access_begin())
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
-    result = _nv_storage_open(handle);
+    esp_err_t result = _nv_storage_open(handle);
     if (result != ESP_OK)
     {
         nv_storage_internal_access_end();
     }
-
-exit:
     return result;
 }
 
@@ -297,7 +293,7 @@ esp_err_t nv_storage_set_u8(const char *key, uint8_t value)
     esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_u8(handle, key, value);
     if (result == ESP_OK)
@@ -309,23 +305,20 @@ esp_err_t nv_storage_set_u8(const char *key, uint8_t value)
         LOG_E("set_u8 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_get_u8(const char *key, uint8_t *output)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (output == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_get_u8(handle, key, output);
     if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
@@ -333,8 +326,6 @@ esp_err_t nv_storage_get_u8(const char *key, uint8_t *output)
         LOG_E("get_u8 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
@@ -344,7 +335,7 @@ esp_err_t nv_storage_set_u16(const char *key, uint16_t value)
     esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_u16(handle, key, value);
     if (result == ESP_OK)
@@ -356,23 +347,20 @@ esp_err_t nv_storage_set_u16(const char *key, uint16_t value)
         LOG_E("set_u16 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_get_u16(const char *key, uint16_t *output)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (output == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_get_u16(handle, key, output);
     if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
@@ -380,8 +368,6 @@ esp_err_t nv_storage_get_u16(const char *key, uint16_t *output)
         LOG_E("get_u16 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
@@ -391,7 +377,7 @@ esp_err_t nv_storage_set_u32(const char *key, uint32_t value)
     esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_u32(handle, key, value);
     if (result == ESP_OK)
@@ -403,23 +389,20 @@ esp_err_t nv_storage_set_u32(const char *key, uint32_t value)
         LOG_E("set_u32 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_get_u32(const char *key, uint32_t *output)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (output == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_get_u32(handle, key, output);
     if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
@@ -427,23 +410,20 @@ esp_err_t nv_storage_get_u32(const char *key, uint32_t *output)
         LOG_E("get_u32 '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_set_str(const char *key, const char *value)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (value == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_str(handle, key, value);
     if (result == ESP_OK)
@@ -455,23 +435,20 @@ esp_err_t nv_storage_set_str(const char *key, const char *value)
         LOG_E("set_str '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_get_str(const char *key, char *output, size_t *size)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (size == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
 
     result = nvs_get_str(handle, key, output, size);
@@ -485,23 +462,20 @@ esp_err_t nv_storage_get_str(const char *key, char *output, size_t *size)
         LOG_E("get_str '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_set_blob(const char *key, const void *data, size_t length)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (data == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_blob(handle, key, data, length);
     if (result == ESP_OK)
@@ -513,23 +487,20 @@ esp_err_t nv_storage_set_blob(const char *key, const void *data, size_t length)
         LOG_E("set_blob '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
 esp_err_t nv_storage_get_blob(const char *key, void *output, size_t *size)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (size == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    result = _nv_storage_begin(key, &handle);
+    esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
 
     result = nvs_get_blob(handle, key, output, size);
@@ -543,8 +514,6 @@ esp_err_t nv_storage_get_blob(const char *key, void *output, size_t *size)
         LOG_E("get_blob '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }
 
@@ -554,7 +523,7 @@ esp_err_t nv_storage_erase_key(const char *key)
     esp_err_t result = _nv_storage_begin(key, &handle);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_erase_key(handle, key);
     if (result == ESP_OK)
@@ -566,7 +535,5 @@ esp_err_t nv_storage_erase_key(const char *key)
         LOG_E("erase_key '%s' failed: %d", key, (int)result);
     }
     _nv_storage_finish(handle);
-
-exit:
     return result;
 }

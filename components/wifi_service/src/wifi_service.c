@@ -99,25 +99,22 @@ static TickType_t _wifi_service_remaining(const wifi_deadline_t *deadline)
 
 static esp_err_t _wifi_service_ensure_core(void)
 {
-    esp_err_t result = ESP_OK;
     int state = atomic_load_explicit(&g_wifi_service.core_state,
                                      memory_order_acquire);
     if (state == WIFI_CORE_READY)
     {
-        goto exit;
+        return ESP_OK;
     }
     if (state == WIFI_CORE_BROKEN)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     int expected = WIFI_CORE_EMPTY;
     if (!atomic_compare_exchange_strong_explicit(
                 &g_wifi_service.core_state, &expected, WIFI_CORE_CREATING,
                 memory_order_acq_rel, memory_order_acquire))
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (!g_wifi_service.primitives_created)
@@ -140,8 +137,7 @@ static esp_err_t _wifi_service_ensure_core(void)
         {
             atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_BROKEN,
                                   memory_order_release);
-            result = ESP_ERR_NO_MEM;
-            goto exit;
+            return ESP_ERR_NO_MEM;
         }
         _wifi_service_reset_shared_state();
         atomic_store(&g_wifi_service.control_inflight, false);
@@ -162,14 +158,11 @@ static esp_err_t _wifi_service_ensure_core(void)
     {
         atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_EMPTY,
                               memory_order_release);
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_READY,
                           memory_order_release);
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static esp_err_t _wifi_service_prepare_init_locked(bool *immediate)
@@ -298,12 +291,11 @@ static esp_err_t _wifi_service_prepare_control(wifi_control_type_t type,
 static esp_err_t _wifi_service_consume_inflight(
     wifi_control_type_t type, const wifi_deadline_t *deadline, bool *reused)
 {
-    esp_err_t result = ESP_OK;
     *reused = false;
     if (!atomic_load_explicit(&g_wifi_service.control_inflight,
                               memory_order_acquire))
     {
-        goto exit;
+        return ESP_OK;
     }
     wifi_control_type_t inflight =
         (wifi_control_type_t)atomic_load(&g_wifi_service.control_type);
@@ -313,22 +305,19 @@ static esp_err_t _wifi_service_consume_inflight(
                              memory_order_acquire);
     if (completed != generation && inflight != type)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(g_wifi_service.control_done,
                        _wifi_service_remaining(deadline)) != pdTRUE)
     {
-        result = ESP_ERR_TIMEOUT;
-        goto exit;
+        return ESP_ERR_TIMEOUT;
     }
     completed = atomic_load_explicit(
                     &g_wifi_service.control_completed_generation,
                     memory_order_acquire);
     if (completed != generation)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     esp_err_t completed_result = (esp_err_t)atomic_load_explicit(
                                      &g_wifi_service.control_result,
@@ -337,12 +326,10 @@ static esp_err_t _wifi_service_consume_inflight(
     atomic_store(&g_wifi_service.control_type, WIFI_CONTROL_NONE);
     if (inflight == type)
     {
-        result = completed_result;
         *reused = true;
+        return completed_result;
     }
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static esp_err_t _wifi_service_submit_control(
@@ -352,7 +339,7 @@ static esp_err_t _wifi_service_submit_control(
     esp_err_t result = _wifi_service_prepare_control(type, &immediate);
     if (result != ESP_OK || immediate)
     {
-        goto exit;
+        return result;
     }
 
     (void)xSemaphoreTake(g_wifi_service.control_done, 0);
@@ -366,21 +353,17 @@ static esp_err_t _wifi_service_submit_control(
     if (xSemaphoreTake(g_wifi_service.control_done,
                        _wifi_service_remaining(deadline)) != pdTRUE)
     {
-        result = ESP_ERR_TIMEOUT;
-        goto exit;
+        return ESP_ERR_TIMEOUT;
     }
     if (atomic_load_explicit(&g_wifi_service.control_completed_generation,
                              memory_order_acquire) != generation)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     result = (esp_err_t)atomic_load_explicit(&g_wifi_service.control_result,
              memory_order_acquire);
     atomic_store(&g_wifi_service.control_inflight, false);
     atomic_store(&g_wifi_service.control_type, WIFI_CONTROL_NONE);
-
-exit:
     return result;
 }
 
@@ -391,19 +374,17 @@ static esp_err_t _wifi_service_control(wifi_control_type_t type,
     bool control_owned = false;
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     if (xTaskGetCurrentTaskHandle() == g_wifi_service.worker)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     wifi_deadline_t deadline = _wifi_service_deadline(timeout_ms);
     if (xSemaphoreTake(g_wifi_service.control_mutex,
                        _wifi_service_remaining(&deadline)) != pdTRUE)
     {
-        result = ESP_ERR_TIMEOUT;
-        goto exit;
+        return ESP_ERR_TIMEOUT;
     }
     control_owned = true;
 
@@ -483,13 +464,12 @@ esp_err_t wifi_service_session_open(
     bool state_owned = false;
     if (out_session_id == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     *out_session_id = 0;
     if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
@@ -521,7 +501,7 @@ esp_err_t wifi_service_session_close(wifi_service_session_id_t session_id)
     bool state_owned = false;
     if (session_id == 0 || atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
@@ -558,13 +538,12 @@ static esp_err_t _wifi_service_admit_simple(
     bool state_owned = false;
     if (session_id == 0 || out_operation_id == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     *out_operation_id = 0;
     if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
@@ -626,14 +605,14 @@ esp_err_t wifi_service_request_disconnect(
 static bool _wifi_service_credentials_valid(
     const wifi_service_credentials_t *credentials)
 {
-    bool valid = false;
     if (credentials == NULL || credentials->ssid == NULL ||
             credentials->ssid_length == 0 ||
             credentials->ssid_length > WIFI_SERVICE_SSID_MAX_BYTES ||
             memchr(credentials->ssid, '\0', credentials->ssid_length) != NULL)
     {
-        goto exit;
+        return false;
     }
+    bool valid;
     if (credentials->security == WIFI_SERVICE_SECURITY_OPEN)
     {
         valid = credentials->password_length == 0;
@@ -648,8 +627,6 @@ static bool _wifi_service_credentials_valid(
                 memchr(credentials->password, '\0',
                        credentials->password_length) == NULL;
     }
-
-exit:
     return valid;
 }
 
@@ -721,13 +698,12 @@ esp_err_t wifi_service_request_connect(
     if (session_id == 0 || out_operation_id == NULL ||
             !_wifi_service_credentials_valid(credentials))
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     *out_operation_id = 0;
     if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
@@ -769,7 +745,7 @@ esp_err_t wifi_service_cancel(wifi_service_session_id_t session_id,
     if (session_id == 0 || operation_id == 0 ||
             atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
@@ -800,10 +776,9 @@ exit:
 esp_err_t wifi_service_get_status(
     wifi_service_status_snapshot_t *snapshot)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (snapshot == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
@@ -817,19 +792,15 @@ esp_err_t wifi_service_get_status(
         *snapshot = g_wifi_service.status_cache;
         xSemaphoreGive(g_wifi_service.state_mutex);
     }
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t wifi_service_get_scan_snapshot(
     wifi_service_scan_snapshot_t *snapshot)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (snapshot == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
     {
@@ -843,25 +814,20 @@ esp_err_t wifi_service_get_scan_snapshot(
         *snapshot = g_wifi_service.scan_cache;
         xSemaphoreGive(g_wifi_service.state_mutex);
     }
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t wifi_service_port_submit_event(
     const wifi_service_port_event_t *event)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
     if (event == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (atomic_load_explicit(&g_wifi_service.core_state, memory_order_acquire) !=
             WIFI_CORE_READY)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     const wifi_queue_item_t item =
     {
@@ -872,13 +838,9 @@ esp_err_t wifi_service_port_submit_event(
     {
         atomic_store_explicit(&g_wifi_service.event_overflow, true,
                               memory_order_release);
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 #ifdef WIFI_SERVICE_TESTING

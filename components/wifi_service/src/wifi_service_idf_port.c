@@ -82,10 +82,9 @@ static void _wifi_service_port_barrier_handler(void *argument,
 
 static esp_err_t _wifi_service_port_drain_event_loop(void)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (!s_state.barrier_handler_ready)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     uint32_t generation = atomic_fetch_add_explicit(
                               &s_barrier_request, 1U,
@@ -96,12 +95,12 @@ static esp_err_t _wifi_service_port_drain_event_loop(void)
                          &s_barrier_request, 1U,
                          memory_order_relaxed) + 1U;
     }
-    result = esp_event_post(WIFI_SERVICE_PORT_BARRIER_EVENT,
-                            WIFI_SERVICE_PORT_BARRIER_ID,
-                            &generation, sizeof(generation), 0);
+    esp_err_t result = esp_event_post(WIFI_SERVICE_PORT_BARRIER_EVENT,
+                                      WIFI_SERVICE_PORT_BARRIER_ID,
+                                      &generation, sizeof(generation), 0);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
 
     TickType_t started = xTaskGetTickCount();
@@ -116,16 +115,12 @@ static esp_err_t _wifi_service_port_drain_event_loop(void)
         if (atomic_load_explicit(&s_barrier_completed,
                                  memory_order_acquire) == generation)
         {
-            result = ESP_OK;
-            goto exit;
+            return ESP_OK;
         }
         vTaskDelay(1);
     }
     while ((xTaskGetTickCount() - started) < timeout);
-    result = ESP_ERR_TIMEOUT;
-
-exit:
-    return result;
+    return ESP_ERR_TIMEOUT;
 }
 
 static bool _wifi_service_port_inactive_error(esp_err_t result)
@@ -263,12 +258,11 @@ static void _wifi_service_port_event_handler(void *argument,
 
 static esp_err_t _wifi_service_port_register_handlers(void)
 {
-    esp_err_t result = ESP_OK;
     if (s_state.wifi_handler_ready && s_state.ip_handler_ready)
     {
         atomic_store_explicit(&s_events_enabled, true,
                               memory_order_release);
-        goto exit;
+        return ESP_OK;
     }
     atomic_store_explicit(&s_event_netif, (uintptr_t)s_state.netif,
                           memory_order_release);
@@ -277,32 +271,30 @@ static esp_err_t _wifi_service_port_register_handlers(void)
     void *handler_argument = (void *)(uintptr_t)epoch;
     if (!s_state.wifi_handler_ready)
     {
-        result = esp_event_handler_instance_register(
-                     WIFI_EVENT, ESP_EVENT_ANY_ID,
-                     _wifi_service_port_event_handler, handler_argument,
-                     &s_state.wifi_handler);
+        esp_err_t result = esp_event_handler_instance_register(
+                               WIFI_EVENT, ESP_EVENT_ANY_ID,
+                               _wifi_service_port_event_handler, handler_argument,
+                               &s_state.wifi_handler);
         if (result != ESP_OK)
         {
-            goto exit;
+            return result;
         }
         s_state.wifi_handler_ready = true;
     }
     if (!s_state.ip_handler_ready)
     {
-        result = esp_event_handler_instance_register(
-                     IP_EVENT, ESP_EVENT_ANY_ID,
-                     _wifi_service_port_event_handler, handler_argument,
-                     &s_state.ip_handler);
+        esp_err_t result = esp_event_handler_instance_register(
+                               IP_EVENT, ESP_EVENT_ANY_ID,
+                               _wifi_service_port_event_handler, handler_argument,
+                               &s_state.ip_handler);
         if (result != ESP_OK)
         {
-            goto exit;
+            return result;
         }
         s_state.ip_handler_ready = true;
     }
     atomic_store_explicit(&s_events_enabled, true, memory_order_release);
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static esp_err_t _wifi_service_port_unregister_handlers(void)
@@ -349,19 +341,17 @@ static esp_err_t _wifi_service_port_unregister_handlers(void)
 
 esp_err_t wifi_service_port_start(void)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     const wifi_service_port_state_t state = wifi_service_port_get_state();
     if (state == WIFI_SERVICE_PORT_STATE_STARTED)
     {
-        result = ESP_OK;
-        goto exit;
+        return ESP_OK;
     }
     if (state != WIFI_SERVICE_PORT_STATE_STOPPED)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     (void)_wifi_service_port_next_epoch();
-    result = _wifi_service_port_register_handlers();
+    esp_err_t result = _wifi_service_port_register_handlers();
     if (result != ESP_OK)
     {
         atomic_store_explicit(&s_events_enabled, false,
@@ -372,7 +362,7 @@ esp_err_t wifi_service_port_start(void)
         {
             result = cleanup;
         }
-        goto exit;
+        return result;
     }
     result = esp_wifi_start();
     if (result != ESP_OK)
@@ -385,8 +375,7 @@ esp_err_t wifi_service_port_start(void)
             s_state.started = true;
             atomic_store_explicit(&s_events_enabled, false,
                                   memory_order_release);
-            result = stop_result;
-            goto exit;
+            return stop_result;
         }
         s_state.started = false;
         s_state.scan_list_owned = false;
@@ -395,8 +384,7 @@ esp_err_t wifi_service_port_start(void)
         esp_err_t drain_result = _wifi_service_port_drain_event_loop();
         if (drain_result != ESP_OK)
         {
-            result = drain_result;
-            goto exit;
+            return drain_result;
         }
         esp_err_t cleanup = _wifi_service_port_unregister_handlers();
         if (cleanup == ESP_OK)
@@ -408,13 +396,10 @@ esp_err_t wifi_service_port_start(void)
         {
             result = cleanup;
         }
-        goto exit;
+        return result;
     }
     s_state.started = true;
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t wifi_service_port_stop(void)
@@ -427,15 +412,14 @@ esp_err_t wifi_service_port_stop(void)
             result = wifi_service_port_get_state() ==
                      WIFI_SERVICE_PORT_STATE_STOPPED ? ESP_OK :
                      ESP_ERR_INVALID_STATE;
-            goto exit;
+            return result;
         }
         atomic_store_explicit(&s_events_enabled, false,
                               memory_order_release);
         esp_err_t drain_result = _wifi_service_port_drain_event_loop();
         if (drain_result != ESP_OK)
         {
-            result = drain_result;
-            goto exit;
+            return drain_result;
         }
         esp_err_t unregister_result =
             _wifi_service_port_unregister_handlers();
@@ -443,8 +427,7 @@ esp_err_t wifi_service_port_stop(void)
         {
             (void)_wifi_service_port_next_epoch();
         }
-        result = unregister_result;
-        goto exit;
+        return unregister_result;
     }
     atomic_store_explicit(&s_events_enabled, false, memory_order_release);
     result = esp_wifi_stop();
@@ -455,8 +438,7 @@ esp_err_t wifi_service_port_stop(void)
         esp_err_t drain_result = _wifi_service_port_drain_event_loop();
         if (drain_result != ESP_OK)
         {
-            result = drain_result;
-            goto exit;
+            return drain_result;
         }
         esp_err_t unregister_result =
             _wifi_service_port_unregister_handlers();
@@ -464,56 +446,47 @@ esp_err_t wifi_service_port_stop(void)
         {
             (void)_wifi_service_port_next_epoch();
         }
-        result = unregister_result;
-        goto exit;
+        return unregister_result;
     }
 
     const esp_err_t stop_result = result;
     esp_err_t rollback = esp_wifi_start();
     if (rollback != ESP_OK && rollback != ESP_ERR_WIFI_NOT_STOPPED)
     {
-        result = rollback;
-        goto exit;
+        return rollback;
     }
     s_state.started = true;
     esp_err_t drain_result = _wifi_service_port_drain_event_loop();
     if (drain_result != ESP_OK)
     {
-        result = drain_result;
-        goto exit;
+        return drain_result;
     }
     atomic_store_explicit(&s_events_enabled, true, memory_order_release);
-    result = stop_result;
-
-exit:
-    return result;
+    return stop_result;
 }
 
 esp_err_t wifi_service_port_init(void)
 {
-    esp_err_t result = ESP_OK;
     if (!wifi_service_port_is_clean())
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     const esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_WIFI_STA();
     s_state.netif = esp_netif_new(&netif_config);
     if (s_state.netif == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     s_state.attach_attempted = true;
-    result = esp_netif_attach_wifi_station(s_state.netif);
+    esp_err_t result = esp_netif_attach_wifi_station(s_state.netif);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = esp_wifi_set_default_wifi_sta_handlers();
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     s_state.default_handlers_ready = true;
 
@@ -524,18 +497,18 @@ esp_err_t wifi_service_port_init(void)
     wifi_service_secure_zero(&config, sizeof(config));
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     s_state.wifi_initialized = true;
     result = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = esp_wifi_set_mode(WIFI_MODE_STA);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = esp_event_handler_instance_register(
                  WIFI_SERVICE_PORT_BARRIER_EVENT,
@@ -544,13 +517,10 @@ esp_err_t wifi_service_port_init(void)
                  &s_state.barrier_handler);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     s_state.barrier_handler_ready = true;
-    result = wifi_service_port_start();
-
-exit:
-    return result;
+    return wifi_service_port_start();
 }
 
 esp_err_t wifi_service_port_scan_abort(void)
@@ -558,7 +528,7 @@ esp_err_t wifi_service_port_scan_abort(void)
     esp_err_t result = ESP_OK;
     if (!s_state.scan_list_owned)
     {
-        goto exit;
+        return ESP_OK;
     }
     if (s_state.started)
     {
@@ -566,8 +536,7 @@ esp_err_t wifi_service_port_scan_abort(void)
         if (stop_result != ESP_OK &&
                 !_wifi_service_port_inactive_error(stop_result))
         {
-            result = stop_result;
-            goto exit;
+            return stop_result;
         }
     }
     result = esp_wifi_clear_ap_list();
@@ -576,8 +545,6 @@ esp_err_t wifi_service_port_scan_abort(void)
         s_state.scan_list_owned = false;
         result = ESP_OK;
     }
-
-exit:
     return result;
 }
 
@@ -594,8 +561,7 @@ esp_err_t wifi_service_port_deinit(void)
         esp_err_t stop_result = wifi_service_port_stop();
         if (stop_result != ESP_OK)
         {
-            result = stop_result;
-            goto exit;
+            return stop_result;
         }
     }
 
@@ -610,7 +576,7 @@ esp_err_t wifi_service_port_deinit(void)
         }
         else
         {
-            goto exit;
+            return result;
         }
     }
 
@@ -650,10 +616,7 @@ esp_err_t wifi_service_port_deinit(void)
     atomic_store_explicit(&s_events_enabled, false, memory_order_release);
     atomic_store_explicit(&s_event_netif, (uintptr_t)NULL,
                           memory_order_release);
-    result = first_error;
-
-exit:
-    return result;
+    return first_error;
 }
 
 bool wifi_service_port_is_clean(void)
@@ -705,24 +668,21 @@ bool wifi_service_port_scan_is_owned(void)
 
 esp_err_t wifi_service_port_scan_start(void)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (wifi_service_port_get_state() != WIFI_SERVICE_PORT_STATE_STARTED ||
             s_state.scan_list_owned)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     wifi_scan_config_t config;
     memset(&config, 0, sizeof(config));
     config.show_hidden = false;
     config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    result = esp_wifi_scan_start(&config, false);
+    esp_err_t result = esp_wifi_scan_start(&config, false);
     wifi_service_secure_zero(&config, sizeof(config));
     if (result == ESP_OK)
     {
         s_state.scan_list_owned = true;
     }
-
-exit:
     return result;
 }
 
@@ -737,13 +697,11 @@ esp_err_t wifi_service_port_scan_finish(
             capacity > WIFI_SERVICE_MAX_SCAN_RECORDS || out_count == NULL ||
             out_truncated == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!s_state.scan_list_owned)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     *out_count = 0;
     *out_truncated = false;
@@ -807,14 +765,12 @@ esp_err_t wifi_service_port_clear_credentials(void)
     esp_err_t result = ESP_OK;
     if (!s_state.wifi_initialized)
     {
-        goto exit;
+        return ESP_OK;
     }
     wifi_config_t config;
     memset(&config, 0, sizeof(config));
     result = esp_wifi_set_config(WIFI_IF_STA, &config);
     wifi_service_secure_zero(&config, sizeof(config));
-
-exit:
     return result;
 }
 
@@ -823,7 +779,6 @@ esp_err_t wifi_service_port_set_credentials(
 {
     esp_err_t result = ESP_ERR_INVALID_ARG;
     wifi_config_t config;
-    bool config_used = false;
     if (credentials == NULL || !s_state.wifi_initialized ||
             credentials->ssid_length == 0 ||
             credentials->ssid_length > WIFI_SERVICE_SSID_MAX_BYTES ||
@@ -831,10 +786,9 @@ esp_err_t wifi_service_port_set_credentials(
             (credentials->security != WIFI_SERVICE_SECURITY_OPEN &&
              credentials->security != WIFI_SERVICE_SECURITY_PERSONAL))
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     memset(&config, 0, sizeof(config));
-    config_used = true;
     memcpy(config.sta.ssid, credentials->ssid,
            credentials->ssid_length);
     if (credentials->password_length > 0)
@@ -850,12 +804,7 @@ esp_err_t wifi_service_port_set_credentials(
     config.sta.pmf_cfg.capable = true;
     config.sta.pmf_cfg.required = false;
     result = esp_wifi_set_config(WIFI_IF_STA, &config);
-
-exit:
-    if (config_used)
-    {
-        wifi_service_secure_zero(&config, sizeof(config));
-    }
+    wifi_service_secure_zero(&config, sizeof(config));
     return result;
 }
 
@@ -866,18 +815,15 @@ esp_err_t wifi_service_port_connect(void)
 
 esp_err_t wifi_service_port_disconnect(void)
 {
-    esp_err_t result = ESP_OK;
     if (!s_state.started)
     {
-        goto exit;
+        return ESP_OK;
     }
-    result = esp_wifi_disconnect();
+    esp_err_t result = esp_wifi_disconnect();
     if (result == ESP_OK || result == ESP_ERR_WIFI_NOT_CONNECT ||
             _wifi_service_port_inactive_error(result))
     {
         result = ESP_OK;
     }
-
-exit:
     return result;
 }

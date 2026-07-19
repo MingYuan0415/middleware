@@ -41,14 +41,13 @@ static esp_err_t _wifi_service_worker_init_runtime(
         }
         result = clean ? result :
                  (cleanup_result != ESP_OK ? cleanup_result : ESP_FAIL);
-        goto exit;
+        return result;
     }
 
     if (wifi_service_port_get_state() != WIFI_SERVICE_PORT_STATE_STARTED)
     {
         wifi_service_worker_enter_cleanup_pending(context, ESP_ERR_INVALID_STATE);
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     context->radio_ready = true;
     context->port_epoch = wifi_service_port_get_epoch();
@@ -63,8 +62,6 @@ static esp_err_t _wifi_service_worker_init_runtime(
     wifi_service_worker_publish_status(context);
     wifi_service_worker_publish_scan(context);
     wifi_service_worker_publish_availability(true);
-
-exit:
     return result;
 }
 
@@ -112,7 +109,7 @@ static void _wifi_service_recover_clear_failure(
                 context, boundary_result != ESP_OK ? boundary_result :
                 ESP_ERR_INVALID_STATE);
             _wifi_service_finish_suspended_scan(context, clear_result, false);
-            goto exit;
+            return;
         }
         const bool reconnect_after_completion =
             boundary_result == ESP_OK &&
@@ -134,9 +131,6 @@ static void _wifi_service_recover_clear_failure(
     {
         wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
     }
-
-exit:
-    return;
 }
 
 static esp_err_t _wifi_service_recover_stop_failure(
@@ -149,7 +143,7 @@ static esp_err_t _wifi_service_recover_stop_failure(
     {
         _wifi_service_finish_suspended_scan(context, transition_error, false);
         wifi_service_worker_enter_cleanup_pending(context, transition_error);
-        goto exit;
+        return transition_error;
     }
     context->radio_ready = true;
     const bool reconnect_after_completion = scan_result == ESP_OK &&
@@ -172,8 +166,6 @@ static esp_err_t _wifi_service_recover_stop_failure(
     {
         wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
     }
-
-exit:
     return transition_error;
 }
 
@@ -193,7 +185,7 @@ static esp_err_t _wifi_service_worker_suspend(
     if (result != ESP_OK)
     {
         _wifi_service_recover_clear_failure(context, scan_result, result);
-        goto exit;
+        return result;
     }
 
     result = wifi_service_port_stop();
@@ -203,7 +195,7 @@ static esp_err_t _wifi_service_worker_suspend(
     {
         result = _wifi_service_recover_stop_failure(
                      context, scan_result, result, port_state);
-        goto exit;
+        return result;
     }
     _wifi_service_finish_suspended_scan(context,
                                         scan_result == ESP_OK ? ESP_OK :
@@ -219,10 +211,7 @@ static esp_err_t _wifi_service_worker_suspend(
     context->status.last_error = ESP_OK;
     wifi_service_worker_set_runtime(WIFI_RUNTIME_SUSPENDED, false);
     wifi_service_worker_publish_status(context);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static esp_err_t _wifi_service_worker_resume(
@@ -246,7 +235,7 @@ static esp_err_t _wifi_service_worker_resume(
             wifi_service_worker_enter_cleanup_pending(context,
                     transition_error);
         }
-        goto exit;
+        return transition_error;
     }
     context->radio_ready = true;
     if (context->status.desired_connected && context->has_credentials)
@@ -268,15 +257,14 @@ static esp_err_t _wifi_service_worker_resume(
                 context->status.state = WIFI_SERVICE_STATE_SUSPENDED;
                 context->status.last_error = result;
                 wifi_service_worker_publish_status(context);
-                goto exit;
+                return result;
             }
             esp_err_t rollback_error = clear_result != ESP_OK ?
                                        clear_result :
                                        (rollback != ESP_OK ? rollback :
                                         ESP_ERR_INVALID_STATE);
             wifi_service_worker_enter_cleanup_pending(context, rollback_error);
-            result = rollback_error;
-            goto exit;
+            return rollback_error;
         }
     }
     else
@@ -287,10 +275,7 @@ static esp_err_t _wifi_service_worker_resume(
     }
     context->suspended = false;
     wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static esp_err_t _wifi_service_worker_deinit(

@@ -251,13 +251,12 @@ static void _power_worker(void *context)
 
 esp_err_t power_service_register_power_ops(const power_service_power_ops_t *ops)
 {
-    esp_err_t result = ESP_OK;
     if (ops == NULL || ops->get_info == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t result = ESP_OK;
     taskENTER_CRITICAL(&s_state_lock);
     if (s_state != POWER_SERVICE_STATE_STOPPED || s_initialized)
     {
@@ -269,8 +268,6 @@ esp_err_t power_service_register_power_ops(const power_service_power_ops_t *ops)
         s_power_ops_registered = true;
     }
     taskEXIT_CRITICAL(&s_state_lock);
-
-exit:
     return result;
 }
 
@@ -295,7 +292,7 @@ esp_err_t power_service_init(void)
     taskEXIT_CRITICAL(&s_state_lock);
     if (!initialize)
     {
-        goto exit;
+        return result;
     }
 
     s_worker_events = xEventGroupCreate();
@@ -331,7 +328,7 @@ esp_err_t power_service_init(void)
     xTaskNotify(s_worker, POWER_SERVICE_CMD_START, eSetBits);
     LOG_I("worker started (interval=%dms)",
           CONFIG_POWER_SERVICE_POLL_INTERVAL_MS);
-    goto exit;
+    return ESP_OK;
 
 cleanup:
     atomic_store_explicit(&s_worker_event_tail_complete, true,
@@ -347,8 +344,6 @@ cleanup:
         s_worker_events = NULL;
     }
     _set_worker_state(POWER_SERVICE_STATE_STOPPED);
-
-exit:
     return result;
 }
 
@@ -487,7 +482,7 @@ esp_err_t power_service_suspend(uint32_t timeout_ms)
 
     if (control == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(control, portMAX_DELAY);
     control_owned = true;
@@ -534,7 +529,7 @@ esp_err_t power_service_resume(uint32_t timeout_ms)
 
     if (control == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(control, portMAX_DELAY);
     control_owned = true;
@@ -587,50 +582,40 @@ exit:
 
 esp_err_t power_service_get_snapshot(power_service_snapshot_t *snapshot)
 {
-    esp_err_t result = ESP_OK;
     if (snapshot == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     taskENTER_CRITICAL(&s_state_lock);
     const bool ready = s_initialized;
     taskEXIT_CRITICAL(&s_state_lock);
     if (!ready)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
     taskENTER_CRITICAL(&s_snapshot_lock);
     *snapshot = s_snapshot;
     taskEXIT_CRITICAL(&s_snapshot_lock);
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t power_service_get_info(power_info_t *info)
 {
-    esp_err_t result = ESP_OK;
     power_service_snapshot_t snapshot;
     if (info == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
-    result = power_service_get_snapshot(&snapshot);
+    esp_err_t result = power_service_get_snapshot(&snapshot);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     if (!snapshot.valid)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     *info = snapshot.info;
-
-exit:
-    return result;
+    return ESP_OK;
 }

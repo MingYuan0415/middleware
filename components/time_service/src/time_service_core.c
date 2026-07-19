@@ -86,10 +86,9 @@ bool time_service_core_tm_valid(const struct tm *value)
 
 bool time_service_core_utc_to_epoch(const struct tm *value, int64_t *epoch)
 {
-    bool converted = false;
     if (epoch == NULL || !time_service_core_tm_valid(value))
     {
-        goto exit;
+        return false;
     }
 
     const int64_t days = _days_from_civil(value->tm_year + 1900,
@@ -97,22 +96,18 @@ bool time_service_core_utc_to_epoch(const struct tm *value, int64_t *epoch)
                                           (unsigned)value->tm_mday);
     *epoch = days * INT64_C(86400) + (int64_t)value->tm_hour * 3600LL +
              (int64_t)value->tm_min * 60LL + (int64_t)value->tm_sec;
-    converted = true;
-
-exit:
-    return converted;
+    return true;
 }
 
 bool time_service_core_epoch_to_utc(int64_t epoch, struct tm *value)
 {
-    bool converted = false;
     if (value == NULL)
     {
-        goto exit;
+        return false;
     }
     if (epoch < INT64_C(-62135596800) || epoch > INT64_C(253402300799))
     {
-        goto exit;
+        return false;
     }
 
     int64_t days = epoch / INT64_C(86400);
@@ -129,7 +124,7 @@ bool time_service_core_epoch_to_utc(int64_t epoch, struct tm *value)
     _civil_from_days(days, &year, &month, &day);
     if (year < 1 || year > 9999)
     {
-        goto exit;
+        return false;
     }
 
     memset(value, 0, sizeof(*value));
@@ -148,8 +143,5 @@ bool time_service_core_epoch_to_utc(int64_t epoch, struct tm *value)
     value->tm_wday = (int)weekday;
     value->tm_yday = (int)(days - _days_from_civil(year, 1U, 1U));
     value->tm_isdst = 0;
-    converted = true;
-
-exit:
-    return converted;
+    return true;
 }

@@ -13,39 +13,29 @@ static esp_err_t _time_service_port_tcpip_barrier(void *context)
 
 esp_err_t time_service_port_clock_set(int64_t epoch)
 {
-    esp_err_t result = ESP_OK;
     const time_t native_epoch = (time_t)epoch;
     if ((int64_t)native_epoch != epoch)
     {
-        result = ESP_ERR_INVALID_SIZE;
-        goto exit;
+        return ESP_ERR_INVALID_SIZE;
     }
     const struct timeval value = { .tv_sec = native_epoch, .tv_usec = 0 };
-    result = settimeofday(&value, NULL) == 0 ? ESP_OK : ESP_FAIL;
-
-exit:
-    return result;
+    return settimeofday(&value, NULL) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t time_service_port_clock_get(int64_t *epoch)
 {
-    esp_err_t result = ESP_OK;
     if (epoch == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     struct timeval value;
     if (gettimeofday(&value, NULL) != 0)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     *epoch = (int64_t)value.tv_sec;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t time_service_port_sntp_start(time_service_port_sync_cb_t callback)

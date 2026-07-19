@@ -95,11 +95,15 @@ BaseType_t xTaskCreate(void (*entry)(void *), const char *name,
     bool changed_ready = false;
     if (entry == NULL || out_task == NULL)
     {
-        goto exit;
+        return pdFAIL;
     }
 
     task = calloc(1, sizeof(*task));
-    if (task == NULL || pthread_mutex_init(&task->lock, NULL) != 0)
+    if (task == NULL)
+    {
+        return pdFAIL;
+    }
+    if (pthread_mutex_init(&task->lock, NULL) != 0)
     {
         goto exit;
     }
@@ -141,20 +145,16 @@ exit:
 BaseType_t xTaskNotify(TaskHandle_t task, uint32_t value,
                        eNotifyAction action)
 {
-    BaseType_t result = pdFAIL;
     if (task == NULL || action != eSetBits)
     {
-        goto exit;
+        return pdFAIL;
     }
     (void)pthread_mutex_lock(&task->lock);
     task->notification |= value;
     (void)pthread_cond_signal(&task->changed);
     (void)pthread_mutex_unlock(&task->lock);
     atomic_fetch_add(&s_notification_count, 1U);
-    result = pdPASS;
-
-exit:
-    return result;
+    return pdPASS;
 }
 
 BaseType_t xTaskNotifyWait(uint32_t clear_on_entry, uint32_t clear_on_exit,
@@ -164,7 +164,7 @@ BaseType_t xTaskNotifyWait(uint32_t clear_on_entry, uint32_t clear_on_exit,
     TaskHandle_t task = s_current_task;
     if (task == NULL)
     {
-        goto exit;
+        return pdFALSE;
     }
 
     (void)pthread_mutex_lock(&task->lock);
@@ -201,8 +201,6 @@ BaseType_t xTaskNotifyWait(uint32_t clear_on_entry, uint32_t clear_on_exit,
         result = pdTRUE;
     }
     (void)pthread_mutex_unlock(&task->lock);
-
-exit:
     return result;
 }
 
@@ -269,13 +267,12 @@ EventGroupHandle_t xEventGroupCreate(void)
     EventGroupHandle_t group = calloc(1, sizeof(*group));
     if (group == NULL)
     {
-        goto exit;
+        return NULL;
     }
     if (pthread_mutex_init(&group->lock, NULL) != 0)
     {
         free(group);
-        group = NULL;
-        goto exit;
+        return NULL;
     }
     if (pthread_cond_init(&group->changed, NULL) != 0)
     {
@@ -283,8 +280,6 @@ EventGroupHandle_t xEventGroupCreate(void)
         free(group);
         group = NULL;
     }
-
-exit:
     return group;
 }
 

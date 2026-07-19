@@ -365,7 +365,7 @@ esp_err_t nvs_open(const char *namespace_name, nvs_open_mode_t open_mode,
     (void)pthread_mutex_unlock(&s_lock);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
 
     (void)pthread_mutex_lock(&s_block_lock);
@@ -408,8 +408,6 @@ esp_err_t nvs_open(const char *namespace_name, nvs_open_mode_t open_mode,
         }
     }
     (void)pthread_mutex_unlock(&s_lock);
-
-exit:
     return result;
 }
 
@@ -432,36 +430,29 @@ static esp_err_t _host_nvs_set_locked(
     esp_err_t result = _host_nvs_record_locked(operation);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     if (_host_nvs_find_handle_locked(handle) == NULL)
     {
-        result = ESP_ERR_NVS_INVALID_HANDLE;
-        goto exit;
+        return ESP_ERR_NVS_INVALID_HANDLE;
     }
     if (!_host_nvs_key_is_valid_locked(key))
     {
-        result = ESP_ERR_NVS_KEY_TOO_LONG;
-        goto exit;
+        return ESP_ERR_NVS_KEY_TOO_LONG;
     }
     if (data == NULL || size > HOST_NVS_MAX_VALUE)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     host_entry_t *entry = _host_nvs_allocate_entry_locked(key);
     if (entry == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     entry->type = type;
     entry->size = size;
     memcpy(entry->data, data, size);
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static void _host_nvs_apply_growth_locked(host_nvs_operation_t operation,
@@ -489,53 +480,43 @@ static esp_err_t _host_nvs_get_locked(
     esp_err_t result = _host_nvs_record_locked(operation);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     if (_host_nvs_find_handle_locked(handle) == NULL)
     {
-        result = ESP_ERR_NVS_INVALID_HANDLE;
-        goto exit;
+        return ESP_ERR_NVS_INVALID_HANDLE;
     }
     if (!_host_nvs_key_is_valid_locked(key))
     {
-        result = ESP_ERR_NVS_KEY_TOO_LONG;
-        goto exit;
+        return ESP_ERR_NVS_KEY_TOO_LONG;
     }
     _host_nvs_apply_growth_locked(operation, key, data != NULL);
     host_entry_t *entry = _host_nvs_find_entry_locked(key);
     if (entry == NULL)
     {
-        result = ESP_ERR_NVS_NOT_FOUND;
-        goto exit;
+        return ESP_ERR_NVS_NOT_FOUND;
     }
     if (entry->type != type)
     {
-        result = ESP_ERR_NVS_TYPE_MISMATCH;
-        goto exit;
+        return ESP_ERR_NVS_TYPE_MISMATCH;
     }
     if (size == NULL)
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (data == NULL)
     {
         *size = entry->size;
-        result = ESP_OK;
-        goto exit;
+        return ESP_OK;
     }
     if (*size < entry->size)
     {
         *size = entry->size;
-        result = ESP_ERR_NVS_INVALID_LENGTH;
-        goto exit;
+        return ESP_ERR_NVS_INVALID_LENGTH;
     }
     memcpy(data, entry->data, entry->size);
     *size = entry->size;
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 esp_err_t nvs_commit(nvs_handle_t handle)

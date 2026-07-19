@@ -79,16 +79,13 @@ static void _wait_for_worker_event_tail(void)
 static esp_err_t _cleanup_cpu_lock(void)
 {
     esp_err_t result = ESP_OK;
-    bool mutex_taken = false;
 
     if (s_cpu_lock_mutex != NULL)
     {
         if (xSemaphoreTake(s_cpu_lock_mutex, portMAX_DELAY) != pdTRUE)
         {
-            result = ESP_FAIL;
-            goto exit;
+            return ESP_FAIL;
         }
-        mutex_taken = true;
     }
 
     if (s_cpu_lock_count > 0)
@@ -115,14 +112,7 @@ static esp_err_t _cleanup_cpu_lock(void)
         }
     }
 
-    if (mutex_taken)
-    {
-        xSemaphoreGive(s_cpu_lock_mutex);
-        mutex_taken = false;
-    }
-
-exit:
-    if (mutex_taken)
+    if (s_cpu_lock_mutex != NULL)
     {
         xSemaphoreGive(s_cpu_lock_mutex);
     }
@@ -163,19 +153,16 @@ static void _reset_stopped_resources(void)
 
 static esp_err_t _cleanup_stopped_resources(void)
 {
-    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (s_sleep_task != NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
 
-    result = _cleanup_cpu_lock();
+    esp_err_t result = _cleanup_cpu_lock();
     if (result == ESP_OK)
     {
         _reset_stopped_resources();
     }
-
-exit:
     return result;
 }
 
@@ -424,33 +411,28 @@ static esp_err_t _wait_for_completion(EventGroupHandle_t events,
     {
         if (_completion_result(generation, &result))
         {
-            goto exit;
+            return result;
         }
 
         const TickType_t elapsed = xTaskGetTickCount() - started;
         if (elapsed >= timeout)
         {
-            result = ESP_ERR_TIMEOUT;
-            goto exit;
+            return ESP_ERR_TIMEOUT;
         }
         const EventBits_t bits = xEventGroupWaitBits(
                                      events, SYSTEM_PM_EVENT_REQUEST_COMPLETE, pdFALSE, pdTRUE,
                                      timeout - elapsed);
         if (_completion_result(generation, &result))
         {
-            goto exit;
+            return result;
         }
         if ((bits & SYSTEM_PM_EVENT_REQUEST_COMPLETE) == 0)
         {
-            result = ESP_ERR_TIMEOUT;
-            goto exit;
+            return ESP_ERR_TIMEOUT;
         }
 
         xEventGroupClearBits(events, SYSTEM_PM_EVENT_REQUEST_COMPLETE);
     }
-
-exit:
-    return result;
 }
 
 static bool _stop_requested(void)
@@ -585,26 +567,23 @@ static esp_err_t _create_system_pm_resources(void)
                                 "system_pm_cpu_max", &lock);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     s_cpu_max_lock = lock;
     s_cpu_lock_mutex = xSemaphoreCreateMutex();
     if (s_cpu_lock_mutex == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     s_command_mutex = xSemaphoreCreateMutex();
     if (s_command_mutex == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
     s_worker_events = xEventGroupCreate();
     if (s_worker_events == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
 
     atomic_store_explicit(&s_worker_event_tail_complete, false,
@@ -616,13 +595,9 @@ static esp_err_t _create_system_pm_resources(void)
         s_sleep_task = NULL;
         atomic_store_explicit(&s_worker_event_tail_complete, true,
                               memory_order_release);
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
-    result = ESP_OK;
-
-exit:
-    return result;
+    return ESP_OK;
 }
 
 static void _activate_system_pm(void)
@@ -644,8 +619,7 @@ esp_err_t system_pm_init(const system_pm_config_t *config)
     bool initialize = false;
     if (!_config_valid(config))
     {
-        result = ESP_ERR_INVALID_ARG;
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
 
     taskENTER_CRITICAL(&s_state_lock);
@@ -668,7 +642,7 @@ esp_err_t system_pm_init(const system_pm_config_t *config)
     taskEXIT_CRITICAL(&s_state_lock);
     if (!initialize)
     {
-        goto exit;
+        return result;
     }
 
     s_config = *config;
@@ -681,12 +655,10 @@ esp_err_t system_pm_init(const system_pm_config_t *config)
     _activate_system_pm();
     LOG_I("initialized with %u wake sources",
           (unsigned)s_config.wake_source_count);
-    goto exit;
+    return ESP_OK;
 
 rollback:
     _rollback_init_resources(result);
-
-exit:
     return result;
 }
 
@@ -730,7 +702,7 @@ esp_err_t system_pm_deinit(void)
     taskEXIT_CRITICAL(&s_state_lock);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
 
     if (worker != NULL)
@@ -741,8 +713,6 @@ esp_err_t system_pm_deinit(void)
         _wait_for_worker_event_tail();
     }
     result = _cleanup_stopped_resources();
-
-exit:
     return result;
 }
 
@@ -754,12 +724,11 @@ esp_err_t system_pm_request_standby(void)
     TaskHandle_t worker = NULL;
     if (s_command_mutex == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     command_owned = true;
 
@@ -785,7 +754,6 @@ esp_err_t system_pm_request_standby(void)
         xTaskNotify(worker, SYSTEM_PM_CMD_REQUEST, eSetBits);
     }
 
-exit:
     if (command_owned)
     {
         xSemaphoreGive(s_command_mutex);
@@ -799,13 +767,11 @@ esp_err_t system_pm_cancel_standby(void)
     bool command_owned = false;
     if (s_command_mutex == NULL)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     command_owned = true;
 
@@ -865,7 +831,6 @@ esp_err_t system_pm_cancel_standby(void)
         result = _wait_for_completion(events, completion_generation);
     }
 
-exit:
     if (command_owned)
     {
         xSemaphoreGive(s_command_mutex);
@@ -879,12 +844,11 @@ esp_err_t system_pm_acquire_cpu_max_freq(void)
     bool mutex_owned = false;
     if (!s_initialized || s_cpu_max_lock == NULL || s_cpu_lock_mutex == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_cpu_lock_mutex, portMAX_DELAY) != pdTRUE)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     mutex_owned = true;
     result = ESP_OK;
@@ -897,7 +861,6 @@ esp_err_t system_pm_acquire_cpu_max_freq(void)
         ++s_cpu_lock_count;
     }
 
-exit:
     if (mutex_owned)
     {
         xSemaphoreGive(s_cpu_lock_mutex);
@@ -911,12 +874,11 @@ esp_err_t system_pm_release_cpu_max_freq(void)
     bool mutex_owned = false;
     if (!s_initialized || s_cpu_max_lock == NULL || s_cpu_lock_mutex == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_cpu_lock_mutex, portMAX_DELAY) != pdTRUE)
     {
-        result = ESP_FAIL;
-        goto exit;
+        return ESP_FAIL;
     }
     mutex_owned = true;
     result = ESP_OK;
@@ -937,7 +899,6 @@ esp_err_t system_pm_release_cpu_max_freq(void)
         --s_cpu_lock_count;
     }
 
-exit:
     if (mutex_owned)
     {
         xSemaphoreGive(s_cpu_lock_mutex);

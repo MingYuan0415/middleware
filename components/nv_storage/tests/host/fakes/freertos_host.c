@@ -176,12 +176,11 @@ SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *storage)
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
                           TickType_t timeout_ticks)
 {
-    BaseType_t result = pdFALSE;
     (void)timeout_ticks;
     _host_freertos_apply_take_gate();
     if (semaphore == NULL || !semaphore->initialized)
     {
-        goto exit;
+        return pdFALSE;
     }
 
     _host_freertos_pending_take_add();
@@ -189,13 +188,10 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
     _host_freertos_pending_take_remove();
     if (lock_result != 0)
     {
-        goto exit;
+        return pdFALSE;
     }
     _host_freertos_apply_after_take_gate();
-    result = pdTRUE;
-
-exit:
-    return result;
+    return pdTRUE;
 }
 
 BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore)

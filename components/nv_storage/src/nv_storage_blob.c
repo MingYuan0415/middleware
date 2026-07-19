@@ -53,12 +53,11 @@ esp_err_t nv_storage_blob_register(const char *key, void *data, size_t size,
     if (!nv_storage_internal_key_is_valid(key) || data == NULL || size == 0 ||
             default_cb == NULL)
     {
-        goto exit;
+        return ESP_ERR_INVALID_ARG;
     }
     if (!nv_storage_internal_access_begin())
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     access_owned = true;
     result = nv_storage_internal_registry_lock();
@@ -132,7 +131,7 @@ static esp_err_t _nv_storage_blob_store_default(
     esp_err_t result = entry->default_cb(candidate, entry->size);
     if (result != ESP_OK)
     {
-        goto exit;
+        return result;
     }
     result = nvs_set_blob(handle, entry->key, candidate, entry->size);
     if (result == ESP_OK)
@@ -143,8 +142,6 @@ static esp_err_t _nv_storage_blob_store_default(
     {
         memcpy(entry->data, candidate, entry->size);
     }
-
-exit:
     return result;
 }
 
@@ -158,14 +155,13 @@ static esp_err_t _nv_storage_blob_load_one(
                        (result == ESP_OK && stored_size != entry->size);
     if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
     {
-        goto exit;
+        return result;
     }
 
     candidate = malloc(entry->size);
     if (candidate == NULL)
     {
-        result = ESP_ERR_NO_MEM;
-        goto exit;
+        return ESP_ERR_NO_MEM;
     }
 
     if (!use_default)
@@ -208,7 +204,7 @@ esp_err_t nv_storage_blob_load_all(void)
     bool lock_owned = false;
     if (!nv_storage_internal_load_begin())
     {
-        goto exit;
+        return ESP_ERR_INVALID_STATE;
     }
     load_owned = true;
     result = nv_storage_internal_registry_lock();
