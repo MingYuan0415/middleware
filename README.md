@@ -60,7 +60,7 @@ idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
 | IMU | `IMU_SERVICE_TASK_STACK`（3072；2048-8192）、`IMU_SERVICE_TASK_PRIORITY`（6；1-24）、`IMU_SERVICE_SAMPLE_RATE_HZ`（100；1-1000） |
 | 音频 | 默认 16 kHz、16-bit、双声道、384x MCLK、streaming 时 PA 开启；`AUDIO_SERVICE_*` choice 提供 8-96 kHz、16/24/32-bit、mono/stereo 及受采样格式约束的 MCLK 倍频 |
 | SD | `SD_STORAGE_SERVICE_ENABLE`（y）、`SD_STORAGE_SERVICE_MOUNT_PATH`（`/sdcard`）、`SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED`（n）、`SD_STORAGE_SERVICE_MAX_FILES`（5；1-32）、`SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE`（16384；0-65536） |
-| 系统 PM | `SYSTEM_PM_STANDBY_TASK_STACK`（4096；2048-16384）、`SYSTEM_PM_STANDBY_TASK_PRIO`（5；1-24） |
+| 系统 PM | `SYSTEM_PM_STANDBY_TASK_STACK`（4096；2048-16384）、`SYSTEM_PM_STANDBY_TASK_PRIO`（5；1-24）、`SYSTEM_PM_DEVELOPMENT_MODE`（n；USB Serial/JTAG 连接时禁止 standby） |
 | Wi-Fi | `WIFI_SERVICE_TASK_STACK`（4096；3072-8192）、`WIFI_SERVICE_TASK_PRIORITY`（4；1-20）、`WIFI_SERVICE_QUEUE_DEPTH`（16；8-32）、`WIFI_SERVICE_WORKER_POLL_MS`（20；5-100）、`WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS`（1000；100-5000） |
 
 时间服务当前固定使用 `CST-8`、`pool.ntp.org` 和 100 ms alarm IRQ 轮询，没有对应 Kconfig。修改配置后运行 `idf.py reconfigure && idf.py build`。
@@ -72,6 +72,7 @@ idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
 - Wi-Fi 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。Wi-Fi、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
 - `system_pm` 接受 1 至 4 个唯一 RTC GPIO 唤醒源，且有效电平必须一致。唤醒回调应只通知其他 worker；外设准备和恢复钩子运行在 PM worker 中，可以阻塞但必须遵守配置超时。
+- `SYSTEM_PM_DEVELOPMENT_MODE=y` 不是让 USB Serial/JTAG 在 light sleep 中继续工作；ESP32-S3 硬件不支持这一点。该模式在 USB 主机连接时跳过 app standby（显示仍可熄灭），并启用 IDF 的自动睡眠连接保护；拔出 USB 后恢复正常 light sleep。
 - 当前板级 EXIO3/5/6 经过 TCA9554，只能由 time/power/IMU worker 轮询，不能成为 RTC GPIO 唤醒源。触摸唤醒尚未实现，GPIO21 未注册；实际 wake descriptor 仍只有 GPIO0 低电平。
 
 ## 宿主测试

@@ -1,5 +1,20 @@
 menu "System Power Management"
 
+    config SYSTEM_PM_DEVELOPMENT_MODE
+        bool "Keep USB Serial/JTAG available while connected"
+        depends on PM_ENABLE && SOC_USB_SERIAL_JTAG_SUPPORTED && \
+                   ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED && USJ_ENABLE_USB_SERIAL_JTAG
+        select USJ_NO_AUTO_LS_ON_CONNECTION
+        default n
+        help
+            Development mode for boards using the ESP32-S3 USB Serial/JTAG
+            console. While the host is connected, application standby is
+            suppressed so the USB CDC link remains active. The display and
+            other peripherals may still be suspended, but the chip does not
+            enter explicit light sleep. Light sleep is restored automatically
+            after the USB host disconnects. This option increases power
+            consumption while connected.
+
     config SYSTEM_PM_STANDBY_TASK_STACK
         int "Standby task stack size (bytes)"
         range 2048 16384
