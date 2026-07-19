@@ -6,20 +6,61 @@
 #include <time.h>
 
 #include "esp_err.h"
+#include "event_bus.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/**
- * @brief Board RTC operations using UTC values.
- */
+/** @brief Calendar fields compared by the recurring RTC alarm. */
+typedef struct time_service_alarm_config
+{
+    bool match_second; /**< Compare second when true. */
+    uint8_t second;    /**< Second in the range 0 through 59. */
+    bool match_minute; /**< Compare minute when true. */
+    uint8_t minute;    /**< Minute in the range 0 through 59. */
+    bool match_hour;   /**< Compare hour when true. */
+    uint8_t hour;      /**< Hour in the range 0 through 23. */
+    bool match_day;    /**< Compare day of month when true. */
+    uint8_t day;       /**< Day of month in the range 1 through 31. */
+    bool match_weekday; /**< Compare weekday when true. */
+    uint8_t weekday;    /**< Weekday in the range 0 through 6. */
+} time_service_alarm_config_t;
+
+/** @brief Current RTC alarm and physical interrupt state. */
+typedef struct time_service_alarm_status
+{
+    bool enabled;          /**< Alarm interrupt generation is enabled. */
+    bool pending;          /**< Hardware alarm flag is currently latched. */
+    bool interrupt_active; /**< Active-low RTC_INT is currently asserted. */
+} time_service_alarm_status_t;
+
+/** @brief Non-coalesced alarm edge payload published by the worker. */
+typedef struct time_service_alarm_event
+{
+    uint32_t sequence; /**< Monotonic alarm edge sequence for this service run. */
+} time_service_alarm_event_t;
+
+/** @brief Board RTC operations using UTC values. */
 typedef struct time_service_rtc_ops
 {
     bool (*is_available)(void);                /**< Optional availability probe. */
     esp_err_t (*read)(struct tm *utc_time);    /**< Optional UTC read operation. */
     esp_err_t (*write)(const struct tm *utc_time); /**< Optional UTC write. */
+    esp_err_t (*alarm_configure)(const time_service_alarm_config_t *config); /**< Arm alarm. */
+    esp_err_t (*alarm_disable)(void); /**< Disable and clear alarm. */
+    esp_err_t (*alarm_get_status)(time_service_alarm_status_t *status); /**< Read state. */
+    esp_err_t (*alarm_clear)(void); /**< Clear hardware pending flag. */
+    esp_err_t (*alarm_poll_interrupt)(bool *active); /**< Poll active-low RTC_INT. */
 } time_service_rtc_ops_t;
+
+EVENT_BUS_DECLARE_ID(TIME_SERVICE_MSG);
+
+/** @brief Events published by time_service. */
+typedef enum
+{
+    TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM = 1, /**< One non-coalesced RTC alarm edge. */
+} time_service_msg_sub_type_t;
 
 /**
  * @brief Confidence level of the current system clock.
@@ -61,6 +102,40 @@ esp_err_t time_service_init(void);
  *          concurrent public API calls before deinitialization.
  */
 esp_err_t time_service_deinit(void);
+
+/** @brief Sentinel accepted by suspend/resume to wait without a deadline. */
+#define TIME_SERVICE_WAIT_FOREVER UINT32_MAX
+
+/**
+ * @brief Quiesce RTC hardware access before system sleep.
+ *
+ * New RTC and SNTP control operations are rejected before existing public and
+ * worker-owned RTC transactions are drained. Pending SNTP completion remains
+ * queued for processing after resume.
+ *
+ * @param timeout_ms is the total maximum wait in milliseconds, or
+ *                   TIME_SERVICE_WAIT_FOREVER.
+ *
+ * @return ESP_OK when no RTC transaction can start; ESP_ERR_TIMEOUT when the
+ *         transition must be recovered with time_service_resume(); otherwise
+ *         an ESP-IDF error.
+ *
+ * @warning Call from task context. Lifecycle control calls must be serialized.
+ */
+esp_err_t time_service_suspend(uint32_t timeout_ms);
+
+/**
+ * @brief Resume RTC worker and public hardware operations after sleep.
+ *
+ * @param timeout_ms is the total maximum wait in milliseconds, or
+ *                   TIME_SERVICE_WAIT_FOREVER.
+ *
+ * @return ESP_OK when RTC access is restored; ESP_ERR_TIMEOUT when recovery
+ *         remains pending; otherwise an ESP-IDF error.
+ *
+ * @warning Call from task context. Lifecycle control calls must be serialized.
+ */
+esp_err_t time_service_resume(uint32_t timeout_ms);
 
 /**
  * @brief Read the current system clock as UTC.
@@ -107,6 +182,52 @@ time_service_quality_t time_service_get_quality(void);
  * @return Last RTC result; ESP_ERR_INVALID_STATE before initialization.
  */
 esp_err_t time_service_get_last_rtc_error(void);
+
+/**
+ * @brief Configure and enable the recurring RTC calendar alarm.
+ *
+ * @note At least one comparison field must be enabled. The alarm is evaluated
+ *       against the RTC's UTC calendar fields.
+ *
+ * @param config selects comparison fields and their values.
+ *
+ * @return ESP_OK on success; ESP_ERR_INVALID_ARG for invalid fields;
+ *         ESP_ERR_NOT_SUPPORTED without complete RTC alarm operations;
+ *         otherwise an ESP-IDF error.
+ *
+ * @warning This task-context operation may block on RTC I2C.
+ */
+esp_err_t time_service_alarm_configure(
+    const time_service_alarm_config_t *config);
+
+/**
+ * @brief Disable the RTC alarm interrupt and clear its pending flag.
+ *
+ * @return ESP_OK on success; otherwise an ESP-IDF error.
+ *
+ * @warning This task-context operation may block on RTC I2C.
+ */
+esp_err_t time_service_alarm_disable(void);
+
+/**
+ * @brief Read alarm control, pending flag, and active-low RTC_INT state.
+ *
+ * @param status receives a complete snapshot after all hardware reads succeed.
+ *
+ * @return ESP_OK on success; otherwise an ESP-IDF error.
+ *
+ * @warning This task-context operation may block on RTC I2C.
+ */
+esp_err_t time_service_alarm_get_status(time_service_alarm_status_t *status);
+
+/**
+ * @brief Clear the hardware alarm flag without disabling future matches.
+ *
+ * @return ESP_OK on success; otherwise an ESP-IDF error.
+ *
+ * @warning This task-context operation may block on RTC I2C.
+ */
+esp_err_t time_service_alarm_clear(void);
 
 /**
  * @brief Start or restart an asynchronous SNTP synchronization request.

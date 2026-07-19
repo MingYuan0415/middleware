@@ -19,11 +19,34 @@
 
 #define TIME_SERVICE_SYNC_COMPLETE_BIT BIT0
 #define TIME_SERVICE_WORKER_STOPPED_BIT BIT1
+#define TIME_SERVICE_WORKER_PAUSED_BIT  BIT2
+#define TIME_SERVICE_WORKER_RUNNING_BIT BIT3
 #define TIME_SERVICE_NOTIFY_SYNC         BIT0
 #define TIME_SERVICE_NOTIFY_STOP         BIT1
+#define TIME_SERVICE_NOTIFY_PAUSE        BIT2
+#define TIME_SERVICE_NOTIFY_RESUME       BIT3
 #define TIME_SERVICE_SYNC_WORKER_STACK  3072U
 #define TIME_SERVICE_SYNC_WORKER_PRIO   4U
 #define TIME_SERVICE_LEGACY_TIMEOUT_MS  30000U
+#define TIME_SERVICE_ALARM_POLL_MS       100U
+
+EVENT_BUS_DEFINE_ID(TIME_SERVICE_MSG);
+
+typedef enum time_service_sleep_state
+{
+    TIME_SERVICE_SLEEP_STOPPED = 0,
+    TIME_SERVICE_SLEEP_RUNNING,
+    TIME_SERVICE_SLEEP_SUSPEND_PENDING,
+    TIME_SERVICE_SLEEP_SUSPENDED,
+    TIME_SERVICE_SLEEP_RESUME_PENDING,
+} time_service_sleep_state_t;
+
+typedef struct time_service_deadline
+{
+    TickType_t started_at;
+    TickType_t duration;
+    bool wait_forever;
+} time_service_deadline_t;
 
 static time_service_rtc_ops_t s_rtc_ops;
 static bool s_rtc_ops_registered;
@@ -45,6 +68,13 @@ static atomic_uint_fast32_t s_notified_generation;
 static atomic_uint s_callback_active;
 static atomic_bool s_callback_enabled;
 static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
+static atomic_bool s_rtc_io_admitted = ATOMIC_VAR_INIT(false);
+static time_service_sleep_state_t s_sleep_state = TIME_SERVICE_SLEEP_STOPPED;
+static bool s_alarm_monitor_enabled;
+static bool s_alarm_event_pending;
+static time_service_alarm_event_t s_pending_alarm_event;
+static uint32_t s_alarm_sequence;
+static esp_err_t s_alarm_worker_error = ESP_OK;
 
 static bool _rtc_available(void)
 {
@@ -54,6 +84,44 @@ static bool _rtc_available(void)
         available = s_rtc_ops.is_available();
     }
     return available;
+}
+
+static bool _rtc_alarm_supported(void)
+{
+    return s_rtc_ops_registered && s_rtc_ops.alarm_configure != NULL &&
+           s_rtc_ops.alarm_disable != NULL &&
+           s_rtc_ops.alarm_get_status != NULL &&
+           s_rtc_ops.alarm_clear != NULL &&
+           s_rtc_ops.alarm_poll_interrupt != NULL;
+}
+
+static bool _alarm_config_valid(const time_service_alarm_config_t *config)
+{
+    if (config == NULL ||
+            (!config->match_second && !config->match_minute &&
+             !config->match_hour && !config->match_day &&
+             !config->match_weekday))
+    {
+        return false;
+    }
+    return (!config->match_second || config->second <= 59U) &&
+           (!config->match_minute || config->minute <= 59U) &&
+           (!config->match_hour || config->hour <= 23U) &&
+           (!config->match_day ||
+            (config->day >= 1U && config->day <= 31U)) &&
+           (!config->match_weekday || config->weekday <= 6U);
+}
+
+static bool _rtc_io_allowed(void)
+{
+    return atomic_load_explicit(&s_rtc_io_admitted, memory_order_acquire);
+}
+
+static void _set_alarm_monitor_enabled(bool enabled)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_alarm_monitor_enabled = enabled;
+    xSemaphoreGive(s_state_mutex);
 }
 
 static void _wait_for_worker_event_tail(void)
@@ -154,62 +222,240 @@ static void _complete_generation_locked(uint32_t generation, esp_err_t result)
     }
 }
 
+static bool _process_sync_notification(void)
+{
+    if (!_rtc_io_allowed())
+    {
+        return false;
+    }
+    const uint32_t generation =
+        (uint32_t)atomic_load(&s_notified_generation);
+
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    if (!_rtc_io_allowed())
+    {
+        xSemaphoreGive(s_update_mutex);
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const bool current_session = !s_stopping && s_ntp_initialized &&
+                                 generation == (uint32_t)atomic_load(
+                                     &s_active_generation);
+    xSemaphoreGive(s_state_mutex);
+    if (!current_session)
+    {
+        xSemaphoreGive(s_update_mutex);
+        return true;
+    }
+
+    int64_t epoch;
+    esp_err_t sync_result = _get_system_epoch(&epoch);
+    esp_err_t rtc_result = ESP_ERR_NOT_SUPPORTED;
+    if (sync_result == ESP_OK)
+    {
+        rtc_result = _write_rtc_epoch(epoch);
+        if (rtc_result != ESP_OK && rtc_result != ESP_ERR_NOT_SUPPORTED)
+        {
+            LOG_W("RTC write after NTP sync failed: 0x%x", rtc_result);
+        }
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (!s_stopping && s_ntp_initialized &&
+            generation == (uint32_t)atomic_load(&s_active_generation))
+    {
+        if (sync_result == ESP_OK)
+        {
+            s_quality = TIME_SERVICE_QUALITY_NTP;
+            s_last_rtc_error = rtc_result;
+        }
+        _complete_generation_locked(generation, sync_result);
+    }
+    xSemaphoreGive(s_state_mutex);
+    xSemaphoreGive(s_update_mutex);
+    return true;
+}
+
+static esp_err_t _publish_pending_alarm_event(void)
+{
+    time_service_alarm_event_t event = {0};
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const bool pending = s_alarm_event_pending && !s_stopping;
+    if (pending)
+    {
+        event = s_pending_alarm_event;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (!pending)
+    {
+        return ESP_OK;
+    }
+
+    esp_err_t result = event_bus_publish(
+                           TIME_SERVICE_MSG,
+                           TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM,
+                           &event, sizeof(event), 0U);
+    if (result == ESP_OK)
+    {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_alarm_event_pending &&
+                s_pending_alarm_event.sequence == event.sequence)
+        {
+            s_alarm_event_pending = false;
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    return result;
+}
+
+static esp_err_t _poll_rtc_alarm(void)
+{
+    if (!_rtc_io_allowed())
+    {
+        return ESP_OK;
+    }
+    esp_err_t result = _publish_pending_alarm_event();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const bool monitor = s_alarm_monitor_enabled && !s_stopping;
+    xSemaphoreGive(s_state_mutex);
+    if (!monitor || !_rtc_alarm_supported() || !_rtc_available())
+    {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    if (!_rtc_io_allowed())
+    {
+        xSemaphoreGive(s_update_mutex);
+        return ESP_OK;
+    }
+    bool interrupt_active = false;
+    result = s_rtc_ops.alarm_poll_interrupt(&interrupt_active);
+    if (result != ESP_OK || !interrupt_active)
+    {
+        goto exit;
+    }
+
+    time_service_alarm_status_t status = {0};
+    result = s_rtc_ops.alarm_get_status(&status);
+    if (result != ESP_OK)
+    {
+        goto exit;
+    }
+    if (!status.enabled)
+    {
+        _set_alarm_monitor_enabled(false);
+        goto exit;
+    }
+    if (!status.pending)
+    {
+        goto exit;
+    }
+
+    result = s_rtc_ops.alarm_clear();
+    if (result == ESP_OK)
+    {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        ++s_alarm_sequence;
+        if (s_alarm_sequence == 0U)
+        {
+            s_alarm_sequence = 1U;
+        }
+        s_pending_alarm_event.sequence = s_alarm_sequence;
+        s_alarm_event_pending = true;
+        xSemaphoreGive(s_state_mutex);
+    }
+
+exit:
+    xSemaphoreGive(s_update_mutex);
+    return result == ESP_OK ? _publish_pending_alarm_event() : result;
+}
+
+static void _worker_set_running(void)
+{
+    xEventGroupClearBits(s_sync_events, TIME_SERVICE_WORKER_PAUSED_BIT);
+    xEventGroupSetBits(s_sync_events, TIME_SERVICE_WORKER_RUNNING_BIT);
+}
+
+static bool _worker_pause(uint32_t *notifications)
+{
+    if ((*notifications & TIME_SERVICE_NOTIFY_PAUSE) == 0U)
+    {
+        return false;
+    }
+    if ((*notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
+    {
+        *notifications &= ~(TIME_SERVICE_NOTIFY_PAUSE |
+                            TIME_SERVICE_NOTIFY_RESUME);
+        _worker_set_running();
+        return false;
+    }
+
+    xEventGroupClearBits(s_sync_events, TIME_SERVICE_WORKER_RUNNING_BIT);
+    xEventGroupSetBits(s_sync_events, TIME_SERVICE_WORKER_PAUSED_BIT);
+    *notifications &= ~TIME_SERVICE_NOTIFY_PAUSE;
+    for (;;)
+    {
+        uint32_t pending = 0U;
+        xTaskNotifyWait(0U, UINT32_MAX, &pending, portMAX_DELAY);
+        *notifications |= pending;
+        if ((*notifications & TIME_SERVICE_NOTIFY_STOP) != 0U)
+        {
+            return true;
+        }
+        if ((*notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
+        {
+            *notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
+            _worker_set_running();
+            return false;
+        }
+    }
+}
+
 static void _sync_worker(void *context)
 {
     (void)context;
+    uint32_t notifications = 0U;
     for (;;)
     {
-        uint32_t notification = 0;
-        xTaskNotifyWait(0, UINT32_MAX, &notification, portMAX_DELAY);
-        if ((notification & TIME_SERVICE_NOTIFY_STOP) != 0)
+        uint32_t pending = 0U;
+        xTaskNotifyWait(0U, UINT32_MAX, &pending,
+                        pdMS_TO_TICKS(TIME_SERVICE_ALARM_POLL_MS));
+        notifications |= pending;
+        if ((notifications & TIME_SERVICE_NOTIFY_STOP) != 0U)
         {
             break;
         }
-        if ((notification & TIME_SERVICE_NOTIFY_SYNC) == 0)
+        if (_worker_pause(&notifications))
         {
-            continue;
+            break;
         }
-        const uint32_t generation =
-            (uint32_t)atomic_load(&s_notified_generation);
-
-        xSemaphoreTake(s_update_mutex, portMAX_DELAY);
-        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        const bool current_session = !s_stopping && s_ntp_initialized &&
-                                     generation == (uint32_t)atomic_load(&s_active_generation);
-        xSemaphoreGive(s_state_mutex);
-        if (!current_session)
+        if ((notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
         {
-            xSemaphoreGive(s_update_mutex);
-            continue;
+            notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
+            _worker_set_running();
+        }
+        if ((notifications & TIME_SERVICE_NOTIFY_SYNC) != 0U &&
+                _process_sync_notification())
+        {
+            notifications &= ~TIME_SERVICE_NOTIFY_SYNC;
         }
 
-        int64_t epoch;
-        esp_err_t sync_result = _get_system_epoch(&epoch);
-        esp_err_t rtc_result = ESP_ERR_NOT_SUPPORTED;
-        if (sync_result == ESP_OK)
+        const esp_err_t alarm_result = _poll_rtc_alarm();
+        if (alarm_result != ESP_OK && alarm_result != s_alarm_worker_error)
         {
-            rtc_result = _write_rtc_epoch(epoch);
-            if (rtc_result != ESP_OK && rtc_result != ESP_ERR_NOT_SUPPORTED)
-            {
-                LOG_W("RTC write after NTP sync failed: 0x%x", rtc_result);
-            }
+            LOG_W("RTC alarm worker failed: 0x%x", alarm_result);
         }
-
-        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        if (!s_stopping && s_ntp_initialized &&
-                generation == (uint32_t)atomic_load(&s_active_generation))
-        {
-            if (sync_result == ESP_OK)
-            {
-                s_quality = TIME_SERVICE_QUALITY_NTP;
-                s_last_rtc_error = rtc_result;
-            }
-            _complete_generation_locked(generation, sync_result);
-        }
-        xSemaphoreGive(s_state_mutex);
-        xSemaphoreGive(s_update_mutex);
+        s_alarm_worker_error = alarm_result;
     }
 
+    xEventGroupClearBits(s_sync_events, TIME_SERVICE_WORKER_RUNNING_BIT |
+                         TIME_SERVICE_WORKER_PAUSED_BIT);
     s_sync_worker = NULL;
     xEventGroupSetBits(s_sync_events, TIME_SERVICE_WORKER_STOPPED_BIT);
     atomic_store_explicit(&s_worker_event_tail_complete, true,
@@ -241,6 +487,28 @@ static TickType_t _timeout_to_ticks(uint32_t timeout_ms)
     return result;
 }
 
+static time_service_deadline_t _deadline_start(uint32_t timeout_ms)
+{
+    const time_service_deadline_t deadline =
+    {
+        .started_at = xTaskGetTickCount(),
+        .duration = _timeout_to_ticks(timeout_ms),
+        .wait_forever = timeout_ms == TIME_SERVICE_WAIT_FOREVER,
+    };
+    return deadline;
+}
+
+static TickType_t _deadline_remaining(
+    const time_service_deadline_t *deadline)
+{
+    if (deadline->wait_forever)
+    {
+        return portMAX_DELAY;
+    }
+    const TickType_t elapsed = xTaskGetTickCount() - deadline->started_at;
+    return elapsed >= deadline->duration ? 0U : deadline->duration - elapsed;
+}
+
 static void _delete_service_mutexes(void)
 {
     if (s_update_mutex != NULL)
@@ -264,6 +532,21 @@ static void _clear_rtc_registration(void)
 {
     memset(&s_rtc_ops, 0, sizeof(s_rtc_ops));
     s_rtc_ops_registered = false;
+}
+
+static void _reset_alarm_runtime(void)
+{
+    s_alarm_monitor_enabled = false;
+    s_alarm_event_pending = false;
+    memset(&s_pending_alarm_event, 0, sizeof(s_pending_alarm_event));
+    s_alarm_sequence = 0U;
+    s_alarm_worker_error = ESP_OK;
+}
+
+static void _reset_sleep_runtime(void)
+{
+    atomic_store_explicit(&s_rtc_io_admitted, false, memory_order_release);
+    s_sleep_state = TIME_SERVICE_SLEEP_STOPPED;
 }
 
 static esp_err_t _create_service_mutexes(void)
@@ -312,6 +595,23 @@ static esp_err_t _restore_initial_clock(void)
     return _set_system_epoch(initial_epoch);
 }
 
+static void _restore_alarm_monitor(void)
+{
+    if (!_rtc_alarm_supported() || !_rtc_available())
+    {
+        return;
+    }
+
+    time_service_alarm_status_t status = {0};
+    const esp_err_t result = s_rtc_ops.alarm_get_status(&status);
+    if (result != ESP_OK)
+    {
+        LOG_W("RTC alarm status restore failed: 0x%x", result);
+        return;
+    }
+    s_alarm_monitor_enabled = status.enabled;
+}
+
 static esp_err_t _create_sync_worker(void)
 {
     s_sync_events = xEventGroupCreate();
@@ -339,7 +639,10 @@ static void _activate_time_service(void)
     s_completed_result = ESP_ERR_INVALID_STATE;
     s_sync_pending = false;
     s_stopping = false;
+    s_sleep_state = TIME_SERVICE_SLEEP_RUNNING;
     s_initialized = true;
+    atomic_store_explicit(&s_rtc_io_admitted, true, memory_order_release);
+    xEventGroupSetBits(s_sync_events, TIME_SERVICE_WORKER_RUNNING_BIT);
 }
 
 esp_err_t time_service_register_rtc_ops(const time_service_rtc_ops_t *ops)
@@ -351,6 +654,20 @@ esp_err_t time_service_register_rtc_ops(const time_service_rtc_ops_t *ops)
     if (s_initialized || s_state_mutex != NULL)
     {
         return ESP_ERR_INVALID_STATE;
+    }
+    const bool any_alarm_op = ops->alarm_configure != NULL ||
+                              ops->alarm_disable != NULL ||
+                              ops->alarm_get_status != NULL ||
+                              ops->alarm_clear != NULL ||
+                              ops->alarm_poll_interrupt != NULL;
+    const bool complete_alarm_ops = ops->alarm_configure != NULL &&
+                                    ops->alarm_disable != NULL &&
+                                    ops->alarm_get_status != NULL &&
+                                    ops->alarm_clear != NULL &&
+                                    ops->alarm_poll_interrupt != NULL;
+    if (any_alarm_op && !complete_alarm_ops)
+    {
+        return ESP_ERR_INVALID_ARG;
     }
     s_rtc_ops = *ops;
     s_rtc_ops_registered = true;
@@ -370,11 +687,14 @@ esp_err_t time_service_init(void)
     {
         goto cleanup;
     }
+    _reset_alarm_runtime();
+    _reset_sleep_runtime();
     result = _restore_initial_clock();
     if (result != ESP_OK)
     {
         goto cleanup;
     }
+    _restore_alarm_monitor();
     result = _create_sync_worker();
     if (result != ESP_OK)
     {
@@ -393,6 +713,8 @@ cleanup:
         vEventGroupDelete(s_sync_events);
         s_sync_events = NULL;
     }
+    _reset_alarm_runtime();
+    _reset_sleep_runtime();
     _delete_service_mutexes();
     return result;
 }
@@ -404,6 +726,8 @@ esp_err_t time_service_deinit(void)
     if (!s_initialized && s_state_mutex == NULL)
     {
         _clear_rtc_registration();
+        _reset_alarm_runtime();
+        _reset_sleep_runtime();
         s_quality = TIME_SERVICE_QUALITY_INVALID;
         s_last_rtc_error = ESP_ERR_NOT_SUPPORTED;
         return ESP_OK;
@@ -418,6 +742,7 @@ esp_err_t time_service_deinit(void)
 
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     control_owned = true;
+    atomic_store_explicit(&s_rtc_io_admitted, false, memory_order_release);
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_stopping = true;
     result = _stop_sntp_locked();
@@ -444,6 +769,8 @@ esp_err_t time_service_deinit(void)
     vEventGroupDelete(s_sync_events);
     s_sync_events = NULL;
     _clear_rtc_registration();
+    _reset_alarm_runtime();
+    _reset_sleep_runtime();
     s_stopping = false;
     s_quality = TIME_SERVICE_QUALITY_INVALID;
     s_last_rtc_error = ESP_ERR_NOT_SUPPORTED;
@@ -456,6 +783,169 @@ exit:
     {
         xSemaphoreGive(s_control_mutex);
     }
+    return result;
+}
+
+esp_err_t time_service_suspend(uint32_t timeout_ms)
+{
+    SemaphoreHandle_t control = s_control_mutex;
+    EventGroupHandle_t events = s_sync_events;
+    TaskHandle_t worker = s_sync_worker;
+    if (control == NULL || s_state_mutex == NULL || events == NULL ||
+            worker == NULL || xTaskGetCurrentTaskHandle() == worker)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const time_service_deadline_t deadline = _deadline_start(timeout_ms);
+    const bool admission_was_open = atomic_exchange_explicit(
+                                        &s_rtc_io_admitted, false,
+                                        memory_order_acq_rel);
+    if (xSemaphoreTake(control, _deadline_remaining(&deadline)) != pdTRUE)
+    {
+        if (admission_was_open)
+        {
+            atomic_store_explicit(&s_rtc_io_admitted, true,
+                                  memory_order_release);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    bool reopen_admission = false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const bool active = s_initialized && !s_stopping &&
+                        s_sync_worker == worker && s_sync_events == events;
+    if (active && s_sleep_state == TIME_SERVICE_SLEEP_SUSPENDED)
+    {
+        result = ESP_OK;
+    }
+    else if (active && s_sleep_state == TIME_SERVICE_SLEEP_RUNNING &&
+             admission_was_open)
+    {
+        s_sleep_state = TIME_SERVICE_SLEEP_SUSPEND_PENDING;
+        result = ESP_OK;
+    }
+    else
+    {
+        reopen_admission = admission_was_open;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (result != ESP_OK || !admission_was_open)
+    {
+        goto exit;
+    }
+
+    xEventGroupClearBits(events, TIME_SERVICE_WORKER_PAUSED_BIT);
+    if (xTaskNotify(worker, TIME_SERVICE_NOTIFY_PAUSE, eSetBits) != pdPASS)
+    {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_sleep_state = TIME_SERVICE_SLEEP_RUNNING;
+        xSemaphoreGive(s_state_mutex);
+        reopen_admission = true;
+        result = ESP_FAIL;
+        goto exit;
+    }
+
+    const EventBits_t bits = xEventGroupWaitBits(
+                                 events, TIME_SERVICE_WORKER_PAUSED_BIT, pdFALSE,
+                                 pdTRUE, _deadline_remaining(&deadline));
+    if ((bits & TIME_SERVICE_WORKER_PAUSED_BIT) != 0U)
+    {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_sleep_state = TIME_SERVICE_SLEEP_SUSPENDED;
+        xSemaphoreGive(s_state_mutex);
+        result = ESP_OK;
+        goto exit;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_sleep_state = TIME_SERVICE_SLEEP_RESUME_PENDING;
+    xSemaphoreGive(s_state_mutex);
+    xEventGroupClearBits(events, TIME_SERVICE_WORKER_RUNNING_BIT);
+    (void)xTaskNotify(worker, TIME_SERVICE_NOTIFY_RESUME, eSetBits);
+    result = ESP_ERR_TIMEOUT;
+
+exit:
+    xSemaphoreGive(control);
+    if (reopen_admission)
+    {
+        atomic_store_explicit(&s_rtc_io_admitted, true,
+                              memory_order_release);
+    }
+    return result;
+}
+
+esp_err_t time_service_resume(uint32_t timeout_ms)
+{
+    SemaphoreHandle_t control = s_control_mutex;
+    EventGroupHandle_t events = s_sync_events;
+    TaskHandle_t worker = s_sync_worker;
+    if (control == NULL || s_state_mutex == NULL || events == NULL ||
+            worker == NULL || xTaskGetCurrentTaskHandle() == worker)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const time_service_deadline_t deadline = _deadline_start(timeout_ms);
+    if (xSemaphoreTake(control, _deadline_remaining(&deadline)) != pdTRUE)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    bool notify_worker = false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const bool active = s_initialized && !s_stopping &&
+                        s_sync_worker == worker && s_sync_events == events;
+    if (active && s_sleep_state == TIME_SERVICE_SLEEP_RUNNING)
+    {
+        atomic_store_explicit(&s_rtc_io_admitted, true,
+                              memory_order_release);
+        result = ESP_OK;
+    }
+    else if (active &&
+             (s_sleep_state == TIME_SERVICE_SLEEP_SUSPEND_PENDING ||
+              s_sleep_state == TIME_SERVICE_SLEEP_SUSPENDED ||
+              s_sleep_state == TIME_SERVICE_SLEEP_RESUME_PENDING))
+    {
+        s_sleep_state = TIME_SERVICE_SLEEP_RESUME_PENDING;
+        notify_worker = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (!notify_worker)
+    {
+        goto exit;
+    }
+
+    xEventGroupClearBits(events, TIME_SERVICE_WORKER_RUNNING_BIT);
+    if (xTaskNotify(worker, TIME_SERVICE_NOTIFY_RESUME, eSetBits) != pdPASS)
+    {
+        result = ESP_FAIL;
+        goto exit;
+    }
+    const EventBits_t bits = xEventGroupWaitBits(
+                                 events, TIME_SERVICE_WORKER_RUNNING_BIT, pdFALSE,
+                                 pdTRUE, _deadline_remaining(&deadline));
+    if ((bits & TIME_SERVICE_WORKER_RUNNING_BIT) == 0U)
+    {
+        result = ESP_ERR_TIMEOUT;
+        goto exit;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_initialized && !s_stopping && s_sync_worker == worker &&
+            s_sync_events == events)
+    {
+        s_sleep_state = TIME_SERVICE_SLEEP_RUNNING;
+        atomic_store_explicit(&s_rtc_io_admitted, true,
+                              memory_order_release);
+        result = ESP_OK;
+    }
+    xSemaphoreGive(s_state_mutex);
+
+exit:
+    xSemaphoreGive(control);
     return result;
 }
 
@@ -567,7 +1057,7 @@ esp_err_t time_service_set_local(const struct tm *local_time)
 
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     control_owned = true;
-    if (!s_initialized)
+    if (!s_initialized || s_stopping || !_rtc_io_allowed())
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit;
@@ -616,6 +1106,150 @@ esp_err_t time_service_get_last_rtc_error(void)
     return result;
 }
 
+esp_err_t time_service_alarm_configure(
+    const time_service_alarm_config_t *config)
+{
+    if (!_alarm_config_valid(config))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_initialized || s_control_mutex == NULL ||
+            s_state_mutex == NULL || s_update_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_control_mutex, portMAX_DELAY);
+    if (!s_initialized || s_stopping || !_rtc_io_allowed())
+    {
+        goto exit;
+    }
+    if (!_rtc_alarm_supported() || !_rtc_available())
+    {
+        result = ESP_ERR_NOT_SUPPORTED;
+        goto exit;
+    }
+
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    result = s_rtc_ops.alarm_configure(config);
+    if (result == ESP_OK)
+    {
+        _set_alarm_monitor_enabled(true);
+    }
+    xSemaphoreGive(s_update_mutex);
+
+exit:
+    xSemaphoreGive(s_control_mutex);
+    return result;
+}
+
+esp_err_t time_service_alarm_disable(void)
+{
+    if (!s_initialized || s_control_mutex == NULL ||
+            s_state_mutex == NULL || s_update_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_control_mutex, portMAX_DELAY);
+    if (!s_initialized || s_stopping || !_rtc_io_allowed())
+    {
+        goto exit;
+    }
+    if (!_rtc_alarm_supported() || !_rtc_available())
+    {
+        result = ESP_ERR_NOT_SUPPORTED;
+        goto exit;
+    }
+
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    result = s_rtc_ops.alarm_disable();
+    if (result == ESP_OK)
+    {
+        _set_alarm_monitor_enabled(false);
+    }
+    xSemaphoreGive(s_update_mutex);
+
+exit:
+    xSemaphoreGive(s_control_mutex);
+    return result;
+}
+
+esp_err_t time_service_alarm_get_status(time_service_alarm_status_t *status)
+{
+    if (status == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_initialized || s_control_mutex == NULL ||
+            s_state_mutex == NULL || s_update_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_control_mutex, portMAX_DELAY);
+    if (!s_initialized || s_stopping || !_rtc_io_allowed())
+    {
+        goto exit;
+    }
+    if (!_rtc_alarm_supported() || !_rtc_available())
+    {
+        result = ESP_ERR_NOT_SUPPORTED;
+        goto exit;
+    }
+
+    time_service_alarm_status_t snapshot = {0};
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    result = s_rtc_ops.alarm_get_status(&snapshot);
+    if (result == ESP_OK)
+    {
+        result = s_rtc_ops.alarm_poll_interrupt(
+                     &snapshot.interrupt_active);
+    }
+    if (result == ESP_OK)
+    {
+        _set_alarm_monitor_enabled(snapshot.enabled);
+        *status = snapshot;
+    }
+    xSemaphoreGive(s_update_mutex);
+
+exit:
+    xSemaphoreGive(s_control_mutex);
+    return result;
+}
+
+esp_err_t time_service_alarm_clear(void)
+{
+    if (!s_initialized || s_control_mutex == NULL ||
+            s_update_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_control_mutex, portMAX_DELAY);
+    if (!s_initialized || s_stopping || !_rtc_io_allowed())
+    {
+        goto exit;
+    }
+    if (!_rtc_alarm_supported() || !_rtc_available())
+    {
+        result = ESP_ERR_NOT_SUPPORTED;
+        goto exit;
+    }
+
+    xSemaphoreTake(s_update_mutex, portMAX_DELAY);
+    result = s_rtc_ops.alarm_clear();
+    xSemaphoreGive(s_update_mutex);
+
+exit:
+    xSemaphoreGive(s_control_mutex);
+    return result;
+}
+
 esp_err_t time_service_request_sync(void)
 {
     esp_err_t result = ESP_ERR_INVALID_STATE;
@@ -631,7 +1265,7 @@ esp_err_t time_service_request_sync(void)
     control_owned = true;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     state_owned = true;
-    if (s_stopping || s_sync_pending)
+    if (s_stopping || !_rtc_io_allowed() || s_sync_pending)
     {
         goto exit;
     }
@@ -702,6 +1336,10 @@ esp_err_t time_service_cancel_sync(void)
     control_owned = true;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     state_owned = true;
+    if (s_stopping || !_rtc_io_allowed())
+    {
+        goto exit;
+    }
     result = _stop_sntp_locked();
     if (s_sync_pending)
     {
@@ -711,6 +1349,7 @@ esp_err_t time_service_cancel_sync(void)
     }
     _next_generation_locked();
 
+exit:
     if (state_owned)
     {
         xSemaphoreGive(s_state_mutex);
@@ -735,6 +1374,11 @@ esp_err_t time_service_wait_sync(uint32_t timeout_ms)
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     state_owned = true;
+    if (s_stopping || !_rtc_io_allowed())
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
     const bool pending = s_sync_pending;
     const uint32_t generation = pending ?
                                 (uint32_t)atomic_load(&s_active_generation) :
@@ -767,6 +1411,11 @@ esp_err_t time_service_wait_sync(uint32_t timeout_ms)
         control_owned = true;
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         state_owned = true;
+        if (s_stopping || !_rtc_io_allowed())
+        {
+            result = ESP_ERR_INVALID_STATE;
+            goto exit;
+        }
         if (s_completed_generation == generation)
         {
             result = s_completed_result;

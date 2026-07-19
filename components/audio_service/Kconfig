@@ -1,0 +1,164 @@
+menu "Audio service"
+    choice AUDIO_SERVICE_SAMPLE_RATE
+        prompt "Default sample rate"
+        default AUDIO_SERVICE_SAMPLE_RATE_16000
+
+        config AUDIO_SERVICE_SAMPLE_RATE_8000
+            bool "8 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_11025
+            bool "11.025 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_12000
+            bool "12 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_16000
+            bool "16 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_22050
+            bool "22.05 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_24000
+            bool "24 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_32000
+            bool "32 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_44100
+            bool "44.1 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_48000
+            bool "48 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_64000
+            bool "64 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_88200
+            bool "88.2 kHz"
+        config AUDIO_SERVICE_SAMPLE_RATE_96000
+            bool "96 kHz"
+    endchoice
+
+    config AUDIO_SERVICE_SAMPLE_RATE_HZ
+        int
+        default 8000 if AUDIO_SERVICE_SAMPLE_RATE_8000
+        default 11025 if AUDIO_SERVICE_SAMPLE_RATE_11025
+        default 12000 if AUDIO_SERVICE_SAMPLE_RATE_12000
+        default 16000 if AUDIO_SERVICE_SAMPLE_RATE_16000
+        default 22050 if AUDIO_SERVICE_SAMPLE_RATE_22050
+        default 24000 if AUDIO_SERVICE_SAMPLE_RATE_24000
+        default 32000 if AUDIO_SERVICE_SAMPLE_RATE_32000
+        default 44100 if AUDIO_SERVICE_SAMPLE_RATE_44100
+        default 48000 if AUDIO_SERVICE_SAMPLE_RATE_48000
+        default 64000 if AUDIO_SERVICE_SAMPLE_RATE_64000
+        default 88200 if AUDIO_SERVICE_SAMPLE_RATE_88200
+        default 96000 if AUDIO_SERVICE_SAMPLE_RATE_96000
+
+    choice AUDIO_SERVICE_SAMPLE_WIDTH
+        prompt "Default sample width"
+        default AUDIO_SERVICE_BITS_16
+
+        config AUDIO_SERVICE_BITS_16
+            bool "16-bit"
+        config AUDIO_SERVICE_BITS_24
+            bool "24-bit"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_24000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_32000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_48000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_64000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_96000
+        config AUDIO_SERVICE_BITS_32
+            bool "32-bit"
+    endchoice
+
+    config AUDIO_SERVICE_BITS_PER_SAMPLE
+        int
+        default 16 if AUDIO_SERVICE_BITS_16
+        default 24 if AUDIO_SERVICE_BITS_24
+        default 32 if AUDIO_SERVICE_BITS_32
+
+    choice AUDIO_SERVICE_CHANNEL_COUNT
+        prompt "Default channel count"
+        default AUDIO_SERVICE_CHANNELS_2
+
+        config AUDIO_SERVICE_CHANNELS_1
+            bool "Mono"
+        config AUDIO_SERVICE_CHANNELS_2
+            bool "Stereo"
+    endchoice
+
+    config AUDIO_SERVICE_CHANNELS
+        int
+        default 1 if AUDIO_SERVICE_CHANNELS_1
+        default 2 if AUDIO_SERVICE_CHANNELS_2
+
+    choice AUDIO_SERVICE_MCLK_RATIO
+        prompt "Default MCLK multiple"
+        default AUDIO_SERVICE_MCLK_384 if AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                                                AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                                                AUDIO_SERVICE_SAMPLE_RATE_32000 || \
+                                                AUDIO_SERVICE_SAMPLE_RATE_48000
+        default AUDIO_SERVICE_MCLK_768 if AUDIO_SERVICE_BITS_24 && \
+                                               AUDIO_SERVICE_SAMPLE_RATE_24000
+        default AUDIO_SERVICE_MCLK_192 if AUDIO_SERVICE_BITS_24
+        default AUDIO_SERVICE_MCLK_128 if AUDIO_SERVICE_SAMPLE_RATE_88200
+        default AUDIO_SERVICE_MCLK_256
+
+        config AUDIO_SERVICE_MCLK_128
+            bool "128x"
+            depends on !AUDIO_SERVICE_BITS_24
+        config AUDIO_SERVICE_MCLK_192
+            bool "192x"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_32000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_64000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_96000
+        config AUDIO_SERVICE_MCLK_256
+            bool "256x"
+            depends on !AUDIO_SERVICE_BITS_24 && \
+                       !AUDIO_SERVICE_SAMPLE_RATE_88200
+        config AUDIO_SERVICE_MCLK_384
+            bool "384x"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_32000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_48000
+        config AUDIO_SERVICE_MCLK_512
+            bool "512x"
+            depends on !AUDIO_SERVICE_BITS_24 && \
+                       (AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_11025 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_12000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_22050 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_24000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_32000)
+        config AUDIO_SERVICE_MCLK_576
+            bool "576x"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_32000
+        config AUDIO_SERVICE_MCLK_768
+            bool "768x"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_16000 || \
+                       AUDIO_SERVICE_SAMPLE_RATE_24000
+        config AUDIO_SERVICE_MCLK_1024
+            bool "1024x"
+            depends on !AUDIO_SERVICE_BITS_24 && \
+                       (AUDIO_SERVICE_SAMPLE_RATE_8000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_11025 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_12000 || \
+                        AUDIO_SERVICE_SAMPLE_RATE_16000)
+        config AUDIO_SERVICE_MCLK_1152
+            bool "1152x"
+            depends on AUDIO_SERVICE_SAMPLE_RATE_16000
+    endchoice
+
+    config AUDIO_SERVICE_MCLK_MULTIPLE
+        int
+        default 128 if AUDIO_SERVICE_MCLK_128
+        default 192 if AUDIO_SERVICE_MCLK_192
+        default 256 if AUDIO_SERVICE_MCLK_256
+        default 384 if AUDIO_SERVICE_MCLK_384
+        default 512 if AUDIO_SERVICE_MCLK_512
+        default 576 if AUDIO_SERVICE_MCLK_576
+        default 768 if AUDIO_SERVICE_MCLK_768
+        default 1024 if AUDIO_SERVICE_MCLK_1024
+        default 1152 if AUDIO_SERVICE_MCLK_1152
+
+    config AUDIO_SERVICE_PA_DEFAULT_ON
+        bool "Enable the power amplifier while streaming by default"
+        default y
+endmenu

@@ -1,0 +1,4 @@
+version: "0.1.0"
+description: "Full-duplex ES8311 board audio service"
+dependencies:
+  idf: ">=5.0"

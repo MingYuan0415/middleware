@@ -32,6 +32,13 @@ typedef struct power_service_snapshot
     bool valid;             /**< Whether info contains a current sample. */
 } power_service_snapshot_t;
 
+/** @brief One consumed AXP2101 interrupt-status observation. */
+typedef struct power_service_irq_event
+{
+    uint32_t status;        /**< Latched AXP2101 interrupt-status bits. */
+    int64_t observed_at_ms; /**< Monotonic observation time in milliseconds. */
+} power_service_irq_event_t;
+
 /**
  * @brief Board operations used to sample power hardware.
  */
@@ -39,6 +46,7 @@ typedef struct power_service_power_ops
 {
     bool (*is_available)(void);                 /**< Optional availability probe. */
     esp_err_t (*get_info)(power_info_t *info);  /**< Required sample operation. */
+    esp_err_t (*poll_irq)(uint32_t *status);    /**< Optional latched IRQ poll. */
 } power_service_power_ops_t;
 
 EVENT_BUS_DECLARE_ID(POWER_SERVICE_MSG);
@@ -50,6 +58,7 @@ typedef enum
 {
     POWER_SERVICE_MSG_SUB_TYPE_SNAPSHOT_UPDATE = 1, /**< Latest UI snapshot. */
     POWER_SERVICE_MSG_SUB_TYPE_AVAILABILITY_CHANGED, /**< Validity edge. */
+    POWER_SERVICE_MSG_SUB_TYPE_IRQ, /**< Non-coalesced PMU interrupt edge. */
 } power_service_msg_sub_type_t;
 
 /**

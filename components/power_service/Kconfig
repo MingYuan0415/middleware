@@ -15,4 +15,9 @@ menu "Power service"
         range 1000 60000
         default 5000
 
+    config POWER_SERVICE_IRQ_POLL_INTERVAL_MS
+        int "PMU IRQ poll interval (milliseconds)"
+        range 10 1000
+        default 100
+
 endmenu

@@ -25,6 +25,9 @@ EVENT_BUS_DEFINE_ID(POWER_SERVICE_MSG);
 #ifndef CONFIG_POWER_SERVICE_POLL_INTERVAL_MS
     #define CONFIG_POWER_SERVICE_POLL_INTERVAL_MS 5000
 #endif
+#ifndef CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS
+    #define CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS 100
+#endif
 
 #define POWER_SERVICE_CMD_START  BIT0
 #define POWER_SERVICE_CMD_PAUSE  BIT1
@@ -34,6 +37,7 @@ EVENT_BUS_DEFINE_ID(POWER_SERVICE_MSG);
 #define POWER_SERVICE_EVENT_PAUSED  BIT1
 #define POWER_SERVICE_EVENT_STOPPED BIT2
 #define POWER_SERVICE_FAILURE_LOG_INTERVAL 12U
+#define POWER_SERVICE_IRQ_FAILURE_LOG_INTERVAL 120U
 
 typedef enum
 {
@@ -54,6 +58,8 @@ static EventGroupHandle_t s_worker_events;
 static SemaphoreHandle_t s_control_mutex;
 static power_service_state_t s_state = POWER_SERVICE_STATE_STOPPED;
 static power_service_snapshot_t s_snapshot;
+static power_service_irq_event_t s_pending_irq_event;
+static bool s_irq_event_pending;
 static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -103,6 +109,27 @@ static void _publish_snapshot(uint32_t subtype,
     }
 }
 
+static esp_err_t _publish_pending_irq(void)
+{
+    if (!s_irq_event_pending)
+    {
+        return ESP_OK;
+    }
+
+    const power_service_irq_event_t event = s_pending_irq_event;
+    esp_err_t result = event_bus_publish(
+                           POWER_SERVICE_MSG, POWER_SERVICE_MSG_SUB_TYPE_IRQ,
+                           &event, sizeof(event), 0U);
+    if (result == ESP_OK && s_irq_event_pending &&
+            s_pending_irq_event.status == event.status &&
+            s_pending_irq_event.observed_at_ms == event.observed_at_ms)
+    {
+        memset(&s_pending_irq_event, 0, sizeof(s_pending_irq_event));
+        s_irq_event_pending = false;
+    }
+    return result;
+}
+
 static bool _hardware_available(void)
 {
     bool available = s_power_ops_registered && s_power_ops.get_info != NULL;
@@ -122,6 +149,16 @@ static bool _sample_hardware(power_info_t *info)
         sample_valid = s_power_ops.get_info(info) == ESP_OK;
     }
     return sample_valid;
+}
+
+static esp_err_t _poll_hardware_irq(uint32_t *status)
+{
+    *status = 0U;
+    if (!_hardware_available())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return s_power_ops.poll_irq(status);
 }
 
 static void _update_snapshot(bool sample_valid, const power_info_t *info)
@@ -194,6 +231,88 @@ static bool _worker_pause(uint32_t commands)
     return stop;
 }
 
+static void _worker_sample(uint32_t *consecutive_failures)
+{
+    power_info_t info;
+    const bool sample_valid = _sample_hardware(&info);
+    _update_snapshot(sample_valid, &info);
+
+    if (sample_valid)
+    {
+        *consecutive_failures = 0U;
+    }
+    else
+    {
+        ++(*consecutive_failures);
+        if (*consecutive_failures == 1U ||
+                *consecutive_failures % POWER_SERVICE_FAILURE_LOG_INTERVAL == 0U)
+        {
+            LOG_W("PMU sample unavailable (failures=%u)",
+                  (unsigned)*consecutive_failures);
+        }
+    }
+}
+
+static void _worker_poll_irq(uint32_t *consecutive_failures)
+{
+    if (s_power_ops.poll_irq == NULL)
+    {
+        return;
+    }
+
+    esp_err_t result = _publish_pending_irq();
+    if (result != ESP_OK)
+    {
+        goto failed;
+    }
+
+    uint32_t status = 0U;
+    result = _poll_hardware_irq(&status);
+    if (result == ESP_OK)
+    {
+        if (status != 0U)
+        {
+            s_pending_irq_event.status = status;
+            s_pending_irq_event.observed_at_ms =
+                esp_timer_get_time() / 1000LL;
+            s_irq_event_pending = true;
+            result = _publish_pending_irq();
+        }
+        if (result == ESP_OK)
+        {
+            *consecutive_failures = 0U;
+            return;
+        }
+    }
+
+failed:
+    ++(*consecutive_failures);
+    if (*consecutive_failures == 1U ||
+            *consecutive_failures %
+            POWER_SERVICE_IRQ_FAILURE_LOG_INTERVAL == 0U)
+    {
+        LOG_W("PMU IRQ handling failed: 0x%x (failures=%u)", result,
+              (unsigned)*consecutive_failures);
+    }
+}
+
+static uint32_t _worker_wait_ms(int64_t next_sample_at_ms)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000LL;
+    if (now_ms >= next_sample_at_ms)
+    {
+        return 1U;
+    }
+
+    const int64_t until_sample_ms = next_sample_at_ms - now_ms;
+    uint32_t wait_ms = CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS;
+    if (until_sample_ms < (int64_t)wait_ms)
+    {
+        wait_ms = (uint32_t)until_sample_ms;
+    }
+    return wait_ms == 0U ? 1U : wait_ms;
+}
+
 static void _power_worker(void *context)
 {
     (void)context;
@@ -206,31 +325,23 @@ static void _power_worker(void *context)
     }
     if (!stop)
     {
-        uint32_t consecutive_failures = 0;
+        uint32_t consecutive_failures = 0U;
+        uint32_t consecutive_irq_failures = 0U;
+        int64_t next_sample_at_ms = 0;
         for (;;)
         {
-            power_info_t info;
-            const bool sample_valid = _sample_hardware(&info);
-            _update_snapshot(sample_valid, &info);
-
-            if (sample_valid)
+            const int64_t now_ms = esp_timer_get_time() / 1000LL;
+            if (now_ms >= next_sample_at_ms)
             {
-                consecutive_failures = 0;
+                _worker_sample(&consecutive_failures);
+                next_sample_at_ms = esp_timer_get_time() / 1000LL +
+                                    CONFIG_POWER_SERVICE_POLL_INTERVAL_MS;
             }
-            else
-            {
-                ++consecutive_failures;
-                if (consecutive_failures == 1U ||
-                        consecutive_failures % POWER_SERVICE_FAILURE_LOG_INTERVAL == 0U)
-                {
-                    LOG_W("PMU sample unavailable (failures=%u)",
-                          (unsigned)consecutive_failures);
-                }
-            }
+            _worker_poll_irq(&consecutive_irq_failures);
 
             commands = 0;
             xTaskNotifyWait(0, UINT32_MAX, &commands,
-                            pdMS_TO_TICKS(CONFIG_POWER_SERVICE_POLL_INTERVAL_MS));
+                            _timeout_to_ticks(_worker_wait_ms(next_sample_at_ms)));
             if ((commands & POWER_SERVICE_CMD_STOP) != 0 ||
                     _worker_pause(commands))
             {
@@ -310,6 +421,8 @@ esp_err_t power_service_init(void)
     taskENTER_CRITICAL(&s_snapshot_lock);
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     taskEXIT_CRITICAL(&s_snapshot_lock);
+    memset(&s_pending_irq_event, 0, sizeof(s_pending_irq_event));
+    s_irq_event_pending = false;
 
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
@@ -326,8 +439,9 @@ esp_err_t power_service_init(void)
     taskEXIT_CRITICAL(&s_state_lock);
     xEventGroupSetBits(s_worker_events, POWER_SERVICE_EVENT_RUNNING);
     xTaskNotify(s_worker, POWER_SERVICE_CMD_START, eSetBits);
-    LOG_I("worker started (interval=%dms)",
-          CONFIG_POWER_SERVICE_POLL_INTERVAL_MS);
+    LOG_I("worker started (sample=%dms, irq=%dms)",
+          CONFIG_POWER_SERVICE_POLL_INTERVAL_MS,
+          CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS);
     return ESP_OK;
 
 cleanup:

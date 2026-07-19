@@ -1,0 +1,61 @@
+menu "SD storage service"
+
+    config SD_STORAGE_SERVICE_ENABLE
+        bool "Enable removable SD storage service"
+        default y
+
+    config SD_STORAGE_SERVICE_MOUNT_PATH
+        string "SD filesystem mount path"
+        default "/sdcard"
+        help
+            VFS path used for the removable SD filesystem.
+
+    config SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED
+        bool "Format SD card when mounting fails"
+        default n
+        help
+            Formatting is destructive. Keep this disabled for production
+            devices unless an explicit recovery workflow enables it.
+
+    config SD_STORAGE_SERVICE_MAX_FILES
+        int "Maximum open SD files"
+        range 1 32
+        default 5
+
+    choice SD_STORAGE_SERVICE_ALLOCATION_UNIT
+        prompt "FAT allocation unit size"
+        default SD_STORAGE_SERVICE_ALLOCATION_UNIT_16384
+
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_AUTO
+            bool "Automatic"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_512
+            bool "512 bytes"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_1024
+            bool "1 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_2048
+            bool "2 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_4096
+            bool "4 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_8192
+            bool "8 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_16384
+            bool "16 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_32768
+            bool "32 KiB"
+        config SD_STORAGE_SERVICE_ALLOCATION_UNIT_65536
+            bool "64 KiB"
+    endchoice
+
+    config SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE
+        int
+        default 0 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_AUTO
+        default 512 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_512
+        default 1024 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_1024
+        default 2048 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_2048
+        default 4096 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_4096
+        default 8192 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_8192
+        default 16384 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_16384
+        default 32768 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_32768
+        default 65536 if SD_STORAGE_SERVICE_ALLOCATION_UNIT_65536
+
+endmenu
