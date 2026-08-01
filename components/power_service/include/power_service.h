@@ -39,6 +39,14 @@ typedef struct power_service_irq_event
     int64_t observed_at_ms; /**< Monotonic observation time in milliseconds. */
 } power_service_irq_event_t;
 
+/** @brief Product-owned PMU worker configuration. */
+typedef struct power_service_config
+{
+    uint32_t poll_interval_ms;     /**< Regular telemetry sampling period. */
+    uint32_t irq_poll_interval_ms; /**< PMU interrupt polling period. */
+    uint32_t task_priority;        /**< FreeRTOS worker priority. */
+} power_service_config_t;
+
 /**
  * @brief Board operations used to sample power hardware.
  */
@@ -81,7 +89,7 @@ esp_err_t power_service_register_power_ops(const power_service_power_ops_t *ops)
  *
  * @warning Call from task context.
  */
-esp_err_t power_service_init(void);
+esp_err_t power_service_init(const power_service_config_t *config);
 
 /**
  * @brief Stop and join the worker, then clear registered board operations.

@@ -13,7 +13,7 @@ bool wifi_service_worker_tick_reached(TickType_t now, TickType_t deadline)
 
 static TickType_t _wifi_service_publish_retry_delay(void)
 {
-    TickType_t delay = pdMS_TO_TICKS(CONFIG_WIFI_SERVICE_WORKER_POLL_MS);
+    TickType_t delay = pdMS_TO_TICKS(WIFI_SERVICE_WORKER_POLL_MS);
     if (delay == 0)
     {
         delay = 1;

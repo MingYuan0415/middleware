@@ -15,19 +15,6 @@
 
 EVENT_BUS_DEFINE_ID(IMU_SERVICE_MSG);
 
-#ifndef CONFIG_IMU_SERVICE_TASK_STACK
-    #define CONFIG_IMU_SERVICE_TASK_STACK 3072
-#endif
-#ifndef CONFIG_IMU_SERVICE_TASK_PRIORITY
-    #define CONFIG_IMU_SERVICE_TASK_PRIORITY 6
-#endif
-#ifndef CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ
-    #define CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ 100
-#endif
-#ifndef configTICK_RATE_HZ
-    #define configTICK_RATE_HZ 1000
-#endif
-
 #define IMU_SERVICE_CMD_PAUSE       BIT0
 #define IMU_SERVICE_CMD_RESUME      BIT1
 #define IMU_SERVICE_CMD_STOP        BIT2
@@ -37,6 +24,7 @@ EVENT_BUS_DEFINE_ID(IMU_SERVICE_MSG);
 #define IMU_SERVICE_STATUS_INT1_LEVEL (1U << 1)
 
 static imu_service_imu_ops_t s_ops;
+static imu_service_config_t s_config;
 static bool s_ops_registered;
 static bool s_initialized;
 static TaskHandle_t s_worker;
@@ -76,7 +64,7 @@ static TickType_t _timeout_to_ticks(uint32_t timeout_ms)
 
 static TickType_t _sample_period_ticks(void)
 {
-    uint32_t rate = CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ;
+    uint32_t rate = s_config.sample_rate_hz;
     if (rate == 0U)
     {
         rate = 1U;
@@ -243,8 +231,7 @@ static esp_err_t _configure_sensor(void)
     }
 
     xSemaphoreTake(s_io_mutex, portMAX_DELAY);
-    const esp_err_t result = s_ops.configure(
-                                 CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ);
+    const esp_err_t result = s_ops.configure(s_config.sample_rate_hz);
     xSemaphoreGive(s_io_mutex);
     return result;
 }
@@ -474,13 +461,22 @@ esp_err_t imu_service_register_imu_ops(const imu_service_imu_ops_t *ops)
     return imu_service_register_ops(ops);
 }
 
-esp_err_t imu_service_init(void)
+esp_err_t imu_service_init(const imu_service_config_t *config)
 {
+    if (config == NULL || config->sample_rate_hz == 0U ||
+            config->sample_rate_hz > 1000U || config->task_priority == 0U ||
+            config->task_priority >= configMAX_PRIORITIES)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     taskENTER_CRITICAL(&s_state_lock);
     if (s_initialized)
     {
+        const bool same_config = s_config.sample_rate_hz ==
+                                 config->sample_rate_hz &&
+                                 s_config.task_priority == config->task_priority;
         taskEXIT_CRITICAL(&s_state_lock);
-        return ESP_OK;
+        return same_config ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
     if (s_state != IMU_SERVICE_STATE_STOPPED)
     {
@@ -491,6 +487,7 @@ esp_err_t imu_service_init(void)
     s_active_readers = 0U;
     s_sensor_disable_required = false;
     s_worker = NULL;
+    s_config = *config;
     taskEXIT_CRITICAL(&s_state_lock);
 
     esp_err_t result = ESP_OK;
@@ -535,7 +532,7 @@ esp_err_t imu_service_init(void)
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
     if (xTaskCreate(_imu_worker, "imu_service", CONFIG_IMU_SERVICE_TASK_STACK,
-                    s_io_mutex, CONFIG_IMU_SERVICE_TASK_PRIORITY,
+                    s_io_mutex, s_config.task_priority,
                     &s_worker) != pdPASS)
     {
         result = ESP_ERR_NO_MEM;
@@ -547,7 +544,7 @@ esp_err_t imu_service_init(void)
     s_state = IMU_SERVICE_STATE_RUNNING;
     taskEXIT_CRITICAL(&s_state_lock);
     xEventGroupSetBits(s_worker_events, IMU_SERVICE_EVENT_RUNNING);
-    LOG_I("worker started (rate=%dHz)", CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ);
+    LOG_I("worker started (rate=%uHz)", (unsigned)s_config.sample_rate_hz);
     return ESP_OK;
 
 cleanup:
@@ -587,9 +584,9 @@ cleanup:
     return result;
 }
 
-esp_err_t imu_service_start(void)
+esp_err_t imu_service_start(const imu_service_config_t *config)
 {
-    return imu_service_init();
+    return imu_service_init(config);
 }
 
 esp_err_t imu_service_stop(uint32_t timeout_ms)

@@ -1,6 +1,7 @@
 #include "host_freertos.h"
 #include "host_time_port.h"
 #include "time_service.h"
+#include "test_time_config.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -237,7 +238,7 @@ int main(void)
         .alarm_poll_interrupt = _alarm_poll_interrupt,
     };
     assert(time_service_register_rtc_ops(&ops) == ESP_OK);
-    assert(time_service_init() == ESP_OK);
+    assert(time_service_init(test_time_config()) == ESP_OK);
 
     assert(_wait_for_flag(&s_rtc.poll_entered, 1000U));
     assert(time_service_suspend(20U) == ESP_ERR_TIMEOUT);

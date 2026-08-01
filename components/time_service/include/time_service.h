@@ -12,6 +12,19 @@
 extern "C" {
 #endif
 
+/** @brief Maximum timezone bytes excluding the terminator. */
+#define TIME_SERVICE_TIMEZONE_MAX_BYTES 63U
+/** @brief Maximum SNTP server bytes excluding the terminator. */
+#define TIME_SERVICE_SNTP_SERVER_MAX_BYTES 127U
+
+/** @brief Product-owned time-service startup configuration. */
+typedef struct time_service_config
+{
+    const char *timezone;    /**< POSIX timezone string copied at startup. */
+    const char *sntp_server; /**< SNTP server name copied at startup. */
+    uint32_t task_priority;  /**< FreeRTOS synchronization worker priority. */
+} time_service_config_t;
+
 /** @brief Calendar fields compared by the recurring RTC alarm. */
 typedef struct time_service_alarm_config
 {
@@ -84,13 +97,13 @@ typedef enum
 esp_err_t time_service_register_rtc_ops(const time_service_rtc_ops_t *ops);
 
 /**
- * @brief Initialize the clock, RTC bridge, and SNTP worker using CST-8.
+ * @brief Initialize the clock, RTC bridge, and SNTP worker.
  *
  * @return ESP_OK on success, otherwise an ESP-IDF error.
  *
  * @warning Call from task context. Lifecycle calls must be serialized.
  */
-esp_err_t time_service_init(void);
+esp_err_t time_service_init(const time_service_config_t *config);
 
 /**
  * @brief Stop SNTP, join the worker, and clear registered RTC operations.

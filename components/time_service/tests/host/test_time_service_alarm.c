@@ -2,6 +2,7 @@
 #include "host_freertos.h"
 #include "host_time_port.h"
 #include "time_service.h"
+#include "test_time_config.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -163,7 +164,7 @@ int main(void)
         .alarm_poll_interrupt = _alarm_poll_interrupt,
     };
     assert(time_service_register_rtc_ops(&ops) == ESP_OK);
-    assert(time_service_init() == ESP_OK);
+    assert(time_service_init(test_time_config()) == ESP_OK);
 
     const time_service_alarm_config_t invalid = {0};
     assert(time_service_alarm_configure(&invalid) == ESP_ERR_INVALID_ARG);

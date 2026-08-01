@@ -121,6 +121,7 @@ typedef struct system_pm_config
     system_pm_commit_guard_t commit_guard;       /**< Optional commit guard. */
     system_pm_commit_callback_t commit_callback; /**< Optional commit notice. */
     void *commit_context;                        /**< Commit-hook context. */
+    uint32_t task_priority;                      /**< Standby worker priority. */
 } system_pm_config_t;
 
 /**

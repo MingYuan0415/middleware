@@ -18,6 +18,7 @@ target_include_directories(audio_service_host_test PRIVATE
 )
 target_compile_features(audio_service_host_test PRIVATE c_std_11)
 target_compile_options(audio_service_host_test PRIVATE
+    -include "${AUDIO_SERVICE_DIR}/../../tests/host/sdkconfig.h"
     -Wall
     -Wextra
     -Werror

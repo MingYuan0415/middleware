@@ -34,11 +34,13 @@ esp_err_t time_service_port_clock_get(int64_t *epoch);
 /**
  * @brief Start the SNTP client with the supplied update callback.
  *
+ * @param server is the non-empty server name retained by the caller.
  * @param callback is invoked after SNTP updates the system clock.
  *
  * @return ESP_OK when started, otherwise an ESP-IDF error.
  */
-esp_err_t time_service_port_sntp_start(time_service_port_sync_cb_t callback);
+esp_err_t time_service_port_sntp_start(const char *server,
+                                       time_service_port_sync_cb_t callback);
 
 /**
  * @brief Restart an initialized SNTP client.

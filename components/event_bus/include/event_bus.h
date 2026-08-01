@@ -59,13 +59,13 @@ typedef const void *event_bus_msg_id_t;
 #define EVENT_BUS_PUBLISH_FLAG_WAKE_SCREEN EVENT_BUS_PUBLISH_FLAG_WAKE_REQUEST
 
 /** @brief Maximum number of live subscriptions. */
-#define EVENT_BUS_MAX_SUBSCRIBERS 24U
+#define EVENT_BUS_MAX_SUBSCRIBERS CONFIG_EVENT_BUS_SUBSCRIBER_CAPACITY
 /** @brief Maximum number of pending UI callback items. */
-#define EVENT_BUS_MAX_PENDING_UI_CALLBACKS 24U
+#define EVENT_BUS_MAX_PENDING_UI_CALLBACKS CONFIG_EVENT_BUS_UI_CALLBACK_CAPACITY
 /** @brief Maximum number of shared pending UI payloads. */
-#define EVENT_BUS_MAX_PENDING_UI_PAYLOADS 24U
+#define EVENT_BUS_MAX_PENDING_UI_PAYLOADS CONFIG_EVENT_BUS_UI_PAYLOAD_CAPACITY
 /** @brief Maximum payload size copied for UI dispatch. */
-#define EVENT_BUS_MAX_UI_PAYLOAD_SIZE 256U
+#define EVENT_BUS_MAX_UI_PAYLOAD_SIZE CONFIG_EVENT_BUS_UI_PAYLOAD_SIZE
 
 /** @brief Generation-protected subscription handle. */
 typedef uint64_t event_bus_sub_handle_t;
@@ -166,8 +166,9 @@ esp_err_t event_bus_unsubscribe(event_bus_sub_handle_t handle);
  * Task-only; not ISR-safe. Publisher callbacks execute before return and
  * receive the caller's payload. UI callbacks receive one shared, aligned,
  * immutable payload copy. If at least one matching UI subscriber exists,
- * payload_size must not exceed 256 bytes. payload may be NULL only when
- * payload_size is zero. EVENT_BUS_PUBLISH_FLAG_UI_LATEST coalesces matching
+ * payload_size must not exceed EVENT_BUS_MAX_UI_PAYLOAD_SIZE. payload may be
+ * NULL only when payload_size is zero. EVENT_BUS_PUBLISH_FLAG_UI_LATEST
+ * coalesces matching
  * pending UI state snapshots by message, subtype, and exact UI subscriber
  * slot/generation set. It must not be used for edge, command, audit, or
  * counter events. Publisher callbacks and wake requests are never coalesced.

@@ -38,10 +38,15 @@ esp_err_t time_service_port_clock_get(int64_t *epoch)
     return ESP_OK;
 }
 
-esp_err_t time_service_port_sntp_start(time_service_port_sync_cb_t callback)
+esp_err_t time_service_port_sntp_start(const char *server,
+                                       time_service_port_sync_cb_t callback)
 {
+    if (server == NULL || server[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(0, server);
     esp_sntp_set_time_sync_notification_cb(callback);
     esp_sntp_init();
     return ESP_OK;

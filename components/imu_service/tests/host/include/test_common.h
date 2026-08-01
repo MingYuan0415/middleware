@@ -20,6 +20,16 @@
         }                                                                  \
     } while (0)
 
+static inline const imu_service_config_t *test_imu_config(void)
+{
+    static const imu_service_config_t config =
+    {
+        .sample_rate_hz = 100U,
+        .task_priority = 6U,
+    };
+    return &config;
+}
+
 static inline void test_sleep_ms(uint32_t delay_ms)
 {
     struct timespec delay =

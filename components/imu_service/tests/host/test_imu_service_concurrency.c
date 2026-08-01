@@ -49,7 +49,7 @@ static bool _start_service_without_worker_reads(void)
     host_imu_reset();
     host_timer_reset();
     TEST_CHECK(imu_service_register_ops(host_imu_ops()) == ESP_OK);
-    TEST_CHECK(imu_service_init() == ESP_OK);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_OK);
     TEST_CHECK(host_event_bus_wait_for_count(
                    IMU_SERVICE_MSG_SUB_TYPE_AVAILABILITY_CHANGED, 1U, 1000U));
 

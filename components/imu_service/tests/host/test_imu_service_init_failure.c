@@ -58,7 +58,7 @@ static bool _run_init_failure(init_failure_case_t failure)
         break;
     }
 
-    TEST_CHECK(imu_service_init() == expected);
+    TEST_CHECK(imu_service_init(test_imu_config()) == expected);
     TEST_CHECK(imu_service_get_state() == IMU_SERVICE_STATE_STOPPED);
     TEST_CHECK(host_freertos_active_mutex_count() == 0U);
     TEST_CHECK(host_freertos_active_event_group_count() == 0U);
@@ -69,7 +69,8 @@ static bool _run_init_failure(init_failure_case_t failure)
             failure == INIT_FAILURE_TASK)
     {
         TEST_CHECK(host_imu_configure_count() == 1U);
-        TEST_CHECK(host_imu_configured_sample_rate_hz() == 200U);
+        TEST_CHECK(host_imu_configured_sample_rate_hz() ==
+                   test_imu_config()->sample_rate_hz);
     }
     if (failure == INIT_FAILURE_CONFIGURE)
     {
@@ -90,7 +91,7 @@ static bool _test_read_and_publish_failures(void)
     TEST_CHECK(_reset_fakes());
     host_imu_set_read_result(ESP_FAIL);
     TEST_CHECK(imu_service_register_ops(host_imu_ops()) == ESP_OK);
-    TEST_CHECK(imu_service_init() == ESP_OK);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_OK);
     TEST_CHECK(host_imu_wait_for_reads(1U, 1000U));
 
     imu_service_snapshot_t snapshot;
@@ -130,7 +131,7 @@ static bool _test_interrupt_publish_retry(void)
                                    sizeof(status_int_values[0]));
     host_event_bus_set_result(ESP_FAIL);
     TEST_CHECK(imu_service_register_ops(host_imu_ops()) == ESP_OK);
-    TEST_CHECK(imu_service_init() == ESP_OK);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_OK);
     TEST_CHECK(host_event_bus_wait_for_attempts(
                    IMU_SERVICE_MSG_SUB_TYPE_INTERRUPT, 2U, 1000U));
     TEST_CHECK(host_imu_read_count() == 1U);
@@ -160,7 +161,7 @@ static bool _test_task_and_disable_failure_retry(void)
     host_freertos_fail_task_create(true);
     host_imu_set_disable_result(ESP_FAIL);
 
-    TEST_CHECK(imu_service_init() == ESP_ERR_NO_MEM);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_ERR_NO_MEM);
     TEST_CHECK(imu_service_get_state() == IMU_SERVICE_STATE_ERROR);
     TEST_CHECK(host_imu_enable_count() == 1U);
     TEST_CHECK(host_imu_disable_count() == 1U);

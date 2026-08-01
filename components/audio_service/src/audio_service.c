@@ -9,25 +9,6 @@
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
-#ifndef CONFIG_AUDIO_SERVICE_SAMPLE_RATE_HZ
-    #define CONFIG_AUDIO_SERVICE_SAMPLE_RATE_HZ 16000
-#endif
-#ifndef CONFIG_AUDIO_SERVICE_BITS_PER_SAMPLE
-    #define CONFIG_AUDIO_SERVICE_BITS_PER_SAMPLE 16
-#endif
-#ifndef CONFIG_AUDIO_SERVICE_CHANNELS
-    #define CONFIG_AUDIO_SERVICE_CHANNELS 2
-#endif
-#ifndef CONFIG_AUDIO_SERVICE_MCLK_MULTIPLE
-    #define CONFIG_AUDIO_SERVICE_MCLK_MULTIPLE 384
-#endif
-#ifndef CONFIG_AUDIO_SERVICE_PA_DEFAULT_ON
-    #define CONFIG_AUDIO_SERVICE_PA_DEFAULT_ON 1
-#endif
-#ifndef configTICK_RATE_HZ
-    #define configTICK_RATE_HZ 1000
-#endif
-
 typedef esp_err_t (*audio_service_io_op_t)(void *data, size_t bytes,
         size_t *transferred, uint32_t timeout_ms);
 
@@ -36,6 +17,7 @@ typedef struct audio_service_context
     SemaphoreHandle_t lock;
     SemaphoreHandle_t drained;
     bsp_audio_ops_t ops;
+    audio_service_init_config_t init_config;
     audio_service_config_t config;
     audio_service_state_t state;
     uint32_t active_io;
@@ -100,6 +82,30 @@ static bsp_audio_config_t _to_bsp_config(const audio_service_config_t *config)
         .mclk_multiple = config->mclk_multiple,
     };
     return bsp_config;
+}
+
+static bool _init_config_valid(const audio_service_init_config_t *config)
+{
+    return config != NULL && config->stream.sample_rate_hz != 0U &&
+           config->stream.bits_per_sample != 0U &&
+           config->stream.channels != 0U &&
+           config->stream.mclk_multiple != 0U &&
+           config->volume_percent <= 100U;
+}
+
+static bool _init_config_equal_locked(const audio_service_init_config_t *config)
+{
+    return s_audio_service.init_config.stream.sample_rate_hz ==
+           config->stream.sample_rate_hz &&
+           s_audio_service.init_config.stream.bits_per_sample ==
+           config->stream.bits_per_sample &&
+           s_audio_service.init_config.stream.channels ==
+           config->stream.channels &&
+           s_audio_service.init_config.stream.mclk_multiple ==
+           config->stream.mclk_multiple &&
+           s_audio_service.init_config.volume_percent == config->volume_percent &&
+           s_audio_service.init_config.muted == config->muted &&
+           s_audio_service.init_config.pa_enabled == config->pa_enabled;
 }
 
 static bool _ops_available_locked(void)
@@ -240,20 +246,12 @@ exit:
     return result;
 }
 
-audio_service_config_t audio_service_get_default_config(void)
+esp_err_t audio_service_init(const audio_service_init_config_t *config)
 {
-    const audio_service_config_t config =
+    if (!_init_config_valid(config))
     {
-        .sample_rate_hz = CONFIG_AUDIO_SERVICE_SAMPLE_RATE_HZ,
-        .bits_per_sample = CONFIG_AUDIO_SERVICE_BITS_PER_SAMPLE,
-        .channels = CONFIG_AUDIO_SERVICE_CHANNELS,
-        .mclk_multiple = CONFIG_AUDIO_SERVICE_MCLK_MULTIPLE,
-    };
-    return config;
-}
-
-esp_err_t audio_service_init(void)
-{
+        return ESP_ERR_INVALID_ARG;
+    }
     if (s_audio_service.lock == NULL)
     {
         s_audio_service.lock = xSemaphoreCreateMutex();
@@ -280,8 +278,9 @@ esp_err_t audio_service_init(void)
     }
     if (s_audio_service.initialized)
     {
-        _unlock_service();
-        return ESP_OK;
+        result = _init_config_equal_locked(config) ?
+                 ESP_OK : ESP_ERR_INVALID_STATE;
+        goto exit;
     }
     if (s_audio_service.stop_required)
     {
@@ -304,7 +303,7 @@ esp_err_t audio_service_init(void)
         goto exit;
     }
 
-    s_audio_service.config = audio_service_get_default_config();
+    s_audio_service.config = config->stream;
     const bsp_audio_config_t bsp_config = _to_bsp_config(&s_audio_service.config);
     s_audio_service.stop_required = true;
     result = s_audio_service.ops.configure(&bsp_config);
@@ -313,7 +312,19 @@ esp_err_t audio_service_init(void)
         s_audio_service.state = AUDIO_SERVICE_STATE_ERROR;
         goto exit;
     }
-    result = s_audio_service.ops.set_pa(CONFIG_AUDIO_SERVICE_PA_DEFAULT_ON);
+    result = s_audio_service.ops.set_volume(config->volume_percent);
+    if (result != ESP_OK)
+    {
+        s_audio_service.state = AUDIO_SERVICE_STATE_ERROR;
+        goto exit;
+    }
+    result = s_audio_service.ops.set_mute(config->muted);
+    if (result != ESP_OK)
+    {
+        s_audio_service.state = AUDIO_SERVICE_STATE_ERROR;
+        goto exit;
+    }
+    result = s_audio_service.ops.set_pa(config->pa_enabled);
     if (result != ESP_OK)
     {
         s_audio_service.state = AUDIO_SERVICE_STATE_ERROR;
@@ -321,10 +332,34 @@ esp_err_t audio_service_init(void)
     }
     s_audio_service.initialized = true;
     s_audio_service.state = AUDIO_SERVICE_STATE_READY;
-    s_audio_service.pa_enabled = CONFIG_AUDIO_SERVICE_PA_DEFAULT_ON;
+    s_audio_service.init_config = *config;
+    s_audio_service.pa_enabled = config->pa_enabled;
     s_audio_service.active_io = 0U;
     s_audio_service.io_admitted = false;
     s_audio_service.drain_waiting = false;
+
+exit:
+    _unlock_service();
+    return result;
+}
+
+esp_err_t audio_service_get_config(audio_service_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = _lock_service();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (!s_audio_service.initialized)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    *config = s_audio_service.config;
 
 exit:
     _unlock_service();
@@ -361,6 +396,8 @@ esp_err_t audio_service_deinit(void)
         return result;
     }
     memset(&s_audio_service.ops, 0, sizeof(s_audio_service.ops));
+    memset(&s_audio_service.init_config, 0, sizeof(s_audio_service.init_config));
+    memset(&s_audio_service.config, 0, sizeof(s_audio_service.config));
     s_audio_service.initialized = false;
     s_audio_service.ops_registered = false;
     s_audio_service.pa_enabled = false;

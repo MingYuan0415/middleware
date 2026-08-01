@@ -82,9 +82,10 @@ esp_err_t time_service_port_clock_get(int64_t *epoch)
     return ESP_OK;
 }
 
-esp_err_t time_service_port_sntp_start(time_service_port_sync_cb_t callback)
+esp_err_t time_service_port_sntp_start(const char *server,
+                                       time_service_port_sync_cb_t callback)
 {
-    if (callback == NULL)
+    if (server == NULL || server[0] == '\0' || callback == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }

@@ -13,9 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#ifndef CONFIG_WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS
-    #define CONFIG_WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS 1000U
-#endif
+#define WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS 1000U
 
 ESP_EVENT_DEFINE_BASE(WIFI_SERVICE_PORT_BARRIER_EVENT);
 
@@ -105,7 +103,7 @@ static esp_err_t _wifi_service_port_drain_event_loop(void)
 
     TickType_t started = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(
-                             CONFIG_WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS);
+                             WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS);
     if (timeout == 0)
     {
         timeout = 1;

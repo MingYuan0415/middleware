@@ -1,0 +1,8 @@
+menu "Time service resources"
+
+config TIME_SERVICE_SYNC_WORKER_STACK
+    int "SNTP worker stack size"
+    range 2048 8192
+    default 3072
+
+endmenu

@@ -18,13 +18,6 @@
 #include "freertos/task.h"
 #include "hal/gpio_types.h"
 
-#ifndef CONFIG_SYSTEM_PM_STANDBY_TASK_STACK
-    #define CONFIG_SYSTEM_PM_STANDBY_TASK_STACK 4096
-#endif
-#ifndef CONFIG_SYSTEM_PM_STANDBY_TASK_PRIO
-    #define CONFIG_SYSTEM_PM_STANDBY_TASK_PRIO 5
-#endif
-
 #define SYSTEM_PM_CMD_REQUEST BIT0
 #define SYSTEM_PM_CMD_STOP    BIT1
 #define SYSTEM_PM_CMD_RECOVER BIT2
@@ -190,7 +183,8 @@ static bool _config_valid(const system_pm_config_t *config)
                 config->wake_source_count <= SYSTEM_PM_MAX_WAKE_SOURCES &&
                 config->prepare_sleep != NULL &&
                 config->complete_sleep != NULL &&
-                config->prepare_timeout_ms > 0;
+                config->prepare_timeout_ms > 0 && config->task_priority > 0U &&
+                config->task_priority < configMAX_PRIORITIES;
     }
     for (size_t i = 0; valid && i < config->wake_source_count; ++i)
     {
@@ -231,7 +225,8 @@ static bool _config_equal(const system_pm_config_t *left,
             left->wake_callback_context != right->wake_callback_context ||
             left->commit_guard != right->commit_guard ||
             left->commit_callback != right->commit_callback ||
-            left->commit_context != right->commit_context)
+            left->commit_context != right->commit_context ||
+            left->task_priority != right->task_priority)
     {
         equal = false;
     }
@@ -590,7 +585,7 @@ static esp_err_t _create_system_pm_resources(void)
                           memory_order_release);
     if (xTaskCreate(_sleep_task, "system_pm_sleep",
                     CONFIG_SYSTEM_PM_STANDBY_TASK_STACK, NULL,
-                    CONFIG_SYSTEM_PM_STANDBY_TASK_PRIO, &s_sleep_task) != pdPASS)
+                    s_config.task_priority, &s_sleep_task) != pdPASS)
     {
         s_sleep_task = NULL;
         atomic_store_explicit(&s_worker_event_tail_complete, true,

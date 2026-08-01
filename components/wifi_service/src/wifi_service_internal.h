@@ -14,19 +14,6 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#ifndef CONFIG_WIFI_SERVICE_TASK_STACK
-    #define CONFIG_WIFI_SERVICE_TASK_STACK 4096
-#endif
-#ifndef CONFIG_WIFI_SERVICE_TASK_PRIORITY
-    #define CONFIG_WIFI_SERVICE_TASK_PRIORITY 4
-#endif
-#ifndef CONFIG_WIFI_SERVICE_QUEUE_DEPTH
-    #define CONFIG_WIFI_SERVICE_QUEUE_DEPTH 16
-#endif
-#ifndef CONFIG_WIFI_SERVICE_WORKER_POLL_MS
-    #define CONFIG_WIFI_SERVICE_WORKER_POLL_MS 20U
-#endif
-
 #ifndef WIFI_SERVICE_RETRY_DELAY_1_MS
     #define WIFI_SERVICE_RETRY_DELAY_1_MS 1000U
 #endif
@@ -39,6 +26,7 @@
 
 #define WIFI_SERVICE_CREDENTIAL_SLOTS 2U
 #define WIFI_SERVICE_RETRY_LIMIT      3U
+#define WIFI_SERVICE_WORKER_POLL_MS   20U
 
 /** @brief Creation state of the process-lifetime static control plane. */
 typedef enum
@@ -182,6 +170,7 @@ typedef struct wifi_service_shared
     StackType_t worker_stack[CONFIG_WIFI_SERVICE_TASK_STACK];
     TaskHandle_t worker;
     bool primitives_created;
+    wifi_service_config_t config;
 
     wifi_runtime_state_t runtime_state;
     bool accept_commands;

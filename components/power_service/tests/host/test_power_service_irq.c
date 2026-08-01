@@ -8,7 +8,7 @@
 #include <time.h>
 
 #define TEST_WAIT_STEP_MS 1U
-#define TEST_WAIT_LIMIT_MS 1000U
+#define TEST_WAIT_LIMIT_MS 2000U
 #define TEST_IRQ_STATUS UINT32_C(0x000a55a5)
 
 static atomic_uint s_sample_calls;
@@ -116,6 +116,12 @@ static esp_err_t _power_poll_irq(uint32_t *status)
 
 int main(void)
 {
+    const power_service_config_t config =
+    {
+        .poll_interval_ms = 1000U,
+        .irq_poll_interval_ms = 10U,
+        .task_priority = 4U,
+    };
     const power_service_power_ops_t ops =
     {
         .is_available = _power_available,
@@ -124,7 +130,12 @@ int main(void)
     };
     atomic_store_explicit(&s_irq_publish_failures, 1U, memory_order_release);
     assert(power_service_register_power_ops(&ops) == ESP_OK);
-    assert(power_service_init() == ESP_OK);
+    assert(power_service_init(NULL) == ESP_ERR_INVALID_ARG);
+    assert(power_service_init(&config) == ESP_OK);
+    assert(power_service_init(&config) == ESP_OK);
+    power_service_config_t different = config;
+    different.task_priority++;
+    assert(power_service_init(&different) == ESP_ERR_INVALID_STATE);
 
     assert(_wait_for_count(&s_irq_event_count, 1U));
     assert(atomic_load_explicit(&s_irq_poll_calls, memory_order_acquire) >= 3U);

@@ -10,22 +10,6 @@
 
 #include "sd_storage_service.h"
 
-#ifndef CONFIG_SD_STORAGE_SERVICE_ENABLE
-    #define CONFIG_SD_STORAGE_SERVICE_ENABLE 1
-#endif
-#ifndef CONFIG_SD_STORAGE_SERVICE_MOUNT_PATH
-    #define CONFIG_SD_STORAGE_SERVICE_MOUNT_PATH "/sdcard"
-#endif
-#ifndef CONFIG_SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED
-    #define CONFIG_SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED 0
-#endif
-#ifndef CONFIG_SD_STORAGE_SERVICE_MAX_FILES
-    #define CONFIG_SD_STORAGE_SERVICE_MAX_FILES 5
-#endif
-#ifndef CONFIG_SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE
-    #define CONFIG_SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE (16 * 1024)
-#endif
-
 #define SD_STORAGE_SERVICE_PATH_MAX (64U)
 
 static sd_storage_service_mount_ops_t s_ops;
@@ -51,6 +35,22 @@ static bool _allocation_unit_valid(size_t size)
 {
     return size == 0U || (size >= 512U && size <= 65536U &&
                           (size & (size - 1U)) == 0U);
+}
+
+static bool _config_valid(const sd_storage_service_config_t *config)
+{
+    return config != NULL && config->mount_path != NULL &&
+           config->mount_path[0] == '/' &&
+           strlen(config->mount_path) < sizeof(s_mount_path) &&
+           config->max_files > 0 &&
+           _allocation_unit_valid(config->allocation_unit_size);
+}
+
+static bool _config_equal_locked(const sd_storage_service_config_t *config)
+{
+    return strcmp(s_config.mount_path, config->mount_path) == 0 &&
+           s_config.max_files == config->max_files &&
+           s_config.allocation_unit_size == config->allocation_unit_size;
 }
 
 static esp_err_t _sd_storage_service_validate_ops(
@@ -85,17 +85,13 @@ esp_err_t sd_storage_service_register_mount_ops(
     return result;
 }
 
-esp_err_t sd_storage_service_init(void)
+static esp_err_t _sd_storage_service_mount(
+    const sd_storage_service_config_t *requested,
+    sd_storage_service_mount_mode_t mode)
 {
-#if !CONFIG_SD_STORAGE_SERVICE_ENABLE
-    return ESP_ERR_NOT_SUPPORTED;
-#else
-    const char *configured_path = CONFIG_SD_STORAGE_SERVICE_MOUNT_PATH;
-    if (configured_path == NULL || configured_path[0] != '/' ||
-            strlen(configured_path) >= sizeof(s_mount_path) ||
-            CONFIG_SD_STORAGE_SERVICE_MAX_FILES <= 0 ||
-            !_allocation_unit_valid(
-                CONFIG_SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE))
+    if (!_config_valid(requested) ||
+            (mode != SD_STORAGE_SERVICE_MOUNT_NORMAL &&
+             mode != SD_STORAGE_SERVICE_MOUNT_RECOVER_FORMAT))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -104,8 +100,9 @@ esp_err_t sd_storage_service_init(void)
     taskENTER_CRITICAL(&s_state_lock);
     if (s_state == SD_STORAGE_SERVICE_STATE_STARTED)
     {
+        const bool same_config = _config_equal_locked(requested);
         taskEXIT_CRITICAL(&s_state_lock);
-        return ESP_OK;
+        return same_config ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
     if (s_state == SD_STORAGE_SERVICE_STATE_CLEANUP_PENDING)
     {
@@ -121,18 +118,17 @@ esp_err_t sd_storage_service_init(void)
     ops = s_ops;
     taskEXIT_CRITICAL(&s_state_lock);
 
-    memcpy(s_mount_path, configured_path, strlen(configured_path) + 1U);
+    memcpy(s_mount_path, requested->mount_path,
+           strlen(requested->mount_path) + 1U);
     const sd_storage_service_config_t config =
     {
         .mount_path = s_mount_path,
-        .format_if_mount_failed =
-        CONFIG_SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED != 0,
-        .max_files = CONFIG_SD_STORAGE_SERVICE_MAX_FILES,
-        .allocation_unit_size = CONFIG_SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE,
+        .max_files = requested->max_files,
+        .allocation_unit_size = requested->allocation_unit_size,
     };
 
     void *handle = NULL;
-    esp_err_t result = ops.mount(ops.context, &config, &handle);
+    esp_err_t result = ops.mount(ops.context, &config, mode, &handle);
     if (result != ESP_OK)
     {
         esp_err_t cleanup_result = ESP_OK;
@@ -212,7 +208,18 @@ esp_err_t sd_storage_service_init(void)
     taskEXIT_CRITICAL(&s_state_lock);
     LOG_I("SD filesystem mounted at %s", s_mount_path);
     return ESP_OK;
-#endif
+}
+
+esp_err_t sd_storage_service_init(const sd_storage_service_config_t *config)
+{
+    return _sd_storage_service_mount(config, SD_STORAGE_SERVICE_MOUNT_NORMAL);
+}
+
+esp_err_t sd_storage_service_recover_and_mount(
+    const sd_storage_service_config_t *config)
+{
+    return _sd_storage_service_mount(
+               config, SD_STORAGE_SERVICE_MOUNT_RECOVER_FORMAT);
 }
 
 esp_err_t sd_storage_service_deinit(void)
@@ -259,9 +266,9 @@ esp_err_t sd_storage_service_deinit(void)
     return ESP_OK;
 }
 
-esp_err_t sd_storage_service_start(void)
+esp_err_t sd_storage_service_start(const sd_storage_service_config_t *config)
 {
-    return sd_storage_service_init();
+    return sd_storage_service_init(config);
 }
 
 esp_err_t sd_storage_service_stop(void)

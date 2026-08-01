@@ -15,6 +15,7 @@ target_include_directories(sd_storage_service_test PRIVATE
 
 target_compile_features(sd_storage_service_test PRIVATE c_std_11)
 target_compile_options(sd_storage_service_test PRIVATE
+    -include "${CMAKE_CURRENT_LIST_DIR}/../../../../tests/host/sdkconfig.h"
     -Wall
     -Wextra
     -Werror

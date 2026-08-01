@@ -38,13 +38,13 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
 ```
 
-构建依赖不会初始化运行时。应在单线程启动阶段初始化 `mt_log`、`nv_storage` 和 `event_bus`；在服务启动前分别调用 `power_service_register_power_ops()`、`imu_service_register_imu_ops()`、`time_service_register_rtc_ops()` 和 `sd_storage_service_register_mount_ops()`。`audio_service_init()` 直接取得已提交的 `bsp_audio_ops_t`，因此也必须在 `bsp_init()` 成功后调用；在 `wifi_service_init()` 前准备 ESP-NETIF 和默认事件循环。停止发布者并等待已接纳工作完成后，再按逆序反初始化。`event_bus` 是进程生命周期单例，没有反初始化接口。
+构建依赖不会初始化运行时。应在单线程启动阶段初始化 `mt_log`、`nv_storage` 和 `event_bus`；在服务启动前分别调用 `power_service_register_power_ops()`、`imu_service_register_imu_ops()`、`time_service_register_rtc_ops()` 和 `sd_storage_service_register_mount_ops()`。Audio、SD、IMU、Power、Time、Wi-Fi 和 System PM 的 init 都接收类型化配置；`audio_service_init()` 直接取得已提交的 `bsp_audio_ops_t`，因此必须在 `bsp_init()` 成功后调用，在 `wifi_service_init()` 前准备 ESP-NETIF 和默认事件循环。相同配置重复初始化幂等，活动状态下不同配置返回 `ESP_ERR_INVALID_STATE`。停止发布者并等待已接纳工作完成后，再按逆序反初始化。`event_bus` 是进程生命周期单例，没有反初始化接口。
 
 ## 新增服务 API 与事件
 
-- `imu_service` 的板级表要求 `read`，并可提供 `is_available`、`configure`、`set_enabled` 和 `poll_interrupt`。初始化会在启用传感器前把 `IMU_SERVICE_SAMPLE_RATE_HZ` 传给 `configure`，使 worker 周期与硬件 ODR 使用同一请求值。公共 API 支持 init/start、stop/deinit、suspend/resume、缓存 `get_snapshot` 和同步 `read`；`IMU_SERVICE_MSG` 发布快照、可用性变化和 interrupt subtype。
-- `audio_service` 支持 Kconfig 默认格式查询、configure、start/stop、全双工 read/write、0-100 音量、mute 和 NS4150B PA 控制。它不发布 event bus 消息。
-- `sd_storage_service` 的 adapter 提供 mount/unmount/is_mounted；公共 API 支持 init/start、stop/deinit，以及 mount path、handle、active config 查询。默认挂载点是 `/sdcard`，`format_if_mount_failed` 默认关闭，挂载失败不会自动格式化。
+- `imu_service` 的板级表要求 `read`，并可提供 `is_available`、`configure`、`set_enabled` 和 `poll_interrupt`。初始化会把运行时 `sample_rate_hz` 同时用于硬件 ODR 和 worker 周期。公共 API 支持 init/start、stop/deinit、suspend/resume、缓存 `get_snapshot` 和同步 `read`。
+- `audio_service_init_config_t` 同时提供 PCM、初始音量、mute 和 PA；`audio_service_get_config()` 返回当前有效 PCM 格式。服务支持 configure、start/stop 和全双工 read/write，不发布 event bus 消息。
+- `sd_storage_service` 的 adapter 提供 mount/unmount/is_mounted；普通 `init/start(config)` 从不格式化。破坏性恢复只能由显式 `sd_storage_service_recover_and_mount(config)` 发起。
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 
@@ -52,18 +52,12 @@ idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
 
 ## 配置
 
-使用 `idf.py menuconfig` 调整以下选项：
-
-| 服务 | 配置项（默认值；范围） |
-| --- | --- |
-| 电源 | `POWER_SERVICE_TASK_STACK`（3072；2048-8192）、`POWER_SERVICE_TASK_PRIORITY`（4；1-24）、`POWER_SERVICE_POLL_INTERVAL_MS`（5000；1000-60000）、`POWER_SERVICE_IRQ_POLL_INTERVAL_MS`（100；10-1000） |
-| IMU | `IMU_SERVICE_TASK_STACK`（3072；2048-8192）、`IMU_SERVICE_TASK_PRIORITY`（6；1-24）、`IMU_SERVICE_SAMPLE_RATE_HZ`（100；1-1000） |
-| 音频 | 默认 16 kHz、16-bit、双声道、384x MCLK、streaming 时 PA 开启；`AUDIO_SERVICE_*` choice 提供 8-96 kHz、16/24/32-bit、mono/stereo 及受采样格式约束的 MCLK 倍频 |
-| SD | `SD_STORAGE_SERVICE_ENABLE`（y）、`SD_STORAGE_SERVICE_MOUNT_PATH`（`/sdcard`）、`SD_STORAGE_SERVICE_FORMAT_IF_MOUNT_FAILED`（n）、`SD_STORAGE_SERVICE_MAX_FILES`（5；1-32）、`SD_STORAGE_SERVICE_ALLOCATION_UNIT_SIZE`（16384；0-65536） |
-| 系统 PM | `SYSTEM_PM_STANDBY_TASK_STACK`（4096；2048-16384）、`SYSTEM_PM_STANDBY_TASK_PRIO`（5；1-24）、`SYSTEM_PM_DEVELOPMENT_MODE`（n；USB Serial/JTAG 连接时禁止 standby） |
-| Wi-Fi | `WIFI_SERVICE_TASK_STACK`（4096；3072-8192）、`WIFI_SERVICE_TASK_PRIORITY`（4；1-20）、`WIFI_SERVICE_QUEUE_DEPTH`（16；8-32）、`WIFI_SERVICE_WORKER_POLL_MS`（20；5-100）、`WIFI_SERVICE_EVENT_DRAIN_TIMEOUT_MS`（1000；100-5000） |
-
-时间服务当前固定使用 `CST-8`、`pool.ntp.org` 和 100 ms alarm IRQ 轮询，没有对应 Kconfig。修改配置后运行 `idf.py reconfigure && idf.py build`。
+Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
+IMU/Power stack 3072，Time stack 3072，Wi-Fi stack 4096 和 queue 16，System PM stack
+4096。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
+`app_product_config_t` 在运行时传入。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，
+定义于 `main/Kconfig.projbuild`。修改 Kconfig 后运行
+`idf.py reconfigure && idf.py save-defconfig && idf.py build`。
 
 ## 并发与资源边界
 

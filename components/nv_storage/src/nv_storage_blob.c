@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define NV_STORAGE_NAMESPACE      "microtech"
-#define NV_STORAGE_BLOB_POOL_SIZE 16U
+#define NV_STORAGE_BLOB_POOL_SIZE CONFIG_NV_STORAGE_BLOB_POOL_SIZE
 
 typedef struct nv_storage_blob_entry
 {

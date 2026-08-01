@@ -20,6 +20,15 @@ typedef struct audio_service_config
     uint16_t mclk_multiple;  /**< MCLK to LRCK ratio. */
 } audio_service_config_t;
 
+/** @brief Complete startup policy supplied by the product integration. */
+typedef struct audio_service_init_config
+{
+    audio_service_config_t stream; /**< Initial full-duplex PCM format. */
+    uint8_t volume_percent;        /**< Initial speaker volume, 0 through 100. */
+    bool muted;                    /**< Initial speaker mute state. */
+    bool pa_enabled;               /**< Requested amplifier state while streaming. */
+} audio_service_init_config_t;
+
 /** @brief Audio service lifecycle state. */
 typedef enum
 {
@@ -33,16 +42,25 @@ typedef enum
 /** @brief Sentinel accepted by suspend/resume to wait without a deadline. */
 #define AUDIO_SERVICE_WAIT_FOREVER UINT32_MAX
 
-/** @brief Return defaults selected by Kconfig. */
-audio_service_config_t audio_service_get_default_config(void);
-
 /**
  * @brief Initialize the service around the board audio device.
  *
  * This function does not claim or release the BSP device. The board must have
  * been initialized before this call and remains the owner of its resources.
+ *
+ * @param config is validated and copied by the service.
+ * @return ESP_OK on success, otherwise an ESP-IDF error.
  */
-esp_err_t audio_service_init(void);
+esp_err_t audio_service_init(const audio_service_init_config_t *config);
+
+/**
+ * @brief Copy the active PCM stream configuration.
+ *
+ * @param config receives the active configuration.
+ * @return ESP_OK when initialized; ESP_ERR_INVALID_ARG for NULL;
+ *         ESP_ERR_INVALID_STATE before initialization.
+ */
+esp_err_t audio_service_get_config(audio_service_config_t *config);
 
 /**
  * @brief Stop streaming and reset service-owned state.

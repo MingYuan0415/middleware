@@ -27,10 +27,9 @@ target_include_directories(power_service_irq_test PRIVATE
 target_compile_features(power_service_irq_test PRIVATE c_std_11)
 target_compile_definitions(power_service_irq_test PRIVATE
     _POSIX_C_SOURCE=200809L
-    CONFIG_POWER_SERVICE_POLL_INTERVAL_MS=100
-    CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS=5
 )
 target_compile_options(power_service_irq_test PRIVATE
+    -include "${POWER_SERVICE_DIR}/../../tests/host/sdkconfig.h"
     -Wall
     -Wextra
     -Werror

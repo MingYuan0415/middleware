@@ -21,6 +21,7 @@ typedef struct host_event_group *EventGroupHandle_t;
 #define pdFAIL  0
 
 #define configTICK_RATE_HZ 1000U
+#define configMAX_PRIORITIES 25U
 #define portMAX_DELAY      UINT32_MAX
 #define BIT0               (UINT32_C(1) << 0)
 #define BIT1               (UINT32_C(1) << 1)

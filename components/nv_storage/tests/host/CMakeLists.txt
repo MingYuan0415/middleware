@@ -30,6 +30,7 @@ target_compile_definitions(nv_storage_host_test PRIVATE
     _POSIX_C_SOURCE=200809L
 )
 target_compile_options(nv_storage_host_test PRIVATE
+    -include "${NV_STORAGE_DIR}/../../tests/host/sdkconfig.h"
     -Wall
     -Wextra
     -Werror

@@ -97,7 +97,7 @@ static TickType_t _wifi_service_remaining(const wifi_deadline_t *deadline)
     return remaining;
 }
 
-static esp_err_t _wifi_service_ensure_core(void)
+static esp_err_t _wifi_service_ensure_core(const wifi_service_config_t *config)
 {
     int state = atomic_load_explicit(&g_wifi_service.core_state,
                                      memory_order_acquire);
@@ -117,6 +117,7 @@ static esp_err_t _wifi_service_ensure_core(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    g_wifi_service.config = *config;
     if (!g_wifi_service.primitives_created)
     {
         g_wifi_service.state_mutex = xSemaphoreCreateMutexStatic(
@@ -151,7 +152,7 @@ static esp_err_t _wifi_service_ensure_core(void)
     g_wifi_service.worker = xTaskCreateStatic(
                                 wifi_service_worker_run, "wifi_service",
                                 CONFIG_WIFI_SERVICE_TASK_STACK, NULL,
-                                CONFIG_WIFI_SERVICE_TASK_PRIORITY,
+                                g_wifi_service.config.task_priority,
                                 g_wifi_service.worker_stack,
                                 &g_wifi_service.worker_control);
     if (g_wifi_service.worker == NULL)
@@ -163,6 +164,26 @@ static esp_err_t _wifi_service_ensure_core(void)
     atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_READY,
                           memory_order_release);
     return ESP_OK;
+}
+
+static esp_err_t _wifi_service_apply_config_locked(
+    const wifi_service_config_t *config)
+{
+    if (g_wifi_service.config.task_priority == config->task_priority)
+    {
+        return ESP_OK;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
+    if (g_wifi_service.runtime_state == WIFI_RUNTIME_OFFLINE)
+    {
+        vTaskPrioritySet(g_wifi_service.worker, config->task_priority);
+        g_wifi_service.config = *config;
+        result = ESP_OK;
+    }
+    xSemaphoreGive(g_wifi_service.state_mutex);
+    return result;
 }
 
 static esp_err_t _wifi_service_prepare_init_locked(bool *immediate)
@@ -368,9 +389,17 @@ static esp_err_t _wifi_service_submit_control(
 }
 
 static esp_err_t _wifi_service_control(wifi_control_type_t type,
-                                       uint32_t timeout_ms)
+                                       uint32_t timeout_ms,
+                                       const wifi_service_config_t *config)
 {
-    esp_err_t result = _wifi_service_ensure_core();
+    if (config == NULL && atomic_load_explicit(&g_wifi_service.core_state,
+            memory_order_acquire) != WIFI_CORE_READY)
+    {
+        return type == WIFI_CONTROL_DEINIT ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+    const wifi_service_config_t *effective_config = config != NULL ?
+        config : &g_wifi_service.config;
+    esp_err_t result = _wifi_service_ensure_core(effective_config);
     bool control_owned = false;
     if (result != ESP_OK)
     {
@@ -388,6 +417,15 @@ static esp_err_t _wifi_service_control(wifi_control_type_t type,
     }
     control_owned = true;
 
+    if (config != NULL)
+    {
+        result = _wifi_service_apply_config_locked(config);
+        if (result != ESP_OK)
+        {
+            goto exit;
+        }
+    }
+
     bool reused = false;
     result = _wifi_service_consume_inflight(type, &deadline, &reused);
     if (result != ESP_OK || reused)
@@ -404,10 +442,15 @@ exit:
     return result;
 }
 
-esp_err_t wifi_service_init(void)
+esp_err_t wifi_service_init(const wifi_service_config_t *config)
 {
+    if (config == NULL || config->task_priority == 0U ||
+            config->task_priority >= configMAX_PRIORITIES)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t result = _wifi_service_control(WIFI_CONTROL_INIT,
-                       WIFI_SERVICE_WAIT_FOREVER);
+                       WIFI_SERVICE_WAIT_FOREVER, config);
     if (result == ESP_OK)
     {
         LOG_I("ready: scan=%u, queue=%u, credentials=RAM-only",
@@ -419,17 +462,17 @@ esp_err_t wifi_service_init(void)
 
 esp_err_t wifi_service_deinit(uint32_t timeout_ms)
 {
-    return _wifi_service_control(WIFI_CONTROL_DEINIT, timeout_ms);
+    return _wifi_service_control(WIFI_CONTROL_DEINIT, timeout_ms, NULL);
 }
 
 esp_err_t wifi_service_suspend(uint32_t timeout_ms)
 {
-    return _wifi_service_control(WIFI_CONTROL_SUSPEND, timeout_ms);
+    return _wifi_service_control(WIFI_CONTROL_SUSPEND, timeout_ms, NULL);
 }
 
 esp_err_t wifi_service_resume(uint32_t timeout_ms)
 {
-    return _wifi_service_control(WIFI_CONTROL_RESUME, timeout_ms);
+    return _wifi_service_control(WIFI_CONTROL_RESUME, timeout_ms, NULL);
 }
 
 bool wifi_service_is_available(void)

@@ -20,6 +20,16 @@
 #define HANDLE_SLOT_MASK ((UINT64_C(1) << HANDLE_SLOT_BITS) - UINT64_C(1))
 #define HANDLE_GENERATION_MAX (UINT64_MAX >> HANDLE_SLOT_BITS)
 
+_Static_assert(EVENT_BUS_MAX_PENDING_UI_CALLBACKS >=
+               EVENT_BUS_MAX_SUBSCRIBERS,
+               "callback pool must cover every subscriber");
+_Static_assert(EVENT_BUS_MAX_SUBSCRIBERS <= UINT8_MAX,
+               "subscriber indexes use uint8_t");
+_Static_assert(EVENT_BUS_MAX_PENDING_UI_CALLBACKS <= UINT8_MAX,
+               "callback indexes use uint8_t");
+_Static_assert(EVENT_BUS_MAX_PENDING_UI_PAYLOADS <= UINT8_MAX,
+               "payload indexes use uint8_t");
+
 typedef struct event_bus_sub_slot
 {
     bool valid;

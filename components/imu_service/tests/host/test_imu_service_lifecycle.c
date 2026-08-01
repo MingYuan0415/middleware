@@ -52,13 +52,14 @@ static bool _run_lifecycle_test(void)
                                    sizeof(status_int_values[0]));
 
     TEST_CHECK(imu_service_register_imu_ops(host_imu_ops()) == ESP_OK);
-    TEST_CHECK(imu_service_start() == ESP_OK);
+    TEST_CHECK(imu_service_start(test_imu_config()) == ESP_OK);
     TEST_CHECK(imu_service_get_state() == IMU_SERVICE_STATE_RUNNING);
-    TEST_CHECK(imu_service_init() == ESP_OK);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_OK);
     TEST_CHECK(imu_service_register_ops(host_imu_ops()) ==
                ESP_ERR_INVALID_STATE);
     TEST_CHECK(host_imu_configure_count() == 1U);
-    TEST_CHECK(host_imu_configured_sample_rate_hz() == 200U);
+    TEST_CHECK(host_imu_configured_sample_rate_hz() ==
+               test_imu_config()->sample_rate_hz);
     TEST_CHECK(host_imu_enable_count() == 1U);
     TEST_CHECK(host_freertos_active_mutex_count() == 2U);
     TEST_CHECK(host_freertos_active_event_group_count() == 1U);
@@ -153,7 +154,7 @@ static bool _run_lifecycle_test(void)
     TEST_CHECK(imu_service_resume(1U) == ESP_ERR_INVALID_STATE);
 
     TEST_CHECK(imu_service_deinit() == ESP_OK);
-    TEST_CHECK(imu_service_init() == ESP_OK);
+    TEST_CHECK(imu_service_init(test_imu_config()) == ESP_OK);
     TEST_CHECK(imu_service_read(&sample) == ESP_ERR_INVALID_STATE);
     TEST_CHECK(imu_service_stop(500U) == ESP_OK);
     TEST_CHECK(host_freertos_wait_for_tasks(1000U));

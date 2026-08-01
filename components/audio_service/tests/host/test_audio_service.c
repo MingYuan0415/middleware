@@ -24,6 +24,19 @@ typedef struct audio_service_suspend_thread
     bool resume_required;
 } audio_service_suspend_thread_t;
 
+static const audio_service_init_config_t s_init_config =
+{
+    .stream = {
+        .sample_rate_hz = 16000U,
+        .bits_per_sample = 16U,
+        .channels = 2U,
+        .mclk_multiple = 384U,
+    },
+    .volume_percent = 60U,
+    .muted = false,
+    .pa_enabled = true,
+};
+
 static void *_run_io(void *context)
 {
     audio_service_io_thread_t *thread = context;
@@ -66,7 +79,11 @@ static void _wait_for_state(audio_service_state_t expected)
 static void _test_missing_hal(void)
 {
     audio_service_fakes_reset();
-    assert(audio_service_init() == ESP_ERR_NOT_FOUND);
+    assert(audio_service_init(NULL) == ESP_ERR_INVALID_ARG);
+    audio_service_init_config_t invalid = s_init_config;
+    invalid.stream.mclk_multiple = 0U;
+    assert(audio_service_init(&invalid) == ESP_ERR_INVALID_ARG);
+    assert(audio_service_init(&s_init_config) == ESP_ERR_NOT_FOUND);
     assert(audio_service_get_state() == AUDIO_SERVICE_STATE_ERROR);
     assert(!audio_service_is_available());
     assert(audio_service_deinit() == ESP_OK);
@@ -78,7 +95,14 @@ static void _test_full_duplex_lifecycle(void)
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
 
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    audio_service_init_config_t different = s_init_config;
+    different.volume_percent++;
+    assert(audio_service_init(&different) == ESP_ERR_INVALID_STATE);
+    audio_service_config_t active = {0};
+    assert(audio_service_get_config(&active) == ESP_OK);
+    assert(active.sample_rate_hz == s_init_config.stream.sample_rate_hz);
     assert(audio_service_get_state() == AUDIO_SERVICE_STATE_READY);
     assert(audio_service_is_available());
     assert(fake->configure_count == 1U);
@@ -133,6 +157,7 @@ static void _test_full_duplex_lifecycle(void)
     bool pa_enabled = true;
     assert(audio_service_get_pa(&pa_enabled) == ESP_OK);
     assert(!pa_enabled);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
 
     assert(audio_service_stop() == ESP_OK);
     assert(audio_service_get_state() == AUDIO_SERVICE_STATE_READY);
@@ -148,7 +173,7 @@ static void _test_stop_and_deinit_retry(void)
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
 
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
     assert(audio_service_start() == ESP_OK);
     fake->stop_result = ESP_FAIL;
     assert(audio_service_stop() == ESP_FAIL);
@@ -194,7 +219,7 @@ static void _test_deinit_accepts_already_unavailable_bsp(void)
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
 
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
     fake->available = false;
     fake->stop_result = ESP_ERR_INVALID_STATE;
     assert(audio_service_deinit() == ESP_OK);
@@ -210,9 +235,9 @@ static void _test_partial_init_cleanup_retry(void)
     fake->set_pa_result = ESP_FAIL;
     fake->stop_result = ESP_FAIL;
 
-    assert(audio_service_init() == ESP_FAIL);
+    assert(audio_service_init(&s_init_config) == ESP_FAIL);
     assert(audio_service_get_state() == AUDIO_SERVICE_STATE_ERROR);
-    assert(audio_service_init() == ESP_ERR_INVALID_STATE);
+    assert(audio_service_init(&s_init_config) == ESP_ERR_INVALID_STATE);
     assert(audio_service_deinit() == ESP_FAIL);
     assert(fake->stop_count == 1U);
     assert(audio_service_get_state() == AUDIO_SERVICE_STATE_ERROR);
@@ -226,7 +251,7 @@ static void _test_partial_init_cleanup_retry(void)
     fake = audio_service_fakes_state();
     fake->expose_ops = true;
     fake->configure_result = ESP_FAIL;
-    assert(audio_service_init() == ESP_FAIL);
+    assert(audio_service_init(&s_init_config) == ESP_FAIL);
     assert(audio_service_deinit() == ESP_OK);
     assert(fake->stop_count == 1U);
 }
@@ -236,7 +261,7 @@ static void _test_suspend_ready_and_error_semantics(void)
     audio_service_fakes_reset();
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
 
     bool resume_required = true;
     assert(audio_service_suspend(0U, &resume_required) == ESP_OK);
@@ -268,7 +293,7 @@ static void _test_failed_running_suspend_can_resume(void)
     audio_service_fakes_reset();
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
     assert(audio_service_start() == ESP_OK);
 
     fake->stop_result = ESP_FAIL;
@@ -299,7 +324,7 @@ static void _test_blocked_io_suspend_timeout(void)
     audio_service_fakes_reset();
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
     assert(audio_service_start() == ESP_OK);
 
     audio_service_fakes_block_io(true);
@@ -331,7 +356,7 @@ static void _test_blocked_io_suspend_drain(void)
     audio_service_fakes_reset();
     audio_service_fake_state_t *fake = audio_service_fakes_state();
     fake->expose_ops = true;
-    assert(audio_service_init() == ESP_OK);
+    assert(audio_service_init(&s_init_config) == ESP_OK);
     assert(audio_service_start() == ESP_OK);
 
     audio_service_fakes_block_io(true);

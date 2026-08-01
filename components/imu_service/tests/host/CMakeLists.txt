@@ -32,9 +32,9 @@ function(add_imu_service_host_test target source)
     target_compile_features(${target} PRIVATE c_std_11)
     target_compile_definitions(${target} PRIVATE
         _POSIX_C_SOURCE=200809L
-        CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ=200
     )
     target_compile_options(${target} PRIVATE
+        -include "${IMU_SERVICE_DIR}/../../tests/host/sdkconfig.h"
         -Wall
         -Wextra
         -Werror

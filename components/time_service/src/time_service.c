@@ -25,8 +25,6 @@
 #define TIME_SERVICE_NOTIFY_STOP         BIT1
 #define TIME_SERVICE_NOTIFY_PAUSE        BIT2
 #define TIME_SERVICE_NOTIFY_RESUME       BIT3
-#define TIME_SERVICE_SYNC_WORKER_STACK  3072U
-#define TIME_SERVICE_SYNC_WORKER_PRIO   4U
 #define TIME_SERVICE_LEGACY_TIMEOUT_MS  30000U
 #define TIME_SERVICE_ALARM_POLL_MS       100U
 
@@ -49,6 +47,9 @@ typedef struct time_service_deadline
 } time_service_deadline_t;
 
 static time_service_rtc_ops_t s_rtc_ops;
+static time_service_config_t s_config;
+static char s_timezone[TIME_SERVICE_TIMEZONE_MAX_BYTES + 1U];
+static char s_sntp_server[TIME_SERVICE_SNTP_SERVER_MAX_BYTES + 1U];
 static bool s_rtc_ops_registered;
 static bool s_ntp_initialized;
 static bool s_initialized;
@@ -566,7 +567,7 @@ static esp_err_t _create_service_mutexes(void)
 static esp_err_t _restore_initial_clock(void)
 {
     int64_t initial_epoch = 0;
-    if (setenv("TZ", "CST-8", 1) != 0)
+    if (setenv("TZ", s_config.timezone, 1) != 0)
     {
         return ESP_FAIL;
     }
@@ -621,8 +622,9 @@ static esp_err_t _create_sync_worker(void)
     }
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
-    if (xTaskCreate(_sync_worker, "time_ntp", TIME_SERVICE_SYNC_WORKER_STACK,
-                    NULL, TIME_SERVICE_SYNC_WORKER_PRIO, &s_sync_worker) != pdPASS)
+    if (xTaskCreate(_sync_worker, "time_ntp",
+                    CONFIG_TIME_SERVICE_SYNC_WORKER_STACK, NULL,
+                    s_config.task_priority, &s_sync_worker) != pdPASS)
     {
         return ESP_ERR_NO_MEM;
     }
@@ -674,13 +676,33 @@ esp_err_t time_service_register_rtc_ops(const time_service_rtc_ops_t *ops)
     return ESP_OK;
 }
 
-esp_err_t time_service_init(void)
+esp_err_t time_service_init(const time_service_config_t *config)
 {
+    if (config == NULL || config->timezone == NULL ||
+            config->sntp_server == NULL || config->timezone[0] == '\0' ||
+            config->sntp_server[0] == '\0' ||
+            strlen(config->timezone) > TIME_SERVICE_TIMEZONE_MAX_BYTES ||
+            strlen(config->sntp_server) > TIME_SERVICE_SNTP_SERVER_MAX_BYTES ||
+            config->task_priority == 0U ||
+            config->task_priority >= configMAX_PRIORITIES)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t result = ESP_OK;
     if (s_initialized)
     {
-        return ESP_OK;
+        return strcmp(s_config.timezone, config->timezone) == 0 &&
+               strcmp(s_config.sntp_server, config->sntp_server) == 0 &&
+               s_config.task_priority == config->task_priority ?
+               ESP_OK : ESP_ERR_INVALID_STATE;
     }
+
+    memcpy(s_timezone, config->timezone, strlen(config->timezone) + 1U);
+    memcpy(s_sntp_server, config->sntp_server,
+           strlen(config->sntp_server) + 1U);
+    s_config = *config;
+    s_config.timezone = s_timezone;
+    s_config.sntp_server = s_sntp_server;
 
     result = _create_service_mutexes();
     if (result != ESP_OK)
@@ -1284,7 +1306,8 @@ esp_err_t time_service_request_sync(void)
     if (!s_ntp_initialized)
     {
         atomic_store(&s_callback_enabled, true);
-        result = time_service_port_sntp_start(_ntp_sync_callback);
+        result = time_service_port_sntp_start(s_config.sntp_server,
+                                              _ntp_sync_callback);
         if (result != ESP_OK)
         {
             atomic_store(&s_callback_enabled, false);

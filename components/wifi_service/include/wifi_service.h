@@ -23,6 +23,12 @@ extern "C" {
 
 EVENT_BUS_DECLARE_ID(WIFI_SERVICE_MSG);
 
+/** @brief Product-owned Wi-Fi worker configuration. */
+typedef struct wifi_service_config
+{
+    uint32_t task_priority; /**< FreeRTOS worker priority. */
+} wifi_service_config_t;
+
 /** @brief Nonzero generation identifying one logical client session. */
 typedef uint64_t wifi_service_session_id_t;
 /** @brief Nonzero generation identifying one admitted operation. */
@@ -129,7 +135,7 @@ typedef struct wifi_service_availability_event
  * @warning Call from task context after ESP-NETIF and the default event loop
  *          are ready. A failure is degradable only when cleanup is not pending.
  */
-esp_err_t wifi_service_init(void);
+esp_err_t wifi_service_init(const wifi_service_config_t *config);
 
 /**
  * @brief Release all worker-owned Wi-Fi resources.

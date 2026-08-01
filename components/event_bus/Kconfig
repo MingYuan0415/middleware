@@ -1,0 +1,23 @@
+menu "Event bus resources"
+
+config EVENT_BUS_SUBSCRIBER_CAPACITY
+    int "Subscriber pool capacity"
+    range 1 64
+    default 24
+
+config EVENT_BUS_UI_CALLBACK_CAPACITY
+    int "Pending UI callback pool capacity"
+    range 1 64
+    default 24
+
+config EVENT_BUS_UI_PAYLOAD_CAPACITY
+    int "Pending UI payload pool capacity"
+    range 1 64
+    default 24
+
+config EVENT_BUS_UI_PAYLOAD_SIZE
+    int "Maximum UI payload size in bytes"
+    range 32 1024
+    default 256
+
+endmenu

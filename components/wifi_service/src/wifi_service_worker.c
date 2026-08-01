@@ -452,7 +452,7 @@ void wifi_service_worker_run(void *argument)
         wifi_queue_item_t item;
         if (xQueueReceive(g_wifi_service.queue, &item,
                           pdMS_TO_TICKS(
-                              CONFIG_WIFI_SERVICE_WORKER_POLL_MS)) == pdTRUE)
+                              WIFI_SERVICE_WORKER_POLL_MS)) == pdTRUE)
         {
             wifi_service_worker_process_item(&context, &item);
         }

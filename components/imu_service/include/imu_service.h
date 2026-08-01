@@ -51,13 +51,18 @@ typedef struct imu_service_snapshot
     bool available;               /**< Current hardware availability probe. */
 } imu_service_snapshot_t;
 
+/** @brief Product-owned IMU worker configuration. */
+typedef struct imu_service_config
+{
+    uint32_t sample_rate_hz; /**< Requested sensor sampling rate. */
+    uint32_t task_priority;  /**< FreeRTOS worker priority. */
+} imu_service_config_t;
+
 /**
  * @brief Board operations consumed by the IMU worker.
  *
  * `read` is the only mandatory operation. All function pointers are copied at
- * registration time and must remain valid until imu_service_deinit(). When
- * supplied, `configure` receives CONFIG_IMU_SERVICE_SAMPLE_RATE_HZ before the
- * sensor is enabled.
+ * registration time and must remain valid until imu_service_deinit().
  */
 typedef struct imu_service_imu_ops
 {
@@ -115,10 +120,10 @@ esp_err_t imu_service_register_imu_ops(const imu_service_imu_ops_t *ops);
  * @return ESP_OK when running; an ESP-IDF error when resources cannot be
  *         created or a lifecycle transition is already in progress.
  */
-esp_err_t imu_service_init(void);
+esp_err_t imu_service_init(const imu_service_config_t *config);
 
 /** @brief Alias for imu_service_init(). */
-esp_err_t imu_service_start(void);
+esp_err_t imu_service_start(const imu_service_config_t *config);
 
 /**
  * @brief Stop the sampling worker and release worker synchronization objects.

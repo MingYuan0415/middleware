@@ -16,19 +16,6 @@
 
 EVENT_BUS_DEFINE_ID(POWER_SERVICE_MSG);
 
-#ifndef CONFIG_POWER_SERVICE_TASK_STACK
-    #define CONFIG_POWER_SERVICE_TASK_STACK 3072
-#endif
-#ifndef CONFIG_POWER_SERVICE_TASK_PRIORITY
-    #define CONFIG_POWER_SERVICE_TASK_PRIORITY 4
-#endif
-#ifndef CONFIG_POWER_SERVICE_POLL_INTERVAL_MS
-    #define CONFIG_POWER_SERVICE_POLL_INTERVAL_MS 5000
-#endif
-#ifndef CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS
-    #define CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS 100
-#endif
-
 #define POWER_SERVICE_CMD_START  BIT0
 #define POWER_SERVICE_CMD_PAUSE  BIT1
 #define POWER_SERVICE_CMD_RESUME BIT2
@@ -51,6 +38,7 @@ typedef enum
 } power_service_state_t;
 
 static power_service_power_ops_t s_power_ops;
+static power_service_config_t s_config;
 static bool s_power_ops_registered;
 static bool s_initialized;
 static TaskHandle_t s_worker;
@@ -305,7 +293,7 @@ static uint32_t _worker_wait_ms(int64_t next_sample_at_ms)
     }
 
     const int64_t until_sample_ms = next_sample_at_ms - now_ms;
-    uint32_t wait_ms = CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS;
+    uint32_t wait_ms = s_config.irq_poll_interval_ms;
     if (until_sample_ms < (int64_t)wait_ms)
     {
         wait_ms = (uint32_t)until_sample_ms;
@@ -335,7 +323,7 @@ static void _power_worker(void *context)
             {
                 _worker_sample(&consecutive_failures);
                 next_sample_at_ms = esp_timer_get_time() / 1000LL +
-                                    CONFIG_POWER_SERVICE_POLL_INTERVAL_MS;
+                                    s_config.poll_interval_ms;
             }
             _worker_poll_irq(&consecutive_irq_failures);
 
@@ -382,14 +370,30 @@ esp_err_t power_service_register_power_ops(const power_service_power_ops_t *ops)
     return result;
 }
 
-esp_err_t power_service_init(void)
+esp_err_t power_service_init(const power_service_config_t *config)
 {
+    if (config == NULL || config->poll_interval_ms < 1000U ||
+            config->poll_interval_ms > 60000U ||
+            config->irq_poll_interval_ms < 10U ||
+            config->irq_poll_interval_ms > 1000U ||
+            config->task_priority == 0U ||
+            config->task_priority >= configMAX_PRIORITIES)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t result = ESP_OK;
     bool initialize = false;
     taskENTER_CRITICAL(&s_state_lock);
     if (s_initialized)
     {
         initialize = false;
+        if (s_config.poll_interval_ms != config->poll_interval_ms ||
+                s_config.irq_poll_interval_ms !=
+                config->irq_poll_interval_ms ||
+                s_config.task_priority != config->task_priority)
+        {
+            result = ESP_ERR_INVALID_STATE;
+        }
     }
     else if (s_state != POWER_SERVICE_STATE_STOPPED)
     {
@@ -398,6 +402,7 @@ esp_err_t power_service_init(void)
     else
     {
         s_state = POWER_SERVICE_STATE_STARTING;
+        s_config = *config;
         initialize = true;
     }
     taskEXIT_CRITICAL(&s_state_lock);
@@ -427,7 +432,7 @@ esp_err_t power_service_init(void)
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
     if (xTaskCreate(_power_worker, "power_worker", CONFIG_POWER_SERVICE_TASK_STACK,
-                    NULL, CONFIG_POWER_SERVICE_TASK_PRIORITY, &s_worker) != pdPASS)
+                    NULL, s_config.task_priority, &s_worker) != pdPASS)
     {
         result = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -439,9 +444,9 @@ esp_err_t power_service_init(void)
     taskEXIT_CRITICAL(&s_state_lock);
     xEventGroupSetBits(s_worker_events, POWER_SERVICE_EVENT_RUNNING);
     xTaskNotify(s_worker, POWER_SERVICE_CMD_START, eSetBits);
-    LOG_I("worker started (sample=%dms, irq=%dms)",
-          CONFIG_POWER_SERVICE_POLL_INTERVAL_MS,
-          CONFIG_POWER_SERVICE_IRQ_POLL_INTERVAL_MS);
+    LOG_I("worker started (sample=%ums, irq=%ums)",
+          (unsigned)s_config.poll_interval_ms,
+          (unsigned)s_config.irq_poll_interval_ms);
     return ESP_OK;
 
 cleanup:

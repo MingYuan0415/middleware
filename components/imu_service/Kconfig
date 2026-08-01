@@ -5,14 +5,4 @@ menu "IMU service"
         range 2048 8192
         default 3072
 
-    config IMU_SERVICE_TASK_PRIORITY
-        int "IMU worker priority"
-        range 1 24
-        default 6
-
-    config IMU_SERVICE_SAMPLE_RATE_HZ
-        int "IMU sampling rate (Hz)"
-        range 1 1000
-        default 100
-
 endmenu

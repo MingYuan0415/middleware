@@ -1,0 +1,8 @@
+menu "NVS storage resources"
+
+config NV_STORAGE_BLOB_POOL_SIZE
+    int "In-memory blob pool capacity"
+    range 1 64
+    default 16
+
+endmenu
