@@ -83,11 +83,21 @@ int main(void)
 
     host_time_port_invoke_callback_on_stop(false);
     assert(time_service_request_sync() == ESP_OK);
+    host_time_port_set_stop_result(ESP_FAIL);
     assert(host_time_port_complete(INT64_C(1704067200)));
-    assert(time_service_wait_sync(1000U) == ESP_OK);
-    assert(host_freertos_notification_count() ==
-           initial_notification_count + 1U);
+    assert(time_service_wait_sync(1000U) == ESP_FAIL);
+    assert(time_service_get_quality() == TIME_SERVICE_QUALITY_NTP);
+    host_time_port_set_stop_result(ESP_OK);
+    assert(time_service_cancel_sync() == ESP_OK);
 
+    assert(time_service_request_sync() == ESP_OK);
+    assert(host_time_port_complete(INT64_C(1704067260)));
+    assert(time_service_wait_sync(1000U) == ESP_OK);
+    assert(!host_time_port_is_running());
+    assert(host_freertos_notification_count() ==
+           initial_notification_count + 2U);
+
+    assert(time_service_request_sync() == ESP_OK);
     host_time_port_set_stop_result(ESP_FAIL);
     assert(time_service_deinit() == ESP_FAIL);
     host_time_port_set_stop_result(ESP_OK);

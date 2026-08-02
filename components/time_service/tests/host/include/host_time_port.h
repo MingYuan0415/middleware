@@ -14,7 +14,7 @@ void host_time_port_invoke_callback_on_stop(bool enabled);
 void host_time_port_set_stop_result(esp_err_t result);
 /** @brief Complete one fake SNTP synchronization. */
 bool host_time_port_complete(int64_t epoch);
-/** @brief Return whether the fake periodic SNTP client is running. */
+/** @brief Return whether the fake SNTP client is running. */
 bool host_time_port_is_running(void);
 /** @brief Return the number of SNTP start calls. */
 unsigned host_time_port_start_count(void);

@@ -49,7 +49,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
-- `time_service_set_network_ready()` 是非阻塞通知。联网时由 time worker 启动或重启系统 SNTP，掉线和待机时停止；应用的“立即校时”只重启请求，不拥有也不在页面关闭时销毁周期客户端。
+- `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 

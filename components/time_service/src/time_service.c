@@ -28,6 +28,12 @@
 #define TIME_SERVICE_NOTIFY_NETWORK      (UINT32_C(1) << 4)
 #define TIME_SERVICE_LEGACY_TIMEOUT_MS  30000U
 #define TIME_SERVICE_ALARM_POLL_MS       100U
+#define TIME_SERVICE_NETWORK_READY_BIT   UINT32_C(1)
+#define TIME_SERVICE_NETWORK_ADMITTED_BIT (UINT32_C(1) << 1)
+
+#ifdef TIME_SERVICE_TESTING
+    #include "time_service_test_hook.h"
+#endif
 
 EVENT_BUS_DEFINE_ID(TIME_SERVICE_MSG);
 
@@ -69,7 +75,7 @@ static atomic_uint_fast32_t s_active_generation;
 static atomic_uint_fast32_t s_notified_generation;
 static atomic_uint s_callback_active;
 static atomic_bool s_callback_enabled;
-static atomic_bool s_network_ready = ATOMIC_VAR_INIT(false);
+static atomic_uint_fast32_t s_network_state = ATOMIC_VAR_INIT(0U);
 static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
 static atomic_bool s_rtc_io_admitted = ATOMIC_VAR_INIT(false);
 static time_service_sleep_state_t s_sleep_state = TIME_SERVICE_SLEEP_STOPPED;
@@ -266,6 +272,7 @@ static bool _process_sync_notification(void)
         }
     }
 
+    esp_err_t completion_result = sync_result;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (!s_stopping && s_ntp_initialized &&
             generation == (uint32_t)atomic_load(&s_active_generation))
@@ -275,7 +282,12 @@ static bool _process_sync_notification(void)
             s_quality = TIME_SERVICE_QUALITY_NTP;
             s_last_rtc_error = rtc_result;
         }
-        _complete_generation_locked(generation, sync_result);
+        const esp_err_t stop_result = _stop_sntp_locked();
+        if (completion_result == ESP_OK)
+        {
+            completion_result = stop_result;
+        }
+        _complete_generation_locked(generation, completion_result);
     }
     xSemaphoreGive(s_state_mutex);
     xSemaphoreGive(s_update_mutex);
@@ -398,7 +410,6 @@ static bool _worker_pause(uint32_t *notifications)
     {
         *notifications &= ~(TIME_SERVICE_NOTIFY_PAUSE |
                             TIME_SERVICE_NOTIFY_RESUME);
-        *notifications |= TIME_SERVICE_NOTIFY_NETWORK;
         _worker_set_running();
         return false;
     }
@@ -418,7 +429,6 @@ static bool _worker_pause(uint32_t *notifications)
         if ((*notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
         {
             *notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
-            *notifications |= TIME_SERVICE_NOTIFY_NETWORK;
             _worker_set_running();
             return false;
         }
@@ -427,8 +437,9 @@ static bool _worker_pause(uint32_t *notifications)
 
 static void _worker_apply_network_ready(void)
 {
-    const bool ready = atomic_load_explicit(&s_network_ready,
-                                            memory_order_acquire);
+    const bool ready = (atomic_load_explicit(&s_network_state,
+                        memory_order_acquire) &
+                        TIME_SERVICE_NETWORK_READY_BIT) != 0U;
     esp_err_t result = ready ? _request_sync(false) :
                        time_service_cancel_sync();
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
@@ -458,7 +469,6 @@ static void _sync_worker(void *context)
         if ((notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
         {
             notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
-            notifications |= TIME_SERVICE_NOTIFY_NETWORK;
             _worker_set_running();
         }
         if ((notifications & TIME_SERVICE_NOTIFY_SYNC) != 0U &&
@@ -662,7 +672,9 @@ static void _activate_time_service(void)
     atomic_store(&s_notified_generation, 0U);
     atomic_store(&s_callback_active, 0U);
     atomic_store(&s_callback_enabled, false);
-    atomic_store_explicit(&s_network_ready, false, memory_order_release);
+    atomic_store_explicit(&s_network_state,
+                          TIME_SERVICE_NETWORK_ADMITTED_BIT,
+                          memory_order_release);
     s_completed_generation = 0;
     s_completed_result = ESP_ERR_INVALID_STATE;
     s_sync_pending = false;
@@ -791,6 +803,9 @@ esp_err_t time_service_deinit(void)
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     control_owned = true;
     atomic_store_explicit(&s_rtc_io_admitted, false, memory_order_release);
+    atomic_fetch_and_explicit(&s_network_state,
+                              ~TIME_SERVICE_NETWORK_ADMITTED_BIT,
+                              memory_order_acq_rel);
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_stopping = true;
     result = _stop_sntp_locked();
@@ -822,6 +837,7 @@ esp_err_t time_service_deinit(void)
     s_stopping = false;
     s_quality = TIME_SERVICE_QUALITY_INVALID;
     s_last_rtc_error = ESP_ERR_NOT_SUPPORTED;
+    atomic_store_explicit(&s_network_state, 0U, memory_order_release);
     xSemaphoreGive(s_control_mutex);
     control_owned = false;
     _delete_service_mutexes();
@@ -846,21 +862,36 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
     }
 
     const time_service_deadline_t deadline = _deadline_start(timeout_ms);
+    const uint_fast32_t previous_network_state =
+        atomic_exchange_explicit(&s_network_state, 0U,
+                                 memory_order_acq_rel);
+    const bool network_admission_was_open =
+        (previous_network_state & TIME_SERVICE_NETWORK_ADMITTED_BIT) != 0U;
     const bool admission_was_open = atomic_exchange_explicit(
                                         &s_rtc_io_admitted, false,
                                         memory_order_acq_rel);
     if (xSemaphoreTake(control, _deadline_remaining(&deadline)) != pdTRUE)
     {
+        if (network_admission_was_open)
+        {
+            atomic_store_explicit(&s_network_state, previous_network_state,
+                                  memory_order_release);
+        }
         if (admission_was_open)
         {
             atomic_store_explicit(&s_rtc_io_admitted, true,
                                   memory_order_release);
+        }
+        if (network_admission_was_open)
+        {
+            (void)xTaskNotify(worker, TIME_SERVICE_NOTIFY_NETWORK, eSetBits);
         }
         return ESP_ERR_TIMEOUT;
     }
 
     esp_err_t result = ESP_ERR_INVALID_STATE;
     bool reopen_admission = false;
+    bool reopen_network_admission = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     const bool active = s_initialized && !s_stopping &&
                         s_sync_worker == worker && s_sync_events == events;
@@ -877,6 +908,7 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
     else
     {
         reopen_admission = admission_was_open;
+        reopen_network_admission = network_admission_was_open;
     }
     xSemaphoreGive(s_state_mutex);
     if (result != ESP_OK || !admission_was_open)
@@ -891,6 +923,7 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
         s_sleep_state = TIME_SERVICE_SLEEP_RUNNING;
         xSemaphoreGive(s_state_mutex);
         reopen_admission = true;
+        reopen_network_admission = true;
         result = ESP_FAIL;
         goto exit;
     }
@@ -923,10 +956,19 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
 
 exit:
     xSemaphoreGive(control);
+    if (reopen_network_admission)
+    {
+        atomic_store_explicit(&s_network_state, previous_network_state,
+                              memory_order_release);
+    }
     if (reopen_admission)
     {
         atomic_store_explicit(&s_rtc_io_admitted, true,
                               memory_order_release);
+    }
+    if (reopen_network_admission)
+    {
+        (void)xTaskNotify(worker, TIME_SERVICE_NOTIFY_NETWORK, eSetBits);
     }
     return result;
 }
@@ -950,11 +992,15 @@ esp_err_t time_service_resume(uint32_t timeout_ms)
 
     esp_err_t result = ESP_ERR_INVALID_STATE;
     bool notify_worker = false;
+    bool apply_network = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     const bool active = s_initialized && !s_stopping &&
                         s_sync_worker == worker && s_sync_events == events;
     if (active && s_sleep_state == TIME_SERVICE_SLEEP_RUNNING)
     {
+        atomic_fetch_or_explicit(&s_network_state,
+                                 TIME_SERVICE_NETWORK_ADMITTED_BIT,
+                                 memory_order_release);
         atomic_store_explicit(&s_rtc_io_admitted, true,
                               memory_order_release);
         result = ESP_OK;
@@ -993,11 +1039,21 @@ esp_err_t time_service_resume(uint32_t timeout_ms)
             s_sync_events == events)
     {
         s_sleep_state = TIME_SERVICE_SLEEP_RUNNING;
+        atomic_fetch_or_explicit(&s_network_state,
+                                 TIME_SERVICE_NETWORK_ADMITTED_BIT,
+                                 memory_order_release);
         atomic_store_explicit(&s_rtc_io_admitted, true,
                               memory_order_release);
+        apply_network = true;
         result = ESP_OK;
     }
     xSemaphoreGive(s_state_mutex);
+    if (apply_network &&
+            xTaskNotify(worker, TIME_SERVICE_NOTIFY_NETWORK,
+                        eSetBits) != pdPASS)
+    {
+        result = ESP_FAIL;
+    }
 
 exit:
     xSemaphoreGive(control);
@@ -1307,13 +1363,48 @@ exit:
 
 esp_err_t time_service_set_network_ready(bool ready)
 {
-    if (!s_initialized || s_stopping || s_sync_worker == NULL)
+    if (!s_initialized || s_stopping || s_sync_worker == NULL ||
+            !_rtc_io_allowed())
     {
         return ESP_ERR_INVALID_STATE;
     }
-    atomic_store_explicit(&s_network_ready, ready, memory_order_release);
-    return xTaskNotify(s_sync_worker, TIME_SERVICE_NOTIFY_NETWORK,
-                       eSetBits) == pdPASS ? ESP_OK : ESP_FAIL;
+#ifdef TIME_SERVICE_TESTING
+    time_service_test_before_network_update();
+#endif
+
+    uint_fast32_t current = atomic_load_explicit(&s_network_state,
+                            memory_order_acquire);
+    uint_fast32_t desired;
+    for (;;)
+    {
+        if ((current & TIME_SERVICE_NETWORK_ADMITTED_BIT) == 0U)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+        desired = ready ? current | TIME_SERVICE_NETWORK_READY_BIT :
+                  current & ~TIME_SERVICE_NETWORK_READY_BIT;
+        if (desired == current)
+        {
+            return ESP_OK;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                    &s_network_state, &current, desired,
+                    memory_order_acq_rel, memory_order_acquire))
+        {
+            break;
+        }
+    }
+    if (xTaskNotify(s_sync_worker, TIME_SERVICE_NOTIFY_NETWORK,
+                    eSetBits) == pdPASS)
+    {
+        return ESP_OK;
+    }
+
+    uint_fast32_t expected = desired;
+    (void)atomic_compare_exchange_strong_explicit(
+        &s_network_state, &expected, current,
+        memory_order_acq_rel, memory_order_acquire);
+    return ESP_FAIL;
 }
 
 static esp_err_t _request_sync(bool restart_existing)
@@ -1332,7 +1423,8 @@ static esp_err_t _request_sync(bool restart_existing)
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     state_owned = true;
     if (s_stopping || !_rtc_io_allowed() ||
-            !atomic_load_explicit(&s_network_ready, memory_order_acquire))
+            (atomic_load_explicit(&s_network_state, memory_order_acquire) &
+             TIME_SERVICE_NETWORK_READY_BIT) == 0U)
     {
         goto exit;
     }

@@ -13,6 +13,7 @@ get_filename_component(TIME_SERVICE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLU
 function(configure_time_service_test target)
     target_compile_features(${target} PRIVATE c_std_11)
     target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+    target_compile_definitions(${target} PRIVATE TIME_SERVICE_TESTING=1)
     target_compile_options(${target} PRIVATE
         -include "${TIME_SERVICE_DIR}/../../tests/host/sdkconfig.h"
         -Wall

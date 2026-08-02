@@ -21,6 +21,7 @@ typedef struct sleep_rtc_fake
     bool status_entered;
     bool block_write;
     bool write_entered;
+    esp_err_t write_result;
     uint32_t poll_count;
     uint32_t write_count;
 } sleep_rtc_fake_t;
@@ -95,9 +96,10 @@ static esp_err_t _rtc_write(const struct tm *utc_time)
             (void)pthread_cond_wait(&s_rtc.changed, &s_rtc.lock);
         }
     }
+    const esp_err_t result = s_rtc.write_result;
     (void)pthread_cond_broadcast(&s_rtc.changed);
     (void)pthread_mutex_unlock(&s_rtc.lock);
-    return ESP_OK;
+    return result;
 }
 
 static esp_err_t _alarm_configure(
@@ -186,6 +188,13 @@ static void _set_block_write(bool blocked)
     (void)pthread_mutex_unlock(&s_rtc.lock);
 }
 
+static void _set_write_result(esp_err_t result)
+{
+    (void)pthread_mutex_lock(&s_rtc.lock);
+    s_rtc.write_result = result;
+    (void)pthread_mutex_unlock(&s_rtc.lock);
+}
+
 static uint32_t _poll_count(void)
 {
     (void)pthread_mutex_lock(&s_rtc.lock);
@@ -207,6 +216,13 @@ static void *_read_alarm_status(void *context)
     esp_err_t *result = context;
     time_service_alarm_status_t status;
     *result = time_service_alarm_get_status(&status);
+    return NULL;
+}
+
+static void *_set_network_ready(void *context)
+{
+    esp_err_t *result = context;
+    *result = time_service_set_network_ready(true);
     return NULL;
 }
 
@@ -263,6 +279,9 @@ int main(void)
     assert(time_service_resume(0U) == ESP_ERR_TIMEOUT);
     _set_block_poll(false);
     assert(time_service_resume(500U) == ESP_OK);
+    assert(_wait_for_port_state(false, 1U, 1U));
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, 2U, 1U));
 
     _set_block_write(true);
     assert(time_service_request_sync() == ESP_OK);
@@ -285,6 +304,8 @@ int main(void)
     assert(status_result == ESP_OK);
     assert(time_service_resume(500U) == ESP_OK);
 
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, 3U, 2U));
     assert(time_service_request_sync() == ESP_OK);
     const unsigned starts_before_suspend = host_time_port_start_count();
     const unsigned stops_before_suspend = host_time_port_stop_count();
@@ -301,6 +322,7 @@ int main(void)
     assert(time_service_alarm_get_status(&status) == ESP_ERR_INVALID_STATE);
     assert(time_service_request_sync() == ESP_ERR_INVALID_STATE);
     assert(time_service_wait_sync(0U) == ESP_ERR_INVALID_STATE);
+    assert(time_service_set_network_ready(true) == ESP_ERR_INVALID_STATE);
 
     assert(time_service_resume(500U) == ESP_OK);
     assert(time_service_wait_sync(0U) == ESP_ERR_INVALID_STATE);
@@ -310,6 +332,41 @@ int main(void)
     assert(host_time_port_complete(INT64_C(1704067201)));
     assert(time_service_wait_sync(1000U) == ESP_OK);
     assert(_write_count() == suspended_writes + 1U);
+
+    assert(time_service_set_network_ready(false) == ESP_OK);
+    _set_write_result(ESP_FAIL);
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, starts_before_suspend + 2U,
+                                stops_before_suspend + 2U));
+    assert(host_time_port_complete(INT64_C(1704067202)));
+    assert(time_service_wait_sync(1000U) == ESP_OK);
+    assert(!host_time_port_is_running());
+    assert(time_service_get_quality() == TIME_SERVICE_QUALITY_NTP);
+    assert(time_service_get_last_rtc_error() == ESP_FAIL);
+
+    assert(time_service_set_network_ready(false) == ESP_OK);
+    host_freertos_block_network_update(true);
+    esp_err_t network_result = ESP_FAIL;
+    pthread_t network_thread;
+    assert(pthread_create(&network_thread, NULL, _set_network_ready,
+                          &network_result) == 0);
+    assert(host_freertos_wait_network_update(1000U));
+    const unsigned starts_before_race = host_time_port_start_count();
+    const unsigned stops_before_race = host_time_port_stop_count();
+    assert(time_service_suspend(500U) == ESP_OK);
+    host_freertos_block_network_update(false);
+    assert(pthread_join(network_thread, NULL) == 0);
+    assert(network_result == ESP_ERR_INVALID_STATE);
+    assert(time_service_resume(500U) == ESP_OK);
+    assert(_wait_for_port_state(false, starts_before_race,
+                                stops_before_race));
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, starts_before_race + 1U,
+                                stops_before_race));
+    assert(host_time_port_complete(INT64_C(1704067203)));
+    assert(time_service_wait_sync(1000U) == ESP_OK);
+    assert(_wait_for_port_state(false, starts_before_race + 1U,
+                                stops_before_race + 1U));
     assert(time_service_deinit() == ESP_OK);
     assert(host_freertos_wait_for_tasks(1000U));
     puts("time_service sleep barrier regression passed");

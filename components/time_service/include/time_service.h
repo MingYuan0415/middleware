@@ -246,10 +246,14 @@ esp_err_t time_service_alarm_clear(void);
  * @brief Notify the time worker whether IPv4 connectivity is ready.
  *
  * The call only updates the desired state and notifies the existing worker.
- * Online starts the periodic SNTP client when stopped; offline stops it.
+ * A new online edge starts one SNTP request. The client stops after the first
+ * completed update; repeated online notifications are idempotent. Offline and
+ * suspend stop any request, and suspend requires a fresh online notification
+ * after resume.
  *
  * @param ready is true while the network has a usable IPv4 address.
- * @return ESP_OK when admitted; ESP_ERR_INVALID_STATE before initialization.
+ * @return ESP_OK when admitted; ESP_ERR_INVALID_STATE before initialization,
+ *         during suspend, or during shutdown.
  */
 esp_err_t time_service_set_network_ready(bool ready);
 
@@ -261,7 +265,7 @@ esp_err_t time_service_set_network_ready(bool ready);
 esp_err_t time_service_request_sync(void);
 
 /**
- * @brief Stop the outstanding or periodic SNTP client.
+ * @brief Stop the outstanding SNTP client.
  *
  * @return ESP_OK when canceled; ESP_ERR_INVALID_STATE before initialization;
  *         otherwise an SNTP stop or callback-drain error.

@@ -52,35 +52,50 @@ int main(void)
     assert(time_service_set_network_ready(true) == ESP_OK);
     assert(time_service_set_network_ready(true) == ESP_OK);
     assert(_wait_for_port_state(true, 1U, 0U));
-    _complete_sync(INT64_C(1704067200));
-    assert(time_service_set_network_ready(true) == ESP_OK);
-    assert(_wait_for_port_state(true, 1U, 0U));
-    assert(host_time_port_restart_count() == 0U);
-
-    assert(time_service_request_sync() == ESP_OK);
-    assert(host_time_port_restart_count() == 1U);
-    _complete_sync(INT64_C(1704067260));
-
-    assert(time_service_set_network_ready(false) == ESP_OK);
     assert(time_service_set_network_ready(false) == ESP_OK);
     assert(_wait_for_port_state(false, 1U, 1U));
-    assert(time_service_request_sync() == ESP_ERR_INVALID_STATE);
-    assert(host_time_port_restart_count() == 1U);
+    assert(time_service_wait_sync(0U) == ESP_ERR_INVALID_STATE);
+    assert(time_service_set_network_ready(false) == ESP_OK);
+    assert(_wait_for_port_state(false, 1U, 1U));
 
     assert(time_service_set_network_ready(true) == ESP_OK);
     assert(_wait_for_port_state(true, 2U, 1U));
+    _complete_sync(INT64_C(1704067200));
+    assert(_wait_for_port_state(false, 2U, 2U));
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(false, 2U, 2U));
+    assert(host_time_port_restart_count() == 0U);
+
+    assert(time_service_request_sync() == ESP_OK);
+    assert(_wait_for_port_state(true, 3U, 2U));
+    assert(host_time_port_restart_count() == 0U);
+    _complete_sync(INT64_C(1704067260));
+    assert(_wait_for_port_state(false, 3U, 3U));
+
+    assert(time_service_set_network_ready(false) == ESP_OK);
+    assert(time_service_set_network_ready(false) == ESP_OK);
+    assert(_wait_for_port_state(false, 3U, 3U));
+    assert(time_service_request_sync() == ESP_ERR_INVALID_STATE);
+    assert(host_time_port_restart_count() == 0U);
+
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, 4U, 3U));
     _complete_sync(INT64_C(1704067320));
+    assert(_wait_for_port_state(false, 4U, 4U));
 
     assert(time_service_suspend(1000U) == ESP_OK);
-    assert(_wait_for_port_state(false, 2U, 2U));
+    assert(_wait_for_port_state(false, 4U, 4U));
     assert(time_service_resume(1000U) == ESP_OK);
-    assert(_wait_for_port_state(true, 3U, 2U));
+    assert(_wait_for_port_state(false, 4U, 4U));
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, 5U, 4U));
     _complete_sync(INT64_C(1704067380));
+    assert(_wait_for_port_state(false, 5U, 5U));
 
     assert(time_service_deinit() == ESP_OK);
     assert(host_freertos_wait_for_tasks(1000U));
     assert(!host_time_port_is_running());
-    assert(host_time_port_stop_count() == 3U);
+    assert(host_time_port_stop_count() == 5U);
     puts("time_service network-ready regression passed");
     return 0;
 }

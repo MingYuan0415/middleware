@@ -37,6 +37,10 @@ static atomic_uint s_notification_count;
 static pthread_mutex_t s_task_count_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_task_count_changed = PTHREAD_COND_INITIALIZER;
 static unsigned s_task_count;
+static pthread_mutex_t s_network_update_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_network_update_changed = PTHREAD_COND_INITIALIZER;
+static bool s_network_update_blocked;
+static bool s_network_update_entered;
 
 static struct timespec _deadline_after_ticks(TickType_t ticks)
 {
@@ -52,6 +56,49 @@ static struct timespec _deadline_after_ticks(TickType_t ticks)
         deadline.tv_nsec -= 1000000000L;
     }
     return deadline;
+}
+
+void time_service_test_before_network_update(void)
+{
+    (void)pthread_mutex_lock(&s_network_update_lock);
+    if (s_network_update_blocked)
+    {
+        s_network_update_entered = true;
+        (void)pthread_cond_broadcast(&s_network_update_changed);
+        while (s_network_update_blocked)
+        {
+            (void)pthread_cond_wait(&s_network_update_changed,
+                                    &s_network_update_lock);
+        }
+    }
+    (void)pthread_mutex_unlock(&s_network_update_lock);
+}
+
+void host_freertos_block_network_update(bool blocked)
+{
+    (void)pthread_mutex_lock(&s_network_update_lock);
+    s_network_update_blocked = blocked;
+    if (blocked)
+    {
+        s_network_update_entered = false;
+    }
+    (void)pthread_cond_broadcast(&s_network_update_changed);
+    (void)pthread_mutex_unlock(&s_network_update_lock);
+}
+
+bool host_freertos_wait_network_update(uint32_t timeout_ms)
+{
+    const struct timespec deadline = _deadline_after_ticks(timeout_ms);
+    (void)pthread_mutex_lock(&s_network_update_lock);
+    int result = 0;
+    while (!s_network_update_entered && result != ETIMEDOUT)
+    {
+        result = pthread_cond_timedwait(&s_network_update_changed,
+                                        &s_network_update_lock, &deadline);
+    }
+    const bool entered = s_network_update_entered;
+    (void)pthread_mutex_unlock(&s_network_update_lock);
+    return entered;
 }
 
 static void _task_count_add(void)
