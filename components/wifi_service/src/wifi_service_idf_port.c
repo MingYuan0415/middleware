@@ -150,6 +150,99 @@ static wifi_service_security_t _wifi_service_port_map_security(
     return security;
 }
 
+static int _wifi_service_port_compare_scan_record(
+    const wifi_service_port_scan_record_t *left,
+    const wifi_service_port_scan_record_t *right)
+{
+    if (left->rssi != right->rssi)
+    {
+        return left->rssi > right->rssi ? -1 : 1;
+    }
+    const size_t common_length = left->ssid_length < right->ssid_length ?
+                                 left->ssid_length : right->ssid_length;
+    const int ssid_order = memcmp(left->ssid, right->ssid, common_length);
+    if (ssid_order != 0)
+    {
+        return ssid_order;
+    }
+    if (left->ssid_length != right->ssid_length)
+    {
+        return left->ssid_length < right->ssid_length ? -1 : 1;
+    }
+    if (left->security != right->security)
+    {
+        return left->security < right->security ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool _wifi_service_port_scan_key_equal(
+    const wifi_service_port_scan_record_t *left,
+    const wifi_service_port_scan_record_t *right)
+{
+    return left->ssid_length == right->ssid_length &&
+           left->security == right->security &&
+           memcmp(left->ssid, right->ssid, left->ssid_length) == 0;
+}
+
+static void _wifi_service_port_sort_scan_records(
+    wifi_service_port_scan_record_t *records, size_t count)
+{
+    for (size_t index = 1U; index < count; ++index)
+    {
+        wifi_service_port_scan_record_t record = records[index];
+        size_t position = index;
+        while (position > 0U &&
+                _wifi_service_port_compare_scan_record(
+                    &record, &records[position - 1U]) < 0)
+        {
+            records[position] = records[position - 1U];
+            --position;
+        }
+        records[position] = record;
+    }
+}
+
+static void _wifi_service_port_retain_scan_record(
+    wifi_service_port_scan_record_t *records, size_t capacity,
+    size_t *count, bool *truncated,
+    const wifi_service_port_scan_record_t *candidate)
+{
+    for (size_t index = 0U; index < *count; ++index)
+    {
+        if (_wifi_service_port_scan_key_equal(&records[index], candidate))
+        {
+            if (candidate->rssi > records[index].rssi)
+            {
+                records[index] = *candidate;
+            }
+            return;
+        }
+    }
+    if (*count < capacity)
+    {
+        records[*count] = *candidate;
+        ++(*count);
+        return;
+    }
+
+    *truncated = true;
+    size_t weakest = 0U;
+    for (size_t index = 1U; index < *count; ++index)
+    {
+        if (_wifi_service_port_compare_scan_record(
+                    &records[weakest], &records[index]) < 0)
+        {
+            weakest = index;
+        }
+    }
+    if (_wifi_service_port_compare_scan_record(
+                candidate, &records[weakest]) < 0)
+    {
+        records[weakest] = *candidate;
+    }
+}
+
 static wifi_service_failure_t _wifi_service_port_map_disconnect_failure(
     uint16_t reason)
 {
@@ -715,8 +808,7 @@ esp_err_t wifi_service_port_scan_finish(
     size_t *out_count, bool *out_truncated)
 {
     esp_err_t result = ESP_OK;
-    wifi_ap_record_t idf_records[WIFI_SERVICE_MAX_SCAN_RECORDS];
-    bool idf_records_used = false;
+    wifi_ap_record_t idf_record;
     if (records == NULL || capacity == 0 ||
             capacity > WIFI_SERVICE_MAX_SCAN_RECORDS || out_count == NULL ||
             out_truncated == NULL)
@@ -731,55 +823,48 @@ esp_err_t wifi_service_port_scan_finish(
     *out_truncated = false;
     memset(records, 0, capacity * sizeof(*records));
 
-    uint16_t total = 0;
-    esp_err_t count_result = esp_wifi_scan_get_ap_num(&total);
-    memset(idf_records, 0, sizeof(idf_records));
-    idf_records_used = true;
-    uint16_t requested = (uint16_t)capacity;
-    result = esp_wifi_scan_get_ap_records(&requested, idf_records);
-    if (result != ESP_OK)
+    uint16_t total = 0U;
+    result = esp_wifi_scan_get_ap_num(&total);
+    for (uint16_t index = 0U; result == ESP_OK && index < total; ++index)
     {
-        esp_err_t clear_result = esp_wifi_clear_ap_list();
-        if (clear_result == ESP_OK ||
-                _wifi_service_port_inactive_error(clear_result))
+        memset(&idf_record, 0, sizeof(idf_record));
+        result = esp_wifi_scan_get_ap_record(&idf_record);
+        if (result == ESP_OK)
         {
-            s_state.scan_list_owned = false;
+            wifi_service_port_scan_record_t candidate;
+            memset(&candidate, 0, sizeof(candidate));
+            const size_t length = strnlen((const char *)idf_record.ssid,
+                                          WIFI_SERVICE_SSID_MAX_BYTES);
+            if (length > 0U)
+            {
+                memcpy(candidate.ssid, idf_record.ssid, length);
+                candidate.ssid_length = (uint8_t)length;
+                candidate.rssi = idf_record.rssi;
+                candidate.channel = idf_record.primary;
+                candidate.security = _wifi_service_port_map_security(
+                                         idf_record.authmode);
+                _wifi_service_port_retain_scan_record(
+                    records, capacity, out_count, out_truncated, &candidate);
+            }
+            wifi_service_secure_zero(&candidate, sizeof(candidate));
         }
-        if (clear_result != ESP_OK &&
-                !_wifi_service_port_inactive_error(clear_result))
-        {
-            result = clear_result;
-        }
-        goto exit;
+        wifi_service_secure_zero(&idf_record, sizeof(idf_record));
     }
-    s_state.scan_list_owned = false;
-    if (requested > capacity)
-    {
-        requested = (uint16_t)capacity;
-    }
-    *out_count = requested;
-    *out_truncated = count_result == ESP_OK ? total > requested :
-                     requested == capacity;
-    for (size_t index = 0; index < requested; ++index)
-    {
-        size_t length = strnlen((const char *)idf_records[index].ssid,
-                                WIFI_SERVICE_SSID_MAX_BYTES);
-        records[index].ssid_length = (uint8_t)length;
-        if (length > 0)
-        {
-            memcpy(records[index].ssid, idf_records[index].ssid, length);
-        }
-        records[index].rssi = idf_records[index].rssi;
-        records[index].channel = idf_records[index].primary;
-        records[index].security = _wifi_service_port_map_security(
-                                      idf_records[index].authmode);
-    }
-    result = ESP_OK;
 
-exit:
-    if (idf_records_used)
+    const esp_err_t clear_result = esp_wifi_clear_ap_list();
+    if (clear_result == ESP_OK ||
+            _wifi_service_port_inactive_error(clear_result))
     {
-        wifi_service_secure_zero(idf_records, sizeof(idf_records));
+        s_state.scan_list_owned = false;
+    }
+    if (clear_result != ESP_OK &&
+            !_wifi_service_port_inactive_error(clear_result))
+    {
+        result = clear_result;
+    }
+    if (result == ESP_OK)
+    {
+        _wifi_service_port_sort_scan_records(records, *out_count);
     }
     return result;
 }

@@ -1,0 +1,13 @@
+menu "MicroTech BLE provisioning"
+
+config PROVISIONING_SERVICE_TASK_STACK
+    int "Provisioning worker stack depth"
+    default 6144
+    range 4096 12288
+
+config PROVISIONING_SERVICE_QUEUE_DEPTH
+    int "Provisioning worker queue depth"
+    default 8
+    range 4 32
+
+endmenu

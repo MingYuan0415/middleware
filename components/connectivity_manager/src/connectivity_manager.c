@@ -32,6 +32,10 @@
 #define CONNECTIVITY_MANAGER_PROFILE_KEY    "wifi_profile"
 #define CONNECTIVITY_MANAGER_PROFILE_MAGIC  UINT32_C(0x57465031)
 #define CONNECTIVITY_MANAGER_PROFILE_VERSION UINT16_C(1)
+#define CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY \
+    (CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH + 2U)
+#define CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY \
+    (CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH + 1U)
 
 EVENT_BUS_DEFINE_ID(CONNECTIVITY_MANAGER_MSG);
 
@@ -105,6 +109,22 @@ typedef struct manager_command
     manager_profile_t credentials;
 } manager_command_t;
 
+typedef enum
+{
+    MANAGER_TERMINAL_STATUS = 0,
+    MANAGER_TERMINAL_SCAN,
+} manager_terminal_type_t;
+
+typedef struct manager_terminal_event
+{
+    manager_terminal_type_t type;
+    union
+    {
+        connectivity_manager_status_snapshot_t status;
+        connectivity_manager_scan_snapshot_t scan;
+    } payload;
+} manager_terminal_event_t;
+
 typedef struct manager_worker
 {
     wifi_service_session_id_t session_id;
@@ -150,9 +170,12 @@ typedef struct manager_shared
     union manager_queue_bytes
     {
         uint8_t bytes[CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH *
-                      sizeof(manager_command_t)];
+                      sizeof(manager_command_t *)];
         uintptr_t alignment;
     } queue_storage;
+    manager_command_t
+    command_pool[CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY];
+    bool command_pool_used[CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY];
     TaskHandle_t worker;
     StaticTask_t worker_control;
     StackType_t worker_stack[CONFIG_CONNECTIVITY_MANAGER_TASK_STACK];
@@ -162,8 +185,13 @@ typedef struct manager_shared
     uint64_t control_generation;
     atomic_uint_fast64_t control_completed_generation;
     atomic_int control_result;
+    atomic_bool worker_stopping;
     connectivity_manager_status_snapshot_t status_cache;
     connectivity_manager_scan_snapshot_t scan_cache;
+    manager_terminal_event_t
+    terminal_outbox[CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY];
+    size_t terminal_outbox_head;
+    size_t terminal_outbox_count;
 } manager_shared_t;
 
 static manager_shared_t s_manager;
@@ -194,6 +222,96 @@ static void _manager_secure_zero(void *data, size_t size)
         ++bytes;
         --size;
     }
+}
+
+static manager_command_t *_manager_command_pool_acquire(
+    const manager_command_t *command)
+{
+    manager_command_t *slot = NULL;
+    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
+    for (size_t index = 0U;
+            index < CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY; ++index)
+    {
+        if (!s_manager.command_pool_used[index])
+        {
+            s_manager.command_pool_used[index] = true;
+            s_manager.command_pool[index] = *command;
+            slot = &s_manager.command_pool[index];
+            break;
+        }
+    }
+    xSemaphoreGive(s_manager.mutex);
+    return slot;
+}
+
+static void _manager_command_pool_release(manager_command_t *command)
+{
+    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
+    for (size_t index = 0U;
+            index < CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY; ++index)
+    {
+        if (command == &s_manager.command_pool[index])
+        {
+            _manager_secure_zero(&s_manager.command_pool[index],
+                                 sizeof(s_manager.command_pool[index]));
+            s_manager.command_pool_used[index] = false;
+            break;
+        }
+    }
+    xSemaphoreGive(s_manager.mutex);
+}
+
+static void _manager_clear_candidate(manager_worker_t *worker)
+{
+    if (!worker->target_candidate)
+    {
+        return;
+    }
+    _manager_secure_zero(&worker->target, sizeof(worker->target));
+    worker->target_valid = false;
+    worker->target_candidate = false;
+    worker->target_persisted = false;
+    worker->target_reconnectable = false;
+}
+
+static void _manager_clear_target(manager_worker_t *worker)
+{
+    _manager_secure_zero(&worker->target, sizeof(worker->target));
+    worker->target_valid = false;
+    worker->target_candidate = false;
+    worker->target_persisted = false;
+    worker->target_reconnectable = false;
+}
+
+static void _manager_clear_ephemeral_link(manager_worker_t *worker)
+{
+    if (worker->target_valid && !worker->target_candidate &&
+            !worker->target_persisted && !worker->target_reconnectable)
+    {
+        _manager_clear_target(worker);
+    }
+}
+
+static void _manager_set_saved_target(manager_worker_t *worker)
+{
+    _manager_clear_target(worker);
+    if (!worker->profile_valid)
+    {
+        return;
+    }
+    worker->target_valid = true;
+    worker->target_persisted = true;
+    worker->target_reconnectable = true;
+}
+
+static void _manager_set_ephemeral_link(
+    manager_worker_t *worker, const manager_profile_t *source)
+{
+    _manager_clear_target(worker);
+    worker->target.security = source->security;
+    worker->target.ssid_length = source->ssid_length;
+    memcpy(worker->target.ssid, source->ssid, source->ssid_length);
+    worker->target_valid = true;
 }
 
 static bool _manager_bytes_are_zero(const uint8_t *data, size_t size)
@@ -271,6 +389,21 @@ static uint32_t _manager_deadline_remaining_ms(
         remaining_ms = CONNECTIVITY_MANAGER_WAIT_FOREVER - 1U;
     }
     return (uint32_t)remaining_ms;
+}
+
+static esp_err_t _manager_wait_worker_suspended(
+    const manager_deadline_t *deadline)
+{
+    while (s_manager.worker != NULL &&
+            eTaskGetState(s_manager.worker) != eSuspended)
+    {
+        if (_manager_deadline_remaining(deadline) == 0U)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1U);
+    }
+    return ESP_OK;
 }
 
 static bool _manager_tick_reached(TickType_t now, TickType_t deadline)
@@ -380,16 +513,86 @@ static esp_err_t _manager_profile_store(const manager_profile_t *profile)
                                sizeof(*profile));
 }
 
+static void _manager_cache_status_snapshot(
+    manager_worker_t *worker,
+    const connectivity_manager_status_snapshot_t *snapshot)
+{
+    worker->status.generation = snapshot->generation;
+    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
+    s_manager.status_cache = *snapshot;
+    xSemaphoreGive(s_manager.mutex);
+}
+
+static void _manager_cache_scan_snapshot(
+    manager_worker_t *worker,
+    const connectivity_manager_scan_snapshot_t *snapshot)
+{
+    worker->scan.generation = snapshot->generation;
+    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
+    s_manager.scan_cache = *snapshot;
+    xSemaphoreGive(s_manager.mutex);
+}
+
+static esp_err_t _manager_dispatch_terminal(
+    const manager_terminal_event_t *event)
+{
+    if (event->type == MANAGER_TERMINAL_STATUS)
+    {
+        return event_bus_publish(
+                   CONNECTIVITY_MANAGER_MSG,
+                   CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                   &event->payload.status, sizeof(event->payload.status), 0U);
+    }
+    return event_bus_publish(
+               CONNECTIVITY_MANAGER_MSG,
+               CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+               &event->payload.scan, sizeof(event->payload.scan), 0U);
+}
+
+static bool _manager_flush_terminal_outbox(void)
+{
+    while (s_manager.terminal_outbox_count > 0U)
+    {
+        manager_terminal_event_t *event =
+            &s_manager.terminal_outbox[s_manager.terminal_outbox_head];
+        const esp_err_t result = _manager_dispatch_terminal(event);
+        if (result != ESP_OK)
+        {
+            return false;
+        }
+        _manager_secure_zero(event, sizeof(*event));
+        s_manager.terminal_outbox_head =
+            (s_manager.terminal_outbox_head + 1U) %
+            CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY;
+        --s_manager.terminal_outbox_count;
+    }
+    return true;
+}
+
+static void _manager_queue_terminal(const manager_terminal_event_t *event)
+{
+    while (s_manager.terminal_outbox_count >=
+            CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY)
+    {
+        if (!_manager_flush_terminal_outbox())
+        {
+            vTaskDelay(1U);
+        }
+    }
+    const size_t tail = (s_manager.terminal_outbox_head +
+                         s_manager.terminal_outbox_count) %
+                        CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY;
+    s_manager.terminal_outbox[tail] = *event;
+    ++s_manager.terminal_outbox_count;
+}
+
 static void _manager_publish_status(
     manager_worker_t *worker,
     const connectivity_manager_status_snapshot_t *snapshot, uint32_t flags)
 {
     connectivity_manager_status_snapshot_t published = *snapshot;
     published.generation = _manager_next_generation();
-    worker->status.generation = published.generation;
-    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
-    s_manager.status_cache = published;
-    xSemaphoreGive(s_manager.mutex);
+    _manager_cache_status_snapshot(worker, &published);
     const esp_err_t result = event_bus_publish(
                                  CONNECTIVITY_MANAGER_MSG,
                                  CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
@@ -423,7 +626,23 @@ static void _manager_publish_status_terminal(
     terminal.operation_complete = true;
     terminal.last_error = result;
     terminal.failure = failure;
-    _manager_publish_status(worker, &terminal, 0U);
+    terminal.generation = _manager_next_generation();
+    _manager_cache_status_snapshot(worker, &terminal);
+    manager_terminal_event_t event =
+    {
+        .type = MANAGER_TERMINAL_STATUS,
+        .payload.status = terminal,
+    };
+    esp_err_t publish_result = ESP_ERR_INVALID_STATE;
+    if (s_manager.terminal_outbox_count == 0U)
+    {
+        publish_result = _manager_dispatch_terminal(&event);
+    }
+    if (publish_result != ESP_OK)
+    {
+        LOG_W("terminal status deferred: %d", (int)publish_result);
+        _manager_queue_terminal(&event);
+    }
 }
 
 static void _manager_publish_scan(
@@ -432,10 +651,7 @@ static void _manager_publish_scan(
 {
     connectivity_manager_scan_snapshot_t published = *snapshot;
     published.generation = _manager_next_generation();
-    worker->scan.generation = published.generation;
-    xSemaphoreTake(s_manager.mutex, portMAX_DELAY);
-    s_manager.scan_cache = published;
-    xSemaphoreGive(s_manager.mutex);
+    _manager_cache_scan_snapshot(worker, &published);
     const esp_err_t result = event_bus_publish(
                                  CONNECTIVITY_MANAGER_MSG,
                                  CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
@@ -448,6 +664,28 @@ static void _manager_publish_scan(
 
 static void _manager_cache_scan(manager_worker_t *worker)
 {
+    if (!worker->scan.running && worker->scan.operation_id != 0U)
+    {
+        connectivity_manager_scan_snapshot_t terminal = worker->scan;
+        terminal.generation = _manager_next_generation();
+        _manager_cache_scan_snapshot(worker, &terminal);
+        manager_terminal_event_t event =
+        {
+            .type = MANAGER_TERMINAL_SCAN,
+            .payload.scan = terminal,
+        };
+        esp_err_t result = ESP_ERR_INVALID_STATE;
+        if (s_manager.terminal_outbox_count == 0U)
+        {
+            result = _manager_dispatch_terminal(&event);
+        }
+        if (result != ESP_OK)
+        {
+            LOG_W("terminal scan deferred: %d", (int)result);
+            _manager_queue_terminal(&event);
+        }
+        return;
+    }
     _manager_publish_scan(worker, &worker->scan,
                           worker->scan.running ?
                           EVENT_BUS_PUBLISH_FLAG_UI_LATEST : 0U);
@@ -461,7 +699,23 @@ static void _manager_publish_scan_terminal(
     memset(&terminal, 0, sizeof(terminal));
     terminal.operation_id = operation_id;
     terminal.last_error = result;
-    _manager_publish_scan(worker, &terminal, 0U);
+    terminal.generation = _manager_next_generation();
+    _manager_cache_scan_snapshot(worker, &terminal);
+    manager_terminal_event_t event =
+    {
+        .type = MANAGER_TERMINAL_SCAN,
+        .payload.scan = terminal,
+    };
+    esp_err_t publish_result = ESP_ERR_INVALID_STATE;
+    if (s_manager.terminal_outbox_count == 0U)
+    {
+        publish_result = _manager_dispatch_terminal(&event);
+    }
+    if (publish_result != ESP_OK)
+    {
+        LOG_W("terminal scan deferred: %d", (int)publish_result);
+        _manager_queue_terminal(&event);
+    }
 }
 
 static connectivity_manager_failure_t _manager_map_failure(
@@ -536,8 +790,10 @@ static void _manager_set_target_status(manager_worker_t *worker)
                                        worker->target_persisted;
     if (worker->target_valid)
     {
-        _manager_copy_ssid(worker->status.ssid, worker->target.ssid,
-                           worker->target.ssid_length);
+        const manager_profile_t *target = worker->target_persisted ?
+                                          &worker->profile : &worker->target;
+        _manager_copy_ssid(worker->status.ssid, target->ssid,
+                           target->ssid_length);
     }
     else if (worker->profile_valid)
     {
@@ -607,6 +863,10 @@ static unsigned _manager_command_priority(manager_command_type_t type)
     }
 }
 
+static void _manager_run_pending(manager_worker_t *worker);
+static void _manager_continue_policy(manager_worker_t *worker,
+                                     bool schedule_retry);
+
 static manager_defer_result_t _manager_defer_foreground(
     manager_worker_t *worker, const manager_command_t *command)
 {
@@ -644,6 +904,20 @@ static manager_defer_result_t _manager_defer_foreground(
     {
         worker->resume_auto_after_scan = true;
     }
+    if (worker->retry_pending &&
+            worker->operation_kind == MANAGER_OPERATION_CONNECT)
+    {
+        worker->retry_pending = false;
+        worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+        worker->status.ipv4_address = 0U;
+        _manager_clear_candidate(worker);
+        _manager_set_target_status(worker);
+        _manager_complete_status_operation(
+            worker, ESP_ERR_NOT_FINISHED,
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
+        _manager_continue_policy(worker, false);
+        return MANAGER_DEFER_QUEUED;
+    }
     if (worker->active_cancel_requested)
     {
         return MANAGER_DEFER_QUEUED;
@@ -665,16 +939,36 @@ static manager_defer_result_t _manager_defer_foreground(
     return MANAGER_DEFER_QUEUED;
 }
 
-static void _manager_run_pending(manager_worker_t *worker);
-static void _manager_continue_policy(manager_worker_t *worker,
-                                     bool schedule_retry);
-
 static bool _manager_auto_connect_eligible(const manager_worker_t *worker)
 {
     return !worker->suspended && !worker->status.manual_hold &&
            worker->target_valid && worker->target_reconnectable &&
-           (worker->target_candidate ||
-            (worker->profile_valid && worker->profile.auto_connect != 0U));
+           !worker->target_candidate && worker->profile_valid &&
+           worker->profile.auto_connect != 0U;
+}
+
+static bool _manager_candidate_retry_eligible(
+    const manager_worker_t *worker)
+{
+    return !worker->suspended && !worker->status.manual_hold &&
+           worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+           worker->operation_id != 0U && worker->target_valid &&
+           worker->target_candidate && worker->target_reconnectable;
+}
+
+static bool _manager_retry_eligible(const manager_worker_t *worker)
+{
+    return _manager_candidate_retry_eligible(worker) ||
+           _manager_auto_connect_eligible(worker);
+}
+
+static bool _manager_failure_retryable(
+    connectivity_manager_failure_t failure)
+{
+    return failure == CONNECTIVITY_MANAGER_FAILURE_AP_NOT_FOUND ||
+           failure == CONNECTIVITY_MANAGER_FAILURE_ASSOCIATION_TIMEOUT ||
+           failure == CONNECTIVITY_MANAGER_FAILURE_DHCP_TIMEOUT ||
+           failure == CONNECTIVITY_MANAGER_FAILURE_LINK_LOST;
 }
 
 static esp_err_t _manager_open_session(manager_worker_t *worker)
@@ -728,7 +1022,7 @@ static uint32_t _manager_retry_delay(uint8_t retry_count)
 
 static void _manager_schedule_retry(manager_worker_t *worker)
 {
-    if (!_manager_auto_connect_eligible(worker))
+    if (!_manager_retry_eligible(worker))
     {
         worker->retry_pending = false;
         return;
@@ -750,38 +1044,52 @@ static esp_err_t _manager_start_connect(manager_worker_t *worker,
                                         connectivity_manager_operation_id_t operation_id,
                                         manager_command_type_t command_type)
 {
-    if (!worker->target_valid || !worker->target_reconnectable)
+    worker->operation_kind = MANAGER_OPERATION_CONNECT;
+    worker->active_command = command_type;
+    worker->operation_id = operation_id;
+    worker->service_operation_id = 0U;
+    worker->active_cancel_requested = false;
+    if (!worker->target_valid || !worker->target_reconnectable ||
+            (!worker->target_candidate && !worker->profile_valid))
     {
-        _manager_publish_status_terminal(
-            worker, operation_id, ESP_ERR_INVALID_STATE,
+        worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
+        worker->status.last_error = ESP_ERR_INVALID_STATE;
+        _manager_clear_candidate(worker);
+        _manager_set_target_status(worker);
+        _manager_complete_status_operation(
+            worker, ESP_ERR_INVALID_STATE,
             CONNECTIVITY_MANAGER_FAILURE_INTERNAL);
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t result = _manager_radio_start(worker);
     if (result != ESP_OK)
     {
+        const bool candidate = worker->target_candidate;
         worker->status.radio_available = false;
         worker->status.state = CONNECTIVITY_MANAGER_STATE_OFFLINE;
         worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
         worker->status.last_error = result;
+        _manager_clear_candidate(worker);
         _manager_set_target_status(worker);
-        _manager_schedule_retry(worker);
-        if (!worker->retry_pending)
+        if (!candidate)
         {
-            _manager_cache_status(worker);
+            _manager_schedule_retry(worker);
         }
-        _manager_publish_status_terminal(
-            worker, operation_id, result,
+        _manager_complete_status_operation(
+            worker, result,
             CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE);
         return result;
     }
+    const manager_profile_t *target = worker->target_candidate ?
+                                      &worker->target : &worker->profile;
     const wifi_service_credentials_t credentials =
     {
-        .ssid = (const char *)worker->target.ssid,
-        .ssid_length = worker->target.ssid_length,
-        .password = (const char *)worker->target.password,
-        .password_length = worker->target.password_length,
-        .security = worker->target.security ==
+        .ssid = (const char *)target->ssid,
+        .ssid_length = target->ssid_length,
+        .password = (const char *)target->password,
+        .password_length = target->password_length,
+        .security = target->security ==
         CONNECTIVITY_MANAGER_SECURITY_PERSONAL ?
         WIFI_SERVICE_SECURITY_PERSONAL :
         WIFI_SERVICE_SECURITY_OPEN,
@@ -790,10 +1098,6 @@ static esp_err_t _manager_start_connect(manager_worker_t *worker,
                                           &worker->service_operation_id);
     if (result == ESP_OK)
     {
-        worker->operation_kind = MANAGER_OPERATION_CONNECT;
-        worker->active_command = command_type;
-        worker->operation_id = operation_id;
-        worker->active_cancel_requested = false;
         worker->retry_pending = false;
         worker->status.operation_id = operation_id;
         worker->status.state = CONNECTIVITY_MANAGER_STATE_CONNECTING;
@@ -809,15 +1113,10 @@ static esp_err_t _manager_start_connect(manager_worker_t *worker,
         worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
         worker->status.last_error = result;
+        _manager_clear_candidate(worker);
         _manager_set_target_status(worker);
-        _manager_schedule_retry(worker);
-        if (!worker->retry_pending)
-        {
-            _manager_cache_status(worker);
-        }
-        _manager_publish_status_terminal(
-            worker, operation_id, result,
-            CONNECTIVITY_MANAGER_FAILURE_INTERNAL);
+        _manager_complete_status_operation(
+            worker, result, CONNECTIVITY_MANAGER_FAILURE_INTERNAL);
     }
     return result;
 }
@@ -834,14 +1133,7 @@ static void _manager_handle_connected(manager_worker_t *worker,
     if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
             worker->active_cancel_requested)
     {
-        if (worker->target_candidate)
-        {
-            _manager_secure_zero(&worker->target, sizeof(worker->target));
-            worker->target_valid = false;
-            worker->target_candidate = false;
-            worker->target_persisted = false;
-            worker->target_reconnectable = false;
-        }
+        _manager_clear_candidate(worker);
         worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.ipv4_address = 0U;
         _manager_set_target_status(worker);
@@ -864,19 +1156,13 @@ static void _manager_handle_connected(manager_worker_t *worker,
             _manager_secure_zero(&worker->profile, sizeof(worker->profile));
             worker->profile = saved;
             worker->profile_valid = true;
-            worker->target_candidate = false;
-            worker->target_persisted = true;
-            worker->target_reconnectable = true;
+            _manager_set_saved_target(worker);
         }
         else
         {
             worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
             worker->status.last_error = result;
-            _manager_secure_zero(worker->target.password,
-                                 sizeof(worker->target.password));
-            worker->target_candidate = false;
-            worker->target_persisted = false;
-            worker->target_reconnectable = false;
+            _manager_set_ephemeral_link(worker, &saved);
         }
         _manager_secure_zero(&saved, sizeof(saved));
     }
@@ -895,6 +1181,7 @@ static void _manager_handle_connect_terminal(manager_worker_t *worker,
         const wifi_service_status_snapshot_t *status)
 {
     const bool canceled = worker->active_cancel_requested;
+    const bool candidate = worker->target_candidate;
     const connectivity_manager_failure_t failure = canceled ?
         CONNECTIVITY_MANAGER_FAILURE_NONE :
         _manager_map_failure(status->failure);
@@ -904,26 +1191,38 @@ static void _manager_handle_connect_terminal(manager_worker_t *worker,
                            CONNECTIVITY_MANAGER_STATE_OFFLINE :
                            CONNECTIVITY_MANAGER_STATE_IDLE;
     worker->status.ipv4_address = 0U;
-    if (failure == CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION)
+    const bool should_retry_candidate = candidate && !canceled &&
+                                        _manager_failure_retryable(failure) &&
+                                        !worker->pending_command_valid &&
+                                        !worker->resume_auto_after_scan;
+    if (should_retry_candidate)
+    {
+        worker->service_operation_id = 0U;
+        worker->status.failure = failure;
+        worker->status.last_error = result;
+        _manager_set_target_status(worker);
+        _manager_schedule_retry(worker);
+        return;
+    }
+    if (candidate)
     {
         worker->retry_pending = false;
-        if (worker->target_candidate)
-        {
-            _manager_secure_zero(&worker->target, sizeof(worker->target));
-            worker->target_valid = false;
-            worker->target_candidate = false;
-            worker->target_persisted = false;
-            worker->target_reconnectable = false;
-        }
+        _manager_clear_candidate(worker);
+        _manager_set_target_status(worker);
+    }
+    else if (failure == CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION)
+    {
+        worker->retry_pending = false;
         _manager_set_target_status(worker);
     }
     else
     {
         _manager_set_target_status(worker);
     }
-    const bool should_retry = !canceled &&
-                              failure !=
-                              CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION &&
+    const bool should_retry = !canceled && !candidate &&
+                              (_manager_failure_retryable(failure) ||
+                               failure ==
+                               CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE) &&
                               !worker->pending_command_valid &&
                               !worker->resume_auto_after_scan;
     if (should_retry)
@@ -952,6 +1251,11 @@ static void _manager_poll_status(manager_worker_t *worker)
     worker->status.failure = _manager_map_failure(status.failure);
     worker->status.last_error = status.last_error;
     worker->status.ipv4_address = status.ipv4_address;
+    if (status.state != WIFI_SERVICE_STATE_IP_READY &&
+            status.failure == WIFI_SERVICE_FAILURE_LINK_LOST)
+    {
+        _manager_clear_ephemeral_link(worker);
+    }
     const bool executor_retry_allowed =
         _manager_auto_connect_eligible(worker);
     if (worker->operation_kind == MANAGER_OPERATION_NONE &&
@@ -1060,6 +1364,9 @@ static void _manager_poll_scan(manager_worker_t *worker)
         const size_t ssid_length = strlen(record->ssid);
         record->saved = worker->profile_valid &&
                         ssid_length == worker->profile.ssid_length &&
+                        record->security ==
+                        (connectivity_manager_security_t)
+                        worker->profile.security &&
                         memcmp(record->ssid, worker->profile.ssid,
                                ssid_length) == 0;
     }
@@ -1154,14 +1461,7 @@ static void _manager_command_disconnect(manager_worker_t *worker,
     worker->resume_auto_after_scan = false;
     worker->retry_pending = false;
     worker->status.manual_hold = true;
-    if (worker->target_candidate)
-    {
-        _manager_secure_zero(&worker->target, sizeof(worker->target));
-        worker->target_valid = false;
-        worker->target_candidate = false;
-        worker->target_persisted = false;
-        worker->target_reconnectable = false;
-    }
+    _manager_clear_candidate(worker);
     if (defer_result == MANAGER_DEFER_QUEUED)
     {
         _manager_set_target_status(worker);
@@ -1223,12 +1523,7 @@ static void _manager_command_reconnect(manager_worker_t *worker,
     }
     worker->retry_pending = false;
     worker->retry_count = 0U;
-    _manager_secure_zero(&worker->target, sizeof(worker->target));
-    worker->target = worker->profile;
-    worker->target_valid = true;
-    worker->target_candidate = false;
-    worker->target_persisted = true;
-    worker->target_reconnectable = true;
+    _manager_set_saved_target(worker);
     worker->retry_count = 0U;
     worker->status.manual_hold = false;
     (void)_manager_start_connect(worker, command->operation_id,
@@ -1246,14 +1541,7 @@ static void _manager_command_forget(manager_worker_t *worker,
     }
     worker->resume_auto_after_scan = false;
     worker->retry_pending = false;
-    if (worker->target_candidate)
-    {
-        _manager_secure_zero(&worker->target, sizeof(worker->target));
-        worker->target_valid = false;
-        worker->target_candidate = false;
-        worker->target_persisted = false;
-        worker->target_reconnectable = false;
-    }
+    _manager_clear_candidate(worker);
     if (defer_result == MANAGER_DEFER_QUEUED)
     {
         _manager_set_target_status(worker);
@@ -1331,12 +1619,7 @@ static void _manager_command_set_auto(manager_worker_t *worker,
     {
         if (worker->operation_kind == MANAGER_OPERATION_NONE)
         {
-            _manager_secure_zero(&worker->target, sizeof(worker->target));
-            worker->target = worker->profile;
-            worker->target_valid = true;
-            worker->target_candidate = false;
-            worker->target_persisted = true;
-            worker->target_reconnectable = true;
+            _manager_set_saved_target(worker);
             (void)_manager_start_connect(worker, 0U, MANAGER_COMMAND_AUTO);
         }
         else if (worker->operation_kind == MANAGER_OPERATION_SCAN)
@@ -1363,8 +1646,25 @@ static void _manager_command_cancel(manager_worker_t *worker,
         _manager_secure_zero(&canceled, sizeof(canceled));
         return;
     }
-    if (worker->operation_id != command->operation_id ||
-            worker->service_operation_id == 0U)
+    if (worker->operation_id != command->operation_id)
+    {
+        return;
+    }
+    if (worker->retry_pending &&
+            worker->operation_kind == MANAGER_OPERATION_CONNECT)
+    {
+        worker->retry_pending = false;
+        worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+        worker->status.ipv4_address = 0U;
+        _manager_clear_candidate(worker);
+        _manager_set_target_status(worker);
+        _manager_complete_status_operation(
+            worker, ESP_ERR_NOT_FINISHED,
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
+        _manager_continue_policy(worker, false);
+        return;
+    }
+    if (worker->service_operation_id == 0U)
     {
         return;
     }
@@ -1374,15 +1674,7 @@ static void _manager_command_cancel(manager_worker_t *worker,
         return;
     }
     worker->active_cancel_requested = true;
-    if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
-            worker->target_candidate)
-    {
-        _manager_secure_zero(&worker->target, sizeof(worker->target));
-        worker->target_valid = false;
-        worker->target_candidate = false;
-        worker->target_persisted = false;
-        worker->target_reconnectable = false;
-    }
+    _manager_clear_candidate(worker);
 }
 
 static void _manager_run_pending(manager_worker_t *worker)
@@ -1421,6 +1713,10 @@ static void _manager_run_pending(manager_worker_t *worker)
 static void _manager_continue_policy(manager_worker_t *worker,
                                      bool schedule_retry)
 {
+    if (s_manager.terminal_outbox_count > 0U)
+    {
+        return;
+    }
     if (worker->pending_command_valid)
     {
         _manager_run_pending(worker);
@@ -1442,6 +1738,22 @@ static void _manager_continue_policy(manager_worker_t *worker,
     if (schedule_retry)
     {
         _manager_schedule_retry(worker);
+    }
+}
+
+static void _manager_start_due_retry(manager_worker_t *worker)
+{
+    worker->retry_pending = false;
+    if (_manager_candidate_retry_eligible(worker))
+    {
+        const connectivity_manager_operation_id_t operation_id =
+            worker->operation_id;
+        const manager_command_type_t command_type = worker->active_command;
+        (void)_manager_start_connect(worker, operation_id, command_type);
+    }
+    else if (_manager_auto_connect_eligible(worker))
+    {
+        (void)_manager_start_connect(worker, 0U, MANAGER_COMMAND_AUTO);
     }
 }
 
@@ -1478,10 +1790,7 @@ static esp_err_t _manager_worker_init(manager_worker_t *worker)
     _manager_cache_scan(worker);
     if (worker->profile_valid && worker->profile.auto_connect != 0U)
     {
-        worker->target = worker->profile;
-        worker->target_valid = true;
-        worker->target_persisted = true;
-        worker->target_reconnectable = true;
+        _manager_set_saved_target(worker);
         (void)_manager_start_connect(worker, 0U, MANAGER_COMMAND_AUTO);
     }
     return ESP_OK;
@@ -1532,8 +1841,7 @@ static esp_err_t _manager_worker_resume(manager_worker_t *worker,
                 _manager_tick_reached(xTaskGetTickCount(),
                                       worker->retry_deadline))
         {
-            worker->retry_pending = false;
-            (void)_manager_start_connect(worker, 0U, MANAGER_COMMAND_AUTO);
+            _manager_start_due_retry(worker);
         }
         else if (worker->resume_connect_pending)
         {
@@ -1558,9 +1866,12 @@ static esp_err_t _manager_worker_resume(manager_worker_t *worker,
 static esp_err_t _manager_worker_deinit(manager_worker_t *worker,
                                         uint32_t timeout_ms)
 {
+    const manager_deadline_t deadline = _manager_deadline(timeout_ms);
     worker->retry_pending = false;
     if (worker->operation_kind != MANAGER_OPERATION_NONE)
     {
+        _manager_clear_candidate(worker);
+        _manager_set_target_status(worker);
         if (worker->operation_kind == MANAGER_OPERATION_SCAN)
         {
             _manager_publish_scan_terminal(
@@ -1583,6 +1894,18 @@ static esp_err_t _manager_worker_deinit(manager_worker_t *worker,
                              sizeof(worker->pending_command));
         worker->pending_command_valid = false;
     }
+    while (s_manager.terminal_outbox_count > 0U)
+    {
+        if (_manager_flush_terminal_outbox())
+        {
+            break;
+        }
+        if (_manager_deadline_remaining(&deadline) == 0U)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1U);
+    }
     if (worker->session_id != 0U)
     {
         (void)wifi_service_session_close(worker->session_id);
@@ -1591,7 +1914,8 @@ static esp_err_t _manager_worker_deinit(manager_worker_t *worker,
     const bool radio_owned = worker->radio_initialized ||
                              wifi_service_is_available() ||
                              wifi_service_is_cleanup_pending();
-    esp_err_t result = radio_owned ? wifi_service_deinit(timeout_ms) : ESP_OK;
+    esp_err_t result = radio_owned ? wifi_service_deinit(
+                           _manager_deadline_remaining_ms(&deadline)) : ESP_OK;
     if (result == ESP_OK)
     {
         worker->radio_initialized = false;
@@ -1663,8 +1987,13 @@ static void _manager_process_command(manager_worker_t *worker,
         atomic_store_explicit(&s_manager.control_completed_generation,
                               command->control_generation,
                               memory_order_release);
-        xSemaphoreGive(s_manager.control_done);
         *stop = control_result == ESP_OK;
+        if (*stop)
+        {
+            atomic_store_explicit(&s_manager.worker_stopping, true,
+                                  memory_order_release);
+        }
+        xSemaphoreGive(s_manager.control_done);
         break;
     case MANAGER_COMMAND_INIT:
     case MANAGER_COMMAND_AUTO:
@@ -1676,35 +2005,60 @@ static void _manager_worker_run(void *argument)
 {
     (void)argument;
     manager_worker_t worker;
-    atomic_store_explicit(&s_manager.control_result,
-                          _manager_worker_init(&worker),
+    const esp_err_t init_result = _manager_worker_init(&worker);
+    atomic_store_explicit(&s_manager.control_result, init_result,
                           memory_order_release);
+    if (init_result != ESP_OK)
+    {
+        atomic_store_explicit(&s_manager.worker_stopping, true,
+                              memory_order_release);
+    }
     xSemaphoreGive(s_manager.control_done);
-    bool stop = atomic_load_explicit(&s_manager.control_result,
-                                     memory_order_acquire) != ESP_OK;
+    bool stop = init_result != ESP_OK;
     while (!stop)
     {
-        manager_command_t command;
-        if (xQueueReceive(s_manager.queue, &command,
+        if (!_manager_flush_terminal_outbox())
+        {
+            vTaskDelay(1U);
+            continue;
+        }
+        manager_command_t *queued_command = NULL;
+        if (xQueueReceive(s_manager.queue, &queued_command,
                           pdMS_TO_TICKS(CONNECTIVITY_MANAGER_POLL_MS)) == pdTRUE)
         {
+            manager_command_t command = *queued_command;
+            _manager_command_pool_release(queued_command);
             _manager_process_command(&worker, &command, &stop);
             _manager_secure_zero(&command, sizeof(command));
+            if (stop)
+            {
+                break;
+            }
+        }
+        if (s_manager.terminal_outbox_count > 0U || stop)
+        {
+            continue;
         }
         _manager_poll_status(&worker);
+        if (s_manager.terminal_outbox_count > 0U)
+        {
+            continue;
+        }
         _manager_poll_scan(&worker);
+        if (s_manager.terminal_outbox_count > 0U)
+        {
+            continue;
+        }
         if (!worker.suspended && worker.retry_pending &&
                 _manager_tick_reached(xTaskGetTickCount(),
                                       worker.retry_deadline))
         {
-            worker.retry_pending = false;
-            (void)_manager_start_connect(&worker, 0U, MANAGER_COMMAND_AUTO);
+            _manager_start_due_retry(&worker);
         }
     }
-    while (true)
-    {
-        vTaskDelay(portMAX_DELAY);
-    }
+    _manager_secure_zero(&worker, sizeof(worker));
+    vTaskSuspend(NULL);
+    vTaskDelete(NULL);
 }
 
 static esp_err_t _manager_submit(manager_command_t *command,
@@ -1719,8 +2073,15 @@ static esp_err_t _manager_submit(manager_command_t *command,
     {
         command->operation_id = _manager_next_generation();
     }
-    esp_err_t result = xQueueSend(s_manager.queue, command, 0) == pdTRUE ?
+    manager_command_t *queued_command =
+        _manager_command_pool_acquire(command);
+    esp_err_t result = queued_command != NULL &&
+                       xQueueSend(s_manager.queue, &queued_command, 0) == pdTRUE ?
                        ESP_OK : ESP_ERR_NO_MEM;
+    if (result != ESP_OK && queued_command != NULL)
+    {
+        _manager_command_pool_release(queued_command);
+    }
     if (result == ESP_OK && out_operation_id != NULL)
     {
         *out_operation_id = command->operation_id;
@@ -1778,8 +2139,15 @@ static esp_err_t _manager_control(manager_command_type_t type,
     s_manager.control_inflight = true;
     atomic_store_explicit(&s_manager.control_completed_generation, 0U,
                           memory_order_release);
-    if (xQueueSend(s_manager.queue, &command, 0) != pdTRUE)
+    manager_command_t *queued_command =
+        _manager_command_pool_acquire(&command);
+    if (queued_command == NULL ||
+            xQueueSend(s_manager.queue, &queued_command, 0) != pdTRUE)
     {
+        if (queued_command != NULL)
+        {
+            _manager_command_pool_release(queued_command);
+        }
         s_manager.control_inflight = false;
         result = ESP_ERR_NO_MEM;
         goto exit;
@@ -1834,6 +2202,10 @@ static void _manager_release_resources(void)
     s_manager.mutex = NULL;
     _manager_secure_zero(&s_manager.queue_storage,
                          sizeof(s_manager.queue_storage));
+    _manager_secure_zero(s_manager.command_pool,
+                         sizeof(s_manager.command_pool));
+    memset(s_manager.command_pool_used, 0,
+           sizeof(s_manager.command_pool_used));
 }
 
 esp_err_t connectivity_manager_init(
@@ -1861,6 +2233,7 @@ esp_err_t connectivity_manager_init(
     atomic_init(&s_manager.generation, 0U);
     atomic_init(&s_manager.control_completed_generation, 0U);
     atomic_init(&s_manager.control_result, ESP_ERR_INVALID_STATE);
+    atomic_init(&s_manager.worker_stopping, false);
     s_manager.config = *config;
     s_manager.mutex = xSemaphoreCreateMutexStatic(&s_manager.mutex_control);
     s_manager.control_mutex = xSemaphoreCreateMutexStatic(
@@ -1869,7 +2242,7 @@ esp_err_t connectivity_manager_init(
                                  &s_manager.control_done_control);
     s_manager.queue = xQueueCreateStatic(
                           CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH,
-                          sizeof(manager_command_t),
+                          sizeof(manager_command_t *),
                           s_manager.queue_storage.bytes,
                           &s_manager.queue_control);
     if (s_manager.mutex == NULL || s_manager.control_mutex == NULL ||
@@ -1913,6 +2286,9 @@ esp_err_t connectivity_manager_init(
     }
     else
     {
+        const manager_deadline_t stop_deadline = _manager_deadline(
+                CONNECTIVITY_MANAGER_WAIT_FOREVER);
+        (void)_manager_wait_worker_suspended(&stop_deadline);
         _manager_release_resources();
         atomic_store_explicit(&s_manager_lifecycle,
                               MANAGER_LIFECYCLE_OFFLINE,
@@ -1961,9 +2337,18 @@ esp_err_t connectivity_manager_deinit(uint32_t timeout_ms)
         }
         vTaskDelay(1U);
     }
-    esp_err_t result = _manager_control(
-                           MANAGER_COMMAND_DEINIT,
-                           _manager_deadline_remaining_ms(&deadline));
+    esp_err_t result = ESP_OK;
+    if (!atomic_load_explicit(&s_manager.worker_stopping,
+                              memory_order_acquire))
+    {
+        result = _manager_control(
+                     MANAGER_COMMAND_DEINIT,
+                     _manager_deadline_remaining_ms(&deadline));
+    }
+    if (result == ESP_OK)
+    {
+        result = _manager_wait_worker_suspended(&deadline);
+    }
     if (result == ESP_OK)
     {
         _manager_release_resources();
@@ -2150,6 +2535,8 @@ esp_err_t connectivity_manager_get_status(
     {
         memset(snapshot, 0, sizeof(*snapshot));
         snapshot->state = CONNECTIVITY_MANAGER_STATE_OFFLINE;
+        snapshot->failure =
+            CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
         snapshot->last_error = ESP_ERR_INVALID_STATE;
         return ESP_OK;
     }
