@@ -34,5 +34,12 @@ bool host_provisioning_application_secrets_zeroized(void);
 const char *host_provisioning_device_name(void);
 const char *host_provisioning_protocol_version(void);
 bool host_provisioning_transport_shape_valid(void);
+void host_provisioning_reset_publish_observer(void);
+void host_provisioning_fail_next_publish(esp_err_t result);
+bool host_provisioning_wait_publish_count(unsigned count, uint32_t timeout_ms);
+unsigned host_provisioning_publish_count(void);
+unsigned host_provisioning_max_publish_depth(void);
+uint64_t host_provisioning_last_publish_generation(void);
+uint64_t host_provisioning_failed_publish_generation(void);
 
 #endif /* __HOST_PROVISIONING_SERVICE_H__ */

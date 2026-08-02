@@ -114,6 +114,28 @@ static uint64_t _set_credentials(void)
     return operation_id;
 }
 
+static uint64_t _start_scan(void)
+{
+    Microtech__Provisioning__V1__StartScanRequest body =
+        MICROTECH__PROVISIONING__V1__START_SCAN_REQUEST__INIT;
+    pb_request_t request =
+        MICROTECH__PROVISIONING__V1__PROVISIONING_REQUEST__INIT;
+    request.request_id = 5U;
+    request.protocol_major = 1U;
+    request.body_case =
+        MICROTECH__PROVISIONING__V1__PROVISIONING_REQUEST__BODY_START_SCAN;
+    request.start_scan = &body;
+    uint8_t *wire = NULL;
+    pb_response_t *response = _request(&request, &wire);
+    assert(response->code ==
+           MICROTECH__PROVISIONING__V1__RESPONSE_CODE__RESPONSE_CODE_OK);
+    assert(response->operation_accepted->operation->operation_id != 0U);
+    const uint64_t operation_id =
+        response->operation_accepted->operation->operation_id;
+    _free_response(response, wire);
+    return operation_id;
+}
+
 static void _finish_session(void)
 {
     Microtech__Provisioning__V1__FinishSessionRequest body =
@@ -367,6 +389,99 @@ static void _test_init_snapshot_refresh(void)
     assert(provisioning_service_deinit(1000U) == ESP_OK);
 }
 
+static void _test_async_publish_boundary(void)
+{
+    host_provisioning_reset();
+    assert(provisioning_service_init(&s_config) == ESP_OK);
+    assert(provisioning_service_open_window() == ESP_OK);
+    assert(host_provisioning_wait_transport(true, 500U));
+    host_freertos_pause_queue_receive(true);
+    assert(host_freertos_wait_queue_receive_paused(500U));
+    host_provisioning_reset_publish_observer();
+
+    const uint64_t scan_operation = _start_scan();
+    connectivity_manager_scan_snapshot_t scan;
+    memset(&scan, 0, sizeof(scan));
+    scan.generation = 100U;
+    scan.operation_id = scan_operation;
+    scan.running = true;
+    host_provisioning_publish_scan(&scan);
+    scan.generation = 101U;
+    scan.running = false;
+    scan.last_error = ESP_OK;
+    scan.record_count = 1U;
+    memcpy(scan.records[0].ssid, "Async AP", sizeof("Async AP"));
+    scan.records[0].security = CONNECTIVITY_MANAGER_SECURITY_PERSONAL;
+    host_provisioning_publish_scan(&scan);
+
+    uint8_t *wire = NULL;
+    pb_response_t *response = _get_scan_results(&wire);
+    assert(response->code ==
+           MICROTECH__PROVISIONING__V1__RESPONSE_CODE__RESPONSE_CODE_OK);
+    assert(response->scan_results->generation == 101U);
+    assert(response->scan_results->n_networks == 1U);
+    _free_response(response, wire);
+
+    const uint64_t connect_operation = _set_credentials();
+    _publish_terminal(connect_operation, false);
+    provisioning_service_status_t status;
+    assert(provisioning_service_get_status(&status) == ESP_OK);
+    assert(!status.wifi_operation_active);
+    const uint64_t expected_generation = status.generation;
+    assert(host_provisioning_publish_count() == 0U);
+    assert(host_provisioning_max_publish_depth() == 1U);
+
+    host_freertos_pause_queue_receive(false);
+    assert(host_provisioning_wait_publish_count(1U, 500U));
+    assert(host_provisioning_publish_count() == 1U);
+    assert(host_provisioning_last_publish_generation() == expected_generation);
+    assert(host_provisioning_max_publish_depth() == 1U);
+    assert(provisioning_service_close_window() == ESP_OK);
+    assert(host_provisioning_wait_transport(false, 500U));
+    assert(provisioning_service_deinit(1000U) == ESP_OK);
+}
+
+static void _test_publish_recovery_and_deinit(void)
+{
+    host_provisioning_reset();
+    assert(provisioning_service_init(&s_config) == ESP_OK);
+    assert(host_provisioning_wait_publish_count(1U, 500U));
+
+    host_provisioning_reset_publish_observer();
+    host_freertos_fail_next_queue_sends(1U);
+    connectivity_manager_status_snapshot_t status;
+    memset(&status, 0, sizeof(status));
+    status.generation = 200U;
+    status.available = true;
+    status.radio_available = true;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    host_provisioning_publish_status(&status);
+    assert(host_provisioning_wait_publish_count(1U, 500U));
+    const uint64_t queue_recovery_generation =
+        host_provisioning_last_publish_generation();
+    assert(queue_recovery_generation != 0U);
+
+    host_provisioning_reset_publish_observer();
+    host_provisioning_fail_next_publish(ESP_FAIL);
+    status.generation = 201U;
+    host_provisioning_publish_status(&status);
+    assert(host_provisioning_wait_publish_count(1U, 500U));
+    assert(host_provisioning_failed_publish_generation() != 0U);
+    assert(host_provisioning_failed_publish_generation() ==
+           host_provisioning_last_publish_generation());
+    assert(host_provisioning_max_publish_depth() == 1U);
+
+    host_freertos_pause_queue_receive(true);
+    assert(host_freertos_wait_queue_receive_paused(500U));
+    host_provisioning_reset_publish_observer();
+    status.generation = 202U;
+    host_provisioning_publish_status(&status);
+    assert(provisioning_service_deinit(20U) == ESP_ERR_TIMEOUT);
+    host_freertos_pause_queue_receive(false);
+    assert(provisioning_service_deinit(1000U) == ESP_OK);
+    assert(host_freertos_wait_no_tasks(100U));
+}
+
 int main(void)
 {
     host_freertos_reset_controls();
@@ -391,6 +506,14 @@ int main(void)
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_semaphores() == 0U);
 
+    _test_async_publish_boundary();
+    assert(host_freertos_live_tasks() == 0U);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_semaphores() == 0U);
+    _test_publish_recovery_and_deinit();
+    assert(host_freertos_live_tasks() == 0U);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_semaphores() == 0U);
     _test_init_snapshot_refresh();
     assert(host_freertos_live_tasks() == 0U);
     assert(host_freertos_live_queues() == 0U);

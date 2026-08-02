@@ -9,6 +9,7 @@
 #include "protocomm.h"
 #include "protocomm_ble.h"
 #include "protocomm_security2.h"
+#include "provisioning_service.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -69,6 +70,12 @@ static bool s_salt_zeroized;
 static bool s_verifier_zeroized;
 static char s_device_name[30];
 static char s_protocol_version[128];
+static _Thread_local unsigned s_publish_depth;
+static unsigned s_max_publish_depth;
+static unsigned s_provisioning_publish_count;
+static uint64_t s_last_publish_generation;
+static uint64_t s_failed_publish_generation;
+static esp_err_t s_next_publish_result;
 
 EVENT_BUS_DEFINE_ID(CONNECTIVITY_MANAGER_MSG);
 esp_event_base_t PROTOCOMM_TRANSPORT_BLE_EVENT = "PROTOCOMM_BLE";
@@ -120,6 +127,12 @@ void host_provisioning_reset(void)
     s_verifier_zeroized = false;
     memset(s_device_name, 0, sizeof(s_device_name));
     memset(s_protocol_version, 0, sizeof(s_protocol_version));
+    s_publish_depth = 0U;
+    s_max_publish_depth = 0U;
+    s_provisioning_publish_count = 0U;
+    s_last_publish_generation = 0U;
+    s_failed_publish_generation = 0U;
+    s_next_publish_result = ESP_OK;
     (void)pthread_mutex_unlock(&s_lock);
 }
 
@@ -321,6 +334,70 @@ bool host_provisioning_transport_shape_valid(void)
     return valid;
 }
 
+void host_provisioning_reset_publish_observer(void)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    s_publish_depth = 0U;
+    s_max_publish_depth = 0U;
+    s_provisioning_publish_count = 0U;
+    s_last_publish_generation = 0U;
+    s_failed_publish_generation = 0U;
+    s_next_publish_result = ESP_OK;
+    (void)pthread_mutex_unlock(&s_lock);
+}
+
+void host_provisioning_fail_next_publish(esp_err_t result)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    s_next_publish_result = result;
+    (void)pthread_mutex_unlock(&s_lock);
+}
+
+bool host_provisioning_wait_publish_count(unsigned count, uint32_t timeout_ms)
+{
+    for (uint32_t elapsed = 0U; elapsed <= timeout_ms; ++elapsed)
+    {
+        if (host_provisioning_publish_count() >= count)
+        {
+            return true;
+        }
+        _host_sleep_ms(1U);
+    }
+    return false;
+}
+
+unsigned host_provisioning_publish_count(void)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    const unsigned count = s_provisioning_publish_count;
+    (void)pthread_mutex_unlock(&s_lock);
+    return count;
+}
+
+unsigned host_provisioning_max_publish_depth(void)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    const unsigned depth = s_max_publish_depth;
+    (void)pthread_mutex_unlock(&s_lock);
+    return depth;
+}
+
+uint64_t host_provisioning_last_publish_generation(void)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    const uint64_t generation = s_last_publish_generation;
+    (void)pthread_mutex_unlock(&s_lock);
+    return generation;
+}
+
+uint64_t host_provisioning_failed_publish_generation(void)
+{
+    (void)pthread_mutex_lock(&s_lock);
+    const uint64_t generation = s_failed_publish_generation;
+    (void)pthread_mutex_unlock(&s_lock);
+    return generation;
+}
+
 esp_err_t event_bus_init(void)
 {
     return ESP_OK;
@@ -386,7 +463,36 @@ esp_err_t event_bus_publish(event_bus_msg_id_t message_id, uint32_t subtype,
     (void)flags;
     host_subscription_t callbacks[HOST_SUBSCRIPTION_CAPACITY];
     size_t callback_count = 0U;
+    ++s_publish_depth;
     (void)pthread_mutex_lock(&s_lock);
+    if (s_publish_depth > s_max_publish_depth)
+    {
+        s_max_publish_depth = s_publish_depth;
+    }
+    esp_err_t result = ESP_OK;
+    if (message_id == PROVISIONING_SERVICE_MSG &&
+            payload != NULL &&
+            payload_size == sizeof(provisioning_service_snapshot_t))
+    {
+        const provisioning_service_snapshot_t *snapshot = payload;
+        if (s_next_publish_result != ESP_OK)
+        {
+            result = s_next_publish_result;
+            s_next_publish_result = ESP_OK;
+            s_failed_publish_generation = snapshot->generation;
+        }
+        else
+        {
+            ++s_provisioning_publish_count;
+            s_last_publish_generation = snapshot->generation;
+        }
+    }
+    if (result != ESP_OK)
+    {
+        (void)pthread_mutex_unlock(&s_lock);
+        --s_publish_depth;
+        return result;
+    }
     for (size_t index = 0U; index < HOST_SUBSCRIPTION_CAPACITY; ++index)
     {
         if (s_subscriptions[index].active &&
@@ -403,6 +509,7 @@ esp_err_t event_bus_publish(event_bus_msg_id_t message_id, uint32_t subtype,
         callbacks[index].callback(message_id, subtype, payload,
                                   payload_size, callbacks[index].user_data);
     }
+    --s_publish_depth;
     return ESP_OK;
 }
 

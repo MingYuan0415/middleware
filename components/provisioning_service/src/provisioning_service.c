@@ -49,6 +49,7 @@ typedef enum provisioning_lifecycle
 typedef enum provisioning_command_type
 {
     PROVISIONING_COMMAND_RECONCILE = 0,
+    PROVISIONING_COMMAND_PUBLISH,
     PROVISIONING_COMMAND_DEINIT,
 } provisioning_command_type_t;
 
@@ -98,6 +99,9 @@ typedef struct provisioning_service_context
     bool desired_open;
     bool desired_cancel_operation;
     bool reconcile_queued;
+    bool publish_pending;
+    bool publish_command_queued;
+    bool publish_failure_reported;
     bool finish_pending;
     bool success_pending;
     bool suspended;
@@ -198,18 +202,107 @@ static void _provisioning_service_next_snapshot_locked(
     {
         ++s_service.snapshot.generation;
     }
-    *snapshot = s_service.snapshot;
+    if (snapshot != NULL)
+    {
+        *snapshot = s_service.snapshot;
+    }
 }
 
-static void _provisioning_service_publish(
+static esp_err_t _provisioning_service_publish_now(
     const provisioning_service_snapshot_t *snapshot)
 {
-    const esp_err_t result = event_bus_publish(
-                                 PROVISIONING_SERVICE_MSG,
-                                 PROVISIONING_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT,
-                                 snapshot, sizeof(*snapshot),
-                                 EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
-    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    return event_bus_publish(
+               PROVISIONING_SERVICE_MSG,
+               PROVISIONING_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+               snapshot, sizeof(*snapshot),
+               EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
+}
+
+static void _provisioning_service_request_publish_locked(void)
+{
+    s_service.publish_pending = true;
+    if (s_service.publish_command_queued)
+    {
+        return;
+    }
+    const provisioning_command_t command =
+    {
+        .type = PROVISIONING_COMMAND_PUBLISH,
+    };
+    if (xQueueSend(s_service.queue, &command, 0U) == pdTRUE)
+    {
+        s_service.publish_command_queued = true;
+    }
+}
+
+static void _provisioning_service_flush_pending_publish(void)
+{
+    provisioning_service_snapshot_t snapshot;
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    const bool pending = s_service.publish_pending;
+    if (pending)
+    {
+        snapshot = s_service.snapshot;
+    }
+    xSemaphoreGive(s_service.mutex);
+    if (!pending)
+    {
+        return;
+    }
+
+    const esp_err_t result = _provisioning_service_publish_now(&snapshot);
+    bool report_failure = false;
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (result == ESP_OK)
+    {
+        if (s_service.snapshot.generation == snapshot.generation)
+        {
+            s_service.publish_pending = false;
+        }
+        s_service.publish_failure_reported = false;
+    }
+    else if (result != ESP_ERR_INVALID_STATE &&
+             !s_service.publish_failure_reported)
+    {
+        s_service.publish_failure_reported = true;
+        report_failure = true;
+    }
+    xSemaphoreGive(s_service.mutex);
+    if (report_failure)
+    {
+        LOG_W("status publish failed: %s", esp_err_to_name(result));
+    }
+}
+
+static void _provisioning_service_worker_publish(
+    const provisioning_service_snapshot_t *snapshot)
+{
+    const esp_err_t result = _provisioning_service_publish_now(snapshot);
+    bool report_failure = false;
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (result == ESP_OK)
+    {
+        if (s_service.snapshot.generation == snapshot->generation)
+        {
+            s_service.publish_pending = false;
+        }
+        s_service.publish_failure_reported = false;
+    }
+    else
+    {
+        if (s_service.snapshot.generation == snapshot->generation)
+        {
+            s_service.publish_pending = true;
+        }
+        if (result != ESP_ERR_INVALID_STATE &&
+                !s_service.publish_failure_reported)
+        {
+            s_service.publish_failure_reported = true;
+            report_failure = true;
+        }
+    }
+    xSemaphoreGive(s_service.mutex);
+    if (report_failure)
     {
         LOG_W("status publish failed: %s", esp_err_to_name(result));
     }
@@ -333,7 +426,6 @@ static esp_err_t _provisioning_service_endpoint(
     esp_err_t result = ESP_ERR_INVALID_STATE;
     uint8_t *packed = NULL;
     size_t packed_size = 0U;
-    bool publish = false;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.transport_accepting)
@@ -353,9 +445,8 @@ static esp_err_t _provisioning_service_endpoint(
                                                 s_service.config.finish_close_delay_ms);
             }
             _provisioning_service_sync_operation_locked();
-            provisioning_service_snapshot_t snapshot;
-            _provisioning_service_next_snapshot_locked(&snapshot);
-            publish = true;
+            _provisioning_service_next_snapshot_locked(NULL);
+            _provisioning_service_request_publish_locked();
         }
     }
     xSemaphoreGive(s_service.mutex);
@@ -371,14 +462,6 @@ static esp_err_t _provisioning_service_endpoint(
         free(packed);
         *output = NULL;
         *output_length = 0;
-    }
-    if (publish)
-    {
-        provisioning_service_snapshot_t snapshot;
-        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        snapshot = s_service.snapshot;
-        xSemaphoreGive(s_service.mutex);
-        _provisioning_service_publish(&snapshot);
     }
     atomic_fetch_sub_explicit(&s_transport_users, 1U,
                               memory_order_release);
@@ -553,7 +636,7 @@ static esp_err_t _provisioning_service_worker_start(void)
     s_service.snapshot.qr_ready = false;
     _provisioning_service_next_snapshot_locked(&snapshot);
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
+    _provisioning_service_worker_publish(&snapshot);
 
     const esp_err_t result = _provisioning_service_transport_start();
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
@@ -582,7 +665,7 @@ static esp_err_t _provisioning_service_worker_start(void)
     }
     _provisioning_service_next_snapshot_locked(&snapshot);
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
+    _provisioning_service_worker_publish(&snapshot);
     return result;
 }
 
@@ -611,7 +694,7 @@ static esp_err_t _provisioning_service_worker_stop(bool cancel_operation)
     }
     _provisioning_service_next_snapshot_locked(&snapshot);
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
+    _provisioning_service_worker_publish(&snapshot);
 
     if (operation_id != 0U)
     {
@@ -636,7 +719,7 @@ static esp_err_t _provisioning_service_worker_stop(bool cancel_operation)
     _provisioning_service_next_snapshot_locked(&snapshot);
     xSemaphoreGive(s_service.mutex);
     atomic_store_explicit(&s_active, remain_active, memory_order_release);
-    _provisioning_service_publish(&snapshot);
+    _provisioning_service_worker_publish(&snapshot);
     if (result != ESP_OK)
     {
         LOG_W("window stop failed: %s", esp_err_to_name(result));
@@ -738,7 +821,7 @@ static void _provisioning_service_worker_tick(void)
     xSemaphoreGive(s_service.mutex);
     if (publish)
     {
-        _provisioning_service_publish(&snapshot);
+        _provisioning_service_worker_publish(&snapshot);
     }
     if (finish || success || timeout)
     {
@@ -769,12 +852,20 @@ static void _provisioning_service_worker(void *argument)
             case PROVISIONING_COMMAND_RECONCILE:
                 _provisioning_service_worker_reconcile();
                 break;
+            case PROVISIONING_COMMAND_PUBLISH:
+                xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+                s_service.publish_command_queued = false;
+                xSemaphoreGive(s_service.mutex);
+                break;
             case PROVISIONING_COMMAND_DEINIT:
             {
                 xSemaphoreTake(s_service.mutex, portMAX_DELAY);
                 s_service.desired_open = false;
                 s_service.desired_cancel_operation = true;
                 s_service.reconcile_queued = false;
+                s_service.publish_pending = false;
+                s_service.publish_command_queued = false;
+                s_service.publish_failure_reported = false;
                 xSemaphoreGive(s_service.mutex);
                 const esp_err_t result =
                     _provisioning_service_worker_stop(true);
@@ -793,7 +884,9 @@ static void _provisioning_service_worker(void *argument)
         }
         if (running)
         {
+            _provisioning_service_flush_pending_publish();
             _provisioning_service_worker_tick();
+            _provisioning_service_flush_pending_publish();
         }
     }
     vTaskSuspend(NULL);
@@ -811,8 +904,6 @@ static void _provisioning_service_ble_event(
     {
         return;
     }
-    provisioning_service_snapshot_t snapshot;
-    bool publish = false;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.transport_accepting)
     {
@@ -820,24 +911,18 @@ static void _provisioning_service_ble_event(
         {
             s_service.snapshot.client_connected = true;
             s_service.snapshot.state = PROVISIONING_SERVICE_STATE_CONNECTED;
-            publish = true;
+            _provisioning_service_next_snapshot_locked(NULL);
+            _provisioning_service_request_publish_locked();
         }
         else if (event_id == PROTOCOMM_TRANSPORT_BLE_DISCONNECTED)
         {
             s_service.snapshot.client_connected = false;
             s_service.snapshot.state = PROVISIONING_SERVICE_STATE_ADVERTISING;
-            publish = true;
-        }
-        if (publish)
-        {
-            _provisioning_service_next_snapshot_locked(&snapshot);
+            _provisioning_service_next_snapshot_locked(NULL);
+            _provisioning_service_request_publish_locked();
         }
     }
     xSemaphoreGive(s_service.mutex);
-    if (publish)
-    {
-        _provisioning_service_publish(&snapshot);
-    }
     _provisioning_service_api_release();
 }
 
@@ -854,11 +939,9 @@ static void _provisioning_service_connectivity_status(
     {
         return;
     }
-    connectivity_manager_status_snapshot_t status;
-    memcpy(&status, payload, sizeof(status));
-    provisioning_service_snapshot_t snapshot;
+    const connectivity_manager_status_snapshot_t *status = payload;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (provisioning_protocol_ingest_status(&s_service.protocol, &status) &&
+    if (provisioning_protocol_ingest_status(&s_service.protocol, status) &&
             s_service.transport_started)
     {
         s_service.success_pending = true;
@@ -867,9 +950,9 @@ static void _provisioning_service_connectivity_status(
                                          s_service.config.success_grace_ms);
     }
     _provisioning_service_sync_operation_locked();
-    _provisioning_service_next_snapshot_locked(&snapshot);
+    _provisioning_service_next_snapshot_locked(NULL);
+    _provisioning_service_request_publish_locked();
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
     _provisioning_service_api_release();
 }
 
@@ -886,15 +969,13 @@ static void _provisioning_service_connectivity_scan(
     {
         return;
     }
-    connectivity_manager_scan_snapshot_t scan;
-    memcpy(&scan, payload, sizeof(scan));
-    provisioning_service_snapshot_t snapshot;
+    const connectivity_manager_scan_snapshot_t *scan = payload;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    provisioning_protocol_ingest_scan(&s_service.protocol, &scan);
+    provisioning_protocol_ingest_scan(&s_service.protocol, scan);
     _provisioning_service_sync_operation_locked();
-    _provisioning_service_next_snapshot_locked(&snapshot);
+    _provisioning_service_next_snapshot_locked(NULL);
+    _provisioning_service_request_publish_locked();
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
     _provisioning_service_api_release();
 }
 
@@ -911,7 +992,6 @@ static void _provisioning_service_refresh_connectivity(void)
         return;
     }
 
-    provisioning_service_snapshot_t snapshot;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (status_result == ESP_OK)
     {
@@ -923,9 +1003,9 @@ static void _provisioning_service_refresh_connectivity(void)
         provisioning_protocol_ingest_scan(&s_service.protocol, &scan);
     }
     _provisioning_service_sync_operation_locked();
-    _provisioning_service_next_snapshot_locked(&snapshot);
+    _provisioning_service_next_snapshot_locked(NULL);
+    _provisioning_service_request_publish_locked();
     xSemaphoreGive(s_service.mutex);
-    _provisioning_service_publish(&snapshot);
 }
 
 static bool _provisioning_service_config_valid(
@@ -1177,6 +1257,11 @@ esp_err_t provisioning_service_deinit(uint32_t timeout_ms)
     {
         return result;
     }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    s_service.publish_pending = false;
+    s_service.publish_command_queued = false;
+    s_service.publish_failure_reported = false;
+    xSemaphoreGive(s_service.mutex);
     if (s_service.ble_event_registered)
     {
         const esp_err_t unregister_result =
@@ -1299,8 +1384,6 @@ esp_err_t provisioning_service_suspend(uint32_t timeout_ms)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    provisioning_service_snapshot_t snapshot;
-    bool publish = false;
     esp_err_t result = ESP_OK;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.transport_faulted)
@@ -1315,14 +1398,10 @@ esp_err_t provisioning_service_suspend(uint32_t timeout_ms)
     {
         s_service.suspended = true;
         s_service.snapshot.state = PROVISIONING_SERVICE_STATE_SUSPENDED;
-        _provisioning_service_next_snapshot_locked(&snapshot);
-        publish = true;
+        _provisioning_service_next_snapshot_locked(NULL);
+        _provisioning_service_request_publish_locked();
     }
     xSemaphoreGive(s_service.mutex);
-    if (publish)
-    {
-        _provisioning_service_publish(&snapshot);
-    }
     _provisioning_service_api_release();
     return result;
 }
@@ -1334,8 +1413,6 @@ esp_err_t provisioning_service_resume(uint32_t timeout_ms)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    provisioning_service_snapshot_t snapshot;
-    bool publish = false;
     esp_err_t result = ESP_OK;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.transport_faulted)
@@ -1346,14 +1423,10 @@ esp_err_t provisioning_service_resume(uint32_t timeout_ms)
     {
         s_service.suspended = false;
         s_service.snapshot.state = PROVISIONING_SERVICE_STATE_IDLE;
-        _provisioning_service_next_snapshot_locked(&snapshot);
-        publish = true;
+        _provisioning_service_next_snapshot_locked(NULL);
+        _provisioning_service_request_publish_locked();
     }
     xSemaphoreGive(s_service.mutex);
-    if (publish)
-    {
-        _provisioning_service_publish(&snapshot);
-    }
     _provisioning_service_api_release();
     return result;
 }

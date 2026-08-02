@@ -165,7 +165,9 @@ esp_err_t event_bus_unsubscribe(event_bus_sub_handle_t handle);
  *
  * Task-only; not ISR-safe. Publisher callbacks execute before return and
  * receive the caller's payload. UI callbacks receive one shared, aligned,
- * immutable payload copy. If at least one matching UI subscriber exists,
+ * immutable payload copy. Publisher callbacks must remain bounded and must
+ * not publish another event synchronously; hand follow-up publication to the
+ * state owner's worker. If at least one matching UI subscriber exists,
  * payload_size must not exceed EVENT_BUS_MAX_UI_PAYLOAD_SIZE. payload may be
  * NULL only when payload_size is zero. EVENT_BUS_PUBLISH_FLAG_UI_LATEST
  * coalesces matching

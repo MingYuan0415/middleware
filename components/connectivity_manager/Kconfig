@@ -2,8 +2,8 @@ menu "MicroTech connectivity manager"
 
 config CONNECTIVITY_MANAGER_TASK_STACK
     int "Connectivity policy worker stack depth"
-    default 4096
-    range 3072 8192
+    default 6144
+    range 4096 8192
 
 config CONNECTIVITY_MANAGER_QUEUE_DEPTH
     int "Connectivity policy command queue depth"

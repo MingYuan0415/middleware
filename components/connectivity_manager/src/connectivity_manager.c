@@ -152,6 +152,8 @@ typedef struct manager_worker
     manager_command_t pending_command;
     TickType_t retry_deadline;
     uint8_t retry_count;
+    UBaseType_t reported_stack_minimum_free;
+    bool stack_minimum_reported;
     connectivity_manager_status_snapshot_t status;
     connectivity_manager_scan_snapshot_t scan;
 } manager_worker_t;
@@ -586,6 +588,18 @@ static void _manager_queue_terminal(const manager_terminal_event_t *event)
     ++s_manager.terminal_outbox_count;
 }
 
+static void _manager_report_stack_minimum_free(manager_worker_t *worker)
+{
+    const UBaseType_t minimum_free = uxTaskGetStackHighWaterMark(NULL);
+    if (!worker->stack_minimum_reported ||
+            minimum_free < worker->reported_stack_minimum_free)
+    {
+        worker->reported_stack_minimum_free = minimum_free;
+        worker->stack_minimum_reported = true;
+        LOG_I("stack minimum free=%u bytes", (unsigned)minimum_free);
+    }
+}
+
 static void _manager_publish_status(
     manager_worker_t *worker,
     const connectivity_manager_status_snapshot_t *snapshot, uint32_t flags)
@@ -643,6 +657,7 @@ static void _manager_publish_status_terminal(
         LOG_W("terminal status deferred: %d", (int)publish_result);
         _manager_queue_terminal(&event);
     }
+    _manager_report_stack_minimum_free(worker);
 }
 
 static void _manager_publish_scan(
@@ -684,11 +699,16 @@ static void _manager_cache_scan(manager_worker_t *worker)
             LOG_W("terminal scan deferred: %d", (int)result);
             _manager_queue_terminal(&event);
         }
+        _manager_report_stack_minimum_free(worker);
         return;
     }
     _manager_publish_scan(worker, &worker->scan,
                           worker->scan.running ?
                           EVENT_BUS_PUBLISH_FLAG_UI_LATEST : 0U);
+    if (!worker->stack_minimum_reported)
+    {
+        _manager_report_stack_minimum_free(worker);
+    }
 }
 
 static void _manager_publish_scan_terminal(
@@ -716,6 +736,7 @@ static void _manager_publish_scan_terminal(
         LOG_W("terminal scan deferred: %d", (int)publish_result);
         _manager_queue_terminal(&event);
     }
+    _manager_report_stack_minimum_free(worker);
 }
 
 static connectivity_manager_failure_t _manager_map_failure(
