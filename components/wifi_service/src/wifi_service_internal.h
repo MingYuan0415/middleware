@@ -23,6 +23,12 @@
 #ifndef WIFI_SERVICE_RETRY_DELAY_3_MS
     #define WIFI_SERVICE_RETRY_DELAY_3_MS 4000U
 #endif
+#ifndef WIFI_SERVICE_ASSOCIATION_TIMEOUT_MS
+    #define WIFI_SERVICE_ASSOCIATION_TIMEOUT_MS 15000U
+#endif
+#ifndef WIFI_SERVICE_DHCP_TIMEOUT_MS
+    #define WIFI_SERVICE_DHCP_TIMEOUT_MS 15000U
+#endif
 
 #define WIFI_SERVICE_CREDENTIAL_SLOTS 2U
 #define WIFI_SERVICE_RETRY_LIMIT      3U
@@ -125,6 +131,8 @@ typedef struct wifi_worker_context
     wifi_service_state_t pre_scan_state;
     bool retry_pending;
     TickType_t retry_deadline;
+    bool phase_deadline_pending;
+    TickType_t phase_deadline;
     wifi_operation_kind_t operation_kind;
     wifi_service_session_id_t operation_session;
     wifi_service_operation_id_t operation_id;
@@ -297,7 +305,15 @@ esp_err_t wifi_service_worker_connect_driver(wifi_worker_context_t *context);
  * @param error is the driver operation result.
  */
 void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
-                                        uint16_t reason, esp_err_t error);
+                                        uint16_t reason, esp_err_t error,
+                                        wifi_service_failure_t failure);
+
+/**
+ * @brief Terminate an expired association or DHCP phase.
+ * @param context is the worker-owned runtime state.
+ */
+void wifi_service_worker_check_phase_deadline(
+    wifi_worker_context_t *context);
 
 /**
  * @brief Cancel an operation invalidated by session or cancel state.

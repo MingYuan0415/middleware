@@ -25,6 +25,7 @@
 #define TIME_SERVICE_NOTIFY_STOP         BIT1
 #define TIME_SERVICE_NOTIFY_PAUSE        BIT2
 #define TIME_SERVICE_NOTIFY_RESUME       BIT3
+#define TIME_SERVICE_NOTIFY_NETWORK      (UINT32_C(1) << 4)
 #define TIME_SERVICE_LEGACY_TIMEOUT_MS  30000U
 #define TIME_SERVICE_ALARM_POLL_MS       100U
 
@@ -68,6 +69,7 @@ static atomic_uint_fast32_t s_active_generation;
 static atomic_uint_fast32_t s_notified_generation;
 static atomic_uint s_callback_active;
 static atomic_bool s_callback_enabled;
+static atomic_bool s_network_ready = ATOMIC_VAR_INIT(false);
 static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
 static atomic_bool s_rtc_io_admitted = ATOMIC_VAR_INIT(false);
 static time_service_sleep_state_t s_sleep_state = TIME_SERVICE_SLEEP_STOPPED;
@@ -76,6 +78,9 @@ static bool s_alarm_event_pending;
 static time_service_alarm_event_t s_pending_alarm_event;
 static uint32_t s_alarm_sequence;
 static esp_err_t s_alarm_worker_error = ESP_OK;
+
+static esp_err_t _cancel_active_sync(void);
+static esp_err_t _request_sync(bool restart_existing);
 
 static bool _rtc_available(void)
 {
@@ -393,6 +398,7 @@ static bool _worker_pause(uint32_t *notifications)
     {
         *notifications &= ~(TIME_SERVICE_NOTIFY_PAUSE |
                             TIME_SERVICE_NOTIFY_RESUME);
+        *notifications |= TIME_SERVICE_NOTIFY_NETWORK;
         _worker_set_running();
         return false;
     }
@@ -412,9 +418,22 @@ static bool _worker_pause(uint32_t *notifications)
         if ((*notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
         {
             *notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
+            *notifications |= TIME_SERVICE_NOTIFY_NETWORK;
             _worker_set_running();
             return false;
         }
+    }
+}
+
+static void _worker_apply_network_ready(void)
+{
+    const bool ready = atomic_load_explicit(&s_network_ready,
+                                            memory_order_acquire);
+    esp_err_t result = ready ? _request_sync(false) :
+                       time_service_cancel_sync();
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        LOG_W("network SNTP transition failed: 0x%x", result);
     }
 }
 
@@ -439,12 +458,18 @@ static void _sync_worker(void *context)
         if ((notifications & TIME_SERVICE_NOTIFY_RESUME) != 0U)
         {
             notifications &= ~TIME_SERVICE_NOTIFY_RESUME;
+            notifications |= TIME_SERVICE_NOTIFY_NETWORK;
             _worker_set_running();
         }
         if ((notifications & TIME_SERVICE_NOTIFY_SYNC) != 0U &&
                 _process_sync_notification())
         {
             notifications &= ~TIME_SERVICE_NOTIFY_SYNC;
+        }
+        if ((notifications & TIME_SERVICE_NOTIFY_NETWORK) != 0U)
+        {
+            notifications &= ~TIME_SERVICE_NOTIFY_NETWORK;
+            _worker_apply_network_ready();
         }
 
         const esp_err_t alarm_result = _poll_rtc_alarm();
@@ -637,6 +662,7 @@ static void _activate_time_service(void)
     atomic_store(&s_notified_generation, 0U);
     atomic_store(&s_callback_active, 0U);
     atomic_store(&s_callback_enabled, false);
+    atomic_store_explicit(&s_network_ready, false, memory_order_release);
     s_completed_generation = 0;
     s_completed_result = ESP_ERR_INVALID_STATE;
     s_sync_pending = false;
@@ -874,10 +900,17 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
                                  pdTRUE, _deadline_remaining(&deadline));
     if ((bits & TIME_SERVICE_WORKER_PAUSED_BIT) != 0U)
     {
+        result = _cancel_active_sync();
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        s_sleep_state = TIME_SERVICE_SLEEP_SUSPENDED;
+        s_sleep_state = result == ESP_OK ?
+                        TIME_SERVICE_SLEEP_SUSPENDED :
+                        TIME_SERVICE_SLEEP_RESUME_PENDING;
         xSemaphoreGive(s_state_mutex);
-        result = ESP_OK;
+        if (result != ESP_OK)
+        {
+            xEventGroupClearBits(events, TIME_SERVICE_WORKER_RUNNING_BIT);
+            (void)xTaskNotify(worker, TIME_SERVICE_NOTIFY_RESUME, eSetBits);
+        }
         goto exit;
     }
 
@@ -1272,7 +1305,18 @@ exit:
     return result;
 }
 
-esp_err_t time_service_request_sync(void)
+esp_err_t time_service_set_network_ready(bool ready)
+{
+    if (!s_initialized || s_stopping || s_sync_worker == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    atomic_store_explicit(&s_network_ready, ready, memory_order_release);
+    return xTaskNotify(s_sync_worker, TIME_SERVICE_NOTIFY_NETWORK,
+                       eSetBits) == pdPASS ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t _request_sync(bool restart_existing)
 {
     esp_err_t result = ESP_ERR_INVALID_STATE;
     bool control_owned = false;
@@ -1287,7 +1331,8 @@ esp_err_t time_service_request_sync(void)
     control_owned = true;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     state_owned = true;
-    if (s_stopping || !_rtc_io_allowed() || s_sync_pending)
+    if (s_stopping || !_rtc_io_allowed() ||
+            !atomic_load_explicit(&s_network_ready, memory_order_acquire))
     {
         goto exit;
     }
@@ -1298,6 +1343,25 @@ esp_err_t time_service_request_sync(void)
         {
             goto exit;
         }
+    }
+    if (!restart_existing && s_ntp_initialized)
+    {
+        result = ESP_OK;
+        goto exit;
+    }
+    if (s_sync_pending)
+    {
+        if (restart_existing && s_ntp_initialized)
+        {
+            result = time_service_port_sntp_restart();
+            if (result != ESP_OK)
+            {
+                (void)_stop_sntp_locked();
+                _complete_generation_locked(
+                    (uint32_t)atomic_load(&s_active_generation), result);
+            }
+        }
+        goto exit;
     }
     const uint32_t generation = _next_generation_locked();
     s_sync_pending = true;
@@ -1344,6 +1408,11 @@ exit:
         xSemaphoreGive(s_control_mutex);
     }
     return result;
+}
+
+esp_err_t time_service_request_sync(void)
+{
+    return _request_sync(true);
 }
 
 esp_err_t time_service_cancel_sync(void)

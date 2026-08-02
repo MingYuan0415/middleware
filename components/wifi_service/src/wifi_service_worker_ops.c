@@ -276,8 +276,10 @@ void wifi_service_worker_enter_cleanup_pending(
     context->radio_ready = false;
     context->suspended = false;
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     context->status.desired_connected = false;
     context->status.state = WIFI_SERVICE_STATE_OFFLINE;
+    context->status.failure = WIFI_SERVICE_FAILURE_DRIVER;
     context->status.last_error = error;
     context->status.available = false;
     context->status.ipv4_address = 0;
@@ -477,7 +479,12 @@ static void _wifi_service_set_status_idle(
     wifi_service_operation_id_t operation_id)
 {
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     context->status.state = WIFI_SERVICE_STATE_IDLE;
+    if (result == ESP_OK)
+    {
+        context->status.failure = WIFI_SERVICE_FAILURE_NONE;
+    }
     context->status.last_error = result;
     context->status.ipv4_address = 0;
     context->status.retry_count = 0;
@@ -502,7 +509,12 @@ esp_err_t wifi_service_worker_connect_driver(
     if (result == ESP_OK)
     {
         context->retry_pending = false;
+        context->phase_deadline = xTaskGetTickCount() +
+                                  pdMS_TO_TICKS(
+                                      WIFI_SERVICE_ASSOCIATION_TIMEOUT_MS);
+        context->phase_deadline_pending = true;
         context->status.state = WIFI_SERVICE_STATE_CONNECTING;
+        context->status.failure = WIFI_SERVICE_FAILURE_NONE;
         context->status.last_error = ESP_OK;
         context->status.ipv4_address = 0;
         wifi_service_worker_publish_status(context);
@@ -512,7 +524,8 @@ esp_err_t wifi_service_worker_connect_driver(
 
 void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
                                         uint16_t reason,
-                                        esp_err_t error)
+                                        esp_err_t error,
+                                        wifi_service_failure_t failure)
 {
     static const uint32_t delays[WIFI_SERVICE_RETRY_LIMIT] =
     {
@@ -523,8 +536,11 @@ void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
     context->status.disconnect_reason = reason;
     context->status.ipv4_address = 0;
     context->status.last_error = error;
+    context->status.failure = failure;
+    context->phase_deadline_pending = false;
     if (!context->status.desired_connected ||
             !context->has_credentials ||
+            failure == WIFI_SERVICE_FAILURE_AUTHENTICATION ||
             context->status.retry_count >= WIFI_SERVICE_RETRY_LIMIT)
     {
         context->status.desired_connected = false;
@@ -558,6 +574,38 @@ void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
     context->retry_pending = true;
     context->status.state = WIFI_SERVICE_STATE_RETRY_WAIT;
     wifi_service_worker_publish_status(context);
+}
+
+void wifi_service_worker_check_phase_deadline(
+    wifi_worker_context_t *context)
+{
+    if (context->suspended || !context->phase_deadline_pending ||
+            !wifi_service_worker_tick_reached(xTaskGetTickCount(),
+                    context->phase_deadline))
+    {
+        return;
+    }
+
+    const wifi_service_failure_t failure =
+        context->status.state == WIFI_SERVICE_STATE_WAITING_IP ?
+        WIFI_SERVICE_FAILURE_DHCP_TIMEOUT :
+        WIFI_SERVICE_FAILURE_ASSOCIATION_TIMEOUT;
+    if (context->status.state != WIFI_SERVICE_STATE_CONNECTING &&
+            context->status.state != WIFI_SERVICE_STATE_WAITING_IP)
+    {
+        context->phase_deadline_pending = false;
+        return;
+    }
+
+    context->phase_deadline_pending = false;
+    esp_err_t result = wifi_service_worker_restart_radio(context);
+    if (context->status.available && context->radio_ready &&
+            context->status.desired_connected)
+    {
+        wifi_service_worker_schedule_retry(
+            context, 0, result == ESP_OK ? ESP_ERR_TIMEOUT : result,
+            result == ESP_OK ? failure : WIFI_SERVICE_FAILURE_DRIVER);
+    }
 }
 
 static void _wifi_service_finish_scan(wifi_worker_context_t *context,
@@ -625,7 +673,8 @@ static void _wifi_service_finish_scan(wifi_worker_context_t *context,
         esp_err_t reconnect_result = wifi_service_worker_connect_driver(context);
         if (reconnect_result != ESP_OK)
         {
-            wifi_service_worker_schedule_retry(context, 0, reconnect_result);
+            wifi_service_worker_schedule_retry(
+                context, 0, reconnect_result, WIFI_SERVICE_FAILURE_DRIVER);
         }
     }
     else if (context->status.state == WIFI_SERVICE_STATE_SCANNING)
@@ -685,7 +734,8 @@ static void _wifi_service_cancel_scan(wifi_worker_context_t *context,
         esp_err_t reconnect_result = wifi_service_worker_connect_driver(context);
         if (reconnect_result != ESP_OK)
         {
-            wifi_service_worker_schedule_retry(context, 0, reconnect_result);
+            wifi_service_worker_schedule_retry(
+                context, 0, reconnect_result, WIFI_SERVICE_FAILURE_DRIVER);
         }
     }
 }
@@ -694,6 +744,7 @@ static void _wifi_service_cancel_connect(wifi_worker_context_t *context,
         esp_err_t reason)
 {
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     context->status.desired_connected = false;
     if (context->suspended || !context->radio_ready)
     {
@@ -845,6 +896,7 @@ static void _wifi_service_begin_connect(wifi_worker_context_t *context,
     context->status.operation_id = item->operation_id;
     context->status.desired_connected = true;
     context->status.disconnect_reason = 0;
+    context->status.failure = WIFI_SERVICE_FAILURE_NONE;
     context->status.retry_count = 0;
     _wifi_service_copy_ssid(context->status.ssid,
                             context->credentials.ssid,
@@ -855,7 +907,8 @@ static void _wifi_service_begin_connect(wifi_worker_context_t *context,
     result = wifi_service_worker_connect_driver(context);
     if (result != ESP_OK)
     {
-        wifi_service_worker_schedule_retry(context, 0, result);
+        wifi_service_worker_schedule_retry(
+            context, 0, result, WIFI_SERVICE_FAILURE_DRIVER);
     }
 
 exit:
@@ -883,6 +936,7 @@ static void _wifi_service_begin_disconnect(wifi_worker_context_t *context,
     }
     context->status.desired_connected = false;
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     (void)wifi_service_port_disconnect();
     esp_err_t clear_result = wifi_service_port_clear_credentials();
     esp_err_t result = wifi_service_worker_restart_radio(context);
@@ -954,6 +1008,9 @@ static void _wifi_service_process_connected(wifi_worker_context_t *context)
             context->status.state == WIFI_SERVICE_STATE_CONNECTING)
     {
         context->status.state = WIFI_SERVICE_STATE_WAITING_IP;
+        context->phase_deadline = xTaskGetTickCount() +
+                                  pdMS_TO_TICKS(WIFI_SERVICE_DHCP_TIMEOUT_MS);
+        context->phase_deadline_pending = true;
         context->status.last_error = ESP_OK;
         wifi_service_worker_publish_status(context);
     }
@@ -981,7 +1038,9 @@ static void _wifi_service_process_got_ip(
         }
     }
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     context->status.state = WIFI_SERVICE_STATE_IP_READY;
+    context->status.failure = WIFI_SERVICE_FAILURE_NONE;
     context->status.last_error = ESP_OK;
     context->status.ipv4_address = event->ipv4_address;
     context->status.retry_count = 0;
@@ -1005,17 +1064,23 @@ static void _wifi_service_process_link_loss(
         }
         esp_err_t retry_error = event->status != 0 ? event->status : ESP_FAIL;
         uint16_t reason = event->disconnect_reason;
+        wifi_service_failure_t failure = event->failure ==
+                                         WIFI_SERVICE_FAILURE_NONE ?
+                                         WIFI_SERVICE_FAILURE_LINK_LOST :
+                                         event->failure;
         if (restart_radio)
         {
             esp_err_t restart_result =
                 wifi_service_worker_restart_radio(context);
             retry_error = restart_result == ESP_OK ? ESP_FAIL : restart_result;
             reason = 0;
+            failure = WIFI_SERVICE_FAILURE_LINK_LOST;
         }
         if (context->status.available && context->radio_ready &&
                 context->status.desired_connected)
         {
-            wifi_service_worker_schedule_retry(context, reason, retry_error);
+            wifi_service_worker_schedule_retry(context, reason, retry_error,
+                                               failure);
         }
     }
 }

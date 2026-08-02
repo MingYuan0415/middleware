@@ -12,6 +12,9 @@ typedef struct host_time_port_state
     bool invoke_callback_on_stop;
     bool running;
     esp_err_t stop_result;
+    unsigned start_count;
+    unsigned restart_count;
+    unsigned stop_count;
 } host_time_port_state_t;
 
 static host_time_port_state_t s_port =
@@ -27,6 +30,9 @@ void host_time_port_reset(void)
     s_port.invoke_callback_on_stop = false;
     s_port.running = false;
     s_port.stop_result = ESP_OK;
+    s_port.start_count = 0U;
+    s_port.restart_count = 0U;
+    s_port.stop_count = 0U;
     (void)pthread_mutex_unlock(&s_port.lock);
 }
 
@@ -62,6 +68,38 @@ bool host_time_port_complete(int64_t epoch)
     return callback != NULL;
 }
 
+bool host_time_port_is_running(void)
+{
+    (void)pthread_mutex_lock(&s_port.lock);
+    const bool running = s_port.running;
+    (void)pthread_mutex_unlock(&s_port.lock);
+    return running;
+}
+
+unsigned host_time_port_start_count(void)
+{
+    (void)pthread_mutex_lock(&s_port.lock);
+    const unsigned count = s_port.start_count;
+    (void)pthread_mutex_unlock(&s_port.lock);
+    return count;
+}
+
+unsigned host_time_port_restart_count(void)
+{
+    (void)pthread_mutex_lock(&s_port.lock);
+    const unsigned count = s_port.restart_count;
+    (void)pthread_mutex_unlock(&s_port.lock);
+    return count;
+}
+
+unsigned host_time_port_stop_count(void)
+{
+    (void)pthread_mutex_lock(&s_port.lock);
+    const unsigned count = s_port.stop_count;
+    (void)pthread_mutex_unlock(&s_port.lock);
+    return count;
+}
+
 esp_err_t time_service_port_clock_set(int64_t epoch)
 {
     (void)pthread_mutex_lock(&s_port.lock);
@@ -90,6 +128,7 @@ esp_err_t time_service_port_sntp_start(const char *server,
         return ESP_ERR_INVALID_ARG;
     }
     (void)pthread_mutex_lock(&s_port.lock);
+    ++s_port.start_count;
     s_port.callback = callback;
     s_port.running = true;
     (void)pthread_mutex_unlock(&s_port.lock);
@@ -100,6 +139,7 @@ esp_err_t time_service_port_sntp_restart(void)
 {
     esp_err_t result = ESP_ERR_INVALID_STATE;
     (void)pthread_mutex_lock(&s_port.lock);
+    ++s_port.restart_count;
     if (s_port.callback != NULL)
     {
         s_port.running = true;
@@ -112,6 +152,7 @@ esp_err_t time_service_port_sntp_restart(void)
 esp_err_t time_service_port_sntp_stop(void)
 {
     (void)pthread_mutex_lock(&s_port.lock);
+    ++s_port.stop_count;
     time_service_port_sync_cb_t callback = s_port.invoke_callback_on_stop ?
                                            s_port.callback : NULL;
     const esp_err_t result = s_port.stop_result;

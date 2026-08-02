@@ -47,6 +47,18 @@ typedef enum
     WIFI_SERVICE_STATE_SUSPENDED,
 } wifi_service_state_t;
 
+/** @brief Classified connection failure reported by the radio executor. */
+typedef enum
+{
+    WIFI_SERVICE_FAILURE_NONE = 0,
+    WIFI_SERVICE_FAILURE_AUTHENTICATION,
+    WIFI_SERVICE_FAILURE_AP_NOT_FOUND,
+    WIFI_SERVICE_FAILURE_ASSOCIATION_TIMEOUT,
+    WIFI_SERVICE_FAILURE_DHCP_TIMEOUT,
+    WIFI_SERVICE_FAILURE_LINK_LOST,
+    WIFI_SERVICE_FAILURE_DRIVER,
+} wifi_service_failure_t;
+
 /** @brief Public scan state reported in scan snapshots. */
 typedef enum
 {
@@ -99,6 +111,7 @@ typedef struct wifi_service_status_snapshot
     wifi_service_session_id_t session_id;      /**< Related session or zero. */
     wifi_service_operation_id_t operation_id;  /**< Related operation or zero. */
     wifi_service_state_t state;                /**< Current connection state. */
+    wifi_service_failure_t failure;            /**< Classified last failure. */
     int32_t last_error;                        /**< Last ESP-IDF error value. */
     uint32_t ipv4_address;                     /**< Network-order IPv4 address. */
     uint16_t disconnect_reason;                /**< Last driver reason code. */
@@ -284,6 +297,15 @@ esp_err_t wifi_service_resume(uint32_t timeout_ms);
  * @param size is the number of bytes to clear.
  */
 void wifi_service_secure_zero(void *memory, size_t size);
+
+#ifdef WIFI_SERVICE_TESTING
+/**
+ * @brief Report whether all internal credential storage is zeroed.
+ *
+ * @return true when queued slots and worker credentials contain only zero.
+ */
+bool wifi_service_test_credentials_are_zero(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -14,8 +14,9 @@
 | `audio_service` | 管理 BSP ES8311/NS4150B 全双工 PCM、音量、静音和 PA 生命周期 | `bsp`；`freertos`、`mt_log`（私有） |
 | `sd_storage_service` | 通过板级 mount adapter 管理可移除存储生命周期，不绑定 SDSPI/SDMMC 实现 | `freertos`、`mt_log`（私有） |
 | `system_pm` | 串行执行外设休眠钩子、ESP32 轻睡眠与唤醒恢复，并管理 CPU 最高频率锁 | `mt_log` 和 ESP-IDF PM/GPIO/硬件支持组件（私有） |
-| `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
-| `wifi_service` | 以常驻 worker 串行处理扫描、连接、断开、挂起和恢复，发布缓存快照 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
+| `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
+| `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
+| `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `ble_service` | BLE 生命周期占位实现；初始化可用，启用、禁用和扫描当前返回 `ESP_ERR_NOT_SUPPORTED` | `event_bus` |
 
 ## 目录结构
@@ -35,10 +36,10 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 消费组件通过 `REQUIRES` 或 `PRIV_REQUIRES` 声明所需服务，例如：
 
 ```cmake
-idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
+idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 ```
 
-构建依赖不会初始化运行时。应在单线程启动阶段初始化 `mt_log`、`nv_storage` 和 `event_bus`；在服务启动前分别调用 `power_service_register_power_ops()`、`imu_service_register_imu_ops()`、`time_service_register_rtc_ops()` 和 `sd_storage_service_register_mount_ops()`。Audio、SD、IMU、Power、Time、Wi-Fi 和 System PM 的 init 都接收类型化配置；`audio_service_init()` 直接取得已提交的 `bsp_audio_ops_t`，因此必须在 `bsp_init()` 成功后调用，在 `wifi_service_init()` 前准备 ESP-NETIF 和默认事件循环。相同配置重复初始化幂等，活动状态下不同配置返回 `ESP_ERR_INVALID_STATE`。停止发布者并等待已接纳工作完成后，再按逆序反初始化。`event_bus` 是进程生命周期单例，没有反初始化接口。
+构建依赖不会初始化运行时。应在单线程启动阶段初始化 `mt_log`、`nv_storage` 和 `event_bus`；在服务启动前分别调用 `power_service_register_power_ops()`、`imu_service_register_imu_ops()`、`time_service_register_rtc_ops()` 和 `sd_storage_service_register_mount_ops()`。Audio、SD、IMU、Power、Time、Connectivity 和 System PM 的 init 都接收类型化配置；`audio_service_init()` 直接取得已提交的 `bsp_audio_ops_t`，因此必须在 `bsp_init()` 成功后调用。启动 Wi-Fi 前先准备 ESP-NETIF 和默认事件循环，再调用 `connectivity_manager_init()`；manager 内部长期持有唯一的 `wifi_service` session。生产代码不得自行初始化或控制 `wifi_service`。相同配置重复初始化幂等，活动状态下不同配置返回 `ESP_ERR_INVALID_STATE`。停止发布者并等待已接纳工作完成后，再按逆序反初始化。`event_bus` 是进程生命周期单例，没有反初始化接口。
 
 ## 新增服务 API 与事件
 
@@ -47,14 +48,16 @@ idf_component_register(SRCS "app.c" REQUIRES event_bus wifi_service)
 - `sd_storage_service` 的 adapter 提供 mount/unmount/is_mounted；普通 `init/start(config)` 从不格式化。破坏性恢复只能由显式 `sd_storage_service_recover_and_mount(config)` 发起。
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
+- `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
+- `time_service_set_network_ready()` 是非阻塞通知。联网时由 time worker 启动或重启系统 SNTP，掉线和待机时停止；应用的“立即校时”只重启请求，不拥有也不在页面关闭时销毁周期客户端。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 
 ## 配置
 
 Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
-IMU/Power stack 3072，Time stack 3072，Wi-Fi stack 4096 和 queue 16，System PM stack
-4096。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
+IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
+stack 4096 和 queue 16，System PM stack 4096。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
 `app_product_config_t` 在运行时传入。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，
 定义于 `main/Kconfig.projbuild`。修改 Kconfig 后运行
 `idf.py reconfigure && idf.py save-defconfig && idf.py build`。
@@ -64,7 +67,7 @@ IMU/Power stack 3072，Time stack 3072，Wi-Fi stack 4096 和 queue 16，System 
 - `event_bus` API 仅限任务上下文，不支持 ISR。最多 24 个订阅、24 个待处理 UI 回调和 24 份 UI payload；匹配 UI 订阅时 payload 最大 256 字节。发布者回调同步执行，UI 回调异步执行；取消订阅不是静默屏障，销毁 `user_data` 前仍需停止发布者并排空 UI 工作。
 - `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 只用于可覆盖的状态快照，不得用于边沿、命令、审计或计数事件。事件 payload 只在回调期间有效。
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
-- Wi-Fi 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。Wi-Fi、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
+- Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
 - `system_pm` 接受 1 至 4 个唯一 RTC GPIO 唤醒源，且有效电平必须一致。唤醒回调应只通知其他 worker；外设准备和恢复钩子运行在 PM worker 中，可以阻塞但必须遵守配置超时。
 - `SYSTEM_PM_DEVELOPMENT_MODE=y` 不是让 USB Serial/JTAG 在 light sleep 中继续工作；ESP32-S3 硬件不支持这一点。该模式在 USB 主机连接时跳过 app standby（显示仍可熄灭），并启用 IDF 的自动睡眠连接保护；拔出 USB 后恢复正常 light sleep。
 - 当前板级 EXIO3/5/6 经过 TCA9554，只能由 time/power/IMU worker 轮询，不能成为 RTC GPIO 唤醒源。触摸唤醒尚未实现，GPIO21 未注册；实际 wake descriptor 仍只有 GPIO0 低电平。

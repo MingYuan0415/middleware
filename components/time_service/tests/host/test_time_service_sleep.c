@@ -222,6 +222,22 @@ static void _delay_ms(uint32_t delay_ms)
     }
 }
 
+static bool _wait_for_port_state(bool running, unsigned starts,
+                                 unsigned stops)
+{
+    for (unsigned attempt = 0U; attempt < 1000U; ++attempt)
+    {
+        if (host_time_port_is_running() == running &&
+                host_time_port_start_count() == starts &&
+                host_time_port_stop_count() == stops)
+        {
+            return true;
+        }
+        _delay_ms(1U);
+    }
+    return false;
+}
+
 int main(void)
 {
     host_time_port_reset();
@@ -239,6 +255,8 @@ int main(void)
     };
     assert(time_service_register_rtc_ops(&ops) == ESP_OK);
     assert(time_service_init(test_time_config()) == ESP_OK);
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, 1U, 0U));
 
     assert(_wait_for_flag(&s_rtc.poll_entered, 1000U));
     assert(time_service_suspend(20U) == ESP_ERR_TIMEOUT);
@@ -268,10 +286,14 @@ int main(void)
     assert(time_service_resume(500U) == ESP_OK);
 
     assert(time_service_request_sync() == ESP_OK);
+    const unsigned starts_before_suspend = host_time_port_start_count();
+    const unsigned stops_before_suspend = host_time_port_stop_count();
     assert(time_service_suspend(500U) == ESP_OK);
+    assert(!host_time_port_is_running());
+    assert(host_time_port_stop_count() == stops_before_suspend + 1U);
     const uint32_t suspended_polls = _poll_count();
     const uint32_t suspended_writes = _write_count();
-    assert(host_time_port_complete(INT64_C(1704067201)));
+    assert(!host_time_port_complete(INT64_C(1704067201)));
     _delay_ms(250U);
     assert(_poll_count() == suspended_polls);
     assert(_write_count() == suspended_writes);
@@ -281,6 +303,11 @@ int main(void)
     assert(time_service_wait_sync(0U) == ESP_ERR_INVALID_STATE);
 
     assert(time_service_resume(500U) == ESP_OK);
+    assert(time_service_wait_sync(0U) == ESP_ERR_INVALID_STATE);
+    assert(time_service_set_network_ready(true) == ESP_OK);
+    assert(_wait_for_port_state(true, starts_before_suspend + 1U,
+                                stops_before_suspend + 1U));
+    assert(host_time_port_complete(INT64_C(1704067201)));
     assert(time_service_wait_sync(1000U) == ESP_OK);
     assert(_write_count() == suspended_writes + 1U);
     assert(time_service_deinit() == ESP_OK);

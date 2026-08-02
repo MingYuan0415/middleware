@@ -122,8 +122,9 @@ static void _wifi_service_recover_clear_failure(
                 wifi_service_worker_connect_driver(context);
             if (reconnect_result != ESP_OK)
             {
-                wifi_service_worker_schedule_retry(context, 0,
-                                                   reconnect_result);
+                wifi_service_worker_schedule_retry(
+                    context, 0, reconnect_result,
+                    WIFI_SERVICE_FAILURE_DRIVER);
             }
         }
     }
@@ -159,7 +160,8 @@ static esp_err_t _wifi_service_recover_stop_failure(
         esp_err_t rollback = wifi_service_worker_connect_driver(context);
         if (rollback != ESP_OK)
         {
-            wifi_service_worker_schedule_retry(context, 0, rollback);
+            wifi_service_worker_schedule_retry(
+                context, 0, rollback, WIFI_SERVICE_FAILURE_DRIVER);
         }
     }
     if (context->status.available)
@@ -201,11 +203,20 @@ static esp_err_t _wifi_service_worker_suspend(
                                         scan_result == ESP_OK ? ESP_OK :
                                         scan_result,
                                         false);
+    context->status.desired_connected = false;
+    context->retry_pending = false;
+    context->phase_deadline_pending = false;
+    wifi_service_worker_wipe_secret(context);
+    if (context->operation_kind != WIFI_OPERATION_NONE)
+    {
+        wifi_service_worker_complete_operation(context);
+    }
     context->radio_ready = false;
     context->suspended = true;
     context->scan_id_known = false;
     atomic_store_explicit(&g_wifi_service.event_overflow, false, memory_order_release);
     context->retry_pending = false;
+    context->phase_deadline_pending = false;
     context->status.state = WIFI_SERVICE_STATE_SUSPENDED;
     context->status.ipv4_address = 0;
     context->status.last_error = ESP_OK;
@@ -448,6 +459,7 @@ void wifi_service_worker_run(void *argument)
         wifi_service_worker_cancel_stale_operation(&context);
         wifi_service_worker_reconcile_overflow(&context);
         wifi_service_worker_retry_publications(&context);
+        wifi_service_worker_check_phase_deadline(&context);
 
         wifi_queue_item_t item;
         if (xQueueReceive(g_wifi_service.queue, &item,
@@ -471,7 +483,8 @@ void wifi_service_worker_run(void *argument)
             {
                 if (context.status.available)
                 {
-                    wifi_service_worker_schedule_retry(&context, 0, result);
+                    wifi_service_worker_schedule_retry(
+                        &context, 0, result, WIFI_SERVICE_FAILURE_DRIVER);
                 }
                 else if (context.operation_kind == WIFI_OPERATION_CONNECT)
                 {

@@ -243,6 +243,17 @@ esp_err_t time_service_alarm_get_status(time_service_alarm_status_t *status);
 esp_err_t time_service_alarm_clear(void);
 
 /**
+ * @brief Notify the time worker whether IPv4 connectivity is ready.
+ *
+ * The call only updates the desired state and notifies the existing worker.
+ * Online starts the periodic SNTP client when stopped; offline stops it.
+ *
+ * @param ready is true while the network has a usable IPv4 address.
+ * @return ESP_OK when admitted; ESP_ERR_INVALID_STATE before initialization.
+ */
+esp_err_t time_service_set_network_ready(bool ready);
+
+/**
  * @brief Start or restart an asynchronous SNTP synchronization request.
  *
  * @return ESP_OK when the request starts, otherwise an ESP-IDF error.

@@ -33,6 +33,7 @@ typedef struct wifi_service_port_event
     wifi_service_port_event_type_t type; /**< Translated event type. */
     uint64_t epoch;                      /**< Adapter ownership epoch. */
     int32_t status;                      /**< Driver or operation result. */
+    wifi_service_failure_t failure;      /**< Classified disconnect failure. */
     uint32_t ipv4_address;               /**< IPv4 address in network order. */
     uint16_t disconnect_reason;          /**< ESP-IDF disconnect reason. */
     uint8_t scan_id;                     /**< ESP-IDF scan identifier. */

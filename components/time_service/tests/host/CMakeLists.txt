@@ -110,11 +110,28 @@ target_compile_definitions(time_service_port_barrier_test PRIVATE
 )
 configure_time_service_test(time_service_port_barrier_test)
 
+add_executable(time_service_network_ready_test
+    test_time_service_network_ready.c
+    event_bus_fake.c
+    freertos_fake.c
+    time_service_port_fake.c
+    "${TIME_SERVICE_DIR}/src/time_service.c"
+    "${TIME_SERVICE_DIR}/src/time_service_core.c"
+)
+target_include_directories(time_service_network_ready_test PRIVATE
+    include
+    "${TIME_SERVICE_DIR}/../event_bus/include"
+    "${TIME_SERVICE_DIR}/include"
+    "${TIME_SERVICE_DIR}/src"
+)
+configure_time_service_test(time_service_network_ready_test)
+
 foreach(test_target IN ITEMS
         time_service_callback_gate_test
         time_service_alarm_test
         time_service_sleep_test
-        time_service_port_barrier_test)
+        time_service_port_barrier_test
+        time_service_network_ready_test)
     if(TIME_SERVICE_SANITIZER STREQUAL "thread" AND
             TIME_SERVICE_SETARCH AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
         add_test(NAME ${test_target} COMMAND

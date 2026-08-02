@@ -150,6 +150,31 @@ static wifi_service_security_t _wifi_service_port_map_security(
     return security;
 }
 
+static wifi_service_failure_t _wifi_service_port_map_disconnect_failure(
+    uint16_t reason)
+{
+    wifi_service_failure_t failure = WIFI_SERVICE_FAILURE_LINK_LOST;
+    switch (reason)
+    {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        failure = WIFI_SERVICE_FAILURE_AUTHENTICATION;
+        break;
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        failure = WIFI_SERVICE_FAILURE_AP_NOT_FOUND;
+        break;
+    default:
+        break;
+    }
+    return failure;
+}
+
 static bool _wifi_service_port_map_wifi_event(
     int32_t event_id, const void *event_data,
     wifi_service_port_event_t *event)
@@ -176,6 +201,8 @@ static bool _wifi_service_port_map_wifi_event(
         {
             const wifi_event_sta_disconnected_t *disconnected = event_data;
             event->disconnect_reason = disconnected->reason;
+            event->failure = _wifi_service_port_map_disconnect_failure(
+                                 disconnected->reason);
         }
         break;
     default:
@@ -489,7 +516,6 @@ esp_err_t wifi_service_port_init(void)
     s_state.default_handlers_ready = true;
 
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
-    config.nvs_enable = false;
     s_state.wifi_init_attempted = true;
     result = esp_wifi_init(&config);
     wifi_service_secure_zero(&config, sizeof(config));

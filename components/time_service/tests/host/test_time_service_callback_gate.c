@@ -64,6 +64,7 @@ int main(void)
     time_service_config_t different = *test_time_config();
     different.task_priority++;
     assert(time_service_init(&different) == ESP_ERR_INVALID_STATE);
+    assert(time_service_set_network_ready(true) == ESP_OK);
     const uint32_t initial_notification_count =
         host_freertos_notification_count();
     assert(time_service_request_sync() == ESP_OK);
