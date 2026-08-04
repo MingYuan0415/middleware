@@ -67,6 +67,21 @@ typedef struct provisioning_service_status
 
 typedef provisioning_service_status_t provisioning_service_snapshot_t;
 
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+/** @brief Development-only protected-session diagnostics. */
+typedef struct provisioning_service_diagnostics
+{
+    uint64_t protected_request_count; /**< Decrypted control endpoint calls. */
+    uint64_t protected_success_count; /**< Successful protected responses. */
+    uint64_t protected_failure_count; /**< Rejected or failed requests. */
+    uint64_t snapshot_success_count; /**< Successful GetSnapshot responses. */
+    uint64_t last_snapshot_request_id; /**< Last successful snapshot request ID. */
+    int64_t last_snapshot_success_us; /**< esp_timer timestamp of last success. */
+    uint32_t worker_stack_high_water; /**< Provisioning worker minimum free stack. */
+    bool worker_found; /**< True while the provisioning worker exists. */
+} provisioning_service_diagnostics_t;
+#endif
+
 /**
  * @brief Initialize the idle manual provisioning service.
  * @param config is copied before the worker starts.
@@ -116,6 +131,16 @@ esp_err_t provisioning_service_resume(uint32_t timeout_ms);
  */
 esp_err_t provisioning_service_get_status(
     provisioning_service_status_t *status);
+
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+/**
+ * @brief Copy development-only protected-session diagnostics.
+ * @param diagnostics receives one coherent diagnostics snapshot.
+ * @return ESP_OK on success; otherwise an argument or lifecycle error.
+ */
+esp_err_t provisioning_service_get_diagnostics(
+    provisioning_service_diagnostics_t *diagnostics);
+#endif
 
 /**
  * @brief Copy the active QR bootstrap JSON for display.

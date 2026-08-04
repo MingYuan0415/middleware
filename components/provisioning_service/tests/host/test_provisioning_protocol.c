@@ -836,6 +836,33 @@ static void _test_scan_polling_and_limits(void)
     _free_response(response, wire);
 }
 
+static void _test_scan_terminal_releases_stale_busy_status(void)
+{
+    provisioning_protocol_t protocol;
+    assert(provisioning_protocol_init(&protocol, "A1B2C3", "1.2.3",
+                                      &s_status) == ESP_OK);
+    const uint64_t scan_operation = _start_scan(&protocol);
+
+    connectivity_manager_status_snapshot_t stale = s_status;
+    stale.generation = 1U;
+    stale.operation_id = scan_operation;
+    stale.operation_complete = false;
+    assert(!provisioning_protocol_ingest_status(&protocol, &stale));
+    assert(protocol.connectivity.operation_id == scan_operation);
+
+    connectivity_manager_scan_snapshot_t terminal;
+    memset(&terminal, 0, sizeof(terminal));
+    terminal.generation = 1U;
+    terminal.operation_id = scan_operation;
+    provisioning_protocol_ingest_scan(&protocol, &terminal);
+    assert(provisioning_protocol_active_operation(&protocol) == 0U);
+    assert(protocol.connectivity.operation_id == 0U);
+
+    const uint64_t connect_operation = _set_credentials(&protocol);
+    assert(connect_operation != 0U);
+    assert(s_last_request == FAKE_REQUEST_CONNECT);
+}
+
 static void _test_rejections_and_finish(void)
 {
     provisioning_protocol_t protocol;
@@ -1069,6 +1096,8 @@ int main(void)
     _test_saved_mutation_matrix();
     _reset();
     _test_scan_polling_and_limits();
+    _reset();
+    _test_scan_terminal_releases_stale_busy_status();
     _reset();
     _test_rejections_and_finish();
     _reset();

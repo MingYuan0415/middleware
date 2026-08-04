@@ -11,6 +11,9 @@
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_srp.h"
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+    #include "esp_timer.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -115,6 +118,14 @@ static atomic_uint s_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_uint s_transport_users = ATOMIC_VAR_INIT(0U);
 static atomic_bool s_active = ATOMIC_VAR_INIT(false);
 static atomic_int s_worker_result = ATOMIC_VAR_INIT(ESP_OK);
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+    static atomic_uint_fast64_t s_protected_request_count;
+    static atomic_uint_fast64_t s_protected_success_count;
+    static atomic_uint_fast64_t s_protected_failure_count;
+    static atomic_uint_fast64_t s_snapshot_success_count;
+    static atomic_uint_fast64_t s_last_snapshot_request_id;
+    static atomic_int_fast64_t s_last_snapshot_success_us;
+#endif
 
 static const char s_protocol_version[] =
     "{\"prov\":{\"ver\":\"v1.0\",\"sec_ver\":2,"
@@ -125,6 +136,48 @@ static const uint8_t s_service_uuid[BLE_UUID128_VAL_LENGTH] =
     0x6b, 0x0e, 0x39, 0x9e, 0x97, 0x73, 0x21, 0x8c,
     0x9f, 0x40, 0x7e, 0xb4, 0x36, 0xc8, 0xf1, 0xd8,
 };
+
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+static void _provisioning_service_reset_diagnostics(void)
+{
+    atomic_store_explicit(&s_protected_request_count, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_protected_success_count, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_protected_failure_count, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_snapshot_success_count, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_last_snapshot_request_id, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_last_snapshot_success_us, 0,
+                          memory_order_relaxed);
+}
+
+static void _provisioning_service_record_request(
+    esp_err_t result, const provisioning_protocol_result_t *request)
+{
+    atomic_fetch_add_explicit(&s_protected_request_count, 1U,
+                              memory_order_relaxed);
+    if (result != ESP_OK || request == NULL || !request->request_succeeded)
+    {
+        atomic_fetch_add_explicit(&s_protected_failure_count, 1U,
+                                  memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(&s_protected_success_count, 1U,
+                              memory_order_relaxed);
+    if (request->get_snapshot)
+    {
+        atomic_fetch_add_explicit(&s_snapshot_success_count, 1U,
+                                  memory_order_relaxed);
+        atomic_store_explicit(&s_last_snapshot_request_id,
+                              request->request_id, memory_order_relaxed);
+        atomic_store_explicit(&s_last_snapshot_success_us,
+                              esp_timer_get_time(), memory_order_release);
+    }
+}
+#endif
 
 static bool _provisioning_service_api_acquire(void)
 {
@@ -414,11 +467,17 @@ static esp_err_t _provisioning_service_endpoint(
             PROVISIONING_PROTOCOL_MAX_PLAINTEXT_REQUEST_BYTES)
     {
         mbedtls_platform_zeroize(mutable_input, (size_t)input_length);
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+        _provisioning_service_record_request(ESP_ERR_INVALID_SIZE, NULL);
+#endif
         return ESP_ERR_INVALID_SIZE;
     }
     if (!_provisioning_service_api_acquire())
     {
         mbedtls_platform_zeroize(mutable_input, (size_t)input_length);
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+        _provisioning_service_record_request(ESP_ERR_INVALID_STATE, NULL);
+#endif
         return ESP_ERR_INVALID_STATE;
     }
     atomic_fetch_add_explicit(&s_transport_users, 1U,
@@ -426,11 +485,11 @@ static esp_err_t _provisioning_service_endpoint(
     esp_err_t result = ESP_ERR_INVALID_STATE;
     uint8_t *packed = NULL;
     size_t packed_size = 0U;
+    provisioning_protocol_result_t request_result = {0};
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.transport_accepting)
     {
-        provisioning_protocol_result_t request_result;
         result = provisioning_protocol_handle(
                      &s_service.protocol, mutable_input,
                      (size_t)input_length, &packed, &packed_size,
@@ -450,6 +509,9 @@ static esp_err_t _provisioning_service_endpoint(
         }
     }
     xSemaphoreGive(s_service.mutex);
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+    _provisioning_service_record_request(result, &request_result);
+#endif
     mbedtls_platform_zeroize(mutable_input, (size_t)input_length);
 
     if (result == ESP_OK)
@@ -1059,6 +1121,9 @@ esp_err_t provisioning_service_init(
     }
 
     memset(&s_service, 0, sizeof(s_service));
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+    _provisioning_service_reset_diagnostics();
+#endif
     atomic_init(&s_service.transport_started, false);
     atomic_init(&s_service.transport_faulted, false);
     atomic_init(&s_service.worker_stopping, false);
@@ -1324,6 +1389,12 @@ esp_err_t provisioning_service_open_window(void)
         const bool previous_cancel = s_service.desired_cancel_operation;
         const bool previous_active = atomic_load_explicit(
                                          &s_active, memory_order_acquire);
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+        if (!previous_active)
+        {
+            _provisioning_service_reset_diagnostics();
+        }
+#endif
         s_service.desired_open = true;
         s_service.desired_cancel_operation = false;
         atomic_store_explicit(&s_active, true, memory_order_release);
@@ -1448,6 +1519,38 @@ esp_err_t provisioning_service_get_status(
     _provisioning_service_api_release();
     return ESP_OK;
 }
+
+#if CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS
+esp_err_t provisioning_service_get_diagnostics(
+    provisioning_service_diagnostics_t *diagnostics)
+{
+    if (diagnostics == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!_provisioning_service_api_acquire())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    diagnostics->protected_request_count = atomic_load_explicit(
+            &s_protected_request_count, memory_order_relaxed);
+    diagnostics->protected_success_count = atomic_load_explicit(
+            &s_protected_success_count, memory_order_relaxed);
+    diagnostics->protected_failure_count = atomic_load_explicit(
+            &s_protected_failure_count, memory_order_relaxed);
+    diagnostics->snapshot_success_count = atomic_load_explicit(
+            &s_snapshot_success_count, memory_order_relaxed);
+    diagnostics->last_snapshot_request_id = atomic_load_explicit(
+            &s_last_snapshot_request_id, memory_order_relaxed);
+    diagnostics->last_snapshot_success_us = atomic_load_explicit(
+            &s_last_snapshot_success_us, memory_order_acquire);
+    diagnostics->worker_found = s_service.task != NULL;
+    diagnostics->worker_stack_high_water = diagnostics->worker_found ?
+                                           (uint32_t)uxTaskGetStackHighWaterMark(s_service.task) : 0U;
+    _provisioning_service_api_release();
+    return ESP_OK;
+}
+#endif
 
 esp_err_t provisioning_service_copy_qr(char *buffer, size_t capacity,
                                        size_t *out_length)

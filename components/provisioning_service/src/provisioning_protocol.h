@@ -38,8 +38,11 @@ typedef provisioning_protocol_t provisioning_protocol_context_t;
 /** @brief Side effects admitted by one protected request. */
 typedef struct provisioning_protocol_result
 {
+    uint64_t request_id;
     bool finish_session;
     bool operation_admitted;
+    bool get_snapshot;
+    bool request_succeeded;
 } provisioning_protocol_result_t;
 
 esp_err_t provisioning_protocol_init(

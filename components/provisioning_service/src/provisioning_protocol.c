@@ -809,6 +809,12 @@ static void _provisioning_protocol_accept_scan(
             context->scan_valid = true;
         }
     }
+    if (context->connectivity.operation_id == scan->operation_id &&
+            !context->connectivity.operation_complete)
+    {
+        context->connectivity.operation_id = 0U;
+        context->connectivity.operation_complete = false;
+    }
     _provisioning_protocol_finish_operation(
         context, scan->last_error,
         scan->last_error == ESP_OK ||
@@ -864,10 +870,15 @@ esp_err_t provisioning_protocol_handle(
     memset(&storage, 0, sizeof(storage));
     response.failure = PROTO_FAILURE_NONE;
     _provisioning_protocol_dispatch(context, request, &response, &storage);
+    request_result->request_id = request->request_id;
     request_result->finish_session = context->finish_requested;
     context->finish_requested = false;
     request_result->operation_admitted = operation_before == 0U &&
                                          provisioning_protocol_active_operation(context) != 0U;
+    request_result->get_snapshot = request->body_case ==
+                                   MICROTECH__PROVISIONING__V1__PROVISIONING_REQUEST__BODY_GET_SNAPSHOT;
+    request_result->request_succeeded = response.code ==
+                                        MICROTECH__PROVISIONING__V1__RESPONSE_CODE__RESPONSE_CODE_OK;
     const size_t packed_size =
         microtech__provisioning__v1__provisioning_response__get_packed_size(
             &response);

@@ -60,6 +60,7 @@ add_executable(test_provisioning_service
 target_compile_features(test_provisioning_service PRIVATE c_std_11)
 target_compile_definitions(test_provisioning_service PRIVATE
     _POSIX_C_SOURCE=200809L
+    CONFIG_PROVISIONING_SERVICE_DIAGNOSTICS=1
 )
 target_include_directories(test_provisioning_service PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/fakes"

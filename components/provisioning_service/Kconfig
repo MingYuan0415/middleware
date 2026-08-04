@@ -10,4 +10,11 @@ config PROVISIONING_SERVICE_QUEUE_DEPTH
     default 8
     range 4 32
 
+config PROVISIONING_SERVICE_DIAGNOSTICS
+    bool "Enable provisioning stress diagnostics"
+    default n
+    help
+        Expose development-only protected-request counters and provisioning
+        worker stack high-water data. Production builds should leave this off.
+
 endmenu

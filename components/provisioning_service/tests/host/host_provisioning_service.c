@@ -81,6 +81,14 @@ EVENT_BUS_DEFINE_ID(CONNECTIVITY_MANAGER_MSG);
 esp_event_base_t PROTOCOMM_TRANSPORT_BLE_EVENT = "PROTOCOMM_BLE";
 const protocomm_security_t protocomm_security2 = {.marker = 2U};
 
+int64_t esp_timer_get_time(void)
+{
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * INT64_C(1000000) +
+           (int64_t)now.tv_nsec / INT64_C(1000);
+}
+
 static void _host_sleep_ms(uint32_t milliseconds)
 {
     const struct timespec delay =

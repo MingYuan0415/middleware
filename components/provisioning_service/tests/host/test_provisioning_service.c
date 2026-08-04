@@ -170,6 +170,19 @@ static pb_response_t *_get_snapshot(uint8_t **wire)
     return _request(&request, wire);
 }
 
+static pb_response_t *_get_invalid_snapshot(uint8_t **wire)
+{
+    Microtech__Provisioning__V1__GetSnapshotRequest body =
+        MICROTECH__PROVISIONING__V1__GET_SNAPSHOT_REQUEST__INIT;
+    pb_request_t request =
+        MICROTECH__PROVISIONING__V1__PROVISIONING_REQUEST__INIT;
+    request.protocol_major = 1U;
+    request.body_case =
+        MICROTECH__PROVISIONING__V1__PROVISIONING_REQUEST__BODY_GET_SNAPSHOT;
+    request.get_snapshot = &body;
+    return _request(&request, wire);
+}
+
 static pb_response_t *_get_scan_results(uint8_t **wire)
 {
     Microtech__Provisioning__V1__GetScanResultsRequest body =
@@ -274,6 +287,49 @@ static void _test_window_transport_and_suspend(void)
     host_provisioning_release_stop();
     assert(host_provisioning_wait_transport(true, 500U));
     assert(host_provisioning_transport_start_count() == starts + 1U);
+}
+
+static void _test_protected_request_diagnostics(void)
+{
+    provisioning_service_diagnostics_t diagnostics;
+    assert(provisioning_service_get_diagnostics(NULL) == ESP_ERR_INVALID_ARG);
+    assert(provisioning_service_get_diagnostics(&diagnostics) == ESP_OK);
+    assert(diagnostics.protected_request_count == 0U);
+    assert(diagnostics.snapshot_success_count == 0U);
+    assert(diagnostics.worker_found);
+    assert(diagnostics.worker_stack_high_water ==
+           CONFIG_PROVISIONING_SERVICE_TASK_STACK / 2U);
+
+    uint8_t *wire = NULL;
+    pb_response_t *response = _get_snapshot(&wire);
+    assert(response->code ==
+           MICROTECH__PROVISIONING__V1__RESPONSE_CODE__RESPONSE_CODE_OK);
+    _free_response(response, wire);
+    wire = NULL;
+    response = _get_invalid_snapshot(&wire);
+    assert(response->code ==
+           MICROTECH__PROVISIONING__V1__RESPONSE_CODE__RESPONSE_CODE_INVALID_ARGUMENT);
+    _free_response(response, wire);
+
+    assert(provisioning_service_get_diagnostics(&diagnostics) == ESP_OK);
+    assert(diagnostics.protected_request_count == 2U);
+    assert(diagnostics.protected_success_count == 1U);
+    assert(diagnostics.protected_failure_count == 1U);
+    assert(diagnostics.snapshot_success_count == 1U);
+    assert(diagnostics.last_snapshot_request_id == 3U);
+    assert(diagnostics.last_snapshot_success_us > 0);
+
+    assert(provisioning_service_close_window() == ESP_OK);
+    assert(host_provisioning_wait_transport(false, 500U));
+    assert(provisioning_service_open_window() == ESP_OK);
+    assert(host_provisioning_wait_transport(true, 500U));
+    assert(provisioning_service_get_diagnostics(&diagnostics) == ESP_OK);
+    assert(diagnostics.protected_request_count == 0U);
+    assert(diagnostics.protected_success_count == 0U);
+    assert(diagnostics.protected_failure_count == 0U);
+    assert(diagnostics.snapshot_success_count == 0U);
+    assert(diagnostics.last_snapshot_request_id == 0U);
+    assert(diagnostics.last_snapshot_success_us == 0);
 }
 
 static void _test_finish_close_and_timeout(void)
@@ -496,6 +552,7 @@ int main(void)
     assert(provisioning_service_init(&s_config) == ESP_OK);
 
     _test_window_transport_and_suspend();
+    _test_protected_request_diagnostics();
     _test_finish_close_and_timeout();
     _test_success_grace();
 

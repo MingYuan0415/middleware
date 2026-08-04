@@ -1395,8 +1395,9 @@ static void _manager_poll_scan(manager_worker_t *worker)
             scan.operation_id == worker->service_operation_id &&
             scan.state != WIFI_SERVICE_SCAN_RUNNING)
     {
-        _manager_cache_scan(worker);
         _manager_clear_active_operation(worker);
+        _manager_cache_status(worker);
+        _manager_cache_scan(worker);
         _manager_continue_policy(worker, false);
         return;
     }
