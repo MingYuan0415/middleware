@@ -13,6 +13,10 @@
 #include "esp_pm.h"
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -583,15 +587,22 @@ static esp_err_t _create_system_pm_resources(void)
 
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
-    if (xTaskCreate(_sleep_task, "system_pm_sleep",
-                    CONFIG_SYSTEM_PM_STANDBY_TASK_STACK, NULL,
-                    s_config.task_priority, &s_sleep_task) != pdPASS)
+    if (xTaskCreatePinnedToCore(
+                _sleep_task, "system_pm_sleep",
+                CONFIG_SYSTEM_PM_STANDBY_TASK_STACK, NULL,
+                s_config.task_priority, &s_sleep_task,
+                CONFIG_MAIN_PROJECT_TASK_CORE_ID) != pdPASS)
     {
         s_sleep_task = NULL;
         atomic_store_explicit(&s_worker_event_tail_complete, true,
                               memory_order_release);
         return ESP_ERR_NO_MEM;
     }
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    LOG_I("task affinity name=system_pm_sleep core=%d",
+          (int)xTaskGetCoreID(s_sleep_task));
+#endif
     return ESP_OK;
 }
 

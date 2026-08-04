@@ -13,6 +13,10 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -657,12 +661,19 @@ static esp_err_t _create_sync_worker(void)
     }
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
-    if (xTaskCreate(_sync_worker, "time_ntp",
-                    CONFIG_TIME_SERVICE_SYNC_WORKER_STACK, NULL,
-                    s_config.task_priority, &s_sync_worker) != pdPASS)
+    if (xTaskCreatePinnedToCore(
+                _sync_worker, "time_ntp",
+                CONFIG_TIME_SERVICE_SYNC_WORKER_STACK, NULL,
+                s_config.task_priority, &s_sync_worker,
+                CONFIG_MAIN_PROJECT_TASK_CORE_ID) != pdPASS)
     {
         return ESP_ERR_NO_MEM;
     }
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    LOG_I("task affinity name=time_ntp core=%d",
+          (int)xTaskGetCoreID(s_sync_worker));
+#endif
     return ESP_OK;
 }
 

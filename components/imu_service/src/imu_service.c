@@ -9,6 +9,10 @@
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -531,13 +535,19 @@ esp_err_t imu_service_init(const imu_service_config_t *config)
 
     atomic_store_explicit(&s_worker_event_tail_complete, false,
                           memory_order_release);
-    if (xTaskCreate(_imu_worker, "imu_service", CONFIG_IMU_SERVICE_TASK_STACK,
-                    s_io_mutex, s_config.task_priority,
-                    &s_worker) != pdPASS)
+    if (xTaskCreatePinnedToCore(
+                _imu_worker, "imu_service", CONFIG_IMU_SERVICE_TASK_STACK,
+                s_io_mutex, s_config.task_priority, &s_worker,
+                CONFIG_MAIN_PROJECT_TASK_CORE_ID) != pdPASS)
     {
         result = ESP_ERR_NO_MEM;
         goto cleanup;
     }
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    LOG_I("task affinity name=imu_service core=%d",
+          (int)xTaskGetCoreID(s_worker));
+#endif
 
     taskENTER_CRITICAL(&s_state_lock);
     s_initialized = true;

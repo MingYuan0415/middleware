@@ -2,6 +2,11 @@
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
+
 #include "wifi_service_internal.h"
 
 #include <string.h>
@@ -149,18 +154,24 @@ static esp_err_t _wifi_service_ensure_core(const wifi_service_config_t *config)
         g_wifi_service.primitives_created = true;
     }
 
-    g_wifi_service.worker = xTaskCreateStatic(
+    g_wifi_service.worker = xTaskCreateStaticPinnedToCore(
                                 wifi_service_worker_run, "wifi_service",
                                 CONFIG_WIFI_SERVICE_TASK_STACK, NULL,
                                 g_wifi_service.config.task_priority,
                                 g_wifi_service.worker_stack,
-                                &g_wifi_service.worker_control);
+                                &g_wifi_service.worker_control,
+                                CONFIG_MAIN_PROJECT_TASK_CORE_ID);
     if (g_wifi_service.worker == NULL)
     {
         atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_EMPTY,
                               memory_order_release);
         return ESP_ERR_NO_MEM;
     }
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    LOG_I("task affinity name=wifi_service core=%d",
+          (int)xTaskGetCoreID(g_wifi_service.worker));
+#endif
     atomic_store_explicit(&g_wifi_service.core_state, WIFI_CORE_READY,
                           memory_order_release);
     return ESP_OK;

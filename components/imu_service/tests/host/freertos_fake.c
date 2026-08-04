@@ -126,14 +126,17 @@ static void *_task_trampoline(void *context)
     return NULL;
 }
 
-BaseType_t xTaskCreate(void (*entry)(void *), const char *name,
-                       uint32_t stack_depth, void *context,
-                       UBaseType_t priority, TaskHandle_t *out_task)
+BaseType_t xTaskCreatePinnedToCore(
+    void (*entry)(void *), const char *name, uint32_t stack_depth,
+    void *context, UBaseType_t priority, TaskHandle_t *out_task,
+    BaseType_t core_id)
 {
     (void)name;
     (void)stack_depth;
     (void)priority;
-    if (entry == NULL || out_task == NULL || _consume_task_failure())
+    if (entry == NULL || out_task == NULL ||
+            core_id != CONFIG_MAIN_PROJECT_TASK_CORE_ID ||
+            _consume_task_failure())
     {
         return pdFAIL;
     }

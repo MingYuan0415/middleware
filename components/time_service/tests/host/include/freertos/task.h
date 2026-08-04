@@ -14,9 +14,10 @@ typedef enum
 } eNotifyAction;
 
 /** @brief Create one pthread-backed fake task. */
-BaseType_t xTaskCreate(void (*entry)(void *), const char *name,
-                       uint32_t stack_depth, void *context,
-                       UBaseType_t priority, TaskHandle_t *out_task);
+BaseType_t xTaskCreatePinnedToCore(
+    void (*entry)(void *), const char *name, uint32_t stack_depth,
+    void *context, UBaseType_t priority, TaskHandle_t *out_task,
+    BaseType_t core_id);
 /** @brief Notify one fake task. */
 BaseType_t xTaskNotify(TaskHandle_t task, uint32_t value,
                        eNotifyAction action);

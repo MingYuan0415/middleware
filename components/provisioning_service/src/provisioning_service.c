@@ -15,6 +15,10 @@
     #include "esp_timer.h"
 #endif
 #include "freertos/FreeRTOS.h"
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -1201,15 +1205,21 @@ esp_err_t provisioning_service_init(
                        PROVISIONING_SERVICE_DEVICE_PREFIX, device_id);
         atomic_store_explicit(&s_worker_result, ESP_OK,
                               memory_order_release);
-        s_service.task = xTaskCreateStatic(
+        s_service.task = xTaskCreateStaticPinnedToCore(
                              _provisioning_service_worker, "provisioning",
                              CONFIG_PROVISIONING_SERVICE_TASK_STACK, NULL,
-                             config->task_priority,
-                             s_service.task_stack, &s_service.task_control);
+                             config->task_priority, s_service.task_stack,
+                             &s_service.task_control,
+                             CONFIG_MAIN_PROJECT_TASK_CORE_ID);
         result = s_service.task != NULL ? ESP_OK : ESP_ERR_NO_MEM;
     }
     if (result == ESP_OK)
     {
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+        LOG_I("task affinity name=provisioning core=%d",
+              (int)xTaskGetCoreID(s_service.task));
+#endif
         atomic_store_explicit(&s_active, false, memory_order_release);
         atomic_store_explicit(&s_lifecycle,
                               PROVISIONING_LIFECYCLE_RUNNING,

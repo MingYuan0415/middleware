@@ -8,6 +8,10 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    #include "freertos/idf_additions.h"
+#endif
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -2277,11 +2281,12 @@ esp_err_t connectivity_manager_init(
                               memory_order_release);
         return ESP_ERR_NO_MEM;
     }
-    s_manager.worker = xTaskCreateStatic(
+    s_manager.worker = xTaskCreateStaticPinnedToCore(
                            _manager_worker_run, "connectivity",
                            CONFIG_CONNECTIVITY_MANAGER_TASK_STACK, NULL,
                            config->task_priority, s_manager.worker_stack,
-                           &s_manager.worker_control);
+                           &s_manager.worker_control,
+                           CONFIG_MAIN_PROJECT_TASK_CORE_ID);
     if (s_manager.worker == NULL)
     {
         _manager_release_resources();
@@ -2290,6 +2295,11 @@ esp_err_t connectivity_manager_init(
                               memory_order_release);
         return ESP_ERR_NO_MEM;
     }
+#if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \
+    CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU1
+    LOG_I("task affinity name=connectivity core=%d",
+          (int)xTaskGetCoreID(s_manager.worker));
+#endif
     if (xSemaphoreTake(s_manager.control_done, portMAX_DELAY) != pdTRUE)
     {
         _manager_release_resources();
