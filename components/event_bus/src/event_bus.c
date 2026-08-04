@@ -16,6 +16,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#ifndef HOST_TEST
+    #include <esp_attr.h>
+    #define EVENT_BUS_EXT_BSS EXT_RAM_BSS_ATTR
+#else
+    #define EVENT_BUS_EXT_BSS
+#endif
+
 #define HANDLE_SLOT_BITS 8U
 #define HANDLE_SLOT_MASK ((UINT64_C(1) << HANDLE_SLOT_BITS) - UINT64_C(1))
 #define HANDLE_GENERATION_MAX (UINT64_MAX >> HANDLE_SLOT_BITS)
@@ -67,7 +74,6 @@ typedef struct event_bus_envelope
     event_bus_msg_id_t msg_id;
     uint32_t sub_type;
     size_t payload_size;
-    event_bus_aligned_payload_t payload;
     struct event_bus_dispatch_item *head;
 } event_bus_envelope_t;
 
@@ -112,6 +118,8 @@ typedef struct event_bus_ui_batch
 
 static event_bus_sub_slot_t s_subscriptions[EVENT_BUS_MAX_SUBSCRIBERS];
 static event_bus_envelope_t s_envelopes[EVENT_BUS_MAX_PENDING_UI_PAYLOADS];
+static EVENT_BUS_EXT_BSS event_bus_aligned_payload_t
+s_payloads[EVENT_BUS_MAX_PENDING_UI_PAYLOADS];
 static event_bus_dispatch_item_t s_dispatch_items[EVENT_BUS_MAX_PENDING_UI_CALLBACKS];
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_ui_admission_mutex;
@@ -159,7 +167,9 @@ static bool _event_bus_decode_handle(event_bus_sub_handle_t handle,
 static void _event_bus_clear_envelope(event_bus_envelope_t *envelope)
 {
     uint64_t allocation_generation = envelope->allocation_generation;
+    size_t slot = (size_t)(envelope - s_envelopes);
 
+    memset(&s_payloads[slot], 0, sizeof(s_payloads[slot]));
     memset(envelope, 0, sizeof(*envelope));
     envelope->allocation_generation = allocation_generation;
 }
@@ -284,7 +294,7 @@ static bool _event_bus_replace_pending_latest(
         envelope->payload_size = payload_size;
         if (payload_size > 0)
         {
-            memcpy(envelope->payload.bytes, payload, payload_size);
+            memcpy(s_payloads[i].bytes, payload, payload_size);
         }
         replaced = true;
         break;
@@ -432,7 +442,8 @@ static esp_err_t _event_bus_prepare_ui_batch_locked(
     envelope->head = batch->head;
     if (payload_size > 0)
     {
-        memcpy(envelope->payload.bytes, payload, payload_size);
+        memcpy(s_payloads[batch->envelope_index].bytes,
+               payload, payload_size);
     }
     batch->allocation_generation = envelope->allocation_generation;
     return ESP_OK;
@@ -532,7 +543,7 @@ static void _event_bus_dispatch_batch(void *arg)
             payload_size = envelope->payload_size;
             if (payload_size > 0)
             {
-                payload = envelope->payload.bytes;
+                payload = s_payloads[item->envelope_slot].bytes;
             }
         }
         xSemaphoreGive(s_mutex);
@@ -575,6 +586,7 @@ esp_err_t event_bus_init(void)
 
     memset(s_subscriptions, 0, sizeof(s_subscriptions));
     memset(s_envelopes, 0, sizeof(s_envelopes));
+    memset(s_payloads, 0, sizeof(s_payloads));
     memset(s_dispatch_items, 0, sizeof(s_dispatch_items));
     for (size_t i = 0; i < EVENT_BUS_MAX_SUBSCRIBERS; ++i)
     {
