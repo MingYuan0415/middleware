@@ -1,0 +1,4 @@
+version: "0.1.0"
+description: "MicroTech Device Link BLE framing and session primitives"
+dependencies:
+  idf: ">=6.0"

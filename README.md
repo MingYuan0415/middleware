@@ -19,10 +19,11 @@
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位，顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
+| `device_link` | Device Link v1 协议原语：framing 重组、冻结契约的 protobuf-c 消费代码与可复现生成校验；不拥有 NimBLE/Protocomm | `protobuf-c`（私有） |
 
 ## 目录结构
 
-每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试位于 `audio_service`、`nv_storage`、`power_service`、`sd_storage_service`、`time_service` 和 `weather_service` 的 `tests/host/`。
+每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试位于 `audio_service`、`device_link`、`nv_storage`、`power_service`、`sd_storage_service`、`time_service` 和 `weather_service` 的 `tests/host/`。
 
 ## 集成与初始化
 
@@ -102,6 +103,15 @@ cmake -S components/power_service/tests/host -B /tmp/mt-power -G Ninja \
     -DPOWER_SERVICE_SANITIZER=none
 cmake --build /tmp/mt-power
 ctest --test-dir /tmp/mt-power --output-on-failure
+```
+
+运行 Device Link framing、protobuf 消费和生成校验套件：
+
+```sh
+cmake -S components/device_link/tests/host -B /tmp/mt-device-link -G Ninja \
+    -DDEVICE_LINK_SANITIZER=none
+cmake --build /tmp/mt-device-link
+ctest --test-dir /tmp/mt-device-link --output-on-failure
 ```
 
 运行 audio 和 SD 生命周期套件：
