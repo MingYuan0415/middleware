@@ -33,12 +33,17 @@ typedef struct weather_service_fetch_result
 esp_err_t weather_service_port_http_get(
     const char *url, const char *token,
     const weather_service_location_t *location, size_t response_limit,
-    uint32_t timeout_ms, weather_service_http_result_t *result);
+    uint32_t timeout_ms, uint64_t cancel_generation,
+    weather_service_http_result_t *result);
 void weather_service_port_http_result_release(
     weather_service_http_result_t *result);
+uint64_t weather_service_port_cancel_generation(void);
 void weather_service_port_cancel(void);
 int64_t weather_service_port_now_seconds(void);
+int64_t weather_service_port_now_milliseconds(void);
 uint32_t weather_service_port_random_u32(void);
+void *weather_service_port_psram_calloc(size_t count, size_t size);
+void weather_service_port_psram_free(void *memory);
 
 esp_err_t weather_service_parse_location(const uint8_t *body,
         size_t body_size, int64_t acquired_at,

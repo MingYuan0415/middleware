@@ -11,8 +11,25 @@
 
 static unsigned s_checks;
 static unsigned s_failures;
+static unsigned s_alert_allocations;
+static bool s_fail_alert_allocation;
 
 #define CHECK(condition) _check((condition), #condition, __LINE__)
+
+void *weather_service_port_psram_calloc(size_t count, size_t size)
+{
+    ++s_alert_allocations;
+    if (s_fail_alert_allocation)
+    {
+        return NULL;
+    }
+    return calloc(count, size);
+}
+
+void weather_service_port_psram_free(void *memory)
+{
+    free(memory);
+}
 
 static void _check(bool condition, const char *expression, int line)
 {
@@ -58,6 +75,136 @@ static esp_err_t _parse(weather_service_kind_t kind, const char *data,
                            snapshot, changed_mask);
     free(json);
     return result;
+}
+
+static char *_build_alerts(unsigned count, int invalid_index)
+{
+    static const char item[] =
+        "%s{\"id\":\"alert-%u\",\"title\":\"Warning %u\","
+        "\"type_name\":\"Weather\",\"severity\":\"moderate\","
+        "\"status\":\"active\","
+        "\"issued_at\":\"2026-08-05T07:00:00+08:00\","
+        "\"description\":\"Details\",\"instruction\":\"Advice\","
+        "\"content_truncated\":false}";
+    size_t capacity = 256U + (size_t)count * (sizeof(item) + 32U);
+    char *json = calloc(1U, capacity);
+    if (json == NULL)
+    {
+        return NULL;
+    }
+    size_t used = (size_t)snprintf(json, capacity,
+                                   "{\"truncated\":false,\"items\":[");
+    for (unsigned index = 0U; index < count; ++index)
+    {
+        int written;
+        if ((int)index == invalid_index)
+        {
+            written = snprintf(json + used, capacity - used,
+                               "%s{\"title\":1}", index == 0U ? "" : ",");
+        }
+        else
+        {
+            written = snprintf(json + used, capacity - used, item,
+                               index == 0U ? "" : ",", index, index);
+        }
+        if (written < 0 || (size_t)written >= capacity - used)
+        {
+            free(json);
+            return NULL;
+        }
+        used += (size_t)written;
+    }
+    if (snprintf(json + used, capacity - used, "]}") != 2)
+    {
+        free(json);
+        return NULL;
+    }
+    return json;
+}
+
+static void _test_alert_boundaries(void)
+{
+    weather_service_snapshot_t snapshot = {0};
+    uint32_t changed = 0U;
+    s_alert_allocations = 0U;
+    CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS,
+                 "{\"truncated\":false,\"items\":[]}",
+                 &snapshot, &changed) == ESP_OK);
+    CHECK(snapshot.alerts.count == 0U);
+    CHECK(s_alert_allocations == 1U);
+
+    char *alerts = _build_alerts(WEATHER_SERVICE_MAX_ALERTS, -1);
+    CHECK(alerts != NULL);
+    if (alerts != NULL)
+    {
+        CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS, alerts, &snapshot,
+                     &changed) == ESP_OK);
+        CHECK(snapshot.alerts.count == WEATHER_SERVICE_MAX_ALERTS);
+        CHECK(!snapshot.alerts.truncated);
+        free(alerts);
+    }
+
+    alerts = _build_alerts(WEATHER_SERVICE_MAX_ALERTS + 1U, -1);
+    CHECK(alerts != NULL);
+    if (alerts != NULL)
+    {
+        CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS, alerts, &snapshot,
+                     &changed) == ESP_OK);
+        CHECK(snapshot.alerts.count == WEATHER_SERVICE_MAX_ALERTS);
+        CHECK(snapshot.alerts.truncated);
+        free(alerts);
+    }
+
+    weather_service_alerts_t previous = snapshot.alerts;
+    changed = UINT32_C(0xA5A5);
+    alerts = _build_alerts(3U, 1);
+    CHECK(alerts != NULL);
+    if (alerts != NULL)
+    {
+        CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS, alerts, &snapshot,
+                     &changed) == ESP_ERR_INVALID_RESPONSE);
+        CHECK(memcmp(&snapshot.alerts, &previous, sizeof(previous)) == 0);
+        CHECK(changed == UINT32_C(0xA5A5));
+        free(alerts);
+    }
+
+    s_fail_alert_allocation = true;
+    CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS,
+                 "{\"truncated\":false,\"items\":[]}",
+                 &snapshot, &changed) == ESP_ERR_NO_MEM);
+    s_fail_alert_allocation = false;
+    CHECK(memcmp(&snapshot.alerts, &previous, sizeof(previous)) == 0);
+    CHECK(changed == UINT32_C(0xA5A5));
+
+    char description[WEATHER_SERVICE_ALERT_TEXT_BYTES + 80U];
+    memset(description, 'x', sizeof(description) - 1U);
+    description[sizeof(description) - 1U] = '\0';
+    size_t capacity = strlen(description) + 1024U;
+    alerts = malloc(capacity);
+    CHECK(alerts != NULL);
+    if (alerts != NULL)
+    {
+        int written = snprintf(alerts, capacity,
+                               "{\"truncated\":false,\"items\":[{"
+                               "\"id\":\"long\",\"title\":\"Warning\","
+                               "\"type_name\":\"Weather\","
+                               "\"severity\":\"moderate\","
+                               "\"status\":\"active\","
+                               "\"issued_at\":\"2026-08-05T07:00:00+08:00\","
+                               "\"description\":\"%s\","
+                               "\"instruction\":\"Advice\","
+                               "\"content_truncated\":false}]}", description);
+        CHECK(written > 0 && (size_t)written < capacity);
+        if (written > 0 && (size_t)written < capacity)
+        {
+            CHECK(_parse(WEATHER_SERVICE_KIND_ALERTS, alerts, &snapshot,
+                         &changed) == ESP_OK);
+            CHECK(snapshot.alerts.items[0].content_truncated);
+            CHECK(strlen(snapshot.alerts.items[0].description) ==
+                  WEATHER_SERVICE_ALERT_TEXT_BYTES - 1U);
+        }
+        free(alerts);
+    }
 }
 
 static void _test_location(void)
@@ -106,6 +253,28 @@ static void _test_weather(void)
     CHECK(snapshot.current.humidity_percent == 72U);
     CHECK(snapshot.current.observed_at.epoch_seconds == 1785887400);
 
+    const char leap_day[] =
+        "{\"observed_at\":\"2024-02-29T23:59:59Z\","
+        "\"temperature_c\":31.2,\"feels_like_c\":35.6,"
+        "\"condition_code\":\"101\",\"condition_text\":\"Cloudy\","
+        "\"wind_degrees\":135,\"wind_speed_kmh\":12.3,"
+        "\"wind_direction\":\"SE\",\"wind_scale\":\"3\","
+        "\"humidity_percent\":72,\"precipitation_mm\":0.2,"
+        "\"pressure_hpa\":1004,\"visibility_km\":18.5}";
+    CHECK(_parse(WEATHER_SERVICE_KIND_CURRENT, leap_day, &snapshot,
+                 &changed) == ESP_OK);
+
+    const char impossible_time[] =
+        "{\"observed_at\":\"2026-02-29T00:00:00Z\","
+        "\"temperature_c\":31.2,\"feels_like_c\":35.6,"
+        "\"condition_code\":\"101\",\"condition_text\":\"Cloudy\","
+        "\"wind_degrees\":135,\"wind_speed_kmh\":12.3,"
+        "\"wind_direction\":\"SE\",\"wind_scale\":\"3\","
+        "\"humidity_percent\":72,\"precipitation_mm\":0.2,"
+        "\"pressure_hpa\":1004,\"visibility_km\":18.5}";
+    CHECK(_parse(WEATHER_SERVICE_KIND_CURRENT, impossible_time, &snapshot,
+                 &changed) == ESP_ERR_INVALID_RESPONSE);
+
     const char hourly[] =
         "{\"hours\":[{\"forecast_at\":\"2026-08-05T09:00:00+08:00\","
         "\"temperature_c\":32,\"condition_code\":\"100\","
@@ -128,6 +297,18 @@ static void _test_weather(void)
                  &changed) == ESP_OK);
     CHECK(snapshot.daily.count == 1U);
     CHECK(snapshot.daily.items[0].maximum_temperature_tenths_c == 340);
+
+    const char impossible_daily[] =
+        "{\"days\":[{\"date\":\"2026-02-31\","
+        "\"temperature_min_c\":27,\"temperature_max_c\":34,"
+        "\"condition_day_code\":\"100\","
+        "\"condition_night_code\":\"150\","
+        "\"condition_day_text\":\"Sunny\","
+        "\"condition_night_text\":\"Clear\","
+        "\"humidity_percent\":70,\"precipitation_mm\":0,"
+        "\"visibility_km\":20,\"uv_index\":8}]}";
+    CHECK(_parse(WEATHER_SERVICE_KIND_DAILY, impossible_daily, &snapshot,
+                 &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char alerts[] =
         "{\"truncated\":false,\"items\":[{\"id\":\"alert-1\","
@@ -235,6 +416,7 @@ int main(void)
     weather_service_parse_init();
     _test_location();
     _test_weather();
+    _test_alert_boundaries();
     _test_cache();
     printf("weather service: %u checks, %u failures\n", s_checks, s_failures);
     return s_failures == 0U ? 0 : 1;

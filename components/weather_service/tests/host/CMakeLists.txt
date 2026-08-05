@@ -39,6 +39,13 @@ function(configure_weather_host_target target)
     endif()
 endfunction()
 
+set_source_files_properties(
+    "${WEATHER_DIR}/src/weather_service.c"
+    "${WEATHER_DIR}/src/weather_service_cache.c"
+    "${WEATHER_DIR}/src/weather_service_parse.c"
+    "${WEATHER_DIR}/src/weather_service_port.c"
+    PROPERTIES COMPILE_OPTIONS "-Wframe-larger-than=4096")
+
 function(add_weather_host_test name target)
     if(WEATHER_SERVICE_SANITIZER STREQUAL "thread" AND
             WEATHER_SERVICE_SETARCH AND
@@ -83,7 +90,24 @@ target_compile_options(weather_service_worker_test PRIVATE
 target_link_libraries(weather_service_worker_test PRIVATE Threads::Threads)
 configure_weather_host_target(weather_service_worker_test)
 
+add_executable(weather_service_port_test
+    weather_service_port_test.c
+    "${WEATHER_DIR}/src/weather_service_port.c")
+target_include_directories(weather_service_port_test PRIVATE
+    port_include
+    include
+    "${INTEGRATION_HOST}/include"
+    "${WEATHER_DIR}/include"
+    "${WEATHER_DIR}/src")
+target_link_libraries(weather_service_port_test PRIVATE Threads::Threads)
+configure_weather_host_target(weather_service_port_test)
+
 enable_testing()
+add_test(NAME weather_cjson_hooks_ownership COMMAND
+    ${CMAKE_COMMAND}
+    -DMT_ROOT=${MT_ROOT}
+    -P ${CMAKE_CURRENT_LIST_DIR}/check_cjson_hooks.cmake)
 add_weather_host_test(weather_service_parse_cache
     weather_service_parse_cache_test)
 add_weather_host_test(weather_service_worker weather_service_worker_test)
+add_weather_host_test(weather_service_port weather_service_port_test)

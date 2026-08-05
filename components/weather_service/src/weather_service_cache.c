@@ -666,6 +666,15 @@ esp_err_t weather_service_cache_load(const char *directory,
         }
         result = ESP_OK;
     }
+    else if (first_result == ESP_ERR_NO_MEM ||
+             second_result == ESP_ERR_NO_MEM)
+    {
+        result = ESP_ERR_NO_MEM;
+    }
+    else if (first_result == ESP_FAIL || second_result == ESP_FAIL)
+    {
+        result = ESP_FAIL;
+    }
     _weather_cache_release(second);
     _weather_cache_release(first);
     return result;

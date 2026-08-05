@@ -276,7 +276,13 @@ esp_err_t weather_service_resume(uint32_t timeout_ms);
 esp_err_t weather_service_set_network_ready(bool ready,
         uint32_t ipv4_address);
 
-/** @brief Request one user-initiated refresh cycle. */
+/**
+ * @brief Request one user-initiated refresh cycle.
+ *
+ * @return ESP_OK when queued; ESP_ERR_INVALID_STATE when the service cannot
+ *         currently execute a refresh; ESP_ERR_TIMEOUT when limited locally
+ *         or blocked by an upstream account Retry-After deadline.
+ */
 esp_err_t weather_service_request_refresh(void);
 
 /** @brief Copy the current small service status. */

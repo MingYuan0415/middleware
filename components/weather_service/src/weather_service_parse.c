@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,8 +30,22 @@ static void _weather_parse_release(void *memory)
 }
 #endif
 
+static atomic_flag s_weather_parse_initialized = ATOMIC_FLAG_INIT;
+static atomic_bool s_weather_parse_ready = ATOMIC_VAR_INIT(false);
+
 void weather_service_parse_init(void)
 {
+    if (atomic_flag_test_and_set_explicit(&s_weather_parse_initialized,
+                                          memory_order_acq_rel))
+    {
+        while (!atomic_load_explicit(&s_weather_parse_ready,
+                                     memory_order_acquire))
+        {
+            atomic_signal_fence(memory_order_acquire);
+        }
+        return;
+    }
+    /* cJSON hooks are process-global; Weather Service owns their one-time setup. */
 #ifdef ESP_PLATFORM
     cJSON_Hooks hooks =
     {
@@ -41,6 +56,43 @@ void weather_service_parse_init(void)
 #else
     cJSON_InitHooks(NULL);
 #endif
+    atomic_store_explicit(&s_weather_parse_ready, true, memory_order_release);
+}
+
+static bool _weather_parse_leap_year(int year)
+{
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+static bool _weather_parse_valid_date(int year, unsigned month, unsigned day)
+{
+    static const uint8_t days_per_month[] =
+    {
+        31U, 28U, 31U, 30U, 31U, 30U,
+        31U, 31U, 30U, 31U, 30U, 31U,
+    };
+    if (year < 1970 || year > 2200 || month < 1U || month > 12U)
+    {
+        return false;
+    }
+    unsigned maximum = days_per_month[month - 1U];
+    if (month == 2U && _weather_parse_leap_year(year))
+    {
+        maximum = 29U;
+    }
+    return day >= 1U && day <= maximum;
+}
+
+static bool _weather_parse_digits(const char *text, size_t count)
+{
+    for (size_t index = 0U; index < count; ++index)
+    {
+        if (!isdigit((unsigned char)text[index]))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool _weather_parse_utf8(const char *text, size_t length)
@@ -187,11 +239,16 @@ static bool _weather_parse_time_text(const char *text,
     unsigned minute = 0U;
     unsigned second = 0U;
     int consumed = 0;
-    if (sscanf(text, "%d-%u-%uT%u:%u:%u%n", &year, &month, &day,
-               &hour, &minute, &second, &consumed) != 6 ||
-            year < 1970 || year > 2200 || month < 1U || month > 12U ||
-            day < 1U || day > 31U || hour > 23U || minute > 59U ||
-            second > 60U)
+    if (strlen(text) < 20U || !_weather_parse_digits(text, 4U) ||
+            text[4] != '-' || !_weather_parse_digits(text + 5, 2U) ||
+            text[7] != '-' || !_weather_parse_digits(text + 8, 2U) ||
+            text[10] != 'T' || !_weather_parse_digits(text + 11, 2U) ||
+            text[13] != ':' || !_weather_parse_digits(text + 14, 2U) ||
+            text[16] != ':' || !_weather_parse_digits(text + 17, 2U) ||
+            sscanf(text, "%d-%u-%uT%u:%u:%u%n", &year, &month, &day,
+                   &hour, &minute, &second, &consumed) != 6 ||
+            consumed != 19 || !_weather_parse_valid_date(year, month, day) ||
+            hour > 23U || minute > 59U || second > 59U)
     {
         return false;
     }
@@ -199,6 +256,10 @@ static bool _weather_parse_time_text(const char *text,
     if (*zone == '.')
     {
         ++zone;
+        if (!isdigit((unsigned char) * zone))
+        {
+            return false;
+        }
         while (isdigit((unsigned char) * zone))
         {
             ++zone;
@@ -215,8 +276,12 @@ static bool _weather_parse_time_text(const char *text,
         int zone_minute = 0;
         char sign = '\0';
         int zone_consumed = 0;
-        if (sscanf(zone, "%c%d:%d%n", &sign, &zone_hour, &zone_minute,
-                   &zone_consumed) != 3 || zone[zone_consumed] != '\0' ||
+        if (strlen(zone) != 6U ||
+                (zone[0] != '+' && zone[0] != '-') ||
+                !_weather_parse_digits(zone + 1, 2U) || zone[3] != ':' ||
+                !_weather_parse_digits(zone + 4, 2U) ||
+                sscanf(zone, "%c%d:%d%n", &sign, &zone_hour, &zone_minute,
+                       &zone_consumed) != 3 || zone[zone_consumed] != '\0' ||
                 (sign != '+' && sign != '-') || zone_hour > 23 ||
                 zone_minute > 59)
         {
@@ -234,6 +299,24 @@ static bool _weather_parse_time_text(const char *text,
     output->epoch_seconds = local_seconds - (int64_t)offset_minutes * 60;
     output->offset_minutes = (int16_t)offset_minutes;
     return true;
+}
+
+static bool _weather_parse_date_text(const char *text)
+{
+    if (text == NULL || strlen(text) != 10U ||
+            !_weather_parse_digits(text, 4U) || text[4] != '-' ||
+            !_weather_parse_digits(text + 5, 2U) || text[7] != '-' ||
+            !_weather_parse_digits(text + 8, 2U))
+    {
+        return false;
+    }
+    int year = (text[0] - '0') * 1000 + (text[1] - '0') * 100 +
+               (text[2] - '0') * 10 + text[3] - '0';
+    unsigned month = (unsigned)(text[5] - '0') * 10U +
+                     (unsigned)(text[6] - '0');
+    unsigned day = (unsigned)(text[8] - '0') * 10U +
+                   (unsigned)(text[9] - '0');
+    return _weather_parse_valid_date(year, month, day);
 }
 
 static bool _weather_parse_time(const cJSON *object, const char *name,
@@ -355,6 +438,8 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
     cJSON *root = cJSON_ParseWithLength((const char *)body, body_size);
     if (!cJSON_IsObject(root))
     {
+        LOG_W("location JSON rejected: root object; bytes=%u",
+              (unsigned)body_size);
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -362,21 +447,43 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
     double latitude = 0.0;
     double longitude = 0.0;
     weather_service_location_t parsed = {0};
-    bool valid = cJSON_IsObject(object) &&
-                 _weather_parse_number(object, "latitude", -90.0, 90.0,
-                                       &latitude, true) &&
-                 _weather_parse_number(object, "longitude", -180.0, 180.0,
-                                       &longitude, true) &&
-                 _weather_parse_copy_text(object, "city", parsed.city,
-                                          sizeof(parsed.city), false, NULL) &&
-                 _weather_parse_copy_text(object, "state", parsed.region,
-                                          sizeof(parsed.region), false, NULL) &&
-                 _weather_parse_copy_text(object, "country_code",
-                                          parsed.country,
-                                          sizeof(parsed.country), true, NULL) &&
-                 _weather_parse_copy_text(object, "timezone",
-                                          parsed.timezone,
-                                          sizeof(parsed.timezone), true, NULL);
+    const char *rejected_field = NULL;
+    if (!cJSON_IsObject(object))
+    {
+        rejected_field = "location object";
+    }
+    else if (!_weather_parse_number(object, "latitude", -90.0, 90.0,
+                                    &latitude, true))
+    {
+        rejected_field = "latitude";
+    }
+    else if (!_weather_parse_number(object, "longitude", -180.0, 180.0,
+                                    &longitude, true))
+    {
+        rejected_field = "longitude";
+    }
+    else if (!_weather_parse_copy_text(object, "city", parsed.city,
+                                       sizeof(parsed.city), false, NULL))
+    {
+        rejected_field = "city";
+    }
+    else if (!_weather_parse_copy_text(object, "state", parsed.region,
+                                       sizeof(parsed.region), false, NULL))
+    {
+        rejected_field = "state";
+    }
+    else if (!_weather_parse_copy_text(object, "country_code",
+                                       parsed.country,
+                                       sizeof(parsed.country), true, NULL))
+    {
+        rejected_field = "country_code";
+    }
+    else if (!_weather_parse_copy_text(object, "timezone", parsed.timezone,
+                                       sizeof(parsed.timezone), true, NULL))
+    {
+        rejected_field = "timezone";
+    }
+    bool valid = rejected_field == NULL;
     if (valid)
     {
         parsed.latitude_tenths = _weather_parse_signed_tenths(latitude);
@@ -385,6 +492,11 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
         parsed.acquired_at = acquired_at;
         parsed.available = true;
         *location = parsed;
+        LOG_D("location JSON accepted");
+    }
+    else
+    {
+        LOG_W("location JSON rejected: %s", rejected_field);
     }
     cJSON_Delete(root);
     return valid ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
@@ -530,7 +642,7 @@ static bool _weather_parse_day(const cJSON *object,
     double value = 0.0;
     if (!_weather_parse_copy_text(object, "date", day->date,
                                   sizeof(day->date), true, NULL) ||
-            strlen(day->date) != 10U ||
+            !_weather_parse_date_text(day->date) ||
             !_weather_parse_number(object, "temperature_min_c", -100.0,
                                    100.0, &value, true))
     {
@@ -666,15 +778,15 @@ static bool _weather_parse_alert(const cJSON *object,
     return true;
 }
 
-static bool _weather_parse_alerts(const cJSON *root, const cJSON *data,
-                                  weather_service_snapshot_t *snapshot)
+static esp_err_t _weather_parse_alerts(const cJSON *root, const cJSON *data,
+                                       weather_service_snapshot_t *snapshot)
 {
     const cJSON *items = cJSON_GetObjectItemCaseSensitive(data, "items");
     const cJSON *source_truncated = cJSON_GetObjectItemCaseSensitive(
                                         data, "truncated");
     if (!cJSON_IsArray(items) || !cJSON_IsBool(source_truncated))
     {
-        return false;
+        return ESP_ERR_INVALID_RESPONSE;
     }
     int source_count = cJSON_GetArraySize(items);
     int count = source_count;
@@ -682,24 +794,34 @@ static bool _weather_parse_alerts(const cJSON *root, const cJSON *data,
     {
         count = (int)WEATHER_SERVICE_MAX_ALERTS;
     }
-    weather_service_alerts_t parsed = {0};
-    if (!_weather_parse_meta(root, &parsed.meta))
+    weather_service_alerts_t *parsed = weather_service_port_psram_calloc(
+                                           1U, sizeof(*parsed));
+    if (parsed == NULL)
     {
-        return false;
+        return ESP_ERR_NO_MEM;
     }
-    parsed.truncated = cJSON_IsTrue(source_truncated) || count < source_count;
+    esp_err_t result = ESP_ERR_INVALID_RESPONSE;
+    if (!_weather_parse_meta(root, &parsed->meta))
+    {
+        goto cleanup;
+    }
+    parsed->truncated = cJSON_IsTrue(source_truncated) || count < source_count;
     for (int index = 0; index < count; ++index)
     {
         if (!_weather_parse_alert(cJSON_GetArrayItem(items, index),
-                                  &parsed.items[index]))
+                                  &parsed->items[index]))
         {
-            return false;
+            goto cleanup;
         }
     }
-    parsed.count = (uint8_t)count;
-    snapshot->alerts = parsed;
+    parsed->count = (uint8_t)count;
+    snapshot->alerts = *parsed;
     snapshot->available_mask |= WEATHER_SERVICE_DATA_ALERTS;
-    return true;
+    result = ESP_OK;
+
+cleanup:
+    weather_service_port_psram_free(parsed);
+    return result;
 }
 
 esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
@@ -727,6 +849,7 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                  cJSON_IsObject(data) &&
                  _weather_parse_public_location(root, &snapshot->location);
     uint32_t mask = 0U;
+    esp_err_t result = ESP_ERR_INVALID_RESPONSE;
     if (valid)
     {
         switch (kind)
@@ -736,7 +859,8 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
             mask = WEATHER_SERVICE_DATA_CURRENT;
             break;
         case WEATHER_SERVICE_KIND_ALERTS:
-            valid = _weather_parse_alerts(root, data, snapshot);
+            result = _weather_parse_alerts(root, data, snapshot);
+            valid = result == ESP_OK;
             mask = WEATHER_SERVICE_DATA_ALERTS;
             break;
         case WEATHER_SERVICE_KIND_HOURLY:
@@ -757,7 +881,8 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
         snapshot->location.available = true;
         snapshot->available_mask |= WEATHER_SERVICE_DATA_LOCATION;
         *changed_mask = mask | WEATHER_SERVICE_DATA_LOCATION;
+        result = ESP_OK;
     }
     cJSON_Delete(root);
-    return valid ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    return result;
 }

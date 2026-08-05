@@ -11,8 +11,11 @@ idf_component_register(
     PRIV_REQUIRES
         mt_log
         esp_http_client
+        esp_timer
         mbedtls
         espressif__cjson
         freertos
         heap
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wframe-larger-than=4096)

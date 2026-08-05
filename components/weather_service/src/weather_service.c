@@ -33,10 +33,13 @@ EVENT_BUS_DEFINE_ID(WEATHER_SERVICE_MSG);
 #define WEATHER_EVENT_STOPPED (UINT32_C(1) << 1)
 
 #define WEATHER_LOCATION_MAX_AGE_SECONDS (30 * 24 * 60 * 60)
-#define WEATHER_CACHE_WRITE_MIN_SECONDS   (5 * 60)
+#define WEATHER_CACHE_WRITE_MIN_MS        (INT64_C(5) * 60 * 1000)
 #define WEATHER_HTTP_TIMEOUT_MS           12000U
-#define WEATHER_LOCATION_TIMEOUT_MS       8000U
+#define WEATHER_LOCATION_TIMEOUT_MS       15000U
 #define WEATHER_LOCATION_RESPONSE_LIMIT   (8U * 1024U)
+#define WEATHER_LOCATION_STABILIZE_MIN_MS 2400U
+#define WEATHER_LOCATION_STABILIZE_RANGE_MS 1200U
+#define WEATHER_STACK_WARNING_BYTES       2048U
 
 #define WEATHER_CURRENT_MAX_STALE_SECONDS (6 * 60 * 60)
 #define WEATHER_ALERTS_MAX_STALE_SECONDS  (1 * 60 * 60)
@@ -71,15 +74,23 @@ typedef struct weather_service_context
     weather_snapshot_node_t *current;
     weather_service_status_snapshot_t status;
     uint64_t network_session;
-    uint64_t attempted_location_session;
+    uint64_t location_state_session;
+    uint64_t located_session;
+    weather_service_location_t session_location;
     uint64_t cache_sequence;
-    int64_t next_due[WEATHER_SERVICE_KIND_COUNT];
-    int64_t retry_due[WEATHER_SERVICE_KIND_COUNT];
-    int64_t account_retry_due;
+    int64_t next_due_ms[WEATHER_SERVICE_KIND_COUNT];
+    int64_t retry_due_ms[WEATHER_SERVICE_KIND_COUNT];
+    int64_t account_retry_due_ms;
+    int64_t location_retry_due_ms;
+    int64_t internal_retry_due_ms;
+    int64_t location_stabilize_due_ms;
     uint8_t retry_attempt[WEATHER_SERVICE_KIND_COUNT];
-    int64_t last_manual_refresh;
-    int64_t last_cache_write;
+    uint8_t location_retry_attempt;
+    uint8_t internal_retry_attempt;
+    int64_t last_manual_refresh_ms;
+    int64_t last_cache_write_ms;
     uint32_t ipv4_address;
+    uint32_t minimum_stack_remaining;
     bool initialized;
     bool network_ready;
     bool suspended;
@@ -192,22 +203,45 @@ static void _weather_publish(uint32_t changed_mask)
     }
 }
 
-static void _weather_swap(weather_snapshot_node_t *node,
-                          uint32_t changed_mask)
+static esp_err_t _weather_swap(weather_snapshot_node_t *node,
+                               uint32_t changed_mask, uint64_t session)
 {
-    weather_snapshot_node_t *previous;
+    weather_snapshot_node_t *previous = NULL;
+    bool swapped = false;
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
-    previous = s_weather.current;
-    node->snapshot.generation = previous == NULL ? 1U :
-                                previous->snapshot.generation + 1U;
-    s_weather.current = node;
-    s_weather.status.generation = node->snapshot.generation;
-    s_weather.status.available_mask = node->snapshot.available_mask;
-    s_weather.status.location_reused = node->snapshot.location.reused;
-    s_weather.cache_dirty = true;
+    if (s_weather.network_ready && s_weather.network_session == session)
+    {
+        previous = s_weather.current;
+        node->snapshot.generation = previous == NULL ? 1U :
+                                    previous->snapshot.generation + 1U;
+        s_weather.current = node;
+        s_weather.status.generation = node->snapshot.generation;
+        s_weather.status.available_mask = node->snapshot.available_mask;
+        s_weather.status.location_reused = node->snapshot.location.reused;
+        s_weather.cache_dirty = true;
+        swapped = true;
+    }
     xSemaphoreGive(s_weather.mutex);
+    if (!swapped)
+    {
+        _weather_node_release(node);
+        return ESP_ERR_INVALID_STATE;
+    }
     _weather_node_release(previous);
     _weather_publish(changed_mask);
+    return ESP_OK;
+}
+
+static esp_err_t _weather_commit_snapshot(
+    const weather_service_snapshot_t *snapshot, uint32_t changed_mask,
+    uint64_t session)
+{
+    weather_snapshot_node_t *node = _weather_node_new(snapshot);
+    if (node == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    return _weather_swap(node, changed_mask, session);
 }
 
 static weather_snapshot_node_t *_weather_clone_current(void)
@@ -368,6 +402,18 @@ static const char *_weather_kind_path(weather_service_kind_t kind)
     return paths[kind];
 }
 
+static const char *_weather_kind_name(weather_service_kind_t kind)
+{
+    static const char *const names[WEATHER_SERVICE_KIND_COUNT] =
+    {
+        "current",
+        "alerts",
+        "hourly",
+        "daily",
+    };
+    return names[kind];
+}
+
 static size_t _weather_kind_limit(weather_service_kind_t kind)
 {
     static const size_t limits[WEATHER_SERVICE_KIND_COUNT] =
@@ -393,8 +439,57 @@ static uint32_t _weather_retry_delay(uint8_t attempt)
                             random % (spread * 2U + 1U));
 }
 
+static int64_t _weather_deadline_after(int64_t now_ms, uint32_t seconds)
+{
+    int64_t delay_ms = (int64_t)seconds * 1000;
+    return now_ms > INT64_MAX - delay_ms ? INT64_MAX : now_ms + delay_ms;
+}
+
+static uint32_t _weather_deadline_remaining(int64_t deadline_ms,
+        int64_t now_ms)
+{
+    if (deadline_ms <= now_ms)
+    {
+        return 0U;
+    }
+    uint64_t remaining_ms = (uint64_t)(deadline_ms - now_ms);
+    uint64_t seconds = (remaining_ms + 999U) / 1000U;
+    return seconds > UINT32_MAX ? UINT32_MAX : (uint32_t)seconds;
+}
+
+static uint32_t _weather_location_stabilize_delay_ms(void)
+{
+    return WEATHER_LOCATION_STABILIZE_MIN_MS +
+           weather_service_port_random_u32() %
+           (WEATHER_LOCATION_STABILIZE_RANGE_MS + 1U);
+}
+
+static void _weather_record_stack(const char *checkpoint)
+{
+#ifdef ESP_PLATFORM
+    uint32_t remaining = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    if (remaining >= s_weather.minimum_stack_remaining)
+    {
+        return;
+    }
+    s_weather.minimum_stack_remaining = remaining;
+    if (remaining < WEATHER_STACK_WARNING_BYTES)
+    {
+        LOG_W("worker stack low after %s: %u bytes remaining",
+              checkpoint, (unsigned)remaining);
+    }
+    else
+    {
+        LOG_D("worker stack minimum after %s: %u bytes remaining",
+              checkpoint, (unsigned)remaining);
+    }
+#else
+    (void)checkpoint;
+#endif
+}
+
 static void _weather_schedule_failure(weather_service_kind_t kind,
-                                      int64_t now, uint32_t retry_after)
+                                      int64_t now_ms, uint32_t retry_after)
 {
     uint32_t delay = retry_after;
     if (delay == 0U)
@@ -405,7 +500,29 @@ static void _weather_schedule_failure(weather_service_kind_t kind,
             ++s_weather.retry_attempt[kind];
         }
     }
-    s_weather.retry_due[kind] = now + delay;
+    s_weather.retry_due_ms[kind] = _weather_deadline_after(now_ms, delay);
+}
+
+static void _weather_schedule_internal_failure(int64_t now_ms)
+{
+    uint32_t delay = _weather_retry_delay(s_weather.internal_retry_attempt);
+    if (s_weather.internal_retry_attempt < UINT8_MAX)
+    {
+        ++s_weather.internal_retry_attempt;
+    }
+    s_weather.internal_retry_due_ms = _weather_deadline_after(now_ms, delay);
+    if (_weather_status_set(WEATHER_SERVICE_STATE_ERROR,
+                            WEATHER_SERVICE_FAILURE_INTERNAL, delay))
+    {
+        _weather_publish(0U);
+    }
+    LOG_W("internal weather failure; retry in %u seconds", (unsigned)delay);
+}
+
+static void _weather_clear_internal_failure(void)
+{
+    s_weather.internal_retry_due_ms = 0;
+    s_weather.internal_retry_attempt = 0U;
 }
 
 static bool _weather_should_stop_cycle(void)
@@ -416,8 +533,8 @@ static bool _weather_should_stop_cycle(void)
     return stop;
 }
 
-static void _weather_mark_expired(weather_service_snapshot_t *snapshot,
-                                  int64_t now)
+static uint32_t _weather_mark_expired(weather_service_snapshot_t *snapshot,
+                                      int64_t now)
 {
     weather_service_dataset_meta_t *metadata[WEATHER_SERVICE_KIND_COUNT] =
     {
@@ -433,38 +550,80 @@ static void _weather_mark_expired(weather_service_snapshot_t *snapshot,
         WEATHER_HOURLY_MAX_STALE_SECONDS,
         WEATHER_DAILY_MAX_STALE_SECONDS,
     };
+    static const uint32_t masks[WEATHER_SERVICE_KIND_COUNT] =
+    {
+        WEATHER_SERVICE_DATA_CURRENT,
+        WEATHER_SERVICE_DATA_ALERTS,
+        WEATHER_SERVICE_DATA_HOURLY,
+        WEATHER_SERVICE_DATA_DAILY,
+    };
+    uint32_t changed_mask = 0U;
     for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
             kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
     {
         weather_service_dataset_meta_t *meta = metadata[kind];
-        meta->expired = meta->available && now > 0 &&
-                        meta->fetched_at.epoch_seconds > 0 &&
+        bool expired = meta->available &&
+                       (now <= 0 || meta->fetched_at.epoch_seconds <= 0 ||
+                        now < meta->fetched_at.epoch_seconds ||
                         now - meta->fetched_at.epoch_seconds >
-                        maximum_age[kind];
+                        maximum_age[kind]);
+        if (meta->expired != expired)
+        {
+            meta->expired = expired;
+            changed_mask |= masks[kind];
+        }
     }
+    return changed_mask;
 }
 
 static bool _weather_transport_retryable(esp_err_t error)
 {
     return error != ESP_OK && error != ESP_ERR_INVALID_ARG &&
            error != ESP_ERR_INVALID_SIZE &&
-           error != ESP_ERR_INVALID_RESPONSE && error != ESP_ERR_NO_MEM;
+           error != ESP_ERR_INVALID_RESPONSE && error != ESP_ERR_NO_MEM &&
+           error != ESP_ERR_INVALID_STATE;
 }
 
-static esp_err_t _weather_locate(weather_service_location_t *location)
+static esp_err_t _weather_http_admit(uint64_t session,
+                                     uint64_t *cancel_generation)
+{
+    xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+    bool admitted = s_weather.network_ready &&
+                    s_weather.network_session == session &&
+                    !s_weather.suspended && !s_weather.stopping;
+    if (admitted)
+    {
+        *cancel_generation = weather_service_port_cancel_generation();
+    }
+    xSemaphoreGive(s_weather.mutex);
+    return admitted ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t _weather_locate(uint64_t session,
+                                 weather_service_location_t *location)
 {
     esp_err_t result = ESP_FAIL;
     for (unsigned attempt = 0U; attempt < 2U; ++attempt)
     {
+        uint64_t cancel_generation = 0U;
+        result = _weather_http_admit(session, &cancel_generation);
+        if (result != ESP_OK)
+        {
+            break;
+        }
         weather_service_http_result_t response;
+        LOG_D("location HTTP attempt %u/2", attempt + 1U);
         result = weather_service_port_http_get(
                      s_weather.config.location_url, NULL, NULL,
                      WEATHER_LOCATION_RESPONSE_LIMIT,
-                     WEATHER_LOCATION_TIMEOUT_MS, &response);
+                     WEATHER_LOCATION_TIMEOUT_MS, cancel_generation,
+                     &response);
         bool retryable = _weather_transport_retryable(result) ||
                          (result == ESP_OK && response.status_code >= 500);
         if (result == ESP_OK)
         {
+            LOG_D("location HTTP response: status=%d bytes=%u",
+                  response.status_code, (unsigned)response.body_size);
             if (response.status_code == 200)
             {
                 result = weather_service_parse_location(
@@ -476,6 +635,15 @@ static esp_err_t _weather_locate(weather_service_location_t *location)
                 result = ESP_ERR_INVALID_RESPONSE;
             }
             weather_service_port_http_result_release(&response);
+        }
+        else
+        {
+            LOG_W("location HTTP attempt %u failed: %s",
+                  attempt + 1U, esp_err_to_name(result));
+        }
+        if (retryable && attempt == 0U)
+        {
+            LOG_D("location HTTP immediate retry admitted");
         }
         if (!retryable || attempt != 0U || _weather_should_stop_cycle())
         {
@@ -489,51 +657,42 @@ static bool _weather_location_usable(const weather_service_location_t *location,
                                      int64_t now)
 {
     return location->available && location->acquired_at > 0 && now > 0 &&
+           now >= location->acquired_at &&
            now - location->acquired_at <= WEATHER_LOCATION_MAX_AGE_SECONDS;
 }
 
-static esp_err_t _weather_prepare_location(weather_snapshot_node_t **staging)
+static bool _weather_location_equal(const weather_service_location_t *left,
+                                    const weather_service_location_t *right)
 {
-    uint64_t session;
-    int64_t now = weather_service_port_now_seconds();
+    return left->latitude_tenths == right->latitude_tenths &&
+           left->longitude_tenths == right->longitude_tenths &&
+           left->acquired_at == right->acquired_at &&
+           left->available == right->available &&
+           left->reused == right->reused &&
+           strcmp(left->city, right->city) == 0 &&
+           strcmp(left->region, right->region) == 0 &&
+           strcmp(left->country, right->country) == 0 &&
+           strcmp(left->timezone, right->timezone) == 0 &&
+           strcmp(left->provider, right->provider) == 0;
+}
+
+static bool _weather_session_active(uint64_t session)
+{
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
-    session = s_weather.network_session;
-    bool attempted = s_weather.attempted_location_session == session;
+    bool active = s_weather.network_ready &&
+                  s_weather.network_session == session;
     xSemaphoreGive(s_weather.mutex);
-    if (attempted)
-    {
-        return _weather_location_usable(&(*staging)->snapshot.location, now) ?
-               ESP_OK : ESP_ERR_NOT_FOUND;
-    }
-    _weather_status_set(WEATHER_SERVICE_STATE_LOCATING,
-                        WEATHER_SERVICE_FAILURE_NONE, 0U);
-    _weather_publish(0U);
-    weather_service_location_t location = {0};
-    esp_err_t result = _weather_locate(&location);
-    now = weather_service_port_now_seconds();
-    xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
-    s_weather.attempted_location_session = session;
-    xSemaphoreGive(s_weather.mutex);
-    if (result != ESP_OK)
-    {
-        if ((*staging)->snapshot.location.available &&
-                _weather_location_usable(&(*staging)->snapshot.location, now))
-        {
-            (*staging)->snapshot.location.reused = true;
-            _weather_status_set(WEATHER_SERVICE_STATE_DEGRADED,
-                                WEATHER_SERVICE_FAILURE_LOCATION, 0U);
-            return ESP_OK;
-        }
-        _weather_status_set(WEATHER_SERVICE_STATE_ERROR,
-                            WEATHER_SERVICE_FAILURE_LOCATION, 0U);
-        _weather_publish(0U);
-        return result;
-    }
+    return active;
+}
+
+static esp_err_t _weather_stage_location(weather_snapshot_node_t **staging,
+        const weather_service_location_t *location)
+{
     bool different = !(*staging)->snapshot.location.available ||
                      (*staging)->snapshot.location.latitude_tenths !=
-                     location.latitude_tenths ||
+                     location->latitude_tenths ||
                      (*staging)->snapshot.location.longitude_tenths !=
-                     location.longitude_tenths;
+                     location->longitude_tenths;
     if (different)
     {
         weather_snapshot_node_t *replacement = _weather_node_new(NULL);
@@ -541,17 +700,132 @@ static esp_err_t _weather_prepare_location(weather_snapshot_node_t **staging)
         {
             return ESP_ERR_NO_MEM;
         }
-        replacement->snapshot.location = location;
+        replacement->snapshot.location = *location;
         replacement->snapshot.available_mask = WEATHER_SERVICE_DATA_LOCATION;
         _weather_node_release(*staging);
         *staging = replacement;
     }
     else
     {
-        (*staging)->snapshot.location = location;
+        (*staging)->snapshot.location = *location;
         (*staging)->snapshot.available_mask |= WEATHER_SERVICE_DATA_LOCATION;
     }
     return ESP_OK;
+}
+
+static esp_err_t _weather_use_location_fallback(
+    weather_snapshot_node_t *staging, int64_t now, uint32_t retry_after)
+{
+    weather_service_state_t state = WEATHER_SERVICE_STATE_ERROR;
+    if (_weather_location_usable(&staging->snapshot.location, now))
+    {
+        staging->snapshot.location.reused = true;
+        state = WEATHER_SERVICE_STATE_DEGRADED;
+    }
+    if (_weather_status_set(state, WEATHER_SERVICE_FAILURE_LOCATION,
+                            retry_after))
+    {
+        _weather_publish(0U);
+    }
+    return state == WEATHER_SERVICE_STATE_DEGRADED ? ESP_OK :
+           ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t _weather_prepare_location(weather_snapshot_node_t **staging,
+        bool force, uint64_t *cycle_session)
+{
+    int64_t now = weather_service_port_now_seconds();
+    int64_t monotonic_now_ms = weather_service_port_now_milliseconds();
+    xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+    uint64_t session = s_weather.network_session;
+    bool ready = s_weather.network_ready;
+    xSemaphoreGive(s_weather.mutex);
+    *cycle_session = session;
+    if (!ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_weather.location_state_session != session)
+    {
+        s_weather.location_state_session = session;
+        s_weather.located_session = 0U;
+        memset(&s_weather.session_location, 0,
+               sizeof(s_weather.session_location));
+        s_weather.location_retry_due_ms = 0;
+        s_weather.location_retry_attempt = 0U;
+        s_weather.location_stabilize_due_ms = monotonic_now_ms +
+                                              _weather_location_stabilize_delay_ms();
+        LOG_D("network location session started");
+    }
+    if (s_weather.located_session == session)
+    {
+        return _weather_stage_location(staging,
+                                       &s_weather.session_location);
+    }
+    if (!force && s_weather.location_stabilize_due_ms > monotonic_now_ms)
+    {
+        uint64_t remaining_ms = (uint64_t)(
+                                    s_weather.location_stabilize_due_ms -
+                                    monotonic_now_ms);
+        uint32_t remaining_seconds = (uint32_t)((remaining_ms + 999U) /
+                                                1000U);
+        if (_weather_status_set(WEATHER_SERVICE_STATE_LOCATING,
+                                WEATHER_SERVICE_FAILURE_NONE,
+                                remaining_seconds))
+        {
+            _weather_publish(0U);
+        }
+        return ESP_ERR_NOT_FINISHED;
+    }
+    if (!force && s_weather.location_retry_due_ms > monotonic_now_ms)
+    {
+        return _weather_use_location_fallback(
+                   *staging, now,
+                   _weather_deadline_remaining(
+                       s_weather.location_retry_due_ms, monotonic_now_ms));
+    }
+    _weather_status_set(WEATHER_SERVICE_STATE_LOCATING,
+                        WEATHER_SERVICE_FAILURE_NONE, 0U);
+    _weather_publish(0U);
+    LOG_D("location attempt started");
+    weather_service_location_t location = {0};
+    esp_err_t result = _weather_locate(session, &location);
+    _weather_record_stack("location");
+    now = weather_service_port_now_seconds();
+    monotonic_now_ms = weather_service_port_now_milliseconds();
+    if (!_weather_session_active(session))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (result != ESP_OK)
+    {
+        if (result == ESP_ERR_NO_MEM || result == ESP_ERR_INVALID_ARG)
+        {
+            return result;
+        }
+        uint32_t delay = _weather_retry_delay(
+                             s_weather.location_retry_attempt);
+        if (s_weather.location_retry_attempt < UINT8_MAX)
+        {
+            ++s_weather.location_retry_attempt;
+        }
+        if (result == ESP_ERR_INVALID_STATE)
+        {
+            return result;
+        }
+        s_weather.location_retry_due_ms = _weather_deadline_after(
+                                              monotonic_now_ms, delay);
+        LOG_W("location attempt failed: %s; retry in %u seconds",
+              esp_err_to_name(result), (unsigned)delay);
+        return _weather_use_location_fallback(*staging, now, delay);
+    }
+    s_weather.session_location = location;
+    s_weather.located_session = session;
+    s_weather.location_retry_due_ms = 0;
+    s_weather.location_retry_attempt = 0U;
+    s_weather.location_stabilize_due_ms = 0;
+    LOG_D("location attempt succeeded");
+    return _weather_stage_location(staging, &location);
 }
 
 static weather_service_failure_t _weather_http_failure(int status)
@@ -573,7 +847,7 @@ static weather_service_failure_t _weather_http_failure(int status)
 
 static weather_service_fetch_result_t _weather_fetch_once(
     weather_service_kind_t kind, weather_snapshot_node_t *node,
-    uint32_t *changed_mask)
+    uint32_t *changed_mask, uint64_t session)
 {
     weather_service_fetch_result_t fetch = {0};
     char url[256];
@@ -590,11 +864,19 @@ static weather_service_fetch_result_t _weather_fetch_once(
         return fetch;
     }
     weather_service_http_result_t response;
-    esp_err_t result = weather_service_port_http_get(
-                           url, s_weather.config.device_token,
-                           &node->snapshot.location,
-                           _weather_kind_limit(kind), WEATHER_HTTP_TIMEOUT_MS,
-                           &response);
+    uint64_t cancel_generation = 0U;
+    esp_err_t result = _weather_http_admit(session, &cancel_generation);
+    if (result != ESP_OK)
+    {
+        fetch.error = result;
+        return fetch;
+    }
+    result = weather_service_port_http_get(
+                 url, s_weather.config.device_token,
+                 &node->snapshot.location,
+                 _weather_kind_limit(kind), WEATHER_HTTP_TIMEOUT_MS,
+                 cancel_generation,
+                 &response);
     fetch.status_code = response.status_code;
     fetch.retry_after_seconds = response.retry_after_seconds;
     if (result != ESP_OK)
@@ -615,12 +897,12 @@ static weather_service_fetch_result_t _weather_fetch_once(
 
 static weather_service_fetch_result_t _weather_fetch(
     weather_service_kind_t kind, weather_snapshot_node_t *node,
-    uint32_t *changed_mask)
+    uint32_t *changed_mask, uint64_t session)
 {
     weather_service_fetch_result_t fetch = {0};
     for (unsigned attempt = 0U; attempt < 2U; ++attempt)
     {
-        fetch = _weather_fetch_once(kind, node, changed_mask);
+        fetch = _weather_fetch_once(kind, node, changed_mask, session);
         bool retryable = _weather_transport_retryable(fetch.error) ||
                          (fetch.error == ESP_OK && fetch.status_code >= 500);
         if (!retryable || attempt != 0U || _weather_should_stop_cycle())
@@ -631,10 +913,11 @@ static weather_service_fetch_result_t _weather_fetch(
     return fetch;
 }
 
-static bool _weather_kind_due(weather_service_kind_t kind, int64_t now,
+static bool _weather_kind_due(weather_service_kind_t kind, int64_t now_ms,
                               bool force)
 {
-    if (s_weather.account_retry_due > now || s_weather.retry_due[kind] > now)
+    if (s_weather.account_retry_due_ms > now_ms ||
+            (!force && s_weather.retry_due_ms[kind] > now_ms))
     {
         return false;
     }
@@ -642,16 +925,17 @@ static bool _weather_kind_due(weather_service_kind_t kind, int64_t now,
     {
         return true;
     }
-    return s_weather.next_due[kind] == 0 || s_weather.next_due[kind] <= now;
+    return s_weather.next_due_ms[kind] == 0 ||
+           s_weather.next_due_ms[kind] <= now_ms;
 }
 
-static void _weather_store_cache_if_due(int64_t now, bool force)
+static void _weather_store_cache_if_due(int64_t now_ms, bool force)
 {
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
     bool due = s_weather.cache_dirty &&
-               (force || s_weather.last_cache_write == 0 ||
-                now - s_weather.last_cache_write >=
-                WEATHER_CACHE_WRITE_MIN_SECONDS);
+               (force || s_weather.last_cache_write_ms == 0 ||
+                now_ms - s_weather.last_cache_write_ms >=
+                WEATHER_CACHE_WRITE_MIN_MS);
     weather_snapshot_node_t *node = s_weather.current;
     if (due && node != NULL)
     {
@@ -670,7 +954,7 @@ static void _weather_store_cache_if_due(int64_t now, bool force)
     {
         xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
         s_weather.cache_sequence = sequence;
-        s_weather.last_cache_write = now;
+        s_weather.last_cache_write_ms = now_ms;
         s_weather.cache_dirty = false;
         xSemaphoreGive(s_weather.mutex);
     }
@@ -681,9 +965,35 @@ static void _weather_store_cache_if_due(int64_t now, bool force)
     _weather_node_release(node);
 }
 
+static void _weather_force_consume(bool force)
+{
+    if (!force)
+    {
+        return;
+    }
+    xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+    s_weather.force_refresh = false;
+    xSemaphoreGive(s_weather.mutex);
+}
+
+static void _weather_force_restore(bool force)
+{
+    if (!force)
+    {
+        return;
+    }
+    xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+    if (!s_weather.stopping)
+    {
+        s_weather.force_refresh = true;
+    }
+    xSemaphoreGive(s_weather.mutex);
+}
+
 static void _weather_run_cycle(bool force)
 {
-    int64_t now = weather_service_port_now_seconds();
+    int64_t wall_now = weather_service_port_now_seconds();
+    int64_t monotonic_now_ms = weather_service_port_now_milliseconds();
     weather_service_state_t previous_state;
     weather_service_failure_t previous_failure;
     uint32_t previous_retry_after;
@@ -692,20 +1002,57 @@ static void _weather_run_cycle(bool force)
     previous_failure = s_weather.status.failure;
     previous_retry_after = s_weather.status.retry_after_seconds;
     xSemaphoreGive(s_weather.mutex);
+    if (!force && s_weather.internal_retry_due_ms > monotonic_now_ms)
+    {
+        uint32_t remaining = _weather_deadline_remaining(
+                                 s_weather.internal_retry_due_ms,
+                                 monotonic_now_ms);
+        if (_weather_status_set(WEATHER_SERVICE_STATE_ERROR,
+                                WEATHER_SERVICE_FAILURE_INTERNAL, remaining))
+        {
+            _weather_publish(0U);
+        }
+        return;
+    }
     weather_snapshot_node_t *staging = _weather_clone_current();
     if (staging == NULL)
     {
-        _weather_status_set(WEATHER_SERVICE_STATE_ERROR,
-                            WEATHER_SERVICE_FAILURE_INTERNAL, 0U);
+        _weather_force_consume(force);
+        _weather_schedule_internal_failure(monotonic_now_ms);
         return;
     }
-    if (_weather_prepare_location(&staging) != ESP_OK)
+    uint64_t cycle_session = 0U;
+    esp_err_t location_result = _weather_prepare_location(
+                                    &staging, force, &cycle_session);
+    if (location_result != ESP_OK)
     {
         _weather_node_release(staging);
+        if (location_result == ESP_ERR_INVALID_STATE)
+        {
+            _weather_force_restore(force);
+        }
+        else if (location_result == ESP_ERR_NO_MEM ||
+                 location_result == ESP_ERR_INVALID_ARG)
+        {
+            _weather_force_consume(force);
+            _weather_schedule_internal_failure(monotonic_now_ms);
+        }
+        else if (force)
+        {
+            _weather_force_consume(true);
+        }
         return;
     }
-    _weather_mark_expired(&staging->snapshot, now);
+    if (!_weather_session_active(cycle_session))
+    {
+        _weather_node_release(staging);
+        _weather_force_restore(force);
+        return;
+    }
+    uint32_t metadata_changed = _weather_mark_expired(&staging->snapshot,
+                                wall_now);
     bool new_location = false;
+    bool location_changed = false;
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
     if (s_weather.current == NULL ||
             s_weather.current->snapshot.location.latitude_tenths !=
@@ -715,19 +1062,64 @@ static void _weather_run_cycle(bool force)
     {
         new_location = true;
     }
-    xSemaphoreGive(s_weather.mutex);
-    bool any_due = false;
-    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
-            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    if (s_weather.current == NULL ||
+            !_weather_location_equal(&s_weather.current->snapshot.location,
+                                     &staging->snapshot.location))
     {
-        if (_weather_kind_due(kind, now, force || new_location))
+        location_changed = true;
+    }
+    xSemaphoreGive(s_weather.mutex);
+    if (!new_location && (location_changed || metadata_changed != 0U))
+    {
+        uint32_t changed_mask = metadata_changed;
+        if (location_changed)
         {
-            any_due = true;
-            break;
+            changed_mask |= WEATHER_SERVICE_DATA_LOCATION;
+        }
+        esp_err_t commit_result = _weather_commit_snapshot(
+                                      &staging->snapshot, changed_mask,
+                                      cycle_session);
+        if (commit_result != ESP_OK)
+        {
+            _weather_node_release(staging);
+            if (commit_result == ESP_ERR_NO_MEM)
+            {
+                _weather_force_consume(force);
+                _weather_schedule_internal_failure(monotonic_now_ms);
+            }
+            else
+            {
+                _weather_force_restore(force);
+            }
+            return;
+        }
+        _weather_clear_internal_failure();
+    }
+    bool refresh_all_for_location = new_location;
+    bool any_due = false;
+    if (new_location)
+    {
+        any_due = _weather_kind_due(WEATHER_SERVICE_KIND_CURRENT,
+                                    monotonic_now_ms, true);
+    }
+    else
+    {
+        for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+                kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+        {
+            if (_weather_kind_due(kind, monotonic_now_ms, force))
+            {
+                any_due = true;
+                break;
+            }
         }
     }
     if (!any_due)
     {
+        if (force && s_weather.account_retry_due_ms > monotonic_now_ms)
+        {
+            _weather_force_consume(true);
+        }
         weather_service_state_t idle_state =
             staging->snapshot.location.reused ?
             WEATHER_SERVICE_STATE_DEGRADED : WEATHER_SERVICE_STATE_READY;
@@ -735,24 +1127,33 @@ static void _weather_run_cycle(bool force)
             staging->snapshot.location.reused ?
             WEATHER_SERVICE_FAILURE_LOCATION : WEATHER_SERVICE_FAILURE_NONE;
         uint32_t idle_retry_after = 0U;
+        if (staging->snapshot.location.reused &&
+                s_weather.location_retry_due_ms > monotonic_now_ms)
+        {
+            idle_retry_after = _weather_deadline_remaining(
+                                   s_weather.location_retry_due_ms,
+                                   monotonic_now_ms);
+        }
         if (previous_state == WEATHER_SERVICE_STATE_AUTH_ERROR)
         {
             idle_state = previous_state;
             idle_failure = previous_failure;
             idle_retry_after = previous_retry_after;
         }
-        else if (s_weather.account_retry_due > now)
+        else if (s_weather.account_retry_due_ms > monotonic_now_ms)
         {
             idle_state = WEATHER_SERVICE_STATE_RATE_LIMITED;
             idle_failure = WEATHER_SERVICE_FAILURE_RATE_LIMITED;
-            idle_retry_after = (uint32_t)(s_weather.account_retry_due - now);
+            idle_retry_after = _weather_deadline_remaining(
+                                   s_weather.account_retry_due_ms,
+                                   monotonic_now_ms);
         }
         else
         {
             for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
                     kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
             {
-                if (s_weather.retry_due[kind] > now)
+                if (s_weather.retry_due_ms[kind] > monotonic_now_ms)
                 {
                     idle_state = WEATHER_SERVICE_STATE_DEGRADED;
                     idle_failure = previous_failure;
@@ -767,6 +1168,7 @@ static void _weather_run_cycle(bool force)
         }
         return;
     }
+    _weather_force_consume(force);
     _weather_status_set(WEATHER_SERVICE_STATE_UPDATING,
                         staging->snapshot.location.reused ?
                         WEATHER_SERVICE_FAILURE_LOCATION :
@@ -775,6 +1177,7 @@ static void _weather_run_cycle(bool force)
     bool any_success = false;
     bool cycle_failed = false;
     bool attempted_fetch = false;
+    uint32_t successful_kinds = 0U;
     weather_service_state_t final_state =
         staging->snapshot.location.reused ? WEATHER_SERVICE_STATE_DEGRADED :
         WEATHER_SERVICE_STATE_READY;
@@ -782,59 +1185,141 @@ static void _weather_run_cycle(bool force)
         staging->snapshot.location.reused ? WEATHER_SERVICE_FAILURE_LOCATION :
         WEATHER_SERVICE_FAILURE_NONE;
     uint32_t final_retry_after = 0U;
+    if (staging->snapshot.location.reused &&
+            s_weather.location_retry_due_ms > monotonic_now_ms)
+    {
+        final_retry_after = _weather_deadline_remaining(
+                                s_weather.location_retry_due_ms,
+                                monotonic_now_ms);
+    }
     for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
             kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
     {
         if (_weather_should_stop_cycle())
         {
+            _weather_force_restore(force);
             break;
         }
-        if (!_weather_kind_due(kind, now, force || new_location))
+        if (new_location && kind != WEATHER_SERVICE_KIND_CURRENT)
+        {
+            continue;
+        }
+        monotonic_now_ms = weather_service_port_now_milliseconds();
+        if (!_weather_kind_due(kind, monotonic_now_ms,
+                               force || refresh_all_for_location))
         {
             continue;
         }
         attempted_fetch = true;
+        weather_snapshot_node_t *candidate = _weather_node_new(
+                &staging->snapshot);
+        if (candidate == NULL)
+        {
+            cycle_failed = true;
+            final_state = WEATHER_SERVICE_STATE_ERROR;
+            final_failure = WEATHER_SERVICE_FAILURE_INTERNAL;
+            _weather_schedule_internal_failure(monotonic_now_ms);
+            break;
+        }
         uint32_t changed_mask = 0U;
         weather_service_fetch_result_t fetch = _weather_fetch(
-                kind, staging,
-                &changed_mask);
+                kind, candidate, &changed_mask, cycle_session);
+        _weather_record_stack(_weather_kind_name(kind));
+        if (!_weather_session_active(cycle_session))
+        {
+            _weather_node_release(candidate);
+            _weather_node_release(staging);
+            _weather_force_restore(force);
+            return;
+        }
         if (fetch.error == ESP_OK && fetch.status_code == 200)
         {
-            s_weather.retry_attempt[kind] = 0U;
-            s_weather.retry_due[kind] = 0;
-            s_weather.next_due[kind] = now +
-                                       s_weather.config.refresh_seconds[kind];
-            any_success = true;
-            weather_snapshot_node_t *published = _weather_node_new(
-                    &staging->snapshot);
-            if (published != NULL &&
-                    (!new_location || kind == WEATHER_SERVICE_KIND_CURRENT ||
-                     (published->snapshot.available_mask &
-                      WEATHER_SERVICE_DATA_CURRENT) != 0U))
+            bool publishable = !new_location ||
+                               kind == WEATHER_SERVICE_KIND_CURRENT ||
+                               (candidate->snapshot.available_mask &
+                                WEATHER_SERVICE_DATA_CURRENT) != 0U;
+            esp_err_t commit_result = publishable ?
+                                      _weather_commit_snapshot(
+                                          &candidate->snapshot,
+                                          changed_mask, cycle_session) :
+                                      ESP_ERR_INVALID_STATE;
+            if (commit_result == ESP_OK)
             {
-                _weather_swap(published, changed_mask);
+                _weather_node_release(staging);
+                staging = candidate;
+                candidate = NULL;
                 new_location = false;
+                s_weather.retry_attempt[kind] = 0U;
+                s_weather.retry_due_ms[kind] = 0;
+                monotonic_now_ms = weather_service_port_now_milliseconds();
+                s_weather.next_due_ms[kind] = _weather_deadline_after(
+                                                  monotonic_now_ms,
+                                                  s_weather.config.refresh_seconds[kind]);
+                _weather_clear_internal_failure();
+                any_success = true;
+                successful_kinds |= UINT32_C(1) << kind;
             }
             else
             {
-                _weather_node_release(published);
+                cycle_failed = true;
+                final_state = WEATHER_SERVICE_STATE_ERROR;
+                final_failure = WEATHER_SERVICE_FAILURE_INTERNAL;
+                if (commit_result == ESP_ERR_NO_MEM)
+                {
+                    _weather_schedule_internal_failure(monotonic_now_ms);
+                }
+                else
+                {
+                    _weather_force_restore(force);
+                }
+            }
+            _weather_node_release(candidate);
+            if (commit_result != ESP_OK)
+            {
+                break;
             }
             continue;
         }
+        _weather_node_release(candidate);
+        if (fetch.error == ESP_ERR_INVALID_STATE)
+        {
+            _weather_node_release(staging);
+            _weather_force_restore(force);
+            return;
+        }
         cycle_failed = true;
         int status = fetch.status_code;
-        weather_service_failure_t failure = status == 0 ?
-                                            WEATHER_SERVICE_FAILURE_NETWORK :
-                                            _weather_http_failure(status);
-        if (fetch.error != ESP_OK && status == 200)
+        weather_service_failure_t failure;
+        if (fetch.error == ESP_ERR_NO_MEM ||
+                fetch.error == ESP_ERR_INVALID_ARG)
+        {
+            failure = WEATHER_SERVICE_FAILURE_INTERNAL;
+        }
+        else if (fetch.error == ESP_ERR_INVALID_SIZE ||
+                 fetch.error == ESP_ERR_INVALID_RESPONSE)
         {
             failure = WEATHER_SERVICE_FAILURE_RESPONSE;
+        }
+        else
+        {
+            failure = status == 0 ? WEATHER_SERVICE_FAILURE_NETWORK :
+                      _weather_http_failure(status);
+        }
+        if (fetch.error == ESP_OK)
+        {
+            LOG_W("weather dataset %u failed: HTTP %d",
+                  (unsigned)kind, status);
+        }
+        else
+        {
+            LOG_W("weather dataset %u failed: %s",
+                  (unsigned)kind, esp_err_to_name(fetch.error));
         }
         if (failure == WEATHER_SERVICE_FAILURE_AUTHENTICATION)
         {
             final_state = WEATHER_SERVICE_STATE_AUTH_ERROR;
             final_failure = failure;
-            s_weather.next_due[kind] = INT64_MAX;
+            s_weather.next_due_ms[kind] = INT64_MAX;
             break;
         }
         if (failure == WEATHER_SERVICE_FAILURE_RATE_LIMITED)
@@ -844,7 +1329,11 @@ static void _weather_run_cycle(bool force)
             final_state = WEATHER_SERVICE_STATE_RATE_LIMITED;
             final_failure = failure;
             final_retry_after = fetch.retry_after_seconds;
-            s_weather.account_retry_due = now + fetch.retry_after_seconds;
+            xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+            s_weather.account_retry_due_ms = _weather_deadline_after(
+                                                 monotonic_now_ms,
+                                                 fetch.retry_after_seconds);
+            xSemaphoreGive(s_weather.mutex);
         }
         else
         {
@@ -852,7 +1341,15 @@ static void _weather_run_cycle(bool force)
             final_failure = failure;
             final_retry_after = 0U;
         }
-        _weather_schedule_failure(kind, now, fetch.retry_after_seconds);
+        if (failure == WEATHER_SERVICE_FAILURE_INTERNAL)
+        {
+            _weather_schedule_internal_failure(monotonic_now_ms);
+        }
+        else
+        {
+            _weather_schedule_failure(kind, monotonic_now_ms,
+                                      fetch.retry_after_seconds);
+        }
         if (failure == WEATHER_SERVICE_FAILURE_RATE_LIMITED ||
                 (new_location && kind == WEATHER_SERVICE_KIND_CURRENT))
         {
@@ -866,13 +1363,23 @@ static void _weather_run_cycle(bool force)
     }
     if (any_success)
     {
-        _weather_store_cache_if_due(now, force);
+        _weather_store_cache_if_due(
+            weather_service_port_now_milliseconds(), force);
+    }
+    if (final_failure == WEATHER_SERVICE_FAILURE_INTERNAL)
+    {
+        return;
     }
     if (!cycle_failed && attempted_fetch)
     {
         final_state = final_failure == WEATHER_SERVICE_FAILURE_LOCATION ?
                       WEATHER_SERVICE_STATE_DEGRADED :
                       WEATHER_SERVICE_STATE_READY;
+        if (successful_kinds ==
+                ((UINT32_C(1) << WEATHER_SERVICE_KIND_COUNT) - 1U))
+        {
+            LOG_I("weather update completed");
+        }
     }
     if (_weather_status_set(final_state, final_failure, final_retry_after))
     {
@@ -911,7 +1418,6 @@ static void _weather_worker(void *context)
         configured = s_weather.config.configured;
         network_ready = s_weather.network_ready;
         force = s_weather.force_refresh;
-        s_weather.force_refresh = false;
         xSemaphoreGive(s_weather.mutex);
         if (!configured)
         {
@@ -929,7 +1435,7 @@ static void _weather_worker(void *context)
         }
         command = 0U;
     }
-    _weather_store_cache_if_due(weather_service_port_now_seconds(), true);
+    _weather_store_cache_if_due(weather_service_port_now_milliseconds(), true);
     xEventGroupSetBits(s_weather.events, WEATHER_EVENT_STOPPED);
     vTaskDeleteWithCaps(NULL);
 }
@@ -952,6 +1458,7 @@ esp_err_t weather_service_init(const weather_service_config_t *config)
     }
     memset(&s_weather, 0, sizeof(s_weather));
     s_weather.config = copied;
+    s_weather.minimum_stack_remaining = UINT32_MAX;
     weather_service_parse_init();
     s_weather.mutex = xSemaphoreCreateMutex();
     s_weather.events = xEventGroupCreate();
@@ -994,6 +1501,12 @@ esp_err_t weather_service_init(const weather_service_config_t *config)
         else
         {
             _weather_node_release(cached);
+            if (result == ESP_ERR_NO_MEM || result == ESP_FAIL)
+            {
+                LOG_W("cache load failed: %s", esp_err_to_name(result));
+                goto cleanup;
+            }
+            LOG_D("weather cache not loaded: %s", esp_err_to_name(result));
             result = ESP_OK;
         }
     }
@@ -1102,22 +1615,32 @@ esp_err_t weather_service_set_network_ready(bool ready,
         return ESP_ERR_INVALID_STATE;
     }
     bool notify = false;
+    bool cancel = false;
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
-    if (ready && !s_weather.network_ready)
+    if (ready && (!s_weather.network_ready ||
+                  s_weather.ipv4_address != ipv4_address))
     {
         ++s_weather.network_session;
         notify = true;
+        cancel = s_weather.network_ready;
     }
     else if (!ready && s_weather.network_ready)
     {
         notify = true;
+        cancel = true;
     }
     s_weather.network_ready = ready;
     s_weather.ipv4_address = ready ? ipv4_address : 0U;
     s_weather.status.network_ready = ready;
     xSemaphoreGive(s_weather.mutex);
+    if (cancel)
+    {
+        weather_service_port_cancel();
+    }
     if (notify)
     {
+        LOG_I("network state changed: %s",
+              ready ? "new IPv4 session" : "unavailable");
         xTaskNotify(s_weather.worker, WEATHER_CMD_NETWORK, eSetBits);
     }
     return ESP_OK;
@@ -1129,16 +1652,23 @@ esp_err_t weather_service_request_refresh(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    int64_t now = weather_service_port_now_seconds();
+    int64_t now_ms = weather_service_port_now_milliseconds();
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
-    if (s_weather.last_manual_refresh != 0 &&
-            now - s_weather.last_manual_refresh <
-            s_weather.config.manual_refresh_min_seconds)
+    if (!s_weather.config.configured || !s_weather.network_ready ||
+            s_weather.suspended || s_weather.stopping)
+    {
+        xSemaphoreGive(s_weather.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_weather.account_retry_due_ms > now_ms ||
+            (s_weather.last_manual_refresh_ms != 0 &&
+             now_ms - s_weather.last_manual_refresh_ms <
+             (int64_t)s_weather.config.manual_refresh_min_seconds * 1000))
     {
         xSemaphoreGive(s_weather.mutex);
         return ESP_ERR_TIMEOUT;
     }
-    s_weather.last_manual_refresh = now;
+    s_weather.last_manual_refresh_ms = now_ms;
     s_weather.force_refresh = true;
     xSemaphoreGive(s_weather.mutex);
     xTaskNotify(s_weather.worker, WEATHER_CMD_REFRESH, eSetBits);
