@@ -1,6 +1,6 @@
 # MicroTech Middleware
 
-本仓库提供 MicroTech 固件的通用 ESP-IDF 服务组件。组件以单例服务为主，覆盖日志、事件分发、NVS、时间/RTC alarm、Wi-Fi、电源采样与 IRQ、IMU、音频、可移除 SD 存储和系统轻睡眠；要求 ESP-IDF 5.0 或更高版本。
+本仓库提供 MicroTech 固件的通用 ESP-IDF 服务组件。组件以单例服务为主，覆盖日志、事件分发、NVS、时间/RTC alarm、Wi-Fi、天气、电源采样与 IRQ、IMU、音频、可移除 SD 存储和系统轻睡眠；要求 ESP-IDF 5.0 或更高版本。
 
 ## 组件
 
@@ -18,10 +18,11 @@
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
+| `weather_service` | 每个 IPv4 会话完成一次城市级定位，顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
 
 ## 目录结构
 
-每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试位于 `audio_service`、`nv_storage`、`power_service`、`sd_storage_service` 和 `time_service` 的 `tests/host/`。
+每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试位于 `audio_service`、`nv_storage`、`power_service`、`sd_storage_service`、`time_service` 和 `weather_service` 的 `tests/host/`。
 
 ## 集成与初始化
 
@@ -50,6 +51,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
+- `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 
@@ -57,7 +59,8 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 
 Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
 IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
-stack 4096 和 queue 16，System PM stack 4096。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
+stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
+256 KiB。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
 `app_product_config_t` 在运行时传入。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，
 定义于 `main/Kconfig.projbuild`。修改 Kconfig 后运行
 `idf.py reconfigure && idf.py save-defconfig && idf.py build`。
@@ -67,7 +70,7 @@ stack 4096 和 queue 16，System PM stack 4096。采样率、轮询周期、任�
 - `event_bus` API 仅限任务上下文，不支持 ISR。最多 24 个订阅、24 个待处理 UI 回调和 24 份 UI payload；匹配 UI 订阅时 payload 最大 256 字节。发布者回调同步执行，UI 回调异步执行；取消订阅不是静默屏障，销毁 `user_data` 前仍需停止发布者并排空 UI 工作。
 - `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 只用于可覆盖的状态快照，不得用于边沿、命令、审计或计数事件。事件 payload 只在回调期间有效。
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
-- Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
+- Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、天气、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
 - `system_pm` 接受 1 至 4 个唯一 RTC GPIO 唤醒源，且有效电平必须一致。唤醒回调应只通知其他 worker；外设准备和恢复钩子运行在 PM worker 中，可以阻塞但必须遵守配置超时。
 - `SYSTEM_PM_DEVELOPMENT_MODE=y` 不是让 USB Serial/JTAG 在 light sleep 中继续工作；ESP32-S3 硬件不支持这一点。该模式在 USB 主机连接时跳过 app standby（显示仍可熄灭），并启用 IDF 的自动睡眠连接保护；拔出 USB 后恢复正常 light sleep。
 - 当前板级 EXIO3/5/6 经过 TCA9554，只能由 time/power/IMU worker 轮询，不能成为 RTC GPIO 唤醒源。触摸唤醒尚未实现，GPIO21 未注册；实际 wake descriptor 仍只有 GPIO0 低电平。

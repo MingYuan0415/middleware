@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Background weather acquisition and cache service for MicroTech"
+dependencies:
+  idf: ">=5.5"
+  espressif/cjson: "^1.7.19"
