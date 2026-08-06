@@ -23,6 +23,8 @@ typedef enum
     BLE_PORT_EVENT_NOTIFY_TX,
     BLE_PORT_EVENT_SYNC,
     BLE_PORT_EVENT_RESET,
+    BLE_PORT_EVENT_ADV_STARTED,
+    BLE_PORT_EVENT_ADV_STOPPED,
 } ble_port_event_type_t;
 
 /** @brief Translated TX outcome, independent of NimBLE error values. */
@@ -47,6 +49,7 @@ typedef struct ble_port_event
     bool encrypted;  /**< Actual link encryption on encrypt events. */
     bool indication; /**< TX was an indication on NOTIFY_TX events. */
     ble_port_tx_result_t tx_result; /**< TX outcome on NOTIFY_TX events. */
+    uint32_t generation; /**< Command generation on ADV_STARTED events. */
 } ble_port_event_t;
 
 /**
@@ -65,6 +68,7 @@ typedef struct ble_port_adv_config
     const uint8_t *service_uuid; /**< 16-byte 128-bit UUID, wire order. */
     const uint8_t *service_data; /**< Payload after the UUID, optional. */
     size_t service_data_len;
+    uint32_t generation; /**< Caller-assigned command identity. */
 } ble_port_adv_config_t;
 
 /**

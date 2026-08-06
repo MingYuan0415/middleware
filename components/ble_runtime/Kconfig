@@ -1,0 +1,28 @@
+menu "BLE Runtime"
+
+config BLE_RUNTIME_ADV_FAST_INTERVAL_MS
+    int "Fast advertising interval in milliseconds"
+    range 20 10240
+    default 100
+    help
+        Connectable advertising interval used during the fast window. This is
+        runtime policy, calibrated on hardware; it is not part of the wire
+        contract.
+
+config BLE_RUNTIME_ADV_SLOW_INTERVAL_MS
+    int "Slow advertising interval in milliseconds"
+    range 20 10240
+    default 700
+    help
+        Low-power connectable advertising interval used after the fast window.
+        Runtime policy, calibrated on hardware.
+
+config BLE_RUNTIME_ADV_FAST_WINDOW_MS
+    int "Fast advertising window in milliseconds"
+    range 1000 600000
+    default 30000
+    help
+        Duration of the fast advertising window before falling back to slow
+        advertising. Runtime policy, calibrated on hardware.
+
+endmenu

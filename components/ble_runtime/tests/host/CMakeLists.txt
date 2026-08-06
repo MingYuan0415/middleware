@@ -19,12 +19,14 @@ foreach(test_target IN ITEMS
         test_ble_runtime
         test_ble_gatt_registry
         test_ble_gap_manager
-        test_ble_event_router)
+        test_ble_event_router
+        test_ble_adv_manager)
     add_executable(${test_target}
         ${test_target}.c
         "${COMPONENT}/src/ble_runtime.c"
         "${COMPONENT}/src/ble_gatt_registry.c"
         "${COMPONENT}/src/ble_gap_manager.c"
+        "${COMPONENT}/src/ble_adv_manager.c"
         "${COMPONENT}/src/ble_event_router.c"
     )
     target_compile_features(${test_target} PRIVATE c_std_11)
@@ -45,7 +47,7 @@ foreach(test_target IN ITEMS
 endforeach()
 
 foreach(target test_ble_runtime test_ble_gatt_registry
-        test_ble_gap_manager test_ble_event_router)
+        test_ble_gap_manager test_ble_event_router test_ble_adv_manager)
     if(BLE_RUNTIME_SANITIZER STREQUAL "address")
         target_compile_options(${target} PRIVATE
             -fsanitize=address,undefined
@@ -83,6 +85,9 @@ if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND
     add_test(NAME ble_gap_manager COMMAND
         ${BLE_RUNTIME_SETARCH} x86_64 -R
         $<TARGET_FILE:test_ble_gap_manager>)
+    add_test(NAME ble_adv_manager COMMAND
+        ${BLE_RUNTIME_SETARCH} x86_64 -R
+        $<TARGET_FILE:test_ble_adv_manager>)
     add_test(NAME ble_event_router COMMAND
         ${BLE_RUNTIME_SETARCH} x86_64 -R
         $<TARGET_FILE:test_ble_event_router>)
@@ -90,11 +95,13 @@ else()
     add_test(NAME ble_runtime COMMAND test_ble_runtime)
     add_test(NAME ble_gatt_registry COMMAND test_ble_gatt_registry)
     add_test(NAME ble_gap_manager COMMAND test_ble_gap_manager)
+    add_test(NAME ble_adv_manager COMMAND test_ble_adv_manager)
     add_test(NAME ble_event_router COMMAND test_ble_event_router)
 endif()
 set_tests_properties(ble_runtime PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_gatt_registry PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_gap_manager PROPERTIES TIMEOUT 10)
+set_tests_properties(ble_adv_manager PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_event_router PROPERTIES TIMEOUT 10)
 
 add_test(NAME ble_runtime_idf_assumptions COMMAND

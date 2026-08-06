@@ -12,6 +12,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -20,6 +21,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#include "ble_adv_manager.h"
 #include "ble_gap_manager.h"
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
@@ -49,21 +51,23 @@ typedef enum
 {
     BLE_NIMBLE_PORT_ADV_CMD_START = 0,
     BLE_NIMBLE_PORT_ADV_CMD_STOP,
+    BLE_NIMBLE_PORT_ADV_CMD_WAKE,
     BLE_NIMBLE_PORT_ADV_CMD_QUIT,
 } ble_nimble_port_adv_cmd_type_t;
 
 typedef struct ble_nimble_port_adv_cmd
 {
     ble_nimble_port_adv_cmd_type_t type;
-    const ble_port_adv_config_t *config;
+    ble_port_adv_config_t config;
+    uint8_t service_data[31U];
 } ble_nimble_port_adv_cmd_t;
-
 typedef struct ble_nimble_port
 {
     SemaphoreHandle_t sync_semaphore;
     SemaphoreHandle_t exit_semaphore;
     SemaphoreHandle_t stop_done_semaphore;
     SemaphoreHandle_t adv_exit_semaphore;
+    SemaphoreHandle_t adv_lock;
     TaskHandle_t host_task;
     TaskHandle_t adv_task;
     QueueHandle_t adv_queue;
@@ -146,6 +150,87 @@ static void _ble_nimble_port_gap_consumer(
         return;
     }
     (void)ble_gap_manager_handle_event(&manager_event);
+}
+
+static void _ble_nimble_port_adv_consumer(
+    const ble_port_event_t *event, void *arg)
+{
+    (void)arg;
+    const esp_err_t result = ble_adv_manager_handle_event(event);
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        LOG_E("adv manager event failed result=%d", result);
+    }
+}
+
+static void _ble_nimble_port_adv_lock_cb(void *arg)
+{
+    (void)arg;
+    (void)xSemaphoreTake(s_port.adv_lock, portMAX_DELAY);
+}
+
+static void _ble_nimble_port_adv_unlock_cb(void *arg)
+{
+    (void)arg;
+    (void)xSemaphoreGive(s_port.adv_lock);
+}
+
+static uint32_t _ble_nimble_port_adv_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000U);
+}
+
+static void _ble_nimble_port_adv_arm_timer(uint32_t delay_ms, void *arg)
+{
+    (void)arg;
+    if (delay_ms > 0U && s_port.adv_queue != NULL && !s_port.quiescing)
+    {
+        ble_nimble_port_adv_cmd_t wake;
+
+        memset(&wake, 0, sizeof(wake));
+        wake.type = BLE_NIMBLE_PORT_ADV_CMD_WAKE;
+        (void)xQueueSend(s_port.adv_queue, &wake, 0U);
+    }
+}
+
+static esp_err_t _ble_nimble_port_adv_manager_init(void)
+{
+    static const uint8_t device_link_uuid[16] =
+    {
+        0xa3, 0x4e, 0x85, 0x57, 0x11, 0x3d, 0x8a, 0xa2,
+        0x59, 0x4e, 0xbb, 0xb4, 0x92, 0x31, 0x20, 0x3e,
+    };
+    static const uint8_t short_name[] = "MT";
+    static ble_adv_manager_config_t config =
+    {
+        .fast_interval_ms = CONFIG_BLE_RUNTIME_ADV_FAST_INTERVAL_MS,
+        .slow_interval_ms = CONFIG_BLE_RUNTIME_ADV_SLOW_INTERVAL_MS,
+        .fast_window_ms = CONFIG_BLE_RUNTIME_ADV_FAST_WINDOW_MS,
+        .short_name = short_name,
+        .short_name_len = sizeof(short_name) - 1U,
+        .service_uuid = device_link_uuid,
+        .adv_version = 1U,
+        .now_ms = _ble_nimble_port_adv_now_ms,
+        .arm_timer = _ble_nimble_port_adv_arm_timer,
+        .timer_arg = NULL,
+        .ops = NULL,
+        .lock = _ble_nimble_port_adv_lock_cb,
+        .unlock = _ble_nimble_port_adv_unlock_cb,
+        .lock_arg = NULL,
+    };
+
+    if (s_port.adv_lock == NULL)
+    {
+        s_port.adv_lock = xSemaphoreCreateMutex();
+        if (s_port.adv_lock == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    config.ops = s_port.ops != NULL ? s_port.ops : &s_production_ops;
+    ble_adv_manager_init(&config);
+    return ESP_OK;
 }
 
 static int _ble_nimble_port_gap_event(
@@ -465,8 +550,20 @@ static esp_err_t _ble_nimble_port_production_adv_start(
     {
         return ESP_ERR_INVALID_STATE;
     }
+    memset(&cmd, 0, sizeof(cmd));
     cmd.type = BLE_NIMBLE_PORT_ADV_CMD_START;
-    cmd.config = config;
+    cmd.config = *config;
+    cmd.config.service_data = cmd.service_data;
+    if (config->service_data != NULL && config->service_data_len > 0U)
+    {
+        const size_t copy = config->service_data_len <
+                            sizeof(cmd.service_data) ?
+                            config->service_data_len :
+                            sizeof(cmd.service_data);
+
+        memcpy(cmd.service_data, config->service_data, copy);
+        cmd.config.service_data_len = copy;
+    }
     if (xQueueSend(s_port.adv_queue, &cmd, 0U) != pdTRUE)
     {
         return ESP_ERR_NO_MEM;
@@ -482,8 +579,8 @@ static esp_err_t _ble_nimble_port_production_adv_stop(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    memset(&cmd, 0, sizeof(cmd));
     cmd.type = BLE_NIMBLE_PORT_ADV_CMD_STOP;
-    cmd.config = NULL;
     if (xQueueSend(s_port.adv_queue, &cmd, 0U) != pdTRUE)
     {
         return ESP_ERR_NO_MEM;
@@ -491,44 +588,46 @@ static esp_err_t _ble_nimble_port_production_adv_stop(void)
     return ESP_OK;
 }
 
-static void _ble_nimble_port_adv_start_execute(
-    const ble_port_adv_config_t *config)
+static int _ble_nimble_port_adv_start_execute(
+    const ble_nimble_port_adv_cmd_t *cmd)
 {
-    struct ble_hs_adv_fields fields;
+    const ble_port_adv_config_t *config = &cmd->config;
+    uint8_t adv_data[31];
+    size_t len = 0U;
     int result;
 
-    memset(&fields, 0, sizeof(fields));
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    if (config->short_name != NULL && config->short_name_len > 0U)
-    {
-        fields.name = (uint8_t *)config->short_name;
-        fields.name_len = (uint8_t)config->short_name_len;
-        fields.name_is_complete = 0;
-    }
+    adv_data[len++] = 2U;
+    adv_data[len++] = BLE_HS_ADV_TYPE_FLAGS;
+    adv_data[len++] = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     if (config->service_uuid != NULL)
     {
-        static uint8_t service_data[1U + 16U + 31U];
-        size_t length = 16U;
-
-        memcpy(service_data, config->service_uuid, 16U);
-        if (config->service_data != NULL && config->service_data_len > 0U)
+        adv_data[len++] = 1U + 16U + (uint8_t)config->service_data_len;
+        adv_data[len++] = BLE_HS_ADV_TYPE_SVC_DATA_UUID128;
+        memcpy(&adv_data[len], config->service_uuid, 16U);
+        len += 16U;
+        if (config->service_data_len > 0U)
         {
             const size_t copy = config->service_data_len <
-                                sizeof(service_data) - 16U ?
+                                sizeof(cmd->service_data) ?
                                 config->service_data_len :
-                                sizeof(service_data) - 16U;
+                                sizeof(cmd->service_data);
 
-            memcpy(service_data + 16U, config->service_data, copy);
-            length += copy;
+            memcpy(&adv_data[len], cmd->service_data, copy);
+            len += copy;
         }
-        fields.svc_data_uuid128 = service_data;
-        fields.svc_data_uuid128_len = (uint8_t)length;
     }
-    result = ble_gap_adv_set_fields(&fields);
+    if (config->short_name != NULL && config->short_name_len > 0U)
+    {
+        adv_data[len++] = 1U + (uint8_t)config->short_name_len;
+        adv_data[len++] = BLE_HS_ADV_TYPE_INCOMP_NAME;
+        memcpy(&adv_data[len], config->short_name, config->short_name_len);
+        len += config->short_name_len;
+    }
+    result = ble_gap_adv_set_data(adv_data, (int)len);
     if (result != 0)
     {
-        LOG_E("adv fields failed result=%d", result);
-        return;
+        LOG_E("adv data failed result=%d", result);
+        return result;
     }
     struct ble_gap_adv_params params;
 
@@ -543,6 +642,28 @@ static void _ble_nimble_port_adv_start_execute(
     {
         LOG_E("adv start failed result=%d", result);
     }
+    return result;
+}
+
+static void _ble_nimble_port_adv_result_event(
+    ble_port_event_type_t type, int status,
+    const ble_port_adv_config_t *config)
+{
+    ble_port_event_t port_event;
+
+    memset(&port_event, 0, sizeof(port_event));
+    port_event.type = type;
+    port_event.status = status;
+    if (config != NULL)
+    {
+        port_event.generation = config->generation;
+    }
+    const esp_err_t result = ble_adv_manager_handle_event(&port_event);
+
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        LOG_E("adv manager result event failed result=%d", result);
+    }
 }
 
 static void _ble_nimble_port_adv_task(void *param)
@@ -551,18 +672,45 @@ static void _ble_nimble_port_adv_task(void *param)
     for (;;)
     {
         ble_nimble_port_adv_cmd_t cmd;
+        const uint32_t remaining =
+            ble_adv_manager_get_fast_window_remaining_ms();
 
-        if (xQueueReceive(s_port.adv_queue, &cmd, portMAX_DELAY) != pdTRUE)
+        if (remaining == 0U)
+        {
+            (void)ble_adv_manager_handle_fast_window_expired();
+            continue;
+        }
+        const TickType_t wait = remaining == UINT32_MAX
+                                ? portMAX_DELAY
+                                : pdMS_TO_TICKS(remaining);
+
+        if (xQueueReceive(s_port.adv_queue, &cmd, wait) != pdTRUE)
         {
             continue;
         }
         if (cmd.type == BLE_NIMBLE_PORT_ADV_CMD_START)
         {
-            _ble_nimble_port_adv_start_execute(cmd.config);
+            cmd.config.service_data = cmd.service_data;
+            const int result = _ble_nimble_port_adv_start_execute(&cmd);
+
+            _ble_nimble_port_adv_result_event(BLE_PORT_EVENT_ADV_STARTED,
+                                              result, &cmd.config);
         }
         else if (cmd.type == BLE_NIMBLE_PORT_ADV_CMD_STOP)
         {
-            (void)ble_gap_adv_stop();
+            const int result = ble_gap_adv_stop();
+
+            if (result != 0 && result != BLE_HS_EALREADY)
+            {
+                LOG_E("adv stop failed result=%d", result);
+            }
+            _ble_nimble_port_adv_result_event(
+                BLE_PORT_EVENT_ADV_STOPPED,
+                result == BLE_HS_EALREADY ? 0 : result, NULL);
+        }
+        else if (cmd.type == BLE_NIMBLE_PORT_ADV_CMD_WAKE)
+        {
+            /* Loop to recompute the fast-window wait. */
         }
         else
         {
@@ -604,16 +752,23 @@ static esp_err_t _ble_nimble_port_production_indicate(
 
 static esp_err_t _ble_nimble_port_quiesce_adv(void)
 {
-    if (s_port.adv_task == NULL)
+    if (s_port.adv_lock != NULL)
     {
-        s_port.quiescing = true;
-        return ESP_OK;
+        (void)xSemaphoreTake(s_port.adv_lock, portMAX_DELAY);
     }
     s_port.quiescing = true;
+    if (s_port.adv_lock != NULL)
+    {
+        (void)xSemaphoreGive(s_port.adv_lock);
+    }
+    if (s_port.adv_task == NULL)
+    {
+        return ESP_OK;
+    }
     ble_nimble_port_adv_cmd_t quit;
 
+    memset(&quit, 0, sizeof(quit));
     quit.type = BLE_NIMBLE_PORT_ADV_CMD_QUIT;
-    quit.config = NULL;
     if (xQueueSend(s_port.adv_queue, &quit,
                    pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) !=
             pdTRUE ||
@@ -688,7 +843,21 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         return result;
     }
+    result = ble_event_router_register(_ble_nimble_port_adv_consumer, NULL);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (s_port.ops == NULL)
+    {
+        s_port.ops = &s_production_ops;
+    }
     ble_gap_manager_init();
+    result = _ble_nimble_port_adv_manager_init();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     s_port.nimble_init_attempted = true;
     result = nimble_port_init();
     if (result != ESP_OK)
@@ -719,10 +888,6 @@ static esp_err_t _ble_nimble_port_init(void)
                        false, false, false);
         }
         s_port.listener_registered = true;
-    }
-    if (s_port.ops == NULL)
-    {
-        s_port.ops = &s_production_ops;
     }
     if (s_port.adv_queue == NULL)
     {
@@ -937,6 +1102,12 @@ static esp_err_t _ble_nimble_port_deinit(void)
     {
         vSemaphoreDelete(s_port.stop_done_semaphore);
         s_port.stop_done_semaphore = NULL;
+    }
+    ble_adv_manager_deinit();
+    if (s_port.adv_lock != NULL)
+    {
+        vSemaphoreDelete(s_port.adv_lock);
+        s_port.adv_lock = NULL;
     }
     return ESP_OK;
 }
