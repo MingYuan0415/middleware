@@ -22,7 +22,8 @@ foreach(test_target IN ITEMS
         test_ble_event_router
         test_ble_adv_manager
         test_ble_tx_scheduler
-        test_ble_response_cache)
+        test_ble_response_cache
+        test_ble_link_codec)
     add_executable(${test_target}
         ${test_target}.c
         "${COMPONENT}/src/ble_runtime.c"
@@ -31,6 +32,7 @@ foreach(test_target IN ITEMS
         "${COMPONENT}/src/ble_adv_manager.c"
         "${COMPONENT}/src/ble_tx_scheduler.c"
         "${COMPONENT}/src/ble_response_cache.c"
+        "${COMPONENT}/src/ble_link_codec.c"
         "${COMPONENT}/src/ble_event_router.c"
     )
     target_compile_features(${test_target} PRIVATE c_std_11)
@@ -52,7 +54,7 @@ endforeach()
 
 foreach(target test_ble_runtime test_ble_gatt_registry
         test_ble_gap_manager test_ble_event_router test_ble_adv_manager
-        test_ble_tx_scheduler test_ble_response_cache)
+        test_ble_tx_scheduler test_ble_response_cache test_ble_link_codec)
     if(BLE_RUNTIME_SANITIZER STREQUAL "address")
         target_compile_options(${target} PRIVATE
             -fsanitize=address,undefined
@@ -99,6 +101,9 @@ if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND
     add_test(NAME ble_response_cache COMMAND
         ${BLE_RUNTIME_SETARCH} x86_64 -R
         $<TARGET_FILE:test_ble_response_cache>)
+    add_test(NAME ble_link_codec COMMAND
+        ${BLE_RUNTIME_SETARCH} x86_64 -R
+        $<TARGET_FILE:test_ble_link_codec>)
     add_test(NAME ble_event_router COMMAND
         ${BLE_RUNTIME_SETARCH} x86_64 -R
         $<TARGET_FILE:test_ble_event_router>)
@@ -109,6 +114,7 @@ else()
     add_test(NAME ble_adv_manager COMMAND test_ble_adv_manager)
     add_test(NAME ble_tx_scheduler COMMAND test_ble_tx_scheduler)
     add_test(NAME ble_response_cache COMMAND test_ble_response_cache)
+    add_test(NAME ble_link_codec COMMAND test_ble_link_codec)
     add_test(NAME ble_event_router COMMAND test_ble_event_router)
 endif()
 set_tests_properties(ble_runtime PROPERTIES TIMEOUT 10)
@@ -117,6 +123,7 @@ set_tests_properties(ble_gap_manager PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_adv_manager PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_tx_scheduler PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_response_cache PROPERTIES TIMEOUT 10)
+set_tests_properties(ble_link_codec PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_event_router PROPERTIES TIMEOUT 10)
 
 add_test(NAME ble_runtime_idf_assumptions COMMAND
