@@ -510,6 +510,141 @@ static void test_max_and_wrapped_field_numbers(void)
                           max_field, sizeof(max_field), &response));
 }
 
+static void test_encoder_flag_validation(void)
+{
+    ble_link_codec_envelope_t envelope;
+    size_t out_len = 0U;
+
+    /* count beyond capacity. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    for (size_t i = 0U; i < BLE_LINK_CODEC_MAX_FLAGS + 1U; ++i)
+    {
+        if (i < BLE_LINK_CODEC_MAX_FLAGS)
+        {
+            envelope.flags_values[i] = (uint32_t)(i + 1U);
+        }
+    }
+    envelope.flags_count = BLE_LINK_CODEC_MAX_FLAGS + 1U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+    /* zero flag value. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    envelope.flags_values[0] = 0U;
+    envelope.flags_count = 1U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+    /* duplicate flag value. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    envelope.flags_values[0] = 1U;
+    envelope.flags_values[1] = 1U;
+    envelope.flags_count = 2U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+}
+
+static void test_wide_varint_truncation_rejected(void)
+{
+    /* protocol_major = 2^32+1: tag 08, varint 81 80 80 80 10. */
+    static const uint8_t wide_major[] =
+    {
+        0x08, 0x81, 0x80, 0x80, 0x80, 0x10,
+    };
+    /* unpacked flag = 2^32+1: tag 20, varint 81 80 80 80 10. */
+    static const uint8_t wide_flag[] =
+    {
+        0x20, 0x81, 0x80, 0x80, 0x80, 0x10,
+    };
+    /* packed flag payload contains 2^32+1. */
+    static const uint8_t packed_wide_flag[] =
+    {
+        0x22, 0x05, 0x81, 0x80, 0x80, 0x80, 0x10,
+    };
+    ble_link_codec_envelope_t envelope;
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_envelope(
+                          wide_major,
+                          sizeof(wide_major),
+                          &envelope));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_envelope(
+                          wide_flag,
+                          sizeof(wide_flag),
+                          &envelope));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_envelope(
+                          packed_wide_flag,
+                          sizeof(packed_wide_flag),
+                          &envelope));
+}
+
+static void test_duplicate_flag_rejected(void)
+{
+    /* unpacked duplicate flags: field 4 varint 1, then field 4 varint 1. */
+    static const uint8_t duplicate[] =
+    {
+        0x08, 0x01, 0x20, 0x01, 0x20, 0x01,
+    };
+    /* packed duplicate: field 4 len 2 [01 01]. */
+    static const uint8_t packed_duplicate[] =
+    {
+        0x08, 0x01, 0x22, 0x02, 0x01, 0x01,
+    };
+    ble_link_codec_envelope_t envelope;
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_envelope(
+                          duplicate, sizeof(duplicate),
+                          &envelope));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_envelope(
+                          packed_duplicate,
+                          sizeof(packed_duplicate),
+                          &envelope));
+}
+
+static void test_response_error_wide_varint_rejected(void)
+{
+    /* Response.error = 2^32+1: tag 10, varint 81 80 80 80 10. */
+    static const uint8_t wide_error[] =
+    {
+        0x10, 0x81, 0x80, 0x80, 0x80, 0x10,
+    };
+    ble_link_codec_response_t response;
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_codec_decode_response(
+                          wide_error,
+                          sizeof(wide_error),
+                          &response));
+}
+
+static void test_flags_aggregate_consistency(void)
+{
+    ble_link_codec_envelope_t envelope;
+    size_t out_len = 0U;
+
+    /* flags set but no values recorded. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    envelope.flags = 1U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+    /* flags not equal to the OR of recorded values. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    envelope.flags = 1U;
+    envelope.flags_values[0] = 2U;
+    envelope.flags_count = 1U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+    /* consistent state encodes. */
+    memset(&envelope, 0, sizeof(envelope));
+    envelope.protocol_major = 1U;
+    envelope.flags = 1U;
+    envelope.flags_values[0] = 1U;
+    envelope.flags_count = 1U;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_encode_envelope(
+                          &envelope, NULL, 0U, &out_len));
+}
+
 int main(void)
 {
     test_capabilities_request_roundtrip();
@@ -526,6 +661,11 @@ int main(void)
     test_invalid_body_tag_rejected();
     test_encoder_overflow_and_capacity_rejected();
     test_max_and_wrapped_field_numbers();
+    test_encoder_flag_validation();
+    test_wide_varint_truncation_rejected();
+    test_duplicate_flag_rejected();
+    test_response_error_wide_varint_rejected();
+    test_flags_aggregate_consistency();
     test_encode_size_query_and_errors();
     printf("ble_link_codec: all tests passed\n");
     return 0;

@@ -175,6 +175,34 @@ static bool _ble_link_codec_size_add(size_t *size, size_t addend)
     return true;
 }
 
+/**
+ * @brief Append one envelope flag value, rejecting duplicates and capacity
+ * overflow.
+ */
+static bool _ble_link_codec_add_flag(
+    ble_link_codec_envelope_t *envelope, uint32_t value)
+{
+    if (value == 0U)
+    {
+        return false;
+    }
+    for (size_t i = 0U; i < envelope->flags_count; ++i)
+    {
+        if (envelope->flags_values[i] == value)
+        {
+            return false;
+        }
+    }
+    if (envelope->flags_count >= BLE_LINK_CODEC_MAX_FLAGS)
+    {
+        return false;
+    }
+    envelope->flags_values[envelope->flags_count] = value;
+    envelope->flags_count++;
+    envelope->flags |= value;
+    return true;
+}
+
 esp_err_t ble_link_codec_decode_envelope(
     const uint8_t *data, size_t len, ble_link_codec_envelope_t *out)
 {
@@ -268,7 +296,8 @@ esp_err_t ble_link_codec_decode_envelope(
             {
                 uint64_t value = 0U;
 
-                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK)
+                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK ||
+                        value > UINT32_MAX)
                 {
                     return ESP_ERR_INVALID_STATE;
                 }
@@ -283,7 +312,8 @@ esp_err_t ble_link_codec_decode_envelope(
             {
                 uint64_t value = 0U;
 
-                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK)
+                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK ||
+                        value > UINT32_MAX)
                 {
                     return ESP_ERR_INVALID_STATE;
                 }
@@ -305,11 +335,15 @@ esp_err_t ble_link_codec_decode_envelope(
             {
                 uint64_t value = 0U;
 
-                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK)
+                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK ||
+                        value > UINT32_MAX)
                 {
                     return ESP_ERR_INVALID_STATE;
                 }
-                out->flags |= (uint32_t)value;
+                if (!_ble_link_codec_add_flag(out, (uint32_t)value))
+                {
+                    return ESP_ERR_INVALID_STATE;
+                }
             }
             else if (wire == BLE_LINK_CODEC_WIRE_LEN)
             {
@@ -331,11 +365,14 @@ esp_err_t ble_link_codec_decode_envelope(
                     uint64_t value = 0U;
 
                     if (_ble_link_codec_read_varint(&packed_reader, &value) !=
-                            ESP_OK)
+                            ESP_OK || value > UINT32_MAX)
                     {
                         return ESP_ERR_INVALID_STATE;
                     }
-                    out->flags |= (uint32_t)value;
+                    if (!_ble_link_codec_add_flag(out, (uint32_t)value))
+                    {
+                        return ESP_ERR_INVALID_STATE;
+                    }
                 }
             }
             else
@@ -572,7 +609,8 @@ esp_err_t ble_link_codec_decode_response(
             {
                 uint64_t value = 0U;
 
-                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK)
+                if (_ble_link_codec_read_varint(&reader, &value) != ESP_OK ||
+                        value > UINT32_MAX)
                 {
                     return ESP_ERR_INVALID_STATE;
                 }
@@ -692,16 +730,47 @@ esp_err_t ble_link_codec_encode_envelope(
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (envelope->flags != 0U)
+    if (envelope->flags_count > 0U)
     {
-        const size_t payload_size = _ble_link_codec_varint_size(envelope->flags);
+        if (envelope->flags_count > BLE_LINK_CODEC_MAX_FLAGS)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+        uint32_t or_value = 0U;
+        size_t payload_size = 0U;
 
+        for (size_t i = 0U; i < envelope->flags_count; ++i)
+        {
+            const uint32_t value = envelope->flags_values[i];
+
+            if (value == 0U)
+            {
+                return ESP_ERR_INVALID_ARG;
+            }
+            for (size_t j = 0U; j < i; ++j)
+            {
+                if (envelope->flags_values[j] == value)
+                {
+                    return ESP_ERR_INVALID_ARG;
+                }
+            }
+            or_value |= value;
+            payload_size += _ble_link_codec_varint_size(value);
+        }
+        if (or_value != envelope->flags)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
         if (!_ble_link_codec_size_add(
                     &size, 1U + _ble_link_codec_varint_size(payload_size) +
                     payload_size))
         {
             return ESP_ERR_INVALID_ARG;
         }
+    }
+    else if (envelope->flags != 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
     }
     if (envelope->body != BLE_LINK_CODEC_BODY_NONE)
     {
@@ -750,13 +819,21 @@ esp_err_t ble_link_codec_encode_envelope(
         _ble_link_codec_write_tag(out, &pos, 3U, BLE_LINK_CODEC_WIRE_FIXED64);
         _ble_link_codec_write_fixed64(out, &pos, envelope->boot_id);
     }
-    if (envelope->flags != 0U)
+    if (envelope->flags_count > 0U)
     {
-        const size_t payload_size = _ble_link_codec_varint_size(envelope->flags);
+        size_t payload_size = 0U;
 
+        for (size_t i = 0U; i < envelope->flags_count; ++i)
+        {
+            payload_size +=
+                _ble_link_codec_varint_size(envelope->flags_values[i]);
+        }
         _ble_link_codec_write_tag(out, &pos, 4U, BLE_LINK_CODEC_WIRE_LEN);
         _ble_link_codec_write_varint(out, &pos, payload_size);
-        _ble_link_codec_write_varint(out, &pos, envelope->flags);
+        for (size_t i = 0U; i < envelope->flags_count; ++i)
+        {
+            _ble_link_codec_write_varint(out, &pos, envelope->flags_values[i]);
+        }
     }
     if (envelope->body != BLE_LINK_CODEC_BODY_NONE)
     {

@@ -14,6 +14,9 @@ extern "C" {
 /** @brief Maximum retained unknown fields per message. */
 #define BLE_LINK_CODEC_MAX_UNKNOWN_FIELDS 8U
 
+/** @brief Maximum repeated envelope flag values per message. */
+#define BLE_LINK_CODEC_MAX_FLAGS 4U
+
 /** @brief One unknown-field byte span in the decoded input buffer. */
 typedef struct ble_link_codec_unknown_field
 {
@@ -60,7 +63,9 @@ typedef struct ble_link_codec_envelope
     uint32_t protocol_major;
     uint32_t protocol_minor;
     uint64_t boot_id;
-    uint32_t flags;       /**< OR of repeated EnvelopeFlag values. */
+    uint32_t flags;       /**< OR of flags_values; encoder validates equality. */
+    uint32_t flags_values[BLE_LINK_CODEC_MAX_FLAGS];
+    size_t flags_count;   /**< Number of repeated flag values. */
     ble_link_codec_body_t body;
     const uint8_t *body_data;
     size_t body_len;

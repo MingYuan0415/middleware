@@ -8,6 +8,7 @@ idf_component_register(
         "src/ble_tx_scheduler.c"
         "src/ble_response_cache.c"
         "src/ble_link_codec.c"
+        "src/ble_link_dispatcher.c"
         "src/ble_event_router.c"
     INCLUDE_DIRS "include"
     REQUIRES bt
