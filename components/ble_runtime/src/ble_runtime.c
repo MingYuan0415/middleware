@@ -109,7 +109,7 @@ esp_err_t ble_runtime_start(void)
     result = s_runtime.config->port->init();
     if (result != ESP_OK)
     {
-        _ble_runtime_teardown_reset();
+        s_runtime.port_initialized = true;
         _ble_runtime_enter_faulted(result);
         return result;
     }
@@ -118,14 +118,13 @@ esp_err_t ble_runtime_start(void)
     if (result != ESP_OK)
     {
         const esp_err_t rollback_result = _ble_runtime_port_teardown();
+
         if (rollback_result != ESP_OK)
         {
             _ble_runtime_enter_faulted(rollback_result);
+            return rollback_result;
         }
-        else
-        {
-            s_runtime.state = BLE_RUNTIME_STATE_STOPPED;
-        }
+        s_runtime.state = BLE_RUNTIME_STATE_STOPPED;
         return result;
     }
     s_runtime.state = BLE_RUNTIME_STATE_RUNNING;

@@ -159,7 +159,7 @@ static void test_restart_runs_full_teardown(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_deinit());
 }
 
-static void test_start_init_failure_faults_without_teardown(void)
+static void test_start_init_failure_faults_then_stop_retries_teardown(void)
 {
     _reset_port();
     s_init_result = ESP_ERR_NO_MEM;
@@ -173,12 +173,32 @@ static void test_start_init_failure_faults_without_teardown(void)
     TEST_ASSERT_EQUAL(0U, s_deinit_calls);
     TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_stop());
     TEST_ASSERT_EQUAL(BLE_RUNTIME_STATE_STOPPED, ble_runtime_get_state());
-    TEST_ASSERT_EQUAL(0U, s_stop_calls);
-    TEST_ASSERT_EQUAL(0U, s_deinit_calls);
+    TEST_ASSERT_EQUAL(1U, s_stop_calls);
+    TEST_ASSERT_EQUAL(1U, s_deinit_calls);
     TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_deinit());
 }
 
-static void test_start_failure_returns_first_error_and_rolls_back(void)
+static void test_start_init_failure_keeps_fault_on_terminal_teardown(void)
+{
+    _reset_port();
+    s_init_result = ESP_ERR_NO_MEM;
+    s_deinit_result = ESP_ERR_TIMEOUT;
+    const ble_runtime_config_t config = {.port = &s_ok_port};
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_init(&config));
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_runtime_start());
+    TEST_ASSERT_EQUAL(BLE_RUNTIME_STATE_FAULTED, ble_runtime_get_state());
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, ble_runtime_stop());
+    TEST_ASSERT_EQUAL(BLE_RUNTIME_STATE_FAULTED, ble_runtime_get_state());
+    s_deinit_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_stop());
+    TEST_ASSERT_EQUAL(BLE_RUNTIME_STATE_STOPPED, ble_runtime_get_state());
+    TEST_ASSERT_EQUAL(1U, s_stop_calls);
+    TEST_ASSERT_EQUAL(2U, s_deinit_calls);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_deinit());
+}
+
+static void test_start_failure_cleanup_error_takes_precedence(void)
 {
     _reset_port();
     s_start_result = ESP_FAIL;
@@ -186,7 +206,7 @@ static void test_start_failure_returns_first_error_and_rolls_back(void)
     const ble_runtime_config_t config = {.port = &s_ok_port};
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_runtime_init(&config));
-    TEST_ASSERT_EQUAL(ESP_FAIL, ble_runtime_start());
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_runtime_start());
     TEST_ASSERT_EQUAL(BLE_RUNTIME_STATE_FAULTED, ble_runtime_get_state());
     TEST_ASSERT_EQUAL(1U, s_init_calls);
     TEST_ASSERT_EQUAL(1U, s_stop_calls);
@@ -297,8 +317,9 @@ int main(void)
     test_init_rejects_bad_config();
     test_happy_path_lifecycle();
     test_restart_runs_full_teardown();
-    test_start_init_failure_faults_without_teardown();
-    test_start_failure_returns_first_error_and_rolls_back();
+    test_start_init_failure_faults_then_stop_retries_teardown();
+    test_start_init_failure_keeps_fault_on_terminal_teardown();
+    test_start_failure_cleanup_error_takes_precedence();
     test_stop_failure_faults_and_retries();
     test_stop_deinit_failure_faults_and_retries();
     test_deinit_from_stopped_never_calls_port();

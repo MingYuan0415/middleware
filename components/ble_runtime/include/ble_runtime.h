@@ -32,11 +32,18 @@ typedef enum
  * All callbacks run synchronously in the caller's context and must not call
  * back into the runtime API. Caller constraints:
  *
- * - init must leave the host stack fully released when it fails;
+ * - init must not leave the host stack initialized when it fails. It may
+ *   retain other resources, but then it must latch a terminal fault whose
+ *   teardown returns the latched error until a device reboot; otherwise it
+ *   must release everything itself on failure;
  * - start must not return before the host stack is synchronized;
- * - stop must not return before the host task has exited and the stack is
- *   stopped;
- * - deinit must leave no host resources behind.
+ * - stop must not return before the advertising task has been quiesced and
+ *   nimble_port_stop() and the host event loop have returned; the host and
+ *   stop tasks self-delete right after signaling completion and perform no
+ *   further host, semaphore, or state access after the signal, so no host
+ *   access happens after stop returns;
+ * - deinit must leave no host resources behind (a latched terminal fault is
+ *   released only by reboot and returns the latched error instead).
  */
 typedef struct ble_runtime_host_port
 {
@@ -78,10 +85,15 @@ esp_err_t ble_runtime_init(const ble_runtime_config_t *config);
  * @brief Start the runtime: STOPPED -> STARTING -> RUNNING.
  *
  * A port start failure rolls the runtime back to STOPPED with all port
- * resources released and returns the start error. A port init failure leaves
- * the runtime FAULTED; the port init contract requires the port to release
- * everything itself on failure, so stop only clears the fault and never
- * touches the port again.
+ * resources released and returns the start error, unless the rollback
+ * teardown itself fails; a failed teardown leaves the runtime FAULTED and
+ * returns the teardown error (cleanup errors take precedence over the start
+ * error). A port init failure leaves the runtime FAULTED; the runtime keeps
+ * port ownership so the outstanding teardown can be retried from FAULTED. If
+ * the port init failed while holding a terminal fault (host resources
+ * retained), the retried stop/deinit return the latched error and the runtime
+ * stays FAULTED until reboot; if the port released everything itself, the
+ * retried teardown completes and the runtime returns to STOPPED.
  *
  * @return ESP_OK, ESP_ERR_INVALID_STATE, or a port error.
  */

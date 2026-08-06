@@ -36,6 +36,12 @@ check_source \
     "$NIMBLE_HOST/include/host/ble_gatt.h" \
     "bb321c6e8d7c1b4245e04f9a927e443368a46495139ed15d26f93b2c8511aff0"
 check_source \
+    "$NIMBLE_HOST/include/host/ble_gap.h" \
+    "f98ffc8c997ca99f0664af90d28bdd34b21a9c867c9231e73270fa0b8477e2e3"
+check_source \
+    "$NIMBLE_HOST/src/ble_gap.c" \
+    "fb2ba887898dae3ec25376e244b0e13694b179f86f509579752925c6cf1feacc"
+check_source \
     "$NIMBLE_HOST/src/ble_gatts.c" \
     "6ecefb0b156c95b6d397dad2121da69f35883c0b42bb1a2435f524e4abf5fa6d"
 check_source \
