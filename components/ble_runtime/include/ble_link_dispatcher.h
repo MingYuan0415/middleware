@@ -52,7 +52,7 @@ typedef struct ble_link_dispatcher_facts
     uint32_t connection_generation;
     bool encrypted;             /**< Link encrypted. */
     bool session_authenticated; /**< Security 2 session authenticated. */
-    bool authorized;            /**< Application authorization committed. */
+    bool authorized;            /**< Session matches the committed record. */
 } ble_link_dispatcher_facts_t;
 
 /**

@@ -11,6 +11,7 @@ idf_component_register(
         "src/ble_link_dispatcher.c"
         "src/ble_link_state.c"
         "src/ble_link_reassembler.c"
+        "src/ble_link_session.c"
         "src/ble_event_router.c"
     INCLUDE_DIRS "include"
     REQUIRES bt
