@@ -15,57 +15,69 @@ get_filename_component(PROJECT_ROOT
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(ESP_ERR "${PROJECT_ROOT}/tests/connectivity/host/include")
 
-add_executable(test_ble_runtime
-    test_ble_runtime.c
-    "${COMPONENT}/src/ble_runtime.c"
-)
-target_compile_features(test_ble_runtime PRIVATE c_std_11)
-target_compile_definitions(test_ble_runtime PRIVATE
-    _POSIX_C_SOURCE=200809L
-)
-target_include_directories(test_ble_runtime PRIVATE
-    "${COMPONENT}/include"
-    "${ESP_ERR}"
-)
-target_compile_options(test_ble_runtime PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    -Wpedantic
-    -UNDEBUG
-)
+foreach(test_target IN ITEMS
+        test_ble_runtime
+        test_ble_gatt_registry)
+    add_executable(${test_target}
+        ${test_target}.c
+        "${COMPONENT}/src/ble_runtime.c"
+        "${COMPONENT}/src/ble_gatt_registry.c"
+    )
+    target_compile_features(${test_target} PRIVATE c_std_11)
+    target_compile_definitions(${test_target} PRIVATE
+        _POSIX_C_SOURCE=200809L
+    )
+    target_include_directories(${test_target} PRIVATE
+        "${COMPONENT}/include"
+        "${ESP_ERR}"
+    )
+    target_compile_options(${test_target} PRIVATE
+        -Wall
+        -Wextra
+        -Werror
+        -Wpedantic
+        -UNDEBUG
+    )
+endforeach()
 
-if(BLE_RUNTIME_SANITIZER STREQUAL "address")
-    target_compile_options(test_ble_runtime PRIVATE
-        -fsanitize=address,undefined
-        -fno-omit-frame-pointer
-        -fno-sanitize-recover=all
-    )
-    target_link_options(test_ble_runtime PRIVATE
-        -fsanitize=address,undefined
-        -fno-omit-frame-pointer
-        -fno-sanitize-recover=all
-    )
-elseif(BLE_RUNTIME_SANITIZER STREQUAL "thread")
-    target_compile_options(test_ble_runtime PRIVATE
-        -fsanitize=thread
-        -fno-omit-frame-pointer
-    )
-    target_link_options(test_ble_runtime PRIVATE
-        -fsanitize=thread
-        -fno-omit-frame-pointer
-    )
-elseif(NOT BLE_RUNTIME_SANITIZER STREQUAL "none")
-    message(FATAL_ERROR
-        "Unsupported BLE_RUNTIME_SANITIZER=${BLE_RUNTIME_SANITIZER}")
-endif()
+foreach(target test_ble_runtime test_ble_gatt_registry)
+    if(BLE_RUNTIME_SANITIZER STREQUAL "address")
+        target_compile_options(${target} PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+            -fno-sanitize-recover=all
+        )
+        target_link_options(${target} PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+            -fno-sanitize-recover=all
+        )
+    elseif(BLE_RUNTIME_SANITIZER STREQUAL "thread")
+        target_compile_options(${target} PRIVATE
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+        )
+        target_link_options(${target} PRIVATE
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+        )
+    elseif(NOT BLE_RUNTIME_SANITIZER STREQUAL "none")
+        message(FATAL_ERROR
+            "Unsupported BLE_RUNTIME_SANITIZER=${BLE_RUNTIME_SANITIZER}")
+    endif()
+endforeach()
 
 if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND
         BLE_RUNTIME_SETARCH AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     add_test(NAME ble_runtime COMMAND
         ${BLE_RUNTIME_SETARCH} x86_64 -R
         $<TARGET_FILE:test_ble_runtime>)
+    add_test(NAME ble_gatt_registry COMMAND
+        ${BLE_RUNTIME_SETARCH} x86_64 -R
+        $<TARGET_FILE:test_ble_gatt_registry>)
 else()
     add_test(NAME ble_runtime COMMAND test_ble_runtime)
+    add_test(NAME ble_gatt_registry COMMAND test_ble_gatt_registry)
 endif()
 set_tests_properties(ble_runtime PROPERTIES TIMEOUT 10)
+set_tests_properties(ble_gatt_registry PROPERTIES TIMEOUT 10)
