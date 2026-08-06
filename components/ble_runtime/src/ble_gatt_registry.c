@@ -300,3 +300,9 @@ esp_err_t ble_gatt_registry_get_service(
     *out = s_registry.services[index];
     return ESP_OK;
 }
+
+bool ble_gatt_registry_admission_requires_encryption(
+    ble_gatt_registry_admission_t admission)
+{
+    return admission >= BLE_GATT_REGISTRY_ADMISSION_ENCRYPTED_SC_BOND;
+}

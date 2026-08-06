@@ -18,6 +18,17 @@
         } \
     } while (0)
 
+#define TEST_ASSERT_FALSE(condition) \
+    do \
+    { \
+        if ((condition)) \
+        { \
+            fprintf(stderr, "assertion failed at line %d: %s\n", \
+                    __LINE__, #condition); \
+            abort(); \
+        } \
+    } while (0)
+
 #define TEST_ASSERT_EQUAL(expected, actual) \
     do \
     { \
@@ -383,6 +394,18 @@ static void test_restart_clear_handles_reassigns(void)
                               &assigned));
 }
 
+static void test_admission_requires_encryption(void)
+{
+    TEST_ASSERT_FALSE(ble_gatt_registry_admission_requires_encryption(
+                          BLE_GATT_REGISTRY_ADMISSION_PUBLIC_MINIMUM));
+    TEST_ASSERT_TRUE(ble_gatt_registry_admission_requires_encryption(
+                         BLE_GATT_REGISTRY_ADMISSION_ENCRYPTED_SC_BOND));
+    TEST_ASSERT_TRUE(ble_gatt_registry_admission_requires_encryption(
+                         BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED));
+    TEST_ASSERT_TRUE(ble_gatt_registry_admission_requires_encryption(
+                         BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER));
+}
+
 int main(void)
 {
     test_register_lookup_and_seal();
@@ -396,6 +419,7 @@ int main(void)
     test_seal_rejects_registration_only();
     test_invalid_arguments_rejected();
     test_iteration_ordering();
+    test_admission_requires_encryption();
     printf("ble_gatt_registry: all tests passed\n");
     return 0;
 }

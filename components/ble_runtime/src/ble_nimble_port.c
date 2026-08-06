@@ -584,6 +584,11 @@ static esp_err_t _ble_nimble_port_register_database(void)
             if (characteristic->properties & BLE_GATT_REGISTRY_PROP_READ)
             {
                 definition->flags |= BLE_GATT_CHR_F_READ;
+                if (ble_gatt_registry_admission_requires_encryption(
+                            characteristic->read_admission))
+                {
+                    definition->flags |= BLE_GATT_CHR_F_READ_ENC;
+                }
             }
             if (characteristic->properties & BLE_GATT_REGISTRY_PROP_WRITE)
             {
@@ -594,6 +599,14 @@ static esp_err_t _ble_nimble_port_register_database(void)
             {
                 definition->flags |= BLE_GATT_CHR_F_WRITE_NO_RSP;
             }
+            if ((characteristic->properties &
+                    (BLE_GATT_REGISTRY_PROP_WRITE |
+                     BLE_GATT_REGISTRY_PROP_WRITE_NO_RESPONSE)) != 0U &&
+                    ble_gatt_registry_admission_requires_encryption(
+                        characteristic->write_admission))
+            {
+                definition->flags |= BLE_GATT_CHR_F_WRITE_ENC;
+            }
             if (characteristic->properties & BLE_GATT_REGISTRY_PROP_NOTIFY)
             {
                 definition->flags |= BLE_GATT_CHR_F_NOTIFY;
@@ -601,6 +614,14 @@ static esp_err_t _ble_nimble_port_register_database(void)
             if (characteristic->properties & BLE_GATT_REGISTRY_PROP_INDICATE)
             {
                 definition->flags |= BLE_GATT_CHR_F_INDICATE;
+            }
+            if ((characteristic->properties &
+                    (BLE_GATT_REGISTRY_PROP_NOTIFY |
+                     BLE_GATT_REGISTRY_PROP_INDICATE)) != 0U &&
+                    ble_gatt_registry_admission_requires_encryption(
+                        characteristic->tx_admission))
+            {
+                definition->flags |= BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC;
             }
         }
         characteristic_sets[service_count]
