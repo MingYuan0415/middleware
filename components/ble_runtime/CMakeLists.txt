@@ -3,6 +3,7 @@ idf_component_register(
         "src/ble_runtime.c"
         "src/ble_gatt_registry.c"
         "src/ble_nimble_port.c"
+        "src/ble_gap_manager.c"
     INCLUDE_DIRS "include"
     REQUIRES bt
     PRIV_REQUIRES

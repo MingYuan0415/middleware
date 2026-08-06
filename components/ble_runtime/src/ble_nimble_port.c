@@ -19,6 +19,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#include "ble_gap_manager.h"
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
 #include "ble_runtime.h"
@@ -45,6 +46,8 @@ typedef struct ble_nimble_port
     TaskHandle_t host_task;
     ble_nimble_port_gap_cb_t gap_callback;
     void *gap_arg;
+    struct ble_gap_event_listener listener;
+    bool listener_registered;
     bool started;
     bool deinitialized;
     bool deinit_failed;
@@ -57,6 +60,74 @@ static int _ble_nimble_port_gap_event(
     struct ble_gap_event *event, void *arg)
 {
     (void)arg;
+    ble_gap_manager_event_t manager_event;
+
+    memset(&manager_event, 0, sizeof(manager_event));
+    switch (event->type)
+    {
+    case BLE_GAP_EVENT_CONNECT:
+        manager_event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
+        manager_event.conn_handle = event->connect.conn_handle;
+        manager_event.status = event->connect.status;
+        if (event->connect.status == 0 &&
+                ble_gap_manager_handle_event(&manager_event) ==
+                ESP_ERR_NO_MEM)
+        {
+            const int terminate_result = ble_gap_terminate(
+                                             event->connect.conn_handle,
+                                             BLE_ERR_CONN_TERM_LOCAL);
+
+            if (terminate_result != 0)
+            {
+                LOG_W("rejected connection terminate failed result=%d",
+                      terminate_result);
+            }
+        }
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        manager_event.type = BLE_GAP_MANAGER_EVENT_DISCONNECT;
+        manager_event.conn_handle = event->disconnect.conn.conn_handle;
+        manager_event.reason = event->disconnect.reason;
+        (void)ble_gap_manager_handle_event(&manager_event);
+        break;
+    case BLE_GAP_EVENT_MTU:
+        if (event->mtu.channel_id != BLE_L2CAP_CID_ATT)
+        {
+            break;
+        }
+        manager_event.type = BLE_GAP_MANAGER_EVENT_MTU;
+        manager_event.conn_handle = event->mtu.conn_handle;
+        manager_event.mtu = event->mtu.value;
+        (void)ble_gap_manager_handle_event(&manager_event);
+        break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        manager_event.type = BLE_GAP_MANAGER_EVENT_ENCRYPT_CHANGE;
+        manager_event.conn_handle = event->enc_change.conn_handle;
+        {
+            struct ble_gap_conn_desc description;
+
+            manager_event.encrypted =
+                ble_gap_conn_find(event->enc_change.conn_handle,
+                                  &description) == 0 &&
+                description.sec_state.encrypted;
+        }
+        (void)ble_gap_manager_handle_event(&manager_event);
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        manager_event.type = BLE_GAP_MANAGER_EVENT_SUBSCRIBE;
+        manager_event.conn_handle = event->subscribe.conn_handle;
+        manager_event.attr_handle = event->subscribe.attr_handle;
+        manager_event.subscribed = event->subscribe.cur_notify ||
+                                   event->subscribe.cur_indicate;
+        (void)ble_gap_manager_handle_event(&manager_event);
+        break;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        manager_event.type = BLE_GAP_MANAGER_EVENT_ADV_COMPLETE;
+        (void)ble_gap_manager_handle_event(&manager_event);
+        break;
+    default:
+        break;
+    }
     if (s_port.gap_callback != NULL)
     {
         s_port.gap_callback(event, s_port.gap_arg);
@@ -139,7 +210,11 @@ static int _ble_nimble_port_access_bridge(
         {
             return BLE_ATT_ERR_UNLIKELY;
         }
-        return os_mbuf_append(context->om, access_buffer, read_len);
+        if (os_mbuf_append(context->om, access_buffer, read_len) != 0)
+        {
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        return 0;
     }
     return result;
 }
@@ -264,10 +339,24 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         return s_port.deinit_error;
     }
+    ble_gap_manager_init();
     result = nimble_port_init();
     if (result != ESP_OK)
     {
         return result;
+    }
+    if (!s_port.listener_registered)
+    {
+        const int register_result = ble_gap_event_listener_register(
+                                        &s_port.listener,
+                                        _ble_nimble_port_gap_event, NULL);
+
+        if (register_result != 0 && register_result != BLE_HS_EALREADY)
+        {
+            nimble_port_deinit();
+            return ESP_FAIL;
+        }
+        s_port.listener_registered = true;
     }
     s_port.deinitialized = false;
     ble_hs_cfg.reset_cb = _ble_nimble_port_on_reset;
@@ -284,6 +373,11 @@ static esp_err_t _ble_nimble_port_init(void)
     result = _ble_nimble_port_register_database();
     if (result != ESP_OK)
     {
+        if (s_port.listener_registered)
+        {
+            (void)ble_gap_event_listener_unregister(&s_port.listener);
+            s_port.listener_registered = false;
+        }
         const esp_err_t cleanup = nimble_port_deinit();
 
         s_port.deinitialized = true;
@@ -374,6 +468,11 @@ static esp_err_t _ble_nimble_port_deinit(void)
     if (s_port.deinit_failed)
     {
         return s_port.deinit_error;
+    }
+    if (s_port.listener_registered)
+    {
+        (void)ble_gap_event_listener_unregister(&s_port.listener);
+        s_port.listener_registered = false;
     }
     if (!s_port.deinitialized)
     {
