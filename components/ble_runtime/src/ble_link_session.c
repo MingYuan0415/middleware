@@ -37,8 +37,20 @@ void ble_link_session_init(uint64_t boot_id)
 
 void ble_link_session_reset(void)
 {
+    /* The epoch allocator is boot-scoped and survives a full teardown;
+     * only a fresh boot via init() resets it. */
+    const uint32_t epoch = s_session.security2_epoch;
+
     memset(&s_session, 0, sizeof(s_session));
+    s_session.security2_epoch = epoch;
 }
+
+#ifdef UNIT_TEST_HOST
+void ble_link_session_test_set_epoch(uint32_t value)
+{
+    s_session.security2_epoch = value;
+}
+#endif
 
 void ble_link_session_set_pairing_window(bool open)
 {
@@ -50,7 +62,7 @@ static void _ble_link_session_clear_connection(void)
     s_session.active = false;
     s_session.encrypted = false;
     s_session.bond_verified = false;
-    s_session.security2_epoch = 0U;
+    /* The epoch allocator is boot-scoped and never resets on disconnect. */
     s_session.security2_open = false;
     s_session.authorized = false;
 }
@@ -74,7 +86,6 @@ esp_err_t ble_link_session_handle_event(
         s_session.active = true;
         s_session.encrypted = false;
         s_session.bond_verified = false;
-        s_session.security2_epoch = 0U;
         s_session.security2_open = false;
         s_session.authorized = false;
         return ESP_OK;
@@ -109,21 +120,26 @@ esp_err_t ble_link_session_handle_event(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_security2(
-    uint32_t generation, bool open, uint32_t epoch)
+esp_err_t ble_link_session_security2_open(
+    uint32_t generation, uint32_t *out_epoch)
 {
+    if (out_epoch == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (generation != s_session.generation || !s_session.active)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (epoch <= s_session.security2_epoch)
+    if (s_session.security2_epoch >= UINT32_MAX)
     {
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
-    s_session.security2_epoch = epoch;
-    s_session.security2_open = open;
+    s_session.security2_epoch++;
+    s_session.security2_open = true;
     /* Any epoch change invalidates the previous session match. */
     s_session.authorized = false;
+    *out_epoch = s_session.security2_epoch;
     return ESP_OK;
 }
 
@@ -137,6 +153,30 @@ esp_err_t ble_link_session_set_authorization(
     s_session.authorization_revision = revision;
     s_session.bound = committed;
     /* A record change invalidates the current session match. */
+    s_session.authorized = false;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_session_report_session_match_current(
+    uint32_t generation, uint32_t revision)
+{
+    return ble_link_session_report_session_match(
+               generation, revision, s_session.security2_epoch);
+}
+
+esp_err_t ble_link_session_security2_close_current(uint32_t generation)
+{
+    if (generation != s_session.generation || !s_session.active)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* The allocator never wraps: at the maximum it is locked out and the
+     * session cannot be reopened for the rest of the boot. */
+    if (s_session.security2_epoch < UINT32_MAX)
+    {
+        s_session.security2_epoch++;
+    }
+    s_session.security2_open = false;
     s_session.authorized = false;
     return ESP_OK;
 }

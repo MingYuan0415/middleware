@@ -44,6 +44,8 @@ static void _connect(uint32_t generation)
                           BLE_LINK_SESSION_EVENT_ACL_CONNECTED));
 }
 
+static uint32_t s_auth_epoch;
+
 static void _authenticate(uint32_t generation)
 {
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
@@ -52,8 +54,8 @@ static void _authenticate(uint32_t generation)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           generation,
                           BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          generation, true, 1U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          generation, &s_auth_epoch));
 }
 
 static void _authorize(uint32_t generation, uint32_t revision)
@@ -118,8 +120,10 @@ static void test_admission_progression(void)
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
     /* Security 2 authenticated: control still needs authorization. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, true, 1U));
+    uint32_t epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &epoch));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
     /* Authorization committed: control and event admitted. */
@@ -146,8 +150,8 @@ static void test_security2_closed_keeps_acl(void)
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
     /* Security 2 session closed without disconnecting. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, false, 2U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_close_current(
+                          GEN1));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
     /* The ACL, link_state, and encrypted+bond session channel remain. */
@@ -192,8 +196,8 @@ static void test_stale_generation_ignored(void)
                           GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_session_security2(
-                          GEN1, false, 2U));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_close_current(GEN1));
     /* GEN2 admission is unchanged: session stays admitted. */
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN2, BLE_LINK_SESSION_CHANNEL_SESSION));
@@ -348,7 +352,8 @@ static void test_reconnect_with_same_revision(void)
     /* The record revision is unchanged; only the session match is new. */
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
                       _query(GEN2, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(GEN2, 5U, 1U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
+                          GEN2, 5U, s_auth_epoch));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN2, BLE_LINK_SESSION_CHANNEL_CONTROL));
 }
@@ -360,14 +365,17 @@ static void test_reconnect_after_security2_closed(void)
     _authenticate(GEN1);
     _authorize(GEN1, 5U);
     /* Security 2 closes; the record survives. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, false, 2U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_close_current(
+                          GEN1));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
     /* Re-authenticated with the same long-term credentials. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, true, 3U));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(GEN1, 5U, 3U));
+    uint32_t reopen_epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &reopen_epoch));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
+                          GEN1, 5U, reopen_epoch));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
 }
@@ -423,7 +431,7 @@ static void test_stale_revision_match_after_replace_rejected(void)
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
 }
 
-static void test_late_security2_epoch_ignored(void)
+static void test_security2_epoch_invalidation(void)
 {
     ble_link_session_init(BOOT1);
     _connect(GEN1);
@@ -431,24 +439,29 @@ static void test_late_security2_epoch_ignored(void)
     _authorize(GEN1, 5U);
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* Security 2 closes with epoch 2. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, false, 2U));
+    /* Security 2 closes: control drops to UNAUTHENTICATED. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_close_current(
+                          GEN1));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* A late authenticated event from the closed handshake (epoch 1) is
-     * ignored, and a match bound to it cannot restore access. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, true, 1U));
+    /* A match bound to the closed epoch cannot restore access. */
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
                       ble_link_session_report_session_match(GEN1, 5U, 1U));
-    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
+    /* A fresh handshake opens with a new epoch; until the match arrives
+     * control is gated as PERMISSION_DENIED. */
+    uint32_t fresh_epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &fresh_epoch));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* The current epoch (3) restores access after a fresh handshake. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, true, 3U));
+    /* A match bound to a stale epoch stays invalid. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_report_session_match(
+                          GEN1, 5U, fresh_epoch - 1U));
+    /* The match for the current epoch restores access. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
-                          GEN1, 5U, 3U));
+                          GEN1, 5U, fresh_epoch));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
 }
@@ -461,23 +474,66 @@ static void test_late_close_does_not_preserve_old_match(void)
     _authorize(GEN1, 5U);
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* A newer open(3) arrives before the late close(2). */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, true, 3U));
-    /* The new epoch invalidates the epoch-1 match: control gated until a
+    /* A newer open arrives before the late close. */
+    uint32_t newer_epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &newer_epoch));
+    /* The new epoch invalidates the previous match: control gated until a
      * match for the current epoch arrives. */
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* The late close(2) is ignored. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2(
-                          GEN1, false, 2U));
-    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
+    /* The late close of a retired epoch is rejected. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_close_current(
+                          GEN1));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* Only a match bound to the current epoch restores access. */
+    /* A match for the closed epoch cannot restore access. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_report_session_match(
+                          GEN1, 5U, newer_epoch));
+    /* A fresh handshake with its own epoch restores access. */
+    uint32_t final_epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &final_epoch));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
-                          GEN1, 5U, 3U));
+                          GEN1, 5U, final_epoch));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
+}
+
+static void test_epoch_exhaustion_survives_reconnect(void)
+{
+    uint32_t epoch = 0U;
+
+    ble_link_session_init(BOOT1);
+    _connect(GEN1);
+    _authenticate(GEN1);
+    /* Push the allocator to the boundary. */
+    ble_link_session_test_set_epoch(UINT32_MAX - 1U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &epoch));
+    TEST_ASSERT_EQUAL(UINT32_MAX, epoch);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_open(GEN1, &epoch));
+    /* Disconnect and reconnect must not release the lock. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1,
+                          BLE_LINK_SESSION_EVENT_ACL_DISCONNECTED));
+    _connect(GEN2);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_open(GEN2, &epoch));
+    /* A full teardown keeps the lock for the boot. */
+    ble_link_session_reset();
+    _connect(GEN2);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_open(GEN2, &epoch));
+    /* A new boot resets the allocator. */
+    ble_link_session_init(BOOT2);
+    _connect(GEN1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &epoch));
 }
 
 static void test_new_boot_resets_session(void)
@@ -513,8 +569,9 @@ int main(void)
     test_match_without_record_rejected();
     test_late_match_after_revoke_rejected();
     test_stale_revision_match_after_replace_rejected();
-    test_late_security2_epoch_ignored();
+    test_security2_epoch_invalidation();
     test_late_close_does_not_preserve_old_match();
+    test_epoch_exhaustion_survives_reconnect();
     test_new_boot_resets_session();
     printf("ble_link_session: all tests passed\n");
     return 0;

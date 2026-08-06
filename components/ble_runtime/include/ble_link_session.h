@@ -10,6 +10,13 @@
 #include "ble_link_dispatcher.h"
 #include "ble_link_state.h"
 
+#ifdef UNIT_TEST_HOST
+    /**
+    * @brief Test-only seam: set the epoch allocator value directly.
+    */
+    void ble_link_session_test_set_epoch(uint32_t value);
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -50,24 +57,44 @@ esp_err_t ble_link_session_set_authorization(
     bool committed, uint32_t revision);
 
 /**
- * @brief Report a Security 2 session open or close.
+ * @brief Open a Security 2 session.
  *
- * Each Security 2 transition carries a strictly increasing epoch from the
- * caller. A transition whose epoch is not newer than the last accepted one
- * is ignored, so a late callback from a closed handshake cannot reopen the
- * session. Every accepted transition, open or close, invalidates the
- * current session match; after an open, the session must match again with
- * the same epoch before control access returns. Closing preserves the ACL
- * and bond facts.
+ * The session is the single epoch allocator: the fresh epoch is returned
+ * and must be used for the subsequent session-match report. Any later
+ * accepted open or close invalidates the previous match.
+ *
+ * @param[in]  generation Current connection generation.
+ * @param[out] out_epoch  Fresh epoch for this handshake.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE when the generation is not
+ *         current or the epoch allocator is exhausted.
+ */
+esp_err_t ble_link_session_security2_open(
+    uint32_t generation, uint32_t *out_epoch);
+
+/**
+ * @brief Report that the current session matched the committed record at
+ * the allocator's current epoch.
+ *
+ * Convenience for flows that do not track the handshake epoch themselves.
  *
  * @param[in] generation Current connection generation.
- * @param[in] open       True when the Security 2 session opened.
- * @param[in] epoch      Monotonic epoch of this transition.
- * @return ESP_OK (including stale epochs), or ESP_ERR_INVALID_STATE when
- *         the generation is not current.
+ * @param[in] revision   Authorization revision the session matched.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE.
  */
-esp_err_t ble_link_session_security2(
-    uint32_t generation, bool open, uint32_t epoch);
+esp_err_t ble_link_session_report_session_match_current(
+    uint32_t generation, uint32_t revision);
+
+/**
+ * @brief Close the Security 2 session for the current generation.
+ *
+ * Allocates a fresh epoch internally so the close always takes effect
+ * regardless of which epoch opened the session. Clears the session match.
+ *
+ * @param[in] generation Current connection generation.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE when the generation is not
+ *         current.
+ */
+esp_err_t ble_link_session_security2_close_current(uint32_t generation);
 
 /**
  * @brief Report that the current generation session matched the committed
@@ -108,7 +135,10 @@ typedef enum
 void ble_link_session_init(uint64_t boot_id);
 
 /**
- * @brief Reset to an inactive, empty session (new boot or full teardown).
+ * @brief Clear the current session state.
+ *
+ * The boot-scoped Security 2 epoch allocator is preserved, so an exhausted
+ * allocator stays locked until a fresh boot calls init().
  */
 void ble_link_session_reset(void);
 
