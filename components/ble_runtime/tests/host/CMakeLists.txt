@@ -81,3 +81,7 @@ else()
 endif()
 set_tests_properties(ble_runtime PROPERTIES TIMEOUT 10)
 set_tests_properties(ble_gatt_registry PROPERTIES TIMEOUT 10)
+
+add_test(NAME ble_runtime_idf_assumptions COMMAND
+    sh "${COMPONENT}/scripts/check_idf_assumptions.sh")
+set_tests_properties(ble_runtime_idf_assumptions PROPERTIES TIMEOUT 10)

@@ -11,8 +11,6 @@
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"
 
-#define BLE_GATT_REGISTRY_MAX_SERVICES 8U
-#define BLE_GATT_REGISTRY_MAX_CHARACTERISTICS 32U
 
 typedef struct ble_gatt_registry
 {

@@ -11,6 +11,10 @@
 extern "C" {
 #endif
 
+/** @brief Registry capacity limits. */
+#define BLE_GATT_REGISTRY_MAX_SERVICES 8U
+#define BLE_GATT_REGISTRY_MAX_CHARACTERISTICS 32U
+
 /** @brief Characteristic property bitmask. */
 typedef enum
 {
@@ -45,6 +49,10 @@ typedef enum
  * The port translates a NimBLE access context into this structure so the
  * routing and handlers stay host-testable. The same buffers the caller owns
  * are exposed here; the handler either consumes write_data or fills read_out.
+ *
+ * For reads, the handler must return the complete attribute value; NimBLE
+ * applies the read offset afterwards, so handlers must never slice by
+ * `offset` themselves. `offset` is informational only.
  */
 typedef struct ble_gatt_registry_access_context
 {
@@ -54,7 +62,7 @@ typedef struct ble_gatt_registry_access_context
     uint8_t *read_out;         /**< Read output buffer, port-owned. */
     uint16_t read_capacity;
     uint16_t *read_len;        /**< Bytes written by the handler. */
-    uint16_t offset;           /**< Read offset for long reads. */
+    uint16_t offset;           /**< Read offset for long reads, informational. */
 } ble_gatt_registry_access_context_t;
 
 /**
