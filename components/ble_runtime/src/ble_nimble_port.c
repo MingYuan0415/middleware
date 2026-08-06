@@ -26,7 +26,9 @@
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
 #include "ble_port_ops.h"
+#include "ble_response_cache.h"
 #include "ble_runtime.h"
+#include "ble_tx_scheduler.h"
 
 #define DBG_TAG "ble_nimble_port"
 #define DBG_LVL DBG_INFO
@@ -164,6 +166,43 @@ static void _ble_nimble_port_adv_consumer(
     }
 }
 
+static void _ble_nimble_port_tx_consumer(
+    const ble_port_event_t *event, void *arg)
+{
+    (void)arg;
+    switch (event->type)
+    {
+    case BLE_PORT_EVENT_NOTIFY_TX:
+    {
+        const esp_err_t result = ble_tx_scheduler_handle_notify_tx(event);
+
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+        {
+            LOG_E("tx scheduler event failed result=%d", result);
+        }
+        break;
+    }
+    case BLE_PORT_EVENT_DISCONNECT:
+    case BLE_PORT_EVENT_RESET:
+        ble_tx_scheduler_reset();
+        break;
+    default:
+        break;
+    }
+}
+
+static void _ble_nimble_port_tx_lock_cb(void *arg)
+{
+    (void)arg;
+    (void)xSemaphoreTake(s_port.adv_lock, portMAX_DELAY);
+}
+
+static void _ble_nimble_port_tx_unlock_cb(void *arg)
+{
+    (void)arg;
+    (void)xSemaphoreGive(s_port.adv_lock);
+}
+
 static void _ble_nimble_port_adv_lock_cb(void *arg)
 {
     (void)arg;
@@ -230,6 +269,53 @@ static esp_err_t _ble_nimble_port_adv_manager_init(void)
     }
     config.ops = s_port.ops != NULL ? s_port.ops : &s_production_ops;
     ble_adv_manager_init(&config);
+    return ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_tx_manager_init(void)
+{
+    static ble_tx_scheduler_config_t scheduler_config =
+    {
+        .queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH,
+        .max_frame_bytes = CONFIG_BLE_RUNTIME_TX_FRAME_BYTES,
+        .ops = NULL,
+        .completed = NULL,
+        .completed_arg = NULL,
+        .lock = _ble_nimble_port_tx_lock_cb,
+        .unlock = _ble_nimble_port_tx_unlock_cb,
+        .lock_arg = NULL,
+    };
+    static const ble_response_cache_config_t cache_config =
+    {
+        .max_entries = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_ENTRIES,
+        .max_entry_bytes = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_ENTRY_BYTES,
+        .max_key_bytes = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_KEY_BYTES,
+        .ttl_ms = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_TTL_MS,
+        .now_ms = _ble_nimble_port_adv_now_ms,
+        .lock = _ble_nimble_port_tx_lock_cb,
+        .unlock = _ble_nimble_port_tx_unlock_cb,
+        .lock_arg = NULL,
+    };
+
+    if (s_port.adv_lock == NULL)
+    {
+        s_port.adv_lock = xSemaphoreCreateMutex();
+        if (s_port.adv_lock == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    scheduler_config.ops = s_port.ops != NULL ? s_port.ops : &s_production_ops;
+    {
+        const esp_err_t scheduler_result = ble_tx_scheduler_init(&scheduler_config);
+
+        if (scheduler_result != ESP_OK)
+        {
+            return scheduler_result;
+        }
+    }
+    ble_response_cache_init(&cache_config);
+    ble_used_id_set_init(&cache_config);
     return ESP_OK;
 }
 
@@ -848,12 +934,22 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         return result;
     }
+    result = ble_event_router_register(_ble_nimble_port_tx_consumer, NULL);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     if (s_port.ops == NULL)
     {
         s_port.ops = &s_production_ops;
     }
     ble_gap_manager_init();
     result = _ble_nimble_port_adv_manager_init();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    result = _ble_nimble_port_tx_manager_init();
     if (result != ESP_OK)
     {
         return result;
@@ -1103,6 +1199,9 @@ static esp_err_t _ble_nimble_port_deinit(void)
         vSemaphoreDelete(s_port.stop_done_semaphore);
         s_port.stop_done_semaphore = NULL;
     }
+    ble_used_id_set_deinit();
+    ble_response_cache_deinit();
+    ble_tx_scheduler_deinit();
     ble_adv_manager_deinit();
     if (s_port.adv_lock != NULL)
     {

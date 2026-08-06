@@ -25,4 +25,50 @@ config BLE_RUNTIME_ADV_FAST_WINDOW_MS
         Duration of the fast advertising window before falling back to slow
         advertising. Runtime policy, calibrated on hardware.
 
+config BLE_RUNTIME_TX_QUEUE_DEPTH
+    int "TX scheduler queue depth"
+    range 1 32
+    default 8
+    help
+        Bounded number of pending frames the TX scheduler holds per
+        connection. Full queues report ESP_ERR_NO_MEM so callers back off.
+
+config BLE_RUNTIME_TX_FRAME_BYTES
+    int "TX scheduler max frame payload"
+    range 1 512
+    default 495
+    help
+        Maximum payload of one notified or indicated frame. 495 bytes fits
+        one ATT PDU at the preferred MTU of 498.
+
+config BLE_RUNTIME_RESPONSE_CACHE_ENTRIES
+    int "Response cache entries"
+    range 1 32
+    default 8
+    help
+        Bounded number of cached responses and used request ids per
+        generation.
+
+config BLE_RUNTIME_RESPONSE_CACHE_ENTRY_BYTES
+    int "Response cache max entry payload"
+    range 1 4096
+    default 1024
+    help
+        Maximum payload of one cached response.
+
+config BLE_RUNTIME_RESPONSE_CACHE_KEY_BYTES
+    int "Response cache max key length"
+    range 1 64
+    default 16
+    help
+        Maximum key length for cached responses and used request ids.
+
+config BLE_RUNTIME_RESPONSE_CACHE_TTL_MS
+    int "Response cache entry lifetime in milliseconds"
+    range 0 600000
+    default 60000
+    help
+        Entry lifetime before a cached response is treated as stale. 0 keeps
+        entries until explicitly cleared.
+
 endmenu

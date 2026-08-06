@@ -5,6 +5,8 @@ idf_component_register(
         "src/ble_nimble_port.c"
         "src/ble_gap_manager.c"
         "src/ble_adv_manager.c"
+        "src/ble_tx_scheduler.c"
+        "src/ble_response_cache.c"
         "src/ble_event_router.c"
     INCLUDE_DIRS "include"
     REQUIRES bt
