@@ -657,7 +657,13 @@ static void _test_suspend_resume(void)
                _status_suspended, 500U));
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED);
-    assert(device_link_service_open_window() == ESP_ERR_INVALID_STATE);
+    /* The open is admitted to the FIFO but the worker rejects it while
+     * suspended, so no window may appear. */
+    assert(device_link_service_open_window() == ESP_OK);
+    _pump_ms(30U);
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.active);
+    assert(status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED);
     assert(device_link_service_resume(0U) == ESP_OK);
     assert(device_link_service_resume(0U) == ESP_OK);
     assert(_wait_for(_status_advertising, 500U));
@@ -702,10 +708,13 @@ static void _test_close_after_pending_open(void)
     _init_service();
 
     /* A close issued immediately after an open must land after it in the
-     * worker FIFO, so the pending open can never outlive its owner. */
+     * worker FIFO: the open publish (active) is followed by the close
+     * publish (idle), and the final state must be idle. */
+    const unsigned before = _publish_count();
+
     assert(device_link_service_open_window() == ESP_OK);
     assert(device_link_service_close_window() == ESP_OK);
-    assert(_wait_for(_status_not_active, 500U));
+    assert(_wait_publish_count(before + 2U, 500U) >= before + 2U);
     device_link_service_status_t status;
 
     assert(device_link_service_get_status(&status) == ESP_OK);

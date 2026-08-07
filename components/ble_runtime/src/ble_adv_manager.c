@@ -379,12 +379,15 @@ esp_err_t ble_adv_manager_release_lease(uint8_t lease_id)
         _ble_adv_manager_unlock();
         return ESP_ERR_INVALID_STATE;
     }
+    size_t slot = BLE_ADV_MANAGER_MAX_LEASES;
+
     for (size_t i = 0U; i < BLE_ADV_MANAGER_MAX_LEASES; ++i)
     {
         if (s_manager.leases[i].in_use && s_manager.leases[i].id == lease_id)
         {
             s_manager.leases[i].in_use = false;
             s_manager.lease_count--;
+            slot = i;
             found = true;
             break;
         }
@@ -394,6 +397,9 @@ esp_err_t ble_adv_manager_release_lease(uint8_t lease_id)
         _ble_adv_manager_unlock();
         return ESP_ERR_NOT_FOUND;
     }
+    /* The released slot must not retain the discovery discriminator. */
+    memset(s_manager.leases[slot].discriminator, 0,
+           BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     const esp_err_t result = _ble_adv_manager_converge();
 
     _ble_adv_manager_unlock();

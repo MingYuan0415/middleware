@@ -308,6 +308,8 @@ static esp_err_t _device_link_service_open_window_locked(void)
         ble_link_session_set_pairing_window(true);
         s_service.bindable_lease_held = true;
         s_service.bindable_lease_id = lease.lease_id;
+        /* The lease copy carries the discriminator. */
+        _device_link_service_zeroize(&lease, sizeof(lease));
     }
     memcpy(s_service.discriminator, discriminator,
            sizeof(s_service.discriminator));
@@ -415,8 +417,9 @@ static void _device_link_service_handle_command(
     {
     case DEVICE_LINK_SERVICE_COMMAND_OPEN:
     {
-        const esp_err_t open_result =
-            _device_link_service_open_window_locked();
+        const esp_err_t open_result = s_service.suspended ?
+                                      ESP_ERR_INVALID_STATE :
+                                      _device_link_service_open_window_locked();
 
         s_service.snapshot.last_error = open_result;
         break;
@@ -426,15 +429,12 @@ static void _device_link_service_handle_command(
         s_service.snapshot.last_error = ESP_OK;
         break;
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
-        if (s_service.window_open)
-        {
-            s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
-        }
-        else
-        {
-            s_service.suspended = true;
-            s_service.snapshot.last_error = ESP_OK;
-        }
+        /* Suspend always ends with no window and the suspended flag set,
+         * so an OPEN that raced into the FIFO first cannot leave a window
+         * open across standby. */
+        _device_link_service_close_window_locked();
+        s_service.suspended = true;
+        s_service.snapshot.last_error = ESP_OK;
         break;
     case DEVICE_LINK_SERVICE_COMMAND_RESUME:
         /* Resume only restores the pre-suspend idle state; it never opens a
@@ -510,8 +510,10 @@ static void _device_link_service_worker(void *arg)
                 break;
             }
             _device_link_service_handle_command(&command);
-            continue;
         }
+        /* The deadline and periodic publication tick runs after every
+         * command as well, so sustained command traffic cannot starve the
+         * window expiry. */
         _device_link_service_worker_tick();
     }
     /* DEINIT: release every lease and clear secrets before the runtime
@@ -654,6 +656,14 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    if (expected == DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED)
+    {
+        /* Re-init from STOPPED: the CAS above failed, so set STARTING
+         * explicitly to keep the admission exclusive. */
+        atomic_store_explicit(&s_lifecycle,
+                              DEVICE_LINK_SERVICE_LIFECYCLE_STARTING,
+                              memory_order_release);
+    }
     memset(&s_service, 0, sizeof(s_service));
     s_service.config = *config;
     atomic_store_explicit(&s_api_users, 0U, memory_order_release);
@@ -713,9 +723,8 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     atomic_store_explicit(&s_worker_result, ESP_OK,
                           memory_order_release);
-    atomic_store_explicit(&s_lifecycle,
-                          DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
-                          memory_order_release);
+    /* The initial snapshot is prepared before RUNNING is exposed so a
+     * concurrent get_status cannot observe a half-initialized service. */
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     s_service.snapshot.generation = 1U;
     s_service.snapshot.available = true;
@@ -727,6 +736,9 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         xSemaphoreGive(s_service.mutex);
         _device_link_service_publish_now(&snapshot);
     }
+    atomic_store_explicit(&s_lifecycle,
+                          DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
+                          memory_order_release);
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
     return ESP_OK;
 }
@@ -795,8 +807,13 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
     }
     esp_err_t result = ESP_OK;
 
-    if (!atomic_load_explicit(&s_worker_exited, memory_order_acquire))
+    if (!command_admitted ||
+            !atomic_load_explicit(&s_worker_exited, memory_order_acquire))
     {
+        /* The first deinit always waits for the worker's exit signal: the
+         * give happens-before the take returns, so the worker can no
+         * longer touch the semaphore afterwards. A retry skips the wait
+         * because the signal was already consumed. */
         if (xSemaphoreTake(s_service.stopped, timeout) != pdTRUE)
         {
             /* The worker never exited: keep STOPPING so a retry can wait
@@ -854,20 +871,9 @@ static esp_err_t _device_link_service_enqueue(
 
 esp_err_t device_link_service_open_window(void)
 {
-    if (!_device_link_service_api_acquire())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    bool suspended = false;
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    suspended = s_service.suspended;
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_api_release();
-    if (suspended)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
+    /* The suspended check happens in the worker, in FIFO order with every
+     * other transition, so an open that races with suspend cannot win out
+     * of order. */
     return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_OPEN);
 }
 
