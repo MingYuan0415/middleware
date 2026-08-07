@@ -54,6 +54,7 @@ typedef enum
 typedef struct device_link_service_command
 {
     device_link_service_command_type_t type;
+    uint32_t sequence; /**< Suspend acknowledgement sequence. */
 } device_link_service_command_t;
 
 typedef struct device_link_service
@@ -97,7 +98,8 @@ static atomic_int s_lifecycle = ATOMIC_VAR_INIT(
 static atomic_uint s_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_uint s_worker_result = ATOMIC_VAR_INIT(0U);
 static atomic_bool s_worker_exited = ATOMIC_VAR_INIT(false);
-static atomic_uint s_suspend_sequence = ATOMIC_VAR_INIT(0U);
+static uint32_t s_suspend_next; /**< Caller-assigned, under the mutex. */
+static atomic_uint s_suspend_applied = ATOMIC_VAR_INIT(0U);
 
 EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
 
@@ -160,13 +162,38 @@ static void _device_link_service_zero_secrets(void)
 
 static bool _device_link_service_api_acquire(void)
 {
+    if (atomic_load_explicit(&s_lifecycle, memory_order_acquire) !=
+            DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
+    {
+        return false;
+    }
+    atomic_fetch_add_explicit(&s_api_users, 1U,
+                              memory_order_acq_rel);
+    if (atomic_load_explicit(&s_lifecycle, memory_order_acquire) ==
+            DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
+    {
+        return true;
+    }
+    atomic_fetch_sub_explicit(&s_api_users, 1U,
+                              memory_order_release);
+    return false;
+}
+
+/**
+ * @brief Early admission for the BLE event callback only.
+ *
+ * STARTING is admitted so a connection accepted between the router
+ * registration and the RUNNING store is tracked; the count keeps teardown
+ * from deleting the mutex underneath an in-flight callback. Public APIs
+ * keep the strict RUNNING-only admission so they can never touch
+ * partially initialized handles.
+ */
+static bool _device_link_service_api_acquire_early(void)
+{
     const device_link_service_lifecycle_t lifecycle =
         (device_link_service_lifecycle_t)atomic_load_explicit(
             &s_lifecycle, memory_order_acquire);
 
-    /* STARTING is admitted so BLE events arriving between the router
-     * registration and the RUNNING store can be tracked; STOPPING and
-     * STOPPED reject so a teardown can never race a live callback. */
     if (lifecycle != DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING &&
             lifecycle != DEVICE_LINK_SERVICE_LIFECYCLE_STARTING)
     {
@@ -174,18 +201,7 @@ static bool _device_link_service_api_acquire(void)
     }
     atomic_fetch_add_explicit(&s_api_users, 1U,
                               memory_order_acq_rel);
-    const device_link_service_lifecycle_t after =
-        (device_link_service_lifecycle_t)atomic_load_explicit(
-            &s_lifecycle, memory_order_acquire);
-
-    if (after == DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING ||
-            after == DEVICE_LINK_SERVICE_LIFECYCLE_STARTING)
-    {
-        return true;
-    }
-    atomic_fetch_sub_explicit(&s_api_users, 1U,
-                              memory_order_release);
-    return false;
+    return true;
 }
 
 static void _device_link_service_api_release(void)
@@ -379,7 +395,7 @@ static void _device_link_service_ble_event(
     {
         return;
     }
-    if (!_device_link_service_api_acquire())
+    if (!_device_link_service_api_acquire_early())
     {
         return;
     }
@@ -456,13 +472,8 @@ static void _device_link_service_handle_command(
         _device_link_service_close_window_locked();
         s_service.suspended = true;
         s_service.snapshot.last_error = ESP_OK;
-        if (atomic_load_explicit(&s_suspend_sequence,
-                                 memory_order_acquire) < UINT32_MAX)
-        {
-            atomic_store_explicit(&s_suspend_sequence,
-                                  s_suspend_sequence + 1U,
-                                  memory_order_release);
-        }
+        atomic_store_explicit(&s_suspend_applied, command->sequence,
+                              memory_order_release);
         break;
     case DEVICE_LINK_SERVICE_COMMAND_RESUME:
         /* Resume only restores the pre-suspend idle state; it never opens a
@@ -629,6 +640,12 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
 {
     esp_err_t cleanup_result = ESP_OK;
 
+    /* Drain in-flight early-admitted callbacks (STARTING events) before
+     * releasing the mutex they may hold. */
+    while (atomic_load_explicit(&s_api_users, memory_order_acquire) != 0U)
+    {
+        vTaskDelay(1U);
+    }
     if (s_service.router_registered)
     {
         cleanup_result = ble_event_router_unregister(
@@ -769,8 +786,8 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         s_service.snapshot.generation = 1U;
         s_service.snapshot.available = true;
-        s_service.snapshot.state = DEVICE_LINK_SERVICE_STATE_ADVERTISING;
-        s_service.snapshot.window_remaining_ms = 0U;
+        /* Reconcile any connection tracked during STARTING. */
+        _device_link_service_refresh_snapshot_locked();
         snapshot = s_service.snapshot;
         xSemaphoreGive(s_service.mutex);
         atomic_store_explicit(&s_lifecycle,
@@ -939,33 +956,40 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    const device_link_service_command_t command =
+    esp_err_t result = ESP_OK;
+    /* Standby preparation needs the suspended state applied before it
+     * proceeds. The caller assigns a unique sequence under the mutex
+     * before the enqueue, so the acknowledgement always refers to this
+     * command: the worker stores the command's sequence after applying it,
+     * and a queued resume ahead of it can never be acknowledged against.
+     * The API user count is held across the wait, so deinit cannot tear
+     * the service down underneath it. */
+    uint32_t expected_sequence = 0U;
+    device_link_service_command_t command;
+
+    memset(&command, 0, sizeof(command));
+    command.type = DEVICE_LINK_SERVICE_COMMAND_SUSPEND;
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (s_suspend_next != UINT32_MAX)
     {
-        .type = DEVICE_LINK_SERVICE_COMMAND_SUSPEND,
-    };
-    esp_err_t result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
-                       ESP_OK : ESP_ERR_NO_MEM;
+        expected_sequence = ++s_suspend_next;
+        command.sequence = expected_sequence;
+    }
+    xSemaphoreGive(s_service.mutex);
+    if (expected_sequence == 0U)
+    {
+        /* The suspend sequence exhausted: fail closed before enqueueing,
+         * so the error is definite and no command is left pending. */
+        _device_link_service_api_release();
+        return ESP_ERR_INVALID_STATE;
+    }
+    result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
+             ESP_OK : ESP_ERR_NO_MEM;
 
     if (result != ESP_OK)
     {
         _device_link_service_api_release();
         return result;
-    }
-    /* Standby preparation needs the suspended state applied before it
-     * proceeds: wait (bounded by timeout_ms) until the worker applied THIS
-     * suspend (its sequence number advanced past the one captured at
-     * enqueue), so a queued resume ahead of it cannot be acknowledged
-     * against. The API user count is held across the wait, so deinit
-     * cannot tear the service down underneath it. */
-    const uint32_t expected_sequence =
-        atomic_load_explicit(&s_suspend_sequence, memory_order_acquire) + 1U;
-
-    if (expected_sequence == 0U)
-    {
-        /* The suspend sequence exhausted: fail closed instead of
-         * acknowledging a wrap. */
-        _device_link_service_api_release();
-        return ESP_ERR_INVALID_STATE;
     }
     TickType_t wait = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
                       portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
@@ -978,7 +1002,7 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 
     for (;;)
     {
-        if (atomic_load_explicit(&s_suspend_sequence,
+        if (atomic_load_explicit(&s_suspend_applied,
                                  memory_order_acquire) >= expected_sequence)
         {
             break;
