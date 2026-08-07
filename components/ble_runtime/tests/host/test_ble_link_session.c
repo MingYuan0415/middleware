@@ -18,6 +18,8 @@
         } \
     } while (0)
 
+#define TEST_ASSERT_FALSE(condition) TEST_ASSERT_TRUE(!(condition))
+
 #define TEST_ASSERT_EQUAL(expected, actual) \
     do \
     { \
@@ -557,8 +559,34 @@ static void test_new_boot_resets_session(void)
     TEST_ASSERT_EQUAL(0U, ble_link_session_get_state_flags());
 }
 
+static void test_authorization_exhausted(void)
+{
+    ble_link_session_init(BOOT1);
+    _connect(GEN1);
+    _authenticate(GEN1);
+    /* Revision 0 auto-advances; a capacity query is non-mutating. */
+    TEST_ASSERT_FALSE(ble_link_session_authorization_exhausted());
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
+                          true, UINT32_MAX - 1U));
+    TEST_ASSERT_FALSE(ble_link_session_authorization_exhausted());
+    /* The final revision exhausts the space; a further commit is
+     * refused before any persistence. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
+                          true, UINT32_MAX));
+    TEST_ASSERT_TRUE(ble_link_session_authorization_exhausted());
+    /* At exhaustion revision-0 commits fail closed. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_session_set_authorization(
+                          true, 0U));
+    /* Revoke still applies at exhaustion. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
+                          false, 0U));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
+                      _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
+}
+
 int main(void)
 {
+    test_authorization_exhausted();
     test_boot_init_and_reset();
     test_admission_progression();
     test_security2_closed_keeps_acl();
