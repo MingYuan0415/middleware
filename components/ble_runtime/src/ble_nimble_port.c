@@ -1242,13 +1242,25 @@ static int _ble_nimble_port_gap_event(
     return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         /* An existing bond attempts to pair again: allowed only while a
-         * replacement window is open, after evicting the old bond. */
+         * replacement window is open. The old authorization must be
+         * invalidated before the old bond is deleted (replacement
+         * ordering: invalidate first, delete second, so a crash leaves
+         * the device unbound but never dual-authorized). */
         if (_ble_nimble_port_pairing_window_open())
         {
+            const esp_err_t erase_result =
+                device_link_security_erase_auth_record();
             const esp_err_t delete_result =
                 _ble_nimble_port_delete_peer_bond(
                     event->repeat_pairing.conn_handle);
 
+            if (erase_result != ESP_OK &&
+                    erase_result != ESP_ERR_NOT_FOUND)
+            {
+                ESP_LOGW(TAG, "replacement authorization invalidation failed (%d)",
+                         erase_result);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
             if (delete_result != ESP_OK)
             {
                 ESP_LOGW(TAG, "repeat pairing eviction failed (%d)",

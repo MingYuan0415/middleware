@@ -411,7 +411,12 @@ static void _device_link_service_close_window_locked(void)
     s_service.window_open = false;
     s_service.qr_ready = false;
     s_service.window_deadline = 0U;
+    /* A closed window invalidates any prepared transaction, and the
+     * committed long-term verifier is restored so a bound peer can
+     * reconnect outside any window. */
+    ble_link_service_clear_session_state();
     device_link_security_close_bootstrap();
+    (void)device_link_security_load_long_term_verifier();
     _device_link_service_zero_secrets();
 }
 

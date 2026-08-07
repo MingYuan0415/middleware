@@ -45,6 +45,7 @@ typedef struct device_link_security
     bool session_open;
     bool authenticated;
     bool initialized;
+    uint32_t session_epoch;
 } device_link_security_t;
 
 /** @brief Storage key of the committed authorization record. */
@@ -338,6 +339,7 @@ esp_err_t device_link_security_handshake(
         }
         s_security.session_open = true;
         s_security.authenticated = false;
+        s_security.session_epoch++;
     }
     uint8_t *response = NULL;
     ssize_t response_len = 0;
@@ -398,6 +400,11 @@ esp_err_t device_link_security_unprotect(
     }
     uint8_t *plain = NULL;
     ssize_t plain_len = 0;
+    const uint32_t session_epoch = s_security.session_epoch;
+    const protocomm_security_handle_t session_instance = s_security.sec_inst;
+    const device_link_security_request_fn request_cb =
+        s_security.config.request_cb;
+    void *const request_arg = s_security.config.request_arg;
     esp_err_t result = protocomm_security2.decrypt(
                            s_security.sec_inst, s_security.config.session_id,
                            input, (ssize_t)input_len, &plain, &plain_len);
@@ -412,19 +419,28 @@ esp_err_t device_link_security_unprotect(
     }
     /* The request callback runs without the adapter lock: it may invoke
      * adapter operations (protect, close_session, verifier transitions)
-     * without re-entering the mutex. The session state is revalidated
-     * before the response is encrypted, so a concurrent close fails
-     * closed. */
+     * without re-entering the mutex. The session identity (instance and
+     * epoch) is snapshotted under the lock and revalidated before the
+     * response is encrypted, so a session replaced during the callback
+     * fails closed instead of encrypting under the new session. */
     _device_link_security_unlock();
     uint8_t *plain_response = NULL;
     size_t plain_response_len = 0U;
 
-    result = s_security.config.request_cb(
+    result = request_cb(
                  plain, (size_t)plain_len,
                  &plain_response, &plain_response_len,
-                 s_security.config.request_arg);
+                 request_arg);
     free(plain);
     _device_link_security_lock();
+    if (s_security.session_epoch != session_epoch ||
+            s_security.sec_inst != session_instance)
+    {
+        /* The session was replaced while the callback ran. */
+        free(plain_response);
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     if (result != ESP_OK)
     {
         free(plain_response);
