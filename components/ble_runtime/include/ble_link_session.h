@@ -57,6 +57,16 @@ esp_err_t ble_link_session_set_authorization(
     bool committed, uint32_t revision);
 
 /**
+ * @brief Whether the authorization revision space is exhausted.
+ *
+ * Non-mutating capacity check for preflight validation: once exhausted,
+ * no commit may install durable credentials (fail closed).
+ *
+ * @return True when the revision space is exhausted.
+ */
+bool ble_link_session_authorization_exhausted(void);
+
+/**
  * @brief Open a Security 2 session.
  *
  * The session is the single epoch allocator: the fresh epoch is returned

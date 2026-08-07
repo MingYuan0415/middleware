@@ -337,10 +337,11 @@ esp_err_t device_link_security_handshake(
     }
     if (!s_security.session_open)
     {
-        if (s_session_epoch == UINT32_MAX)
+        if (s_session_epoch >= UINT32_MAX - 1U)
         {
-            /* The session generation space is exhausted: every retired
-             * session would be indistinguishable from a new one. */
+            /* The session generation space is exhausted: UINT32_MAX is
+             * reserved as the retired sentinel, so a session opened at
+             * the maximum could never be retired safely. */
             _device_link_security_unlock();
             return ESP_ERR_INVALID_STATE;
         }
@@ -360,10 +361,7 @@ esp_err_t device_link_security_handshake(
         }
         s_security.session_open = true;
         s_security.authenticated = false;
-        if (s_session_epoch < UINT32_MAX)
-        {
-            s_session_epoch++;
-        }
+        s_session_epoch++;
     }
     uint8_t *response = NULL;
     ssize_t response_len = 0;

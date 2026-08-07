@@ -972,9 +972,9 @@ static uint32_t _ble_link_service_handle_authorize_commit(
            sizeof(local_password));
     s_service.auth_txn.committing = true;
     /* The authorization revision space is checked before anything is
-     * persisted: at exhaustion a commit fails closed without installing
-     * durable credentials. */
-    if (ble_link_session_set_authorization(true, 0U) != ESP_OK)
+     * persisted (non-mutating): at exhaustion a commit fails closed
+     * without installing durable credentials. */
+    if (ble_link_session_authorization_exhausted())
     {
         commit_error = BLE_LINK_ERROR_UNAVAILABLE;
         if (s_service_mutex != NULL)
@@ -1054,7 +1054,8 @@ static uint32_t _ble_link_service_handle_authorize_commit(
      * disconnect cannot clear the transaction between the persistence
      * and the publication. */
     s_service.switch_long_term_pending = true;
-    if (ble_link_session_report_session_match_current(
+    if (ble_link_session_set_authorization(true, 0U) != ESP_OK ||
+            ble_link_session_report_session_match_current(
                 facts->connection_generation, 0U) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;

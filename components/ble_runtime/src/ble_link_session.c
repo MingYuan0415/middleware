@@ -166,6 +166,11 @@ esp_err_t ble_link_session_security2_open(
     return ESP_OK;
 }
 
+bool ble_link_session_authorization_exhausted(void)
+{
+    return s_session.authorization_revision == UINT32_MAX;
+}
+
 esp_err_t ble_link_session_set_authorization(
     bool committed, uint32_t revision)
 {
