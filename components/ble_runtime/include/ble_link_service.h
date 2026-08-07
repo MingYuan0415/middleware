@@ -8,6 +8,7 @@
 #include "esp_err.h"
 
 #include "ble_link_events.h"
+#include "ble_link_security_ops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,12 @@ extern "C" {
 
 /** @brief Maximum bytes of one assembled session message (profile 1024). */
 #define BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES 1024U
+
+/** @brief Transport type byte: Security 2 handshake wire. */
+#define BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE 0x00U
+
+/** @brief Transport type byte: AES-GCM ciphertext of an Envelope. */
+#define BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED 0x01U
 
 /** @brief Maximum number of concurrent event subscribers. */
 #define BLE_LINK_SERVICE_MAX_SUBSCRIBERS 1U
@@ -81,16 +88,16 @@ typedef struct ble_link_service_facts
  * @param[in] boot_id   Fresh nonzero value for this boot.
  * @param[in] output    Outbound sink, required.
  * @param[in] arg       Sink argument.
- * @param[in] authorize_enabled True when the fake authorize flow may run.
- *                              Production leaves this false until real
- *                              Security 2 and confirmation are wired.
+ * @param[in] security Security 2 operations, or NULL when no session is
+ *                     wired (host test harness); requests then run in
+ *                     plaintext and responses are sent plaintext.
  * @param[in] max_pending_frames Max frames one response may need in the
  *                              TX queue; a response requiring more fails
  *                              closed (the session is terminated).
  */
 void ble_link_service_init(
     uint64_t boot_id, ble_link_service_output_t output, void *arg,
-    bool authorize_enabled, size_t max_pending_frames);
+    const ble_link_security_ops_t *security, size_t max_pending_frames);
 
 /**
  * @brief Reset the service (new boot or full teardown).
@@ -187,6 +194,25 @@ void ble_link_service_idle_timeout(uint32_t generation);
 esp_err_t ble_link_service_publish_link_state(
     const ble_link_service_facts_t *facts,
     const ble_link_state_snapshot_t *link_state);
+
+/**
+ * @brief Process one plaintext Envelope and produce the plaintext response
+ * envelope.
+ *
+ * Invoked by the Security 2 adapter's request callback after decryption.
+ * Decodes and validates the Envelope, dispatches the request, and fills
+ * the response Envelope (allocated). Failures return an error and the
+ * caller closes the session.
+ *
+ * @param[in] msg Plaintext Envelope bytes.
+ * @param[in] len Envelope length.
+ * @param[out] response Allocated response Envelope.
+ * @param[out] response_len Response length.
+ * @return ESP_OK, or a protocol/admission error.
+ */
+esp_err_t ble_link_service_process_plaintext(
+    const uint8_t *msg, size_t len,
+    uint8_t **response, size_t *response_len);
 
 #ifdef __cplusplus
 }

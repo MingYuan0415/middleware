@@ -131,15 +131,16 @@ static void test_write_feeds_service(void)
     framed[1] = 3U;
     framed[2] = 0x01U;
     framed[3] = 0x00U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[6] = 0x00U;
     framed[7] = 0x00U;
-    memcpy(&framed[8], request, sizeof(request));
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     memset(&context, 0, sizeof(context));
     context.op = BLE_GATT_REGISTRY_OP_WRITE_CHR;
     context.write_data = framed;
-    context.write_len = (uint16_t)(8U + sizeof(request));
+    context.write_len = (uint16_t)(9U + sizeof(request));
     /* Assign the control_rx handle. */
     const uint16_t control_rx_handle = 0x20U;
 
@@ -252,10 +253,10 @@ static void test_transfer_service_rejects(void)
                          7U, 0x50U, &context, NULL) != 0);
 }
 
-static void test_authorize_gated_in_production(void)
+static void test_authorize_prepare_on_session_channel(void)
 {
-    /* With authorize_enabled=false (production), the authorize request is
-     * rejected with UNSUPPORTED_OPERATION. */
+    /* The authorize flow is no longer gated behind a flag; the prepare
+     * request runs through the session channel admission. */
     _reset();
     _establish_session();
     static const uint8_t prepare[] =
@@ -271,13 +272,14 @@ static void test_authorize_gated_in_production(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(prepare) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(prepare) >> 8U) & 0xffU);
-    memcpy(&framed[8], prepare, sizeof(prepare));
+    framed[4] = (uint8_t)((sizeof(prepare) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(prepare) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], prepare, sizeof(prepare));
     memset(&context, 0, sizeof(context));
     context.op = BLE_GATT_REGISTRY_OP_WRITE_CHR;
     context.write_data = framed;
-    context.write_len = (uint16_t)(8U + sizeof(prepare));
+    context.write_len = (uint16_t)(9U + sizeof(prepare));
     const uint16_t session_rx_handle = 0x60U;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
@@ -290,7 +292,7 @@ static void test_authorize_gated_in_production(void)
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_handle(
                           session_rx_handle, &characteristic));
-    /* The feed succeeds (no error response), but the handler is gated. */
+    /* The feed succeeds: the prepare response is produced. */
     TEST_ASSERT_EQUAL(0, characteristic->access_cb(
                           7U, session_rx_handle, &context, NULL));
 }
@@ -321,7 +323,7 @@ int main(void)
     test_update_handles();
     test_idle_timeout_wired();
     test_transfer_service_rejects();
-    test_authorize_gated_in_production();
+    test_authorize_prepare_on_session_channel();
     printf("ble_link_gatt: all tests passed\n");
     return 0;
 }

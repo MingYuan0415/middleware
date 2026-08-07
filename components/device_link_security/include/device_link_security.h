@@ -11,6 +11,9 @@
 extern "C" {
 #endif
 
+/** @brief Default SRP username (also used when the config leaves it NULL). */
+#define DEVICE_LINK_SECURITY_USERNAME "microtech"
+
 /**
  * @brief Session request callback.
  *

@@ -19,6 +19,7 @@ idf_component_register(
     INCLUDE_DIRS "include"
     REQUIRES bt
     PRIV_REQUIRES
+        device_link_security
         freertos
         mt_log
 )

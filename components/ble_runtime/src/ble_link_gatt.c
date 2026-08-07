@@ -400,7 +400,7 @@ esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
                                config->tx_queue_depth : 32U;
 
     ble_link_service_init(config->boot_id, _ble_link_gatt_output,
-                          NULL, false, queue_depth);
+                          NULL, config->security_ops, queue_depth);
     if (!s_gatt.registered)
     {
         /* The registry is process-global; the services register once. */
@@ -449,7 +449,9 @@ esp_err_t ble_link_gatt_restart(void)
     const size_t queue_depth = (s_gatt.config->tx_queue_depth > 0U) ?
                                s_gatt.config->tx_queue_depth : 32U;
 
-    ble_link_service_init(boot_id, _ble_link_gatt_output, NULL, false,
+    ble_link_service_init(boot_id, _ble_link_gatt_output, NULL,
+                          (s_gatt.config != NULL) ?
+                          s_gatt.config->security_ops : NULL,
                           queue_depth);
     return ESP_OK;
 }

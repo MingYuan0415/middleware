@@ -29,7 +29,71 @@
 #include "ble_nimble_port.h"
 #include "ble_port_ops.h"
 
+#include "device_link_security.h"
+
+#include "ble_link_security_ops.h"
+#include "ble_link_service.h"
+
 static const char *const TAG = "ble_nimble_port";
+
+/**
+ * @brief Security 2 ops bound to the device_link_security adapter.
+ *
+ * The adapter owns the session; the port wires it to the GATT transport
+ * (type 0x00 handshake, 0x01 protected). The bootstrap/long-term verifier
+ * lifecycle is driven by the link service window ops.
+ */
+static esp_err_t _ble_nimble_port_sec_handshake(
+    const uint8_t *input, size_t input_len,
+    uint8_t **output, size_t *output_len)
+{
+    return device_link_security_handshake(input, input_len,
+                                          output, output_len);
+}
+
+static esp_err_t _ble_nimble_port_sec_unprotect(
+    const uint8_t *input, size_t input_len,
+    uint8_t **output, size_t *output_len)
+{
+    return device_link_security_unprotect(input, input_len,
+                                          output, output_len);
+}
+
+static esp_err_t _ble_nimble_port_sec_protect(
+    const uint8_t *plain, size_t plain_len,
+    uint8_t **cipher, size_t *cipher_len)
+{
+    return device_link_security_protect(plain, plain_len,
+                                        cipher, cipher_len);
+}
+
+static bool _ble_nimble_port_sec_is_authenticated(void)
+{
+    return device_link_security_is_authenticated();
+}
+
+static void _ble_nimble_port_sec_close_session(void)
+{
+    device_link_security_close_session();
+}
+
+static esp_err_t _ble_nimble_port_security_request(
+    const uint8_t *request, size_t request_len,
+    uint8_t **response, size_t *response_len, void *arg)
+{
+    (void)arg;
+    return ble_link_service_process_plaintext(request, request_len,
+            response, response_len);
+}
+
+static const ble_link_security_ops_t s_security_ops =
+{
+    .handshake = _ble_nimble_port_sec_handshake,
+    .unprotect = _ble_nimble_port_sec_unprotect,
+    .protect = _ble_nimble_port_sec_protect,
+    .is_authenticated = _ble_nimble_port_sec_is_authenticated,
+    .close_session = _ble_nimble_port_sec_close_session,
+};
 #include "ble_response_cache.h"
 #include "ble_link_gatt.h"
 #include "ble_link_session.h"
@@ -89,6 +153,7 @@ typedef struct ble_nimble_port
     const ble_port_ops_t *ops;
     bool started;
     bool deinitialized;
+    bool link_security_initialized;
     bool conn_had_bond; /**< Peer had a stored bond before this pairing. */
     bool nimble_init_attempted;
     bool quiescing;
@@ -1956,6 +2021,24 @@ static esp_err_t _ble_nimble_port_init(void)
         gatt_config.att_mtu = 23U;
         gatt_config.tx_queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH;
         gatt_config.publish_link_state = _ble_nimble_port_publish_link_state;
+        gatt_config.security_ops = &s_security_ops;
+        if (!s_port.link_security_initialized)
+        {
+            const device_link_security_config_t security_config =
+            {
+                .username = DEVICE_LINK_SECURITY_USERNAME,
+                .session_id = 1U,
+                .request_cb = _ble_nimble_port_security_request,
+                .request_arg = NULL,
+            };
+
+            result = device_link_security_init(&security_config);
+            if (result != ESP_OK)
+            {
+                return result;
+            }
+            s_port.link_security_initialized = true;
+        }
         result = ble_link_gatt_init(&gatt_config);
         if (result != ESP_OK)
         {

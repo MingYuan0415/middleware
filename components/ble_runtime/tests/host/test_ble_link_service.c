@@ -78,37 +78,26 @@ static void _feed_single_channel(
     ble_link_service_rx_channel_t channel)
 {
     uint8_t framed[512];
+    const size_t total = payload_len + 1U;
 
     framed[0] = 1U;
     framed[1] = 3U; /* START|END */
     framed[2] = 0x01U;
     framed[3] = 0x00U;
-    framed[4] = (uint8_t)(payload_len & 0xffU);
-    framed[5] = (uint8_t)((payload_len >> 8U) & 0xffU);
+    framed[4] = (uint8_t)(total & 0xffU);
+    framed[5] = (uint8_t)((total >> 8U) & 0xffU);
     framed[6] = 0x00U;
     framed[7] = 0x00U;
-    memcpy(&framed[8], payload, payload_len);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], payload, payload_len);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
-                          &s_facts, channel, framed,
-                          8U + payload_len));
+                          &s_facts, channel, framed, 8U + total));
 }
 
 static void _feed_single(const uint8_t *payload, size_t payload_len)
 {
-    uint8_t framed[512];
-
-    framed[0] = 1U;
-    framed[1] = 3U; /* START|END */
-    framed[2] = 0x01U;
-    framed[3] = 0x00U;
-    framed[4] = (uint8_t)(payload_len & 0xffU);
-    framed[5] = (uint8_t)((payload_len >> 8U) & 0xffU);
-    framed[6] = 0x00U;
-    framed[7] = 0x00U;
-    memcpy(&framed[8], payload, payload_len);
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
-                          &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + payload_len));
+    _feed_single_channel(payload, payload_len,
+                         BLE_LINK_SERVICE_RX_CONTROL);
 }
 
 /**
@@ -126,6 +115,12 @@ static void _reassemble_captured(void)
         memcpy(&s_outbound[s_outbound_len], &f[8], f_len - 8U);
         s_outbound_len += f_len - 8U;
     }
+    /* The reassembled message begins with the transport type byte. */
+    TEST_ASSERT_TRUE(s_outbound_len >= 1U);
+    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED,
+                      s_outbound[0]);
+    memmove(s_outbound, &s_outbound[1], s_outbound_len - 1U);
+    s_outbound_len -= 1U;
 }
 
 static void _set_facts(bool encrypted, bool authenticated, bool authorized)
@@ -172,7 +167,7 @@ static void _reset(void)
     memset(s_capture_channels, 0, sizeof(s_capture_channels));
     s_capture_count = 0U;
     ble_link_service_reset();
-    ble_link_service_init(BOOT_ID, _capture, NULL, true, 32U);
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
     ble_link_events_init();
     _establish_session();
 }
@@ -458,17 +453,19 @@ static void test_admission_denied(void)
                           false, 2U));
     _set_facts(true, true, false);
     uint8_t framed[512];
+    const size_t total = sizeof(request) + 1U;
 
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+    framed[4] = (uint8_t)(total & 0xffU);
+    framed[5] = (uint8_t)((total >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
                           framed,
-                          8U + sizeof(request)));
+                          8U + total));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
@@ -513,12 +510,13 @@ static void test_authorize_commit_truncated_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(commit) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(commit) >> 8U) & 0xffU);
-    memcpy(&framed[8], commit, sizeof(commit));
+    framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], commit, sizeof(commit));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_SESSION,
-                          framed, 8U + sizeof(commit)));
+                          framed, 9U + sizeof(commit)));
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
@@ -550,12 +548,13 @@ static void test_dispatch_error_encoded(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
@@ -609,13 +608,14 @@ static void test_bootstrap_admission_for_authorize(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(capabilities) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(capabilities) >> 8U) & 0xffU);
-    memcpy(&framed[8], capabilities, sizeof(capabilities));
+    framed[4] = (uint8_t)((sizeof(capabilities) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(capabilities) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], capabilities, sizeof(capabilities));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
                           framed,
-                          8U + sizeof(capabilities)));
+                          9U + sizeof(capabilities)));
 }
 
 static void test_generation_change_resets_state(void)
@@ -667,12 +667,13 @@ static void test_generation_change_resets_state(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
@@ -786,12 +787,13 @@ static void test_committed_replay_idempotent(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(commit) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(commit) >> 8U) & 0xffU);
-    memcpy(&framed[8], commit, sizeof(commit));
+    framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], commit, sizeof(commit));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_SESSION,
-                          framed, 8U + sizeof(commit)));
+                          framed, 9U + sizeof(commit)));
     /* Replay the same commit with a fresh request id: idempotent success
      * with the full result. */
     uint8_t replay_commit[sizeof(commit)];
@@ -802,14 +804,15 @@ static void test_committed_replay_idempotent(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(commit) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(commit) >> 8U) & 0xffU);
-    memcpy(&framed[8], replay_commit, sizeof(commit));
+    framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], replay_commit, sizeof(commit));
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_SESSION,
-                          framed, 8U + sizeof(commit)));
+                          framed, 9U + sizeof(commit)));
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
@@ -882,12 +885,13 @@ static void test_stale_feed_ignored(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     /* A stale feed from generation 1 has no effect. */
     ble_link_service_facts_t stale = s_facts;
 
@@ -896,7 +900,7 @@ static void test_stale_feed_ignored(void)
     s_capture_count = 0U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &stale, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
@@ -916,14 +920,15 @@ static void test_channel_mismatch_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts,
                           BLE_LINK_SERVICE_RX_SESSION,
                           framed,
-                          8U + sizeof(request)));
+                          9U + sizeof(request)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
     /* The reverse direction: a bootstrap request on the control channel. */
     static const uint8_t prepare[] =
@@ -937,14 +942,15 @@ static void test_channel_mismatch_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-    framed[4] = (uint8_t)(sizeof(prepare) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(prepare) >> 8U) & 0xffU);
-    memcpy(&framed[8], prepare, sizeof(prepare));
+        framed[4] = (uint8_t)((sizeof(prepare) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(prepare) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], prepare, sizeof(prepare));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts,
                           BLE_LINK_SERVICE_RX_CONTROL,
                           framed,
-                          8U + sizeof(prepare)));
+                          9U + sizeof(prepare)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
@@ -969,14 +975,15 @@ static void test_boot_mismatch_closes_session(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts,
                           BLE_LINK_SERVICE_RX_CONTROL,
                           framed,
-                          8U + sizeof(request)));
+                          9U + sizeof(request)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
     uint32_t error = 0U;
 
@@ -1011,10 +1018,10 @@ static void test_one_transaction_at_a_time(void)
     TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
 }
 
-static void test_authorize_disabled_in_production(void)
+static void test_authorize_prepare_produces_transaction(void)
 {
-    /* Production passes authorize_enabled=false: the fake authorize flow is
-     * rejected with UNSUPPORTED_OPERATION and no fake credentials leave. */
+    /* The authorize flow is always enabled: prepare produces a transaction
+     * and an authorize-prepare response. */
     static const uint8_t prepare[] =
     {
         0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
@@ -1025,7 +1032,7 @@ static void test_authorize_disabled_in_production(void)
     ble_link_codec_response_t response;
 
     ble_link_service_reset();
-    ble_link_service_init(BOOT_ID, _capture, NULL, false, 32U);
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
     memset(s_capture, 0, sizeof(s_capture));
     memset(s_capture_lens, 0, sizeof(s_capture_lens));
     memset(s_capture_channels, 0, sizeof(s_capture_channels));
@@ -1041,8 +1048,10 @@ static void test_authorize_disabled_in_production(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
                           envelope.body_data, envelope.body_len,
                           &response));
-    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNSUPPORTED_OPERATION, response.error);
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_AUTHORIZE_PREPARE,
+                      response.body);
+    TEST_ASSERT_TRUE(response.body_len >= 8U);
 }
 
 static void test_session_channel_reassembly(void)
@@ -1070,12 +1079,13 @@ static void test_session_channel_reassembly(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     TEST_ASSERT_EQUAL(1U, s_capture_count);
 }
 
@@ -1098,12 +1108,13 @@ static void test_low_mtu_multi_fragment(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
-    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
-    memcpy(&framed[8], request, sizeof(request));
+        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
-                          framed, 8U + sizeof(request)));
+                          framed, 9U + sizeof(request)));
     /* Multiple fragments, each within the 20-byte write value bound. */
     TEST_ASSERT_TRUE(s_capture_count > 1U);
     for (size_t i = 0U; i < s_capture_count; ++i)
@@ -1173,7 +1184,7 @@ int main(void)
     test_channel_mismatch_rejected();
     test_low_mtu_multi_fragment();
     test_session_channel_reassembly();
-    test_authorize_disabled_in_production();
+    test_authorize_prepare_produces_transaction();
     test_one_transaction_at_a_time();
     test_boot_mismatch_closes_session();
     printf("ble_link_service: all tests passed\n");

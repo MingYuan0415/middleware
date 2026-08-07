@@ -27,6 +27,9 @@ typedef struct ble_link_gatt_config
     void (*publish_link_state)(const uint8_t *value, size_t len,
                                void *arg); /**< link_state notify sink. */
     void *publish_arg;
+    const ble_link_security_ops_t *security_ops; /**< Security 2 ops, or
+                                                  *  NULL for the plaintext
+                                                  *  host harness. */
 } ble_link_gatt_config_t;
 
 /**

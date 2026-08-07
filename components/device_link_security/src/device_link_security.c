@@ -24,7 +24,6 @@
 #define DEVICE_LINK_SECURITY_ENDPOINT_SECURITY "sec2"
 #define DEVICE_LINK_SECURITY_ENDPOINT_APP "dl"
 #define DEVICE_LINK_SECURITY_SALT_BYTES 16U
-#define DEVICE_LINK_SECURITY_USERNAME "microtech"
 
 typedef enum
 {
@@ -388,11 +387,17 @@ esp_err_t device_link_security_unprotect(
         _device_link_security_unlock();
         return result;
     }
+    /* The callback may consume the request itself and emit the response
+     * through the transport (ESP_OK with a NULL response); otherwise the
+     * plaintext response is encrypted and returned. */
     if (plain_response == NULL || plain_response_len == 0U)
     {
         free(plain_response);
+        s_security.authenticated = true;
+        *output = NULL;
+        *output_len = 0U;
         _device_link_security_unlock();
-        return ESP_ERR_INVALID_STATE;
+        return ESP_OK;
     }
     uint8_t *cipher = NULL;
     ssize_t cipher_len = 0;
