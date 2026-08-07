@@ -11,6 +11,30 @@
 #include "ble_link_service.h"
 #include "ble_link_session.h"
 
+#include "esp_random.h"
+
+#include "device_link_security.h"
+
+static esp_err_t _sec_stub_request(
+    const uint8_t *request, size_t request_len,
+    uint8_t **response, size_t *response_len, void *arg)
+{
+    (void)request;
+    (void)request_len;
+    (void)arg;
+    *response = NULL;
+    *response_len = 0U;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+static const device_link_security_config_t s_sec_config =
+{
+    .username = "microtech",
+    .session_id = 1U,
+    .request_cb = _sec_stub_request,
+    .request_arg = NULL,
+};
+
 #define TEST_ASSERT_TRUE(condition) \
     do \
     { \
@@ -170,6 +194,8 @@ static void _reset(void)
     ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
     ble_link_events_init();
     _establish_session();
+    _set_facts(true, true, true);
+    (void)device_link_security_init(&s_sec_config);
 }
 
 static void test_capabilities_request(void)
@@ -265,36 +291,36 @@ static void test_snapshot_request(void)
     TEST_ASSERT_EQUAL(0x09U, response.body_data[0]);
 }
 
-static void test_authorize_flow(void)
+/* authorize_prepare request, request_id=3. */
+static const uint8_t s_prepare_request[] =
 {
-    /* authorize_prepare request, request_id=3. */
-    static const uint8_t prepare[] =
+    0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+    0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x03, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
+};
+
+/**
+ * @brief Parse the captured prepare response (Envelope at s_outbound) and
+ * build a matching AuthorizeCommit request body.
+ *
+ * The device generates a random txn id and credential id per prepare, so
+ * the commit must echo what the device produced. The response body layout
+ * is fixed by the encoder: tag(0x09)+fixed64 txn, tag(0x12)+len(0x10)+16B
+ * credential.
+ */
+static uint8_t s_pending_txn[8];
+static uint8_t s_pending_credential[16];
+static bool s_pending_captured;
+
+static void _capture_pending_credential(void)
+{
+    if (s_pending_captured)
     {
-        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
-        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x03, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
-    };
-    /* authorize_commit: txn=1234605616436508552, credential 01..10. */
-    static const uint8_t commit[] =
-    {
-        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
-        0x03, 0x02, 0x01, 0x52, 0x26, 0x09, 0x02, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x1b,
-        0x09, 0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b,
-        0x0a, 0x12, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05,
-        0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-        0x0e, 0x0f, 0x10,
-    };
+        return;
+    }
     ble_link_codec_envelope_t envelope;
     ble_link_codec_response_t response;
 
-    _reset();
-    _feed_single_channel(prepare, sizeof(prepare),
-                         BLE_LINK_SERVICE_RX_SESSION);
-    TEST_ASSERT_EQUAL(1U, s_capture_count);
-    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TX_SESSION,
-                      s_capture_channels[0]);
-    _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
@@ -303,12 +329,103 @@ static void test_authorize_flow(void)
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_AUTHORIZE_PREPARE,
                       response.body);
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
-    /* txn_id fixed64 == 1234605616436508552. */
+    TEST_ASSERT_TRUE(response.body_len >= 27U);
     TEST_ASSERT_EQUAL(0x09U, response.body_data[0]);
+    TEST_ASSERT_EQUAL(0x12U, response.body_data[9]);
+    TEST_ASSERT_EQUAL(0x10U, response.body_data[10]);
+    memcpy(s_pending_txn, &response.body_data[1], 8U);
+    memcpy(s_pending_credential, &response.body_data[11], 16U);
+    s_pending_captured = true;
+}
 
+static size_t _build_commit_body(uint8_t *out, size_t out_cap,
+                                 uint64_t request_id)
+{
+    _capture_pending_credential();
+    const size_t commit_len = 1U + 8U + 1U + 1U + 16U;
+    uint8_t commit_body[32];
+
+    TEST_ASSERT_TRUE(commit_len <= sizeof(commit_body));
+    commit_body[0] = 0x09U;
+    memcpy(&commit_body[1], s_pending_txn, 8U);
+    commit_body[9] = 0x12U;
+    commit_body[10] = 0x10U;
+    memcpy(&commit_body[11], s_pending_credential, 16U);
+    /* Request message: request_id + authorize_commit body (field 13). */
+    const size_t request_len = 1U + 8U + 2U + commit_len;
+    uint8_t request_msg[48];
+
+    TEST_ASSERT_TRUE(request_len <= sizeof(request_msg));
+    request_msg[0] = 0x09U;
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        request_msg[1U + i] = (uint8_t)(request_id >> (8U * i));
+    }
+    request_msg[9] = 0x6aU;
+    request_msg[10] = (uint8_t)commit_len;
+    memcpy(&request_msg[11], commit_body, commit_len);
+    /* Wrap the request message in a full Envelope. */
+    const size_t len = 2U + 9U + 2U + request_len;
+
+    TEST_ASSERT_TRUE(len <= out_cap);
+    out[0] = 0x08U;
+    out[1] = 0x01U;
+    out[2] = 0x19U;
+    const uint64_t boot = BOOT_ID;
+
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        out[3U + i] = (uint8_t)(boot >> (8U * i));
+    }
+    out[11] = 0x52U;
+    out[12] = (uint8_t)request_len;
+    memcpy(&out[13], request_msg, request_len);
+    return len;
+}
+
+static void test_authorize_flow(void)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+    uint8_t commit[64];
+
+    _reset();
+    s_pending_captured = false;
+    _set_facts(true, true, true);
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TX_SESSION,
+                      s_capture_channels[0]);
+    _reassemble_captured();
+    const size_t commit_len = _build_commit_body(commit, sizeof(commit), 5U);
+
+    /* A commit before local confirmation is refused. */
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
-    _feed_single_channel(commit, sizeof(commit),
+    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_CONFIRMATION_REQUIRED, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
+
+    /* Confirm locally, then commit succeeds with a fresh request id
+     * (the dispatcher replay guard rejects reused ids). */
+    ble_link_service_confirm_binding(true);
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    const size_t commit2_len = _build_commit_body(commit, sizeof(commit), 6U);
+
+    TEST_ASSERT_EQUAL(commit_len, commit2_len);
+    _feed_single_channel(commit, commit_len,
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
@@ -495,6 +612,7 @@ static void test_authorize_commit_truncated_rejected(void)
     ble_link_codec_response_t response;
 
     _reset();
+    _set_facts(true, true, true);
     static const uint8_t prepare[] =
     {
         0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
@@ -667,7 +785,7 @@ static void test_generation_change_resets_state(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -757,62 +875,31 @@ static void test_publish_after_revoke_no_output(void)
 
 static void test_committed_replay_idempotent(void)
 {
-    /* authorize_prepare then commit twice with the same txn. */
-    static const uint8_t prepare[] =
-    {
-        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
-        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x03, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
-    };
-    static const uint8_t commit[] =
-    {
-        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
-        0x03, 0x02, 0x01, 0x52, 0x26, 0x09, 0x02, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x1b,
-        0x09, 0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b,
-        0x0a, 0x12, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05,
-        0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-        0x0e, 0x0f, 0x10,
-    };
+    /* authorize_prepare, confirm, then commit twice with the same txn
+     * (fresh request ids): the second commit is an idempotent replay. */
     ble_link_codec_envelope_t envelope;
     ble_link_codec_response_t response;
+    uint8_t commit[64];
 
     _reset();
-    _feed_single_channel(prepare, sizeof(prepare),
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
                          BLE_LINK_SERVICE_RX_SESSION);
-    uint8_t framed[512];
+    _reassemble_captured();
+    ble_link_service_confirm_binding(true);
+    const size_t commit_len = _build_commit_body(commit, sizeof(commit), 5U);
 
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
-    framed[0] = 1U;
-    framed[1] = 3U;
-    framed[2] = 0x02U;
-    framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
-    framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
-    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
-    memcpy(&framed[9], commit, sizeof(commit));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
-                          &s_facts, BLE_LINK_SERVICE_RX_SESSION,
-                          framed, 9U + sizeof(commit)));
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
     /* Replay the same commit with a fresh request id: idempotent success
      * with the full result. */
-    uint8_t replay_commit[sizeof(commit)];
-
-    memcpy(replay_commit, commit, sizeof(commit));
-    replay_commit[14] = 0x05U; /* request_id low byte. */
-    memset(framed, 0, sizeof(framed));
-    framed[0] = 1U;
-    framed[1] = 3U;
-    framed[2] = 0x02U;
-    framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
-    framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
-    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
-    memcpy(&framed[9], replay_commit, sizeof(commit));
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
-                          &s_facts, BLE_LINK_SERVICE_RX_SESSION,
-                          framed, 9U + sizeof(commit)));
+    (void)_build_commit_body(commit, sizeof(commit), 6U);
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
                           s_outbound, s_outbound_len, &envelope));
@@ -885,7 +972,7 @@ static void test_stale_feed_ignored(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -920,7 +1007,7 @@ static void test_channel_mismatch_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -942,7 +1029,7 @@ static void test_channel_mismatch_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
-        framed[4] = (uint8_t)((sizeof(prepare) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(prepare) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(prepare) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], prepare, sizeof(prepare));
@@ -975,7 +1062,7 @@ static void test_boot_mismatch_closes_session(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -1079,7 +1166,7 @@ static void test_session_channel_reassembly(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -1108,7 +1195,7 @@ static void test_low_mtu_multi_fragment(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-        framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], request, sizeof(request));
@@ -1160,33 +1247,34 @@ static void test_idle_timeout_clears_state(void)
 
 int main(void)
 {
+    test_authorize_commit_wrong_credential();
+    test_authorize_commit_truncated_rejected();
     test_capabilities_request();
     test_capabilities_response_bytes();
     test_snapshot_request();
     test_authorize_flow();
-    test_authorize_commit_wrong_credential();
     test_subscribe_then_publish();
     test_no_subscriber_no_output();
     test_intermediate_fragment();
     test_admission_denied();
     test_bad_fragment_rejected();
-    test_authorize_commit_truncated_rejected();
     test_dispatch_error_encoded();
     test_bootstrap_admission_for_authorize();
     test_generation_change_resets_state();
     test_event_wire_structure();
     test_publish_after_revoke_no_output();
-    test_idle_timeout_clears_state();
     test_committed_replay_idempotent();
     test_timeout_closes_security2();
     test_stale_timeout_ignored();
     test_stale_feed_ignored();
     test_channel_mismatch_rejected();
-    test_low_mtu_multi_fragment();
-    test_session_channel_reassembly();
-    test_authorize_prepare_produces_transaction();
-    test_one_transaction_at_a_time();
     test_boot_mismatch_closes_session();
-    printf("ble_link_service: all tests passed\n");
+    test_one_transaction_at_a_time();
+    test_authorize_prepare_produces_transaction();
+    test_session_channel_reassembly();
+    test_low_mtu_multi_fragment();
+    test_idle_timeout_clears_state();
+
+    return 0;
     return 0;
 }

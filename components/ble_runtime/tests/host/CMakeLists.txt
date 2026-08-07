@@ -10,7 +10,9 @@ find_program(BLE_RUNTIME_SETARCH setarch)
 get_filename_component(PROJECT_ROOT
     "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
+set(DEVICE_LINK_SECURITY "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
 set(ESP_ERR "${PROJECT_ROOT}/tests/connectivity/host/include")
+set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 
 project(ble_runtime_host_tests C)
 
@@ -31,7 +33,13 @@ set(TEST_SOURCES
     "${COMPONENT}/src/ble_link_events.c"
     "${COMPONENT}/src/ble_link_service.c"
     "${COMPONENT}/src/ble_link_gatt.c"
-    "${COMPONENT}/src/ble_event_router.c")
+    "${COMPONENT}/src/ble_event_router.c"
+    "${DEVICE_LINK_SECURITY}/src/device_link_security.c"
+    "${HOST_CONNECTIVITY}/freertos_host.c"
+    "${CMAKE_CURRENT_LIST_DIR}/fakes/esp_random.c"
+    "${CMAKE_CURRENT_LIST_DIR}/fakes/esp_srp.c"
+    "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
+    "${CMAKE_CURRENT_LIST_DIR}/fakes/protocomm_security2.c")
 
 foreach(test_target IN ITEMS
         test_ble_runtime
@@ -54,8 +62,12 @@ foreach(test_target IN ITEMS
     target_compile_definitions(${test_target} PRIVATE
         _POSIX_C_SOURCE=200809L
         UNIT_TEST_HOST)
+    target_compile_options(${test_target} PRIVATE
+        -include "${PROJECT_ROOT}/tests/host/sdkconfig.h")
     target_include_directories(${test_target} PRIVATE
         "${COMPONENT}/include"
+        "${DEVICE_LINK_SECURITY}/include"
+        "${CMAKE_CURRENT_LIST_DIR}/fakes"
         "${ESP_ERR}")
     target_compile_options(${test_target} PRIVATE
         -Wall -Wextra -Werror -Wpedantic -UNDEBUG)

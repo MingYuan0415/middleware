@@ -9,6 +9,7 @@
 
 #include "ble_link_events.h"
 #include "ble_link_security_ops.h"
+#include "device_link_security_auth.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,8 +30,9 @@ extern "C" {
 /** @brief Maximum number of concurrent event subscribers. */
 #define BLE_LINK_SERVICE_MAX_SUBSCRIBERS 1U
 
-/** @brief Fake authorization credential length while crypto is deferred. */
-#define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES 16U
+/** @brief Authorization credential length (matches the auth record). */
+#define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES \
+    DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES
 
 /** @brief Fixed fake event key length while encrypted events are deferred. */
 #define BLE_LINK_SERVICE_EVENT_KEY_BYTES 16U
@@ -194,6 +196,26 @@ void ble_link_service_idle_timeout(uint32_t generation);
 esp_err_t ble_link_service_publish_link_state(
     const ble_link_service_facts_t *facts,
     const ble_link_state_snapshot_t *link_state);
+
+/**
+ * @brief Accept or deny the pending binding confirmation.
+ *
+ * Accepting arms the active authorize transaction so a subsequent
+ * AuthorizeCommit persists the authorization record. Denying invalidates
+ * the transaction: any later commit of it is rejected. Without an active
+ * transaction the call has no effect.
+ *
+ * @param[in] accept True to confirm, false to deny.
+ */
+void ble_link_service_confirm_binding(bool accept);
+
+/**
+ * @brief Report whether a binding awaits local confirmation.
+ *
+ * @return True while an authorize transaction is active and not yet
+ *         confirmed (or denied).
+ */
+bool ble_link_service_pending_confirmation(void);
 
 /**
  * @brief Process one plaintext Envelope and produce the plaintext response

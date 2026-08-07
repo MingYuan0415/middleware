@@ -1,10 +1,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_random.h"
 
 #include "ble_link_codec.h"
 #include "ble_link_dispatcher.h"
@@ -14,6 +16,8 @@
 #include "ble_link_session.h"
 #include "ble_link_state.h"
 
+#include "device_link_security_auth.h"
+
 #define DBG_TAG "ble_link_service"
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
@@ -22,7 +26,11 @@
 #define BLE_LINK_SERVICE_PREFERRED_ATT_MTU 498U
 #define BLE_LINK_SERVICE_CONTROL_MAX_BYTES 4096U
 #define BLE_LINK_SERVICE_SESSION_MAX_BYTES 1024U
-#define BLE_LINK_SERVICE_DEVICE_AUTH_ID_BYTES 16U
+#define BLE_LINK_SERVICE_DEVICE_AUTH_ID_BYTES \
+    DEVICE_LINK_SECURITY_AUTH_ID_BYTES
+#define BLE_LINK_SERVICE_AUTH_ID_BYTES DEVICE_LINK_SECURITY_AUTH_ID_BYTES
+#define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES \
+    DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES
 #define BLE_LINK_SERVICE_PROTOCOMM_PATCH_VERSION 1U
 
 typedef struct ble_link_service
@@ -48,8 +56,11 @@ typedef struct ble_link_service
     {
         bool active;
         bool committed;
+        bool confirmed;
         uint64_t authorization_txn_id;
         uint8_t credential_id[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
+        uint8_t application_password[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
+        uint8_t device_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
     } auth_txn;
     ble_link_service_facts_t current_facts;
     ble_link_service_rx_channel_t current_channel;
@@ -99,10 +110,21 @@ static void _ble_link_service_abort_session(uint32_t generation)
     s_service.subscriber.active = false;
     s_service.auth_txn.active = false;
     s_service.auth_txn.committed = false;
+    s_service.auth_txn.confirmed = false;
     ble_link_dispatcher_clear_session();
     if (s_service.security != NULL)
     {
         s_service.security->close_session();
+    }
+}
+
+static void _ble_link_service_zeroize(void *data, size_t size)
+{
+    volatile uint8_t *bytes = (volatile uint8_t *)data;
+
+    for (size_t i = 0U; i < size; ++i)
+    {
+        bytes[i] = 0U;
     }
 }
 
@@ -323,15 +345,10 @@ static void _ble_link_service_encode_authorize_prepare(
     _ble_link_service_write_tag(out, pos, 2U, 2U);
     _ble_link_service_write_bytes(out, pos, s_service.auth_txn.credential_id,
                                   BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES);
-    /* application_password=3: fake fixed password. */
-    static const uint8_t password[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES] =
-    {
-        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-        0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
-    };
-
     _ble_link_service_write_tag(out, pos, 3U, 2U);
-    _ble_link_service_write_bytes(out, pos, password, sizeof(password));
+    _ble_link_service_write_bytes(out, pos,
+                                  s_service.auth_txn.application_password,
+                                  BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES);
     _ble_link_service_write_tag(out, pos, 4U, 0U);
     _ble_link_service_write_varint(out, pos,
                                    BLE_LINK_SERVICE_AUTH_EXPIRES_MS);
@@ -340,18 +357,13 @@ static void _ble_link_service_encode_authorize_prepare(
 static void _ble_link_service_encode_authorization_result(
     uint8_t *out, size_t *pos)
 {
-    static const uint8_t device_auth_id[BLE_LINK_SERVICE_DEVICE_AUTH_ID_BYTES] =
-    {
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    };
-
     _ble_link_service_write_tag(out, pos, 1U, 2U);
     _ble_link_service_write_bytes(out, pos, s_service.auth_txn.credential_id,
                                   BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES);
     _ble_link_service_write_tag(out, pos, 2U, 2U);
-    _ble_link_service_write_bytes(out, pos, device_auth_id,
-                                  sizeof(device_auth_id));
+    _ble_link_service_write_bytes(out, pos,
+                                  s_service.auth_txn.device_auth_id,
+                                  BLE_LINK_SERVICE_AUTH_ID_BYTES);
     _ble_link_service_write_tag(out, pos, 3U, 0U);
     _ble_link_service_write_varint(out, pos,
                                    BLE_LINK_AUTHORIZATION_AUTHORIZED);
@@ -653,11 +665,17 @@ static uint32_t _ble_link_service_handle_authorize_prepare(
     }
     s_service.auth_txn.active = true;
     s_service.auth_txn.committed = false;
-    s_service.auth_txn.authorization_txn_id = 723685415333072913ULL;
-    for (size_t i = 0U; i < BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES; ++i)
+    s_service.auth_txn.confirmed = false;
+    s_service.auth_txn.authorization_txn_id =
+        ((uint64_t)esp_random() << 32U) | (uint64_t)esp_random();
+    if (s_service.auth_txn.authorization_txn_id == 0U)
     {
-        s_service.auth_txn.credential_id[i] = (uint8_t)(i + 1U);
+        s_service.auth_txn.authorization_txn_id = 1U;
     }
+    esp_fill_random(s_service.auth_txn.credential_id,
+                    sizeof(s_service.auth_txn.credential_id));
+    esp_fill_random(s_service.auth_txn.application_password,
+                    sizeof(s_service.auth_txn.application_password));
     uint8_t body[64];
     size_t body_len = 0U;
 
@@ -795,6 +813,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (!ok)
     {
         s_service.auth_txn.active = false;
+        s_service.auth_txn.confirmed = false;
         _ble_link_service_emit_response(
             request->request_id, BLE_LINK_ERROR_INVALID_ARGUMENT,
             BLE_LINK_CODEC_RESPONSE_NONE, NULL, 0U,
@@ -803,6 +822,50 @@ static uint32_t _ble_link_service_handle_authorize_commit(
             _ble_link_service_response_channel());
         return BLE_LINK_ERROR_OK;
     }
+    if (!s_service.auth_txn.confirmed)
+    {
+        /* The user has not confirmed this binding on the device. */
+        _ble_link_service_emit_response(
+            request->request_id, BLE_LINK_ERROR_CONFIRMATION_REQUIRED,
+            BLE_LINK_CODEC_RESPONSE_NONE, NULL, 0U,
+
+            s_service.current_facts.preferred_att_mtu,
+            _ble_link_service_response_channel());
+        return BLE_LINK_ERROR_OK;
+    }
+    /* Real commit: persist the authorization record with a long-term
+     * verifier derived from the application password (never persisted in
+     * plaintext) and switch the active session to it. */
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    esp_fill_random(s_service.auth_txn.device_auth_id,
+                    sizeof(s_service.auth_txn.device_auth_id));
+    memcpy(record.credential_id, s_service.auth_txn.credential_id,
+           DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES);
+    memcpy(record.device_auth_id, s_service.auth_txn.device_auth_id,
+           DEVICE_LINK_SECURITY_AUTH_ID_BYTES);
+    /* The peer identity address is filled by the integration layer from
+     * the SMP identity (peer_id_addr); zeroed here. */
+    const esp_err_t derive_result =
+        device_link_security_derive_long_term_verifier(
+            s_service.auth_txn.application_password,
+            sizeof(s_service.auth_txn.application_password),
+            record.salt, record.verifier);
+
+    if (derive_result != ESP_OK)
+    {
+        return BLE_LINK_ERROR_INTERNAL;
+    }
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    if (device_link_security_save_auth_record(&record) != ESP_OK ||
+            device_link_security_load_long_term_verifier() != ESP_OK)
+    {
+        _ble_link_service_zeroize(&record, sizeof(record));
+        return BLE_LINK_ERROR_STORAGE;
+    }
+    _ble_link_service_zeroize(&record, sizeof(record));
     s_service.auth_txn.committed = true;
     if (ble_link_session_set_authorization(true, 1U) != ESP_OK ||
             ble_link_session_report_session_match_current(
@@ -822,6 +885,28 @@ static uint32_t _ble_link_service_handle_authorize_commit(
         s_service.current_facts.preferred_att_mtu,
         _ble_link_service_response_channel());
     return BLE_LINK_ERROR_OK;
+}
+
+void ble_link_service_confirm_binding(bool accept)
+{
+    if (!s_service.auth_txn.active)
+    {
+        return;
+    }
+    if (!accept)
+    {
+        /* A denied binding is invalidated immediately: any later commit
+         * of this transaction is rejected. */
+        s_service.auth_txn.active = false;
+        s_service.auth_txn.confirmed = false;
+        return;
+    }
+    s_service.auth_txn.confirmed = true;
+}
+
+bool ble_link_service_pending_confirmation(void)
+{
+    return s_service.auth_txn.active && !s_service.auth_txn.confirmed;
 }
 
 static uint32_t _ble_link_service_handle_subscribe_events(
