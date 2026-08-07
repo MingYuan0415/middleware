@@ -18,6 +18,7 @@
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "nimble/nimble_port.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -86,6 +87,7 @@ typedef struct ble_nimble_port
     const ble_port_ops_t *ops;
     bool started;
     bool deinitialized;
+    bool conn_had_bond; /**< Peer had a store bond at connect/identity time. */
     bool nimble_init_attempted;
     bool quiescing;
     bool deinit_failed;
@@ -95,6 +97,12 @@ typedef struct ble_nimble_port
 
 static ble_nimble_port_t s_port;
 
+static bool _ble_nimble_port_bond_store_verified(
+    const struct ble_gap_conn_desc *desc);
+static bool _ble_nimble_port_pairing_window_open(void);
+static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle);
+static int _ble_nimble_port_store_status(
+    struct ble_store_status_event *event, void *arg);
 static esp_err_t _ble_nimble_port_production_adv_start(
     const ble_port_adv_config_t *config);
 static esp_err_t _ble_nimble_port_production_adv_stop(void);
@@ -589,12 +597,10 @@ static void _ble_nimble_port_link_gatt_consumer(
     (void)arg;
     ble_gap_manager_snapshot_t snapshot;
     uint32_t generation = 0U;
-    uint16_t mtu = 23U;
 
     if (ble_gap_manager_get_snapshot(&snapshot) == ESP_OK)
     {
         generation = snapshot.generation;
-        mtu = snapshot.mtu;
     }
     switch (event->type)
     {
@@ -655,9 +661,38 @@ static void _ble_nimble_port_link_gatt_consumer(
         {
             (void)ble_link_session_handle_event(
                 generation, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED);
-            /* SC_BOND_VERIFIED is not reported until the bond store and
-             * peer identity are actually verified on device; the session
-             * then stays unauthenticated (fail closed). */
+            struct ble_gap_conn_desc desc;
+
+            if (ble_gap_conn_find(event->conn_handle, &desc) != 0)
+            {
+                break;
+            }
+            if (!_ble_nimble_port_bond_store_verified(&desc))
+            {
+                /* Incomplete or non-SC bond material: fail closed. */
+                (void)ble_gap_terminate(event->conn_handle,
+                                        BLE_ERR_CONN_TERM_LOCAL);
+                break;
+            }
+            if (_ble_nimble_port_pairing_window_open() ||
+                    s_port.conn_had_bond)
+            {
+                /* The bond matches the contract and the peer is either
+                 * pairing inside a window or reconnecting with a stored
+                 * bond: report the verified identity. */
+                (void)ble_link_session_handle_event(
+                    generation, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED);
+                (void)ble_link_session_set_identity_known(
+                    generation, true);
+            }
+            else
+            {
+                /* An unknown peer paired outside a window: terminate the
+                 * connection and delete the orphan bond. */
+                _ble_nimble_port_delete_peer_bond(event->conn_handle);
+                (void)ble_gap_terminate(event->conn_handle,
+                                        BLE_ERR_CONN_TERM_LOCAL);
+            }
         }
         else
         {
@@ -902,6 +937,87 @@ static esp_err_t _ble_nimble_port_tx_manager_init(void)
     return ESP_OK;
 }
 
+static bool _ble_nimble_port_bond_store_verified(
+    const struct ble_gap_conn_desc *desc)
+{
+    if (desc == NULL || !desc->sec_state.encrypted ||
+            !desc->sec_state.bonded)
+    {
+        return false;
+    }
+    if (desc->sec_state.key_size != 16)
+    {
+        return false;
+    }
+    struct ble_store_key_sec key;
+
+    memset(&key, 0, sizeof(key));
+    key.peer_addr = desc->peer_id_addr;
+    struct ble_store_value_sec peer_sec;
+    struct ble_store_value_sec our_sec;
+
+    memset(&peer_sec, 0, sizeof(peer_sec));
+    memset(&our_sec, 0, sizeof(our_sec));
+    if (ble_store_read_peer_sec(&key, &peer_sec) != 0 ||
+            ble_store_read_our_sec(&key, &our_sec) != 0)
+    {
+        return false;
+    }
+    /* The contract requires a Secure Connections bond with a 16-byte LTK
+     * and both identity keys, indexed by the normalized identity address. */
+    if (!peer_sec.sc || !our_sec.sc || !peer_sec.ltk_present ||
+            !our_sec.ltk_present || !peer_sec.irk_present ||
+            !our_sec.irk_present)
+    {
+        return false;
+    }
+    return peer_sec.key_size == 16 && our_sec.key_size == 16;
+}
+
+static bool _ble_nimble_port_pairing_window_open(void)
+{
+    return (ble_link_session_get_state_flags() &
+            BLE_LINK_STATE_FLAG_BINDABLE) != 0U;
+}
+
+static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+
+    if (ble_gap_conn_find(conn_handle, &desc) == 0)
+    {
+        /* Orphan cleanup: a bond without admission must not outlive the
+         * connection. */
+        (void)ble_store_util_delete_peer(&desc.peer_id_addr);
+    }
+}
+
+static int _ble_nimble_port_store_status(
+    struct ble_store_status_event *event, void *arg)
+{
+    (void)arg;
+    if (event == NULL || event->event_code != BLE_STORE_EVENT_FULL)
+    {
+        return 0;
+    }
+    if (!_ble_nimble_port_pairing_window_open())
+    {
+        /* Outside a pairing window no new bond may displace the existing
+         * one; abort the store so the pairing cannot complete. */
+        return -1;
+    }
+    /* Replacement window: make room for the new bond. The single-bond
+     * model means there is at most one existing peer to evict. */
+    ble_addr_t peers[1];
+    int count = 0;
+
+    if (ble_store_util_bonded_peers(peers, &count, 1) == 0 && count > 0)
+    {
+        (void)ble_store_util_delete_peer(&peers[0]);
+    }
+    return 0;
+}
+
 static int _ble_nimble_port_gap_event(
     struct ble_gap_event *event, void *arg)
 {
@@ -917,6 +1033,24 @@ static int _ble_nimble_port_gap_event(
         port_event.status = event->connect.status;
         if (event->connect.status == 0)
         {
+            /* Remember whether the peer already had a bond at connect
+             * time; an RPA peer is re-evaluated on IDENTITY_RESOLVED. */
+            struct ble_gap_conn_desc desc;
+
+            s_port.conn_had_bond = false;
+            if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0)
+            {
+                struct ble_store_key_sec key;
+
+                memset(&key, 0, sizeof(key));
+                key.peer_addr = desc.peer_id_addr;
+                struct ble_store_value_sec value;
+
+                memset(&value, 0, sizeof(value));
+                s_port.conn_had_bond =
+                    ble_store_read_peer_sec(&key, &value) == 0 &&
+                    value.ltk_present;
+            }
             _ble_nimble_port_dispatch(&port_event);
             ble_gap_manager_snapshot_t snapshot;
 
@@ -941,6 +1075,7 @@ static int _ble_nimble_port_gap_event(
         port_event.type = BLE_PORT_EVENT_DISCONNECT;
         port_event.conn_handle = event->disconnect.conn.conn_handle;
         port_event.reason = event->disconnect.reason;
+        s_port.conn_had_bond = false;
         break;
     case BLE_GAP_EVENT_MTU:
         if (event->mtu.channel_id != BLE_L2CAP_CID_ATT)
@@ -970,6 +1105,39 @@ static int _ble_nimble_port_gap_event(
         port_event.subscribed = event->subscribe.cur_notify ||
                                 event->subscribe.cur_indicate;
         break;
+    case BLE_GAP_EVENT_IDENTITY_RESOLVED:
+        /* The peer RPA resolved to a stored identity: the reconnect is a
+         * known peer, so the pairing window is not required. */
+    {
+        struct ble_gap_conn_desc desc;
+
+        s_port.conn_had_bond = false;
+        if (ble_gap_conn_find(event->identity_resolved.conn_handle,
+                              &desc) == 0)
+        {
+            struct ble_store_key_sec key;
+
+            memset(&key, 0, sizeof(key));
+            key.peer_addr = desc.peer_id_addr;
+            struct ble_store_value_sec value;
+
+            memset(&value, 0, sizeof(value));
+            s_port.conn_had_bond =
+                ble_store_read_peer_sec(&key, &value) == 0 &&
+                value.ltk_present;
+        }
+    }
+    return 0;
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        /* An existing bond attempts to pair again: allowed only while a
+         * replacement window is open, after evicting the old bond. */
+        if (_ble_nimble_port_pairing_window_open())
+        {
+            _ble_nimble_port_delete_peer_bond(
+                event->repeat_pairing.conn_handle);
+            return BLE_GAP_REPEAT_PAIRING_RETRY;
+        }
+        return BLE_GAP_REPEAT_PAIRING_IGNORE;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         port_event.type = BLE_PORT_EVENT_ADV_COMPLETE;
         break;
@@ -1790,7 +1958,7 @@ static esp_err_t _ble_nimble_port_init(void)
     ble_hs_cfg.reset_cb = _ble_nimble_port_on_reset;
     ble_hs_cfg.sync_cb = _ble_nimble_port_on_sync;
     ble_hs_cfg.gatts_register_cb = _ble_nimble_port_gatts_register;
-    ble_hs_cfg.store_status_cb = NULL;
+    ble_hs_cfg.store_status_cb = _ble_nimble_port_store_status;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
