@@ -81,14 +81,20 @@ void device_link_security_close_bootstrap(void);
  *
  * The input is the Protocomm SessionData wire; the output is the
  * SessionData response, allocated by the adapter and freed by the caller
- * with free(). A success means the SRP proof verified and the session is
- * AUTHENTICATED.
+ * with free(). A success means the command was accepted; the handshake
+ * sequence may still be mid-flight (command 0), so AUTHENTICATED is not
+ * implied. The session becomes AUTHENTICATED only when the first
+ * protected frame decrypts successfully, which the Security 2 scheme
+ * only allows after the SRP proof verified. Poll
+ * device_link_security_is_authenticated() after the first successful
+ * protected exchange; unprotect() is permitted while pending because
+ * the upstream decrypt is the proof-completion gate.
  *
  * @param[in] input SessionData bytes.
  * @param[in] input_len Input length.
  * @param[out] output Allocated SessionData response.
  * @param[out] output_len Response length.
- * @return ESP_OK when authenticated, otherwise a Protocomm error.
+ * @return ESP_OK, or a Protocomm error (the session is closed on failure).
  */
 esp_err_t device_link_security_handshake(
     const uint8_t *input, size_t input_len,

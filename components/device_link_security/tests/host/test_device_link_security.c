@@ -205,6 +205,14 @@ static esp_err_t _echo_request(
     return ESP_OK;
 }
 
+static const device_link_security_config_t s_lifecycle_config =
+{
+    .username = TEST_USERNAME,
+    .session_id = 7U,
+    .request_cb = _echo_request,
+    .request_arg = NULL,
+};
+
 static void _test_init_validation(void)
 {
     _reset_fakes();
@@ -293,6 +301,21 @@ static void _test_bootstrap_lifecycle(void)
     device_link_security_deinit();
     /* The close_bootstrap teardown already deleted the instance. */
     assert(s_delete_count == 1U);
+    /* After deinit no bootstrap can open; re-init is idempotent and the
+     * adapter is usable again. */
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)"pop", 3U) == ESP_ERR_INVALID_STATE);
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)"pop", 3U) == ESP_OK);
+    assert(device_link_security_is_authenticated() == false);
+    device_link_security_deinit();
+    /* The re-init instance is torn down on deinit; double deinit is a
+     * no-op. */
+    assert(s_delete_count == 2U);
+    device_link_security_deinit();
+    assert(device_link_security_is_authenticated() == false);
+    assert(s_delete_count == 2U);
 }
 
 static void _test_failed_handshake_closes_session(void)

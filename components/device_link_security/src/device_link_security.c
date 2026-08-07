@@ -41,27 +41,28 @@ typedef struct device_link_security
     size_t verifier_len;
     bool session_open;
     bool authenticated;
-    SemaphoreHandle_t mutex;
-    StaticSemaphore_t mutex_control;
+    bool initialized;
 } device_link_security_t;
 
 static device_link_security_t s_security;
+static SemaphoreHandle_t s_mutex;
+static StaticSemaphore_t s_mutex_control;
 
 static void _device_link_security_close_session_locked(void);
 
 static void _device_link_security_lock(void)
 {
-    if (s_security.mutex != NULL)
+    if (s_mutex != NULL)
     {
-        (void)xSemaphoreTake(s_security.mutex, portMAX_DELAY);
+        (void)xSemaphoreTake(s_mutex, portMAX_DELAY);
     }
 }
 
 static void _device_link_security_unlock(void)
 {
-    if (s_security.mutex != NULL)
+    if (s_mutex != NULL)
     {
-        (void)xSemaphoreGive(s_security.mutex);
+        (void)xSemaphoreGive(s_mutex);
     }
 }
 
@@ -199,28 +200,39 @@ esp_err_t device_link_security_init(const device_link_security_config_t *config)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_mutex == NULL)
+    {
+        s_mutex = xSemaphoreCreateMutexStatic(&s_mutex_control);
+        if (s_mutex == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    _device_link_security_lock();
+    if (s_security.initialized)
+    {
+        /* Idempotent re-init: tear the previous instance down first so
+         * no verifier or session state survives across configurations. */
+        _device_link_security_teardown_protocomm();
+        _device_link_security_free_verifier();
+    }
     memset(&s_security, 0, sizeof(s_security));
     s_security.config = *config;
-    s_security.mutex = xSemaphoreCreateMutexStatic(&s_security.mutex_control);
-    if (s_security.mutex == NULL)
-    {
-        return ESP_ERR_NO_MEM;
-    }
+    s_security.initialized = true;
+    _device_link_security_unlock();
     return ESP_OK;
 }
 
 void device_link_security_deinit(void)
 {
     _device_link_security_lock();
-    _device_link_security_teardown_protocomm();
-    _device_link_security_free_verifier();
-    _device_link_security_unlock();
-    if (s_security.mutex != NULL)
+    if (s_security.initialized)
     {
-        vSemaphoreDelete(s_security.mutex);
-        s_security.mutex = NULL;
+        _device_link_security_teardown_protocomm();
+        _device_link_security_free_verifier();
+        memset(&s_security, 0, sizeof(s_security));
     }
-    memset(&s_security, 0, sizeof(s_security));
+    _device_link_security_unlock();
 }
 
 esp_err_t device_link_security_open_bootstrap(
@@ -231,6 +243,11 @@ esp_err_t device_link_security_open_bootstrap(
         return ESP_ERR_INVALID_ARG;
     }
     _device_link_security_lock();
+    if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     /* Tear the old Protocomm instance down before freeing the verifier it
      * references: protocomm_set_security shallow-copies the params, so the
      * salt and verifier buffers must outlive every instance using them. */
@@ -279,9 +296,12 @@ esp_err_t device_link_security_open_bootstrap(
 void device_link_security_close_bootstrap(void)
 {
     _device_link_security_lock();
-    _device_link_security_teardown_protocomm();
-    _device_link_security_free_verifier();
-    (void)_device_link_security_rebuild();
+    if (s_security.initialized)
+    {
+        _device_link_security_teardown_protocomm();
+        _device_link_security_free_verifier();
+        (void)_device_link_security_rebuild();
+    }
     _device_link_security_unlock();
 }
 
@@ -294,7 +314,7 @@ esp_err_t device_link_security_handshake(
         return ESP_ERR_INVALID_ARG;
     }
     _device_link_security_lock();
-    if (s_security.protocomm == NULL)
+    if (!s_security.initialized || s_security.protocomm == NULL)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
@@ -362,7 +382,8 @@ esp_err_t device_link_security_unprotect(
         return ESP_ERR_INVALID_ARG;
     }
     _device_link_security_lock();
-    if (!s_security.session_open || s_security.protocomm == NULL)
+    if (!s_security.initialized || !s_security.session_open ||
+            s_security.protocomm == NULL)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
@@ -405,14 +426,16 @@ bool device_link_security_is_authenticated(void)
     bool authenticated = false;
 
     _device_link_security_lock();
-    authenticated = s_security.authenticated && s_security.session_open;
+    authenticated = s_security.initialized &&
+                    s_security.authenticated && s_security.session_open;
     _device_link_security_unlock();
     return authenticated;
 }
 
 static void _device_link_security_close_session_locked(void)
 {
-    if (s_security.session_open && s_security.protocomm != NULL)
+    if (s_security.initialized && s_security.session_open &&
+            s_security.protocomm != NULL)
     {
         (void)protocomm_close_session(s_security.protocomm,
                                       s_security.config.session_id);

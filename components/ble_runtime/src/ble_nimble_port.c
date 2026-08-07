@@ -28,6 +28,8 @@
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
 #include "ble_port_ops.h"
+
+static const char *const TAG = "ble_nimble_port";
 #include "ble_response_cache.h"
 #include "ble_link_gatt.h"
 #include "ble_link_session.h"
@@ -100,7 +102,7 @@ static ble_nimble_port_t s_port;
 static bool _ble_nimble_port_bond_store_verified(
     const struct ble_gap_conn_desc *desc);
 static bool _ble_nimble_port_pairing_window_open(void);
-static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle);
+static esp_err_t _ble_nimble_port_delete_peer_bond(uint16_t conn_handle);
 static int _ble_nimble_port_store_status(
     struct ble_store_status_event *event, void *arg);
 static esp_err_t _ble_nimble_port_production_adv_start(
@@ -672,7 +674,14 @@ static void _ble_nimble_port_link_gatt_consumer(
                 /* Incomplete or non-SC bond material: fail closed and
                  * remove the malformed record so it cannot occupy the
                  * single bond slot. */
-                _ble_nimble_port_delete_peer_bond(event->conn_handle);
+                const esp_err_t delete_result =
+                    _ble_nimble_port_delete_peer_bond(event->conn_handle);
+
+                if (delete_result != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "malformed bond cleanup failed (%d)",
+                             delete_result);
+                }
                 (void)ble_gap_terminate(event->conn_handle,
                                         BLE_ERR_CONN_TERM_LOCAL);
                 break;
@@ -692,7 +701,14 @@ static void _ble_nimble_port_link_gatt_consumer(
             {
                 /* An unknown peer paired outside a window: terminate the
                  * connection and delete the orphan bond. */
-                _ble_nimble_port_delete_peer_bond(event->conn_handle);
+                const esp_err_t delete_result =
+                    _ble_nimble_port_delete_peer_bond(event->conn_handle);
+
+                if (delete_result != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "orphan bond cleanup failed (%d)",
+                             delete_result);
+                }
                 (void)ble_gap_terminate(event->conn_handle,
                                         BLE_ERR_CONN_TERM_LOCAL);
             }
@@ -1009,16 +1025,18 @@ static bool _ble_nimble_port_peer_has_bond(
            value.ltk_present;
 }
 
-static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle)
+static esp_err_t _ble_nimble_port_delete_peer_bond(uint16_t conn_handle)
 {
     struct ble_gap_conn_desc desc;
 
-    if (ble_gap_conn_find(conn_handle, &desc) == 0)
+    if (ble_gap_conn_find(conn_handle, &desc) != 0)
     {
-        /* Orphan cleanup: a bond without admission must not outlive the
-         * connection. */
-        (void)ble_store_util_delete_peer(&desc.peer_id_addr);
+        return ESP_ERR_NOT_FOUND;
     }
+    /* Orphan cleanup: a bond without admission must not outlive the
+     * connection. */
+    return ble_store_util_delete_peer(&desc.peer_id_addr) == 0 ?
+           ESP_OK : ESP_FAIL;
 }
 
 static int _ble_nimble_port_store_status(
@@ -1145,8 +1163,16 @@ static int _ble_nimble_port_gap_event(
          * replacement window is open, after evicting the old bond. */
         if (_ble_nimble_port_pairing_window_open())
         {
-            _ble_nimble_port_delete_peer_bond(
-                event->repeat_pairing.conn_handle);
+            const esp_err_t delete_result =
+                _ble_nimble_port_delete_peer_bond(
+                    event->repeat_pairing.conn_handle);
+
+            if (delete_result != ESP_OK)
+            {
+                ESP_LOGW(TAG, "repeat pairing eviction failed (%d)",
+                         delete_result);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
             return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
         return BLE_GAP_REPEAT_PAIRING_IGNORE;
