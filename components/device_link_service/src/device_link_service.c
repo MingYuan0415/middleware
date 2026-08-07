@@ -201,7 +201,21 @@ static bool _device_link_service_api_acquire_early(void)
     }
     atomic_fetch_add_explicit(&s_api_users, 1U,
                               memory_order_acq_rel);
-    return true;
+    /* Revalidate after the increment: teardown may have transitioned to
+     * STOPPING while this admission was in flight, in which case the
+     * mutex may already be doomed and the count must be released. */
+    const device_link_service_lifecycle_t after =
+        (device_link_service_lifecycle_t)atomic_load_explicit(
+            &s_lifecycle, memory_order_acquire);
+
+    if (after == DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING ||
+            after == DEVICE_LINK_SERVICE_LIFECYCLE_STARTING)
+    {
+        return true;
+    }
+    atomic_fetch_sub_explicit(&s_api_users, 1U,
+                              memory_order_release);
+    return false;
 }
 
 static void _device_link_service_api_release(void)
@@ -640,18 +654,23 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
 {
     esp_err_t cleanup_result = ESP_OK;
 
-    /* Drain in-flight early-admitted callbacks (STARTING events) before
-     * releasing the mutex they may hold. */
-    while (atomic_load_explicit(&s_api_users, memory_order_acquire) != 0U)
-    {
-        vTaskDelay(1U);
-    }
+    /* STOPPING rejects any new early admission; unregister stops new
+     * dispatches; the drain then waits for in-flight callbacks that were
+     * already admitted, so the mutex can never be released underneath
+     * one. */
+    atomic_store_explicit(&s_lifecycle,
+                          DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
+                          memory_order_release);
     if (s_service.router_registered)
     {
         cleanup_result = ble_event_router_unregister(
                              _device_link_service_ble_event, NULL);
         s_service.router_registered =
             cleanup_result == ESP_OK || cleanup_result == ESP_ERR_NOT_FOUND;
+    }
+    while (atomic_load_explicit(&s_api_users, memory_order_acquire) != 0U)
+    {
+        vTaskDelay(1U);
     }
     if (cleanup_result == ESP_OK && s_service.slow_lease_held)
     {
@@ -786,13 +805,15 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         s_service.snapshot.generation = 1U;
         s_service.snapshot.available = true;
-        /* Reconcile any connection tracked during STARTING. */
+        /* Reconcile any connection tracked during STARTING, then expose
+         * RUNNING while still holding the mutex so no STARTING callback
+         * can update state between the refresh and the store. */
         _device_link_service_refresh_snapshot_locked();
-        snapshot = s_service.snapshot;
-        xSemaphoreGive(s_service.mutex);
         atomic_store_explicit(&s_lifecycle,
                               DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
                               memory_order_release);
+        snapshot = s_service.snapshot;
+        xSemaphoreGive(s_service.mutex);
         _device_link_service_publish_now(&snapshot);
     }
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
@@ -969,11 +990,18 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 
     memset(&command, 0, sizeof(command));
     command.type = DEVICE_LINK_SERVICE_COMMAND_SUSPEND;
+    /* The sequence assignment and the queue insertion happen under the
+     * same mutex, so concurrent suspend callers cannot reorder: the FIFO
+     * application order matches the sequence order and the acknowledgement
+     * always refers to this exact command. The nonblocking send cannot
+     * block while the worker briefly holds the mutex. */
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_suspend_next != UINT32_MAX)
     {
         expected_sequence = ++s_suspend_next;
         command.sequence = expected_sequence;
+        result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
+                 ESP_OK : ESP_ERR_NO_MEM;
     }
     xSemaphoreGive(s_service.mutex);
     if (expected_sequence == 0U)
@@ -983,9 +1011,6 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
         _device_link_service_api_release();
         return ESP_ERR_INVALID_STATE;
     }
-    result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
-             ESP_OK : ESP_ERR_NO_MEM;
-
     if (result != ESP_OK)
     {
         _device_link_service_api_release();
