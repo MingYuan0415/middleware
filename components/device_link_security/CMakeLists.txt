@@ -7,4 +7,5 @@ idf_component_register(
     PRIV_REQUIRES
         mbedtls
         mt_log
+        nvs_flash
 )

@@ -428,7 +428,7 @@ static void _test_auth_record_persistence(void)
            ESP_ERR_INVALID_ARG);
     assert(device_link_security_auth_record_valid(&record) == false);
     assert(device_link_security_load_auth_record(&record) ==
-           ESP_ERR_NVS_NOT_FOUND);
+           ESP_ERR_NOT_FOUND);
     /* Commit a valid record. */
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
@@ -460,10 +460,10 @@ static void _test_auth_record_persistence(void)
     /* Erase clears the record. */
     assert(device_link_security_erase_auth_record() == ESP_OK);
     assert(device_link_security_load_auth_record(&loaded) ==
-           ESP_ERR_NVS_NOT_FOUND);
+           ESP_ERR_NOT_FOUND);
     /* Erasing again is a not-found. */
     assert(device_link_security_erase_auth_record() ==
-           ESP_ERR_NVS_NOT_FOUND);
+           ESP_ERR_NOT_FOUND);
 }
 
 static void _test_long_term_verifier(void)
@@ -472,7 +472,7 @@ static void _test_long_term_verifier(void)
     assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
     /* No record: long-term load fails closed. */
     assert(device_link_security_load_long_term_verifier() ==
-           ESP_ERR_NVS_NOT_FOUND);
+           ESP_ERR_NOT_FOUND);
     assert(device_link_security_is_authenticated() == false);
     /* Derive from an application password and commit a record. */
     static const uint8_t password[24] =

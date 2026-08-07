@@ -12,6 +12,8 @@
 #include "protocomm_security2.h"
 #include "esp_srp.h"
 
+#include "nvs.h"
+
 #include "nv_storage.h"
 
 #include "device_link_security.h"
@@ -592,6 +594,11 @@ esp_err_t device_link_security_load_auth_record(
         nv_storage_get_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
                             record, &size);
 
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        /* Normalize the storage not-found class for callers. */
+        return ESP_ERR_NOT_FOUND;
+    }
     if (result != ESP_OK)
     {
         return result;
@@ -606,7 +613,15 @@ esp_err_t device_link_security_load_auth_record(
 
 esp_err_t device_link_security_erase_auth_record(void)
 {
-    return nv_storage_erase_key(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY);
+    const esp_err_t result =
+        nv_storage_erase_key(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        /* Normalize the storage not-found class for callers. */
+        return ESP_ERR_NOT_FOUND;
+    }
+    return result;
 }
 
 esp_err_t device_link_security_derive_long_term_verifier(

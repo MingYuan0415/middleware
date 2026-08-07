@@ -1248,11 +1248,11 @@ static int _ble_nimble_port_gap_event(
          * the device unbound but never dual-authorized). */
         if (_ble_nimble_port_pairing_window_open())
         {
+            /* Invalidate the old authorization before touching the bond
+             * (replacement ordering); the delete only runs after the
+             * invalidation is confirmed durable. */
             const esp_err_t erase_result =
                 device_link_security_erase_auth_record();
-            const esp_err_t delete_result =
-                _ble_nimble_port_delete_peer_bond(
-                    event->repeat_pairing.conn_handle);
 
             if (erase_result != ESP_OK &&
                     erase_result != ESP_ERR_NOT_FOUND)
@@ -1261,6 +1261,10 @@ static int _ble_nimble_port_gap_event(
                          erase_result);
                 return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
+            const esp_err_t delete_result =
+                _ble_nimble_port_delete_peer_bond(
+                    event->repeat_pairing.conn_handle);
+
             if (delete_result != ESP_OK)
             {
                 ESP_LOGW(TAG, "repeat pairing eviction failed (%d)",

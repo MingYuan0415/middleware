@@ -868,17 +868,6 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     uint8_t local_password[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
     uint8_t local_credential[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
 
-    if (ok)
-    {
-        memcpy(local_password, s_service.auth_txn.application_password,
-               sizeof(local_password));
-        memcpy(local_credential, s_service.auth_txn.credential_id,
-               sizeof(local_credential));
-        if (confirmed)
-        {
-            s_service.auth_txn.committing = true;
-        }
-    }
     if (s_service_mutex != NULL)
     {
         (void)xSemaphoreGive(s_service_mutex);
@@ -935,20 +924,44 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     }
     /* Real commit: persist the authorization record with a long-term
      * verifier derived from the application password (never persisted in
-     * plaintext) and switch the active session to it. The credential and
-     * password were copied under the mutex, so a concurrent deny cannot
-     * tear the transaction out from under the persistence. */
+     * plaintext) and switch the active session to it. The credential,
+     * password, and the generated device authorization id are local
+     * copies made under the service mutex, so a concurrent deny, window
+     * close, or disconnect cannot tear the transaction out from under
+     * the persistence. All exits share one cleanup path. */
     device_link_security_auth_record_t record;
+    uint8_t local_device_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
+    uint32_t commit_error = BLE_LINK_ERROR_OK;
 
     memset(&record, 0, sizeof(record));
-    esp_fill_random(s_service.auth_txn.device_auth_id,
-                    sizeof(s_service.auth_txn.device_auth_id));
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+    }
+    if (!s_service.auth_txn.active || !s_service.auth_txn.confirmed ||
+            s_service.auth_txn.committing)
+    {
+        commit_error = BLE_LINK_ERROR_UNAVAILABLE;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
+        goto commit_exit;
+    }
+    esp_fill_random(local_device_auth_id, sizeof(local_device_auth_id));
+    memcpy(local_credential, s_service.auth_txn.credential_id,
+           sizeof(local_credential));
+    memcpy(local_password, s_service.auth_txn.application_password,
+           sizeof(local_password));
+    s_service.auth_txn.committing = true;
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGive(s_service_mutex);
+    }
     memcpy(record.credential_id, local_credential,
            DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES);
-    memcpy(record.device_auth_id, s_service.auth_txn.device_auth_id,
+    memcpy(record.device_auth_id, local_device_auth_id,
            DEVICE_LINK_SECURITY_AUTH_ID_BYTES);
-    _ble_link_service_zeroize(local_password, sizeof(local_password));
-    _ble_link_service_zeroize(local_credential, sizeof(local_credential));
     /* The committed record must carry the normalized SMP identity of the
      * authenticated connection; an unknown or invalid identity is
      * refused. */
@@ -965,8 +978,8 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     }
     if (!s_service.current_facts.identity_known || !peer_valid)
     {
-        _ble_link_service_zeroize(&record, sizeof(record));
-        return BLE_LINK_ERROR_INVALID_ARGUMENT;
+        commit_error = BLE_LINK_ERROR_INVALID_ARGUMENT;
+        goto commit_exit;
     }
     record.peer_addr_type = s_service.current_facts.peer_addr_type;
     memcpy(record.peer_addr, s_service.current_facts.peer_addr,
@@ -975,22 +988,31 @@ static uint32_t _ble_link_service_handle_authorize_commit(
         device_link_security_derive_long_term_verifier(
             local_password, sizeof(local_password),
             record.salt, record.verifier);
-    _ble_link_service_zeroize(local_password, sizeof(local_password));
 
     if (derive_result != ESP_OK)
     {
-        return BLE_LINK_ERROR_INTERNAL;
+        commit_error = BLE_LINK_ERROR_INTERNAL;
+        goto commit_exit;
     }
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
     if (device_link_security_save_auth_record(&record) != ESP_OK)
     {
-        _ble_link_service_zeroize(&record, sizeof(record));
-        return BLE_LINK_ERROR_STORAGE;
+        commit_error = BLE_LINK_ERROR_STORAGE;
+        goto commit_exit;
     }
-    _ble_link_service_zeroize(&record, sizeof(record));
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+    }
     s_service.auth_txn.committed = true;
     s_service.auth_txn.committing = false;
+    memcpy(s_service.auth_txn.device_auth_id, local_device_auth_id,
+           sizeof(s_service.auth_txn.device_auth_id));
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGive(s_service_mutex);
+    }
     /* The bootstrap response is still encrypted under the bootstrap
      * session; the long-term verifier switch is deferred to the feed once
      * the protected response has been handed to the transport. The flag
@@ -1001,7 +1023,8 @@ static uint32_t _ble_link_service_handle_authorize_commit(
             ble_link_session_report_session_match_current(
                 facts->connection_generation, 1U) != ESP_OK)
     {
-        return BLE_LINK_ERROR_INTERNAL;
+        commit_error = BLE_LINK_ERROR_INTERNAL;
+        goto commit_exit;
     }
     uint8_t body_bytes[64];
     size_t body_len_bytes = 0U;
@@ -1014,6 +1037,26 @@ static uint32_t _ble_link_service_handle_authorize_commit(
         body_len_bytes,
         s_service.current_facts.preferred_att_mtu,
         _ble_link_service_response_channel());
+
+commit_exit:
+    _ble_link_service_zeroize(&record, sizeof(record));
+    _ble_link_service_zeroize(local_password, sizeof(local_password));
+    _ble_link_service_zeroize(local_credential, sizeof(local_credential));
+    _ble_link_service_zeroize(local_device_auth_id,
+                              sizeof(local_device_auth_id));
+    if (commit_error != BLE_LINK_ERROR_OK)
+    {
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+        }
+        s_service.auth_txn.committing = false;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
+        return commit_error;
+    }
     return BLE_LINK_ERROR_OK;
 }
 
@@ -1360,8 +1403,27 @@ esp_err_t ble_link_service_feed(
         if (!s_service.sec2_opened && s_service.security != NULL &&
                 s_service.security->is_authenticated())
         {
-            if (!_ble_link_service_pairing_window_open())
+            uint32_t epoch = 0U;
+
+            if (_ble_link_service_pairing_window_open())
             {
+                /* Bootstrap session inside a pairing window: mark only
+                 * the Security 2 authentication; authorization is
+                 * established by the commit. */
+                if (ble_link_session_security2_open(
+                            facts->connection_generation, &epoch) != ESP_OK)
+                {
+                    _ble_link_service_abort_session(
+                        facts->connection_generation);
+                    return ESP_ERR_INVALID_STATE;
+                }
+            }
+            else
+            {
+                /* Long-term reconnect: the committed record must match
+                 * the resolved identity, and the record restores the
+                 * bound/authorized state before the session match is
+                 * reported. */
                 device_link_security_auth_record_t record;
 
                 memset(&record, 0, sizeof(record));
@@ -1376,17 +1438,16 @@ esp_err_t ble_link_service_feed(
                     return ESP_ERR_INVALID_STATE;
                 }
                 _ble_link_service_zeroize(&record, sizeof(record));
-            }
-            uint32_t epoch = 0U;
-
-            if (ble_link_session_security2_open(
-                        facts->connection_generation, &epoch) != ESP_OK ||
-                    ble_link_session_report_session_match_current(
-                        facts->connection_generation, 1U) != ESP_OK)
-            {
-                _ble_link_service_abort_session(
-                    facts->connection_generation);
-                return ESP_ERR_INVALID_STATE;
+                if (ble_link_session_set_authorization(true, 1U) != ESP_OK ||
+                        ble_link_session_security2_open(
+                            facts->connection_generation, &epoch) != ESP_OK ||
+                        ble_link_session_report_session_match_current(
+                            facts->connection_generation, 1U) != ESP_OK)
+                {
+                    _ble_link_service_abort_session(
+                        facts->connection_generation);
+                    return ESP_ERR_INVALID_STATE;
+                }
             }
             s_service.sec2_opened = true;
         }
@@ -1403,6 +1464,15 @@ esp_err_t ble_link_service_feed(
                     facts->connection_generation);
                 return ESP_ERR_INVALID_STATE;
             }
+            /* The adapter tore the bootstrap session down: close the
+             * external Security 2 epoch and clear the authorization
+             * admission so no GATT path admits traffic the adapter
+             * cannot serve. The client re-handshakes under the long-term
+             * verifier on the next request. */
+            (void)ble_link_session_security2_close_current(
+                facts->connection_generation);
+            (void)ble_link_session_set_authorization(false, 0U);
+            s_service.sec2_opened = false;
         }
         return ESP_OK;
     }
