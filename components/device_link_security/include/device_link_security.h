@@ -126,6 +126,26 @@ esp_err_t device_link_security_unprotect(
     uint8_t **output, size_t *output_len);
 
 /**
+ * @brief Encrypt one outbound plaintext application frame.
+ *
+ * The adapter encrypts the plaintext Envelope and returns the allocated
+ * AES-GCM ciphertext in @p output (freed by the caller). Requires an
+ * AUTHENTICATED session; the counter stream is shared with unprotect,
+ * so every outbound frame advances the nonce and the peer must decrypt
+ * in order.
+ *
+ * @param[in] plain Plaintext Envelope.
+ * @param[in] plain_len Plaintext length.
+ * @param[out] cipher Allocated ciphertext.
+ * @param[out] cipher_len Ciphertext length.
+ * @return ESP_OK, ESP_ERR_INVALID_STATE when unauthenticated, or an
+ *         encryption error.
+ */
+esp_err_t device_link_security_protect(
+    const uint8_t *plain, size_t plain_len,
+    uint8_t **cipher, size_t *cipher_len);
+
+/**
  * @brief Report whether the current session is AUTHENTICATED.
  */
 bool device_link_security_is_authenticated(void);

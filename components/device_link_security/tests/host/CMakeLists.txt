@@ -20,6 +20,7 @@ add_executable(test_device_link_security
     "${HOST_CONNECTIVITY}/freertos_host.c"
     "${COMPONENT}/src/device_link_security.c"
 )
+
 target_compile_features(test_device_link_security PRIVATE c_std_11)
 target_compile_definitions(test_device_link_security PRIVATE
     _POSIX_C_SOURCE=200809L

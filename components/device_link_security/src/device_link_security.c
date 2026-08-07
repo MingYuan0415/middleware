@@ -9,7 +9,6 @@
 
 #include "esp_err.h"
 
-#include "protocomm.h"
 #include "protocomm_security2.h"
 #include "esp_srp.h"
 
@@ -37,7 +36,8 @@ typedef enum
 typedef struct device_link_security
 {
     device_link_security_config_t config;
-    protocomm_t *protocomm;
+    protocomm_security_handle_t sec_inst;
+    protocomm_security2_params_t sec_params;
     device_link_security_verifier_kind_t verifier_kind;
     char *salt;
     size_t salt_len;
@@ -114,56 +114,19 @@ static void _device_link_security_free_verifier(void)
     s_security.verifier_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
 }
 
-static void _device_link_security_teardown_protocomm(void)
+static void _device_link_security_teardown_sec(void)
 {
-    if (s_security.protocomm != NULL)
+    if (s_security.sec_inst != NULL)
     {
-        protocomm_delete(s_security.protocomm);
-        s_security.protocomm = NULL;
+        if (protocomm_security2.cleanup != NULL)
+        {
+            (void)protocomm_security2.cleanup(s_security.sec_inst);
+        }
+        s_security.sec_inst = NULL;
     }
+    memset(&s_security.sec_params, 0, sizeof(s_security.sec_params));
     s_security.session_open = false;
     s_security.authenticated = false;
-}
-
-/**
- * @brief Rebuild the Protocomm instance with the current verifier.
- *
- * Called after a verifier change so a new handshake always uses the
- * current window POP or long-term credential; any previous session is
- * replaced.
- */
-static esp_err_t _device_link_security_app_handler(
-    uint32_t session_id, const uint8_t *inbuf, ssize_t inlen,
-    uint8_t **outbuf, ssize_t *outlen, void *priv_data)
-{
-    (void)session_id;
-    (void)priv_data;
-    if (inbuf == NULL || inlen <= 0 || outbuf == NULL || outlen == NULL ||
-            s_security.config.request_cb == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint8_t *response = NULL;
-    size_t response_len = 0U;
-    const esp_err_t result = s_security.config.request_cb(
-                                 inbuf, (size_t)inlen,
-                                 &response, &response_len,
-                                 s_security.config.request_arg);
-
-    if (result != ESP_OK)
-    {
-        /* The callback may have allocated a response before failing. */
-        free(response);
-        return result;
-    }
-    if (response == NULL || response_len == 0U)
-    {
-        free(response);
-        return ESP_ERR_INVALID_STATE;
-    }
-    *outbuf = response;
-    *outlen = (ssize_t)response_len;
-    return ESP_OK;
 }
 
 static esp_err_t _device_link_security_rebuild(void)
@@ -171,44 +134,26 @@ static esp_err_t _device_link_security_rebuild(void)
     if (s_security.verifier_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
     {
         /* No verifier: no session can be established (fail closed). */
-        _device_link_security_teardown_protocomm();
+        _device_link_security_teardown_sec();
         return ESP_OK;
     }
-    _device_link_security_teardown_protocomm();
-    s_security.protocomm = protocomm_new();
-    if (s_security.protocomm == NULL)
+    _device_link_security_teardown_sec();
+    if (protocomm_security2.init == NULL)
     {
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_NOT_SUPPORTED;
     }
-    const protocomm_security2_params_t params =
-    {
-        .salt = (const char *)s_security.salt,
-        .salt_len = (int)s_security.salt_len,
-        .verifier = s_security.verifier,
-        .verifier_len = (uint16_t)s_security.verifier_len,
-    };
-    esp_err_t result = protocomm_set_security(
-                           s_security.protocomm,
-                           DEVICE_LINK_SECURITY_ENDPOINT_SECURITY,
-                           &protocomm_security2, &params);
+    esp_err_t result = protocomm_security2.init(&s_security.sec_inst);
 
     if (result != ESP_OK)
     {
-        goto fail;
+        s_security.sec_inst = NULL;
+        return result;
     }
-    result = protocomm_add_endpoint(
-                 s_security.protocomm, DEVICE_LINK_SECURITY_ENDPOINT_APP,
-                 _device_link_security_app_handler, NULL);
-    if (result != ESP_OK)
-    {
-        goto fail;
-    }
+    s_security.sec_params.salt = (const char *)s_security.salt;
+    s_security.sec_params.salt_len = (uint16_t)s_security.salt_len;
+    s_security.sec_params.verifier = s_security.verifier;
+    s_security.sec_params.verifier_len = (uint16_t)s_security.verifier_len;
     return ESP_OK;
-
-fail:
-    protocomm_delete(s_security.protocomm);
-    s_security.protocomm = NULL;
-    return result;
 }
 
 esp_err_t device_link_security_init(const device_link_security_config_t *config)
@@ -231,7 +176,7 @@ esp_err_t device_link_security_init(const device_link_security_config_t *config)
     {
         /* Idempotent re-init: tear the previous instance down first so
          * no verifier or session state survives across configurations. */
-        _device_link_security_teardown_protocomm();
+        _device_link_security_teardown_sec();
         _device_link_security_free_verifier();
     }
     memset(&s_security, 0, sizeof(s_security));
@@ -246,7 +191,7 @@ void device_link_security_deinit(void)
     _device_link_security_lock();
     if (s_security.initialized)
     {
-        _device_link_security_teardown_protocomm();
+        _device_link_security_teardown_sec();
         _device_link_security_free_verifier();
         memset(&s_security, 0, sizeof(s_security));
     }
@@ -266,10 +211,10 @@ esp_err_t device_link_security_open_bootstrap(
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    /* Tear the old Protocomm instance down before freeing the verifier it
-     * references: protocomm_set_security shallow-copies the params, so the
-     * salt and verifier buffers must outlive every instance using them. */
-    _device_link_security_teardown_protocomm();
+    /* Tear the old security instance down before freeing the verifier it
+     * references: the SRP context shallow-copies the params, so the salt
+     * and verifier buffers must outlive every instance using them. */
+    _device_link_security_teardown_sec();
     _device_link_security_free_verifier();
     char *salt = NULL;
     char *verifier = NULL;
@@ -316,7 +261,7 @@ void device_link_security_close_bootstrap(void)
     _device_link_security_lock();
     if (s_security.initialized)
     {
-        _device_link_security_teardown_protocomm();
+        _device_link_security_teardown_sec();
         _device_link_security_free_verifier();
         (void)_device_link_security_rebuild();
     }
@@ -332,15 +277,21 @@ esp_err_t device_link_security_handshake(
         return ESP_ERR_INVALID_ARG;
     }
     _device_link_security_lock();
-    if (!s_security.initialized || s_security.protocomm == NULL)
+    if (!s_security.initialized || s_security.sec_inst == NULL ||
+            protocomm_security2.security_req_handler == NULL)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     if (!s_security.session_open)
     {
-        const esp_err_t result = protocomm_open_session(
-                                     s_security.protocomm,
+        if (protocomm_security2.new_transport_session == NULL)
+        {
+            _device_link_security_unlock();
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        const esp_err_t result = protocomm_security2.new_transport_session(
+                                     s_security.sec_inst,
                                      s_security.config.session_id);
 
         if (result != ESP_OK)
@@ -353,12 +304,12 @@ esp_err_t device_link_security_handshake(
     }
     uint8_t *response = NULL;
     ssize_t response_len = 0;
-    const esp_err_t result = protocomm_req_handle(
-                                 s_security.protocomm,
-                                 DEVICE_LINK_SECURITY_ENDPOINT_SECURITY,
+    const esp_err_t result = protocomm_security2.security_req_handler(
+                                 s_security.sec_inst,
+                                 &s_security.sec_params,
                                  s_security.config.session_id,
                                  input, (ssize_t)input_len,
-                                 &response, &response_len);
+                                 &response, &response_len, NULL);
 
     if (result != ESP_OK)
     {
@@ -401,40 +352,101 @@ esp_err_t device_link_security_unprotect(
     }
     _device_link_security_lock();
     if (!s_security.initialized || !s_security.session_open ||
-            s_security.protocomm == NULL)
+            s_security.sec_inst == NULL ||
+            protocomm_security2.decrypt == NULL ||
+            protocomm_security2.encrypt == NULL)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    uint8_t *response = NULL;
-    ssize_t response_len = 0;
-    const esp_err_t result = protocomm_req_handle(
-                                 s_security.protocomm,
-                                 DEVICE_LINK_SECURITY_ENDPOINT_APP,
-                                 s_security.config.session_id,
-                                 input, (ssize_t)input_len,
-                                 &response, &response_len);
+    uint8_t *plain = NULL;
+    ssize_t plain_len = 0;
+    esp_err_t result = protocomm_security2.decrypt(
+                           s_security.sec_inst, s_security.config.session_id,
+                           input, (ssize_t)input_len, &plain, &plain_len);
 
     if (result != ESP_OK)
     {
-        if (response != NULL)
-        {
-            free(response);
-        }
+        free(plain);
         /* Malformed ciphertext or a failed tag closes the session. */
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
         return result;
     }
-    if (response == NULL || response_len <= 0)
+    uint8_t *plain_response = NULL;
+    size_t plain_response_len = 0U;
+
+    result = s_security.config.request_cb(
+                 plain, (size_t)plain_len,
+                 &plain_response, &plain_response_len,
+                 s_security.config.request_arg);
+    free(plain);
+    if (result != ESP_OK)
+    {
+        free(plain_response);
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return result;
+    }
+    if (plain_response == NULL || plain_response_len == 0U)
+    {
+        free(plain_response);
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t *cipher = NULL;
+    ssize_t cipher_len = 0;
+    result = protocomm_security2.encrypt(
+                 s_security.sec_inst, s_security.config.session_id,
+                 plain_response, (ssize_t)plain_response_len,
+                 &cipher, &cipher_len);
+    free(plain_response);
+    if (result != ESP_OK)
+    {
+        free(cipher);
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return result;
+    }
+    /* A successful decrypt proves the SRP proof already verified. */
+    s_security.authenticated = true;
+    *output = cipher;
+    *output_len = (size_t)cipher_len;
+    _device_link_security_unlock();
+    return ESP_OK;
+}
+
+esp_err_t device_link_security_protect(
+    const uint8_t *plain, size_t plain_len,
+    uint8_t **cipher, size_t *cipher_len)
+{
+    if (plain == NULL || cipher == NULL || cipher_len == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _device_link_security_lock();
+    if (!s_security.initialized || !s_security.session_open ||
+            !s_security.authenticated || s_security.sec_inst == NULL ||
+            protocomm_security2.encrypt == NULL)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    /* A successful decrypt proves the SRP proof already verified. */
-    s_security.authenticated = true;
-    *output = response;
-    *output_len = (size_t)response_len;
+    ssize_t out_len = 0;
+    const esp_err_t result = protocomm_security2.encrypt(
+                                 s_security.sec_inst,
+                                 s_security.config.session_id,
+                                 plain, (ssize_t)plain_len,
+                                 cipher, &out_len);
+
+    if (result != ESP_OK)
+    {
+        free(*cipher);
+        *cipher = NULL;
+        _device_link_security_unlock();
+        return result;
+    }
+    *cipher_len = (size_t)out_len;
     _device_link_security_unlock();
     return ESP_OK;
 }
@@ -453,10 +465,11 @@ bool device_link_security_is_authenticated(void)
 static void _device_link_security_close_session_locked(void)
 {
     if (s_security.initialized && s_security.session_open &&
-            s_security.protocomm != NULL)
+            s_security.sec_inst != NULL &&
+            protocomm_security2.close_transport_session != NULL)
     {
-        (void)protocomm_close_session(s_security.protocomm,
-                                      s_security.config.session_id);
+        (void)protocomm_security2.close_transport_session(
+            s_security.sec_inst, s_security.config.session_id);
     }
     s_security.session_open = false;
     s_security.authenticated = false;
@@ -580,7 +593,7 @@ esp_err_t device_link_security_load_long_term_verifier(void)
     }
     /* Tear the old Protocomm instance down before freeing the verifier it
      * references, then install the long-term salt and verifier. */
-    _device_link_security_teardown_protocomm();
+    _device_link_security_teardown_sec();
     _device_link_security_free_verifier();
     s_security.salt = malloc(DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
     s_security.verifier = malloc(DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
