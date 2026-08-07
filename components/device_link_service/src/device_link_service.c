@@ -308,7 +308,8 @@ static esp_err_t _device_link_service_open_window_locked(void)
         ble_link_session_set_pairing_window(true);
         s_service.bindable_lease_held = true;
         s_service.bindable_lease_id = lease.lease_id;
-        /* The lease copy carries the discriminator. */
+        /* The lease copy carries the discriminator; erase it on every
+         * path, including a convergence failure that released it above. */
         _device_link_service_zeroize(&lease, sizeof(lease));
     }
     memcpy(s_service.discriminator, discriminator,
@@ -540,10 +541,18 @@ static void _device_link_service_worker(void *arg)
     xSemaphoreGive(s_service.stopped);
 #ifdef UNIT_TEST_HOST
     /* The host FreeRTOS fake needs the caller-side vTaskDelete to join the
-     * worker thread; on the device the task must delete itself. */
+     * worker thread; the worker returns and the trampoline exits. */
     return;
 #else
-    vTaskDelete(NULL);
+    /* The device task never self-deletes: it parks here until the caller
+     * deletes it after taking the exit signal, so teardown owns the task
+     * lifetime and cannot race a self-deletion. */
+    for (;;)
+    {
+        device_link_service_command_t parked;
+
+        (void)xQueueReceive(s_service.queue, &parked, portMAX_DELAY);
+    }
 #endif
 }
 
@@ -563,18 +572,12 @@ static void _device_link_service_release_resources(void)
 {
     if (s_service.task != NULL)
     {
-#ifdef UNIT_TEST_HOST
-        /* The worker returned from its entry; this vTaskDelete joins its
-         * thread. It is idempotent for an already-joined task. */
+        /* The worker parked (device) or returned (host) after its exit
+         * signal, so deleting it here is the single, safe delete on both
+         * platforms: on the host it joins the thread, on the device it
+         * removes the parked task. The handle is cleared so a retry never
+         * deletes twice. */
         vTaskDelete(s_service.task);
-#else
-        if (!atomic_load_explicit(&s_worker_exited, memory_order_acquire))
-        {
-            /* Rollback path only: the worker never processed DEINIT and is
-             * still alive; the normal path has already self-deleted. */
-            vTaskDelete(s_service.task);
-        }
-#endif
     }
     if (s_service.queue != NULL)
     {
@@ -651,18 +654,21 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     if (!atomic_compare_exchange_strong_explicit(
                 &s_lifecycle, &expected,
                 DEVICE_LINK_SERVICE_LIFECYCLE_STARTING,
-                memory_order_acq_rel, memory_order_acquire) &&
-            expected != DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED)
+                memory_order_acq_rel, memory_order_acquire))
     {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (expected == DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED)
-    {
-        /* Re-init from STOPPED: the CAS above failed, so set STARTING
-         * explicitly to keep the admission exclusive. */
-        atomic_store_explicit(&s_lifecycle,
-                              DEVICE_LINK_SERVICE_LIFECYCLE_STARTING,
-                              memory_order_release);
+        if (expected != DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+        /* Re-init from STOPPED: a second exclusive CAS admits exactly one
+         * caller. */
+        if (!atomic_compare_exchange_strong_explicit(
+                    &s_lifecycle, &expected,
+                    DEVICE_LINK_SERVICE_LIFECYCLE_STARTING,
+                    memory_order_acq_rel, memory_order_acquire))
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     memset(&s_service, 0, sizeof(s_service));
     s_service.config = *config;
@@ -723,22 +729,27 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     atomic_store_explicit(&s_worker_result, ESP_OK,
                           memory_order_release);
-    /* The initial snapshot is prepared before RUNNING is exposed so a
-     * concurrent get_status cannot observe a half-initialized service. */
+    /* The initial snapshot is prepared and RUNNING is exposed before the
+     * publish: get_status sees a complete snapshot, and a publisher-context
+     * subscriber that re-enters the service API during the publish sees a
+     * running service. */
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     s_service.snapshot.generation = 1U;
     s_service.snapshot.available = true;
     s_service.snapshot.state = DEVICE_LINK_SERVICE_STATE_ADVERTISING;
     s_service.snapshot.window_remaining_ms = 0U;
-    {
-        device_link_service_snapshot_t snapshot = s_service.snapshot;
-
-        xSemaphoreGive(s_service.mutex);
-        _device_link_service_publish_now(&snapshot);
-    }
+    xSemaphoreGive(s_service.mutex);
     atomic_store_explicit(&s_lifecycle,
                           DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
                           memory_order_release);
+    {
+        device_link_service_snapshot_t snapshot;
+
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        snapshot = s_service.snapshot;
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+    }
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
     return ESP_OK;
 }
@@ -821,6 +832,15 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
             return ESP_ERR_TIMEOUT;
         }
     }
+    /* The worker has parked (or returned) and cannot touch service state
+     * anymore; delete it now so a later teardown failure cannot retry
+     * against a live task. The handle is cleared by release_resources on
+     * success and this call is skipped on retry. */
+    if (s_service.task != NULL)
+    {
+        vTaskDelete(s_service.task);
+        s_service.task = NULL;
+    }
     result = atomic_load_explicit(&s_worker_result,
                                   memory_order_acquire);
     if (result == ESP_OK)
@@ -887,8 +907,43 @@ esp_err_t device_link_service_close_window(void)
 
 esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 {
-    (void)timeout_ms;
-    return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_SUSPEND);
+    const esp_err_t result =
+        _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_SUSPEND);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    /* Standby preparation needs the suspended state applied before it
+     * proceeds: wait (bounded by timeout_ms) until the worker has closed
+     * the window and set the flag. */
+    TickType_t wait = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
+                      portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+
+    if (timeout_ms > 0U && wait == 0U)
+    {
+        wait = 1U;
+    }
+    const TickType_t started = xTaskGetTickCount();
+
+    for (;;)
+    {
+        bool applied = false;
+
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        applied = s_service.suspended && !s_service.window_open;
+        xSemaphoreGive(s_service.mutex);
+        if (applied)
+        {
+            return ESP_OK;
+        }
+        if (timeout_ms != DEVICE_LINK_SERVICE_WAIT_FOREVER &&
+                xTaskGetTickCount() - started >= wait)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1U);
+    }
 }
 
 esp_err_t device_link_service_resume(uint32_t timeout_ms)

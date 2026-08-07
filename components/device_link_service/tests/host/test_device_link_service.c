@@ -649,8 +649,8 @@ static void _test_suspend_resume(void)
     _reset_host();
     _init_service();
 
-    assert(device_link_service_suspend(0U) == ESP_OK);
-    assert(device_link_service_suspend(0U) == ESP_OK);
+    assert(device_link_service_suspend(1000U) == ESP_OK);
+    assert(device_link_service_suspend(1000U) == ESP_OK);
     device_link_service_status_t status;
 
     assert(_wait_for(
@@ -664,8 +664,8 @@ static void _test_suspend_resume(void)
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(!status.active);
     assert(status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED);
-    assert(device_link_service_resume(0U) == ESP_OK);
-    assert(device_link_service_resume(0U) == ESP_OK);
+    assert(device_link_service_resume(1000U) == ESP_OK);
+    assert(device_link_service_resume(1000U) == ESP_OK);
     assert(_wait_for(_status_advertising, 500U));
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(!status.active);
@@ -692,8 +692,8 @@ static void _test_suspend_resume(void)
     assert(device_link_service_close_window() == ESP_OK);
     assert(_wait_for(_status_not_active, 500U));
     _adv_converge();
-    assert(device_link_service_suspend(0U) == ESP_OK);
-    assert(device_link_service_resume(0U) == ESP_OK);
+    assert(device_link_service_suspend(1000U) == ESP_OK);
+    assert(device_link_service_resume(1000U) == ESP_OK);
     assert(_wait_for(_status_advertising, 500U));
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(!status.active);

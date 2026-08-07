@@ -101,9 +101,16 @@ esp_err_t device_link_service_open_window(void);
 esp_err_t device_link_service_close_window(void);
 
 /**
- * @brief Close the binding window before standby.
- * @param[in] timeout_ms Reserved for lifecycle symmetry.
- * @return ESP_OK when suspended; ESP_ERR_INVALID_STATE while a window is open.
+ * @brief Close the binding window and suspend the service before standby.
+ *
+ * The suspend command joins the worker FIFO, so an open that raced into the
+ * queue first is closed by the suspend itself; the service then has no
+ * window and the suspended flag is set. The call waits (bounded by
+ * timeout_ms, or forever with DEVICE_LINK_SERVICE_WAIT_FOREVER) until the
+ * worker applied the state, so standby preparation can rely on it.
+ *
+ * @param[in] timeout_ms Maximum wait for the state to be applied.
+ * @return ESP_OK when applied, ESP_ERR_TIMEOUT, or a queue error.
  */
 esp_err_t device_link_service_suspend(uint32_t timeout_ms);
 
