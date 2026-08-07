@@ -867,26 +867,30 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     confirmed = s_service.auth_txn.confirmed;
     uint8_t local_password[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
     uint8_t local_credential[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
+    uint8_t replay_credential[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
+    uint8_t replay_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
 
+    if (replay)
+    {
+        /* Idempotent replay of a committed transaction: the credential
+         * and auth id are snapshotted while the lock is still held, so a
+         * concurrent clear cannot tear them between the eligibility
+         * check and the copy. */
+        memcpy(replay_credential, s_service.auth_txn.credential_id,
+               sizeof(replay_credential));
+        memcpy(replay_auth_id, s_service.auth_txn.device_auth_id,
+               sizeof(replay_auth_id));
+    }
     if (s_service_mutex != NULL)
     {
         (void)xSemaphoreGive(s_service_mutex);
     }
     if (replay)
     {
-        /* Idempotent replay of a committed transaction. The credential
-         * and auth id are snapshotted in the same locked section that
-         * established the replay eligibility, so a concurrent clear
-         * cannot tear them between two lock acquisitions. */
+        /* Idempotent replay of a committed transaction. */
         uint8_t replay_body[64];
         size_t replay_body_len = 0U;
-        uint8_t replay_credential[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
-        uint8_t replay_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
 
-        memcpy(replay_credential, s_service.auth_txn.credential_id,
-               sizeof(replay_credential));
-        memcpy(replay_auth_id, s_service.auth_txn.device_auth_id,
-               sizeof(replay_auth_id));
         _ble_link_service_encode_authorization_result(
             replay_body, &replay_body_len,
             replay_credential, replay_auth_id);
@@ -1029,22 +1033,29 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     s_service.auth_txn.committing = false;
     memcpy(s_service.auth_txn.device_auth_id, local_device_auth_id,
            sizeof(s_service.auth_txn.device_auth_id));
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
     /* The bootstrap response is still encrypted under the bootstrap
      * session; the long-term verifier switch is deferred to the feed once
      * the protected response has been handed to the transport. The flag
      * survives a response abort so a committed record always takes
-     * effect. */
+     * effect. Both this flag and the external authorization are published
+     * while the transaction mutex is held, so a window close or
+     * disconnect cannot clear the transaction between the persistence
+     * and the publication. */
     s_service.switch_long_term_pending = true;
     if (ble_link_session_set_authorization(true, 0U) != ESP_OK ||
             ble_link_session_report_session_match_current(
                 facts->connection_generation, 0U) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
         goto commit_exit;
+    }
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGive(s_service_mutex);
     }
     uint8_t body_bytes[64];
     size_t body_len_bytes = 0U;
