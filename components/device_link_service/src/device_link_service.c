@@ -97,6 +97,7 @@ static atomic_int s_lifecycle = ATOMIC_VAR_INIT(
 static atomic_uint s_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_uint s_worker_result = ATOMIC_VAR_INIT(0U);
 static atomic_bool s_worker_exited = ATOMIC_VAR_INIT(false);
+static atomic_uint s_suspend_sequence = ATOMIC_VAR_INIT(0U);
 
 EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
 
@@ -159,15 +160,26 @@ static void _device_link_service_zero_secrets(void)
 
 static bool _device_link_service_api_acquire(void)
 {
-    if (atomic_load_explicit(&s_lifecycle, memory_order_acquire) !=
-            DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
+    const device_link_service_lifecycle_t lifecycle =
+        (device_link_service_lifecycle_t)atomic_load_explicit(
+            &s_lifecycle, memory_order_acquire);
+
+    /* STARTING is admitted so BLE events arriving between the router
+     * registration and the RUNNING store can be tracked; STOPPING and
+     * STOPPED reject so a teardown can never race a live callback. */
+    if (lifecycle != DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING &&
+            lifecycle != DEVICE_LINK_SERVICE_LIFECYCLE_STARTING)
     {
         return false;
     }
     atomic_fetch_add_explicit(&s_api_users, 1U,
                               memory_order_acq_rel);
-    if (atomic_load_explicit(&s_lifecycle, memory_order_acquire) ==
-            DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
+    const device_link_service_lifecycle_t after =
+        (device_link_service_lifecycle_t)atomic_load_explicit(
+            &s_lifecycle, memory_order_acquire);
+
+    if (after == DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING ||
+            after == DEVICE_LINK_SERVICE_LIFECYCLE_STARTING)
     {
         return true;
     }
@@ -372,36 +384,42 @@ static void _device_link_service_ble_event(
         return;
     }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (atomic_load_explicit(&s_lifecycle, memory_order_acquire) ==
+    /* Connection state is tracked from STARTING (the router is already
+     * registered and advertising may be live), so a connection accepted
+     * before the RUNNING store is not lost; only the publication is gated
+     * on RUNNING. */
+    if (event->type == BLE_PORT_EVENT_CONNECT && event->status == 0)
+    {
+        s_service.client_connected = true;
+        s_service.client_conn_handle = event->conn_handle;
+        publish = true;
+    }
+    else if (event->type == BLE_PORT_EVENT_DISCONNECT &&
+             event->conn_handle == s_service.client_conn_handle)
+    {
+        /* A late disconnect for a retired connection must not clear a
+         * newer one. */
+        s_service.client_connected = false;
+        s_service.client_conn_handle = 0U;
+        publish = true;
+    }
+    else if (event->type == BLE_PORT_EVENT_RESET)
+    {
+        s_service.client_connected = false;
+        s_service.client_conn_handle = 0U;
+        publish = true;
+    }
+    if (publish &&
+            atomic_load_explicit(&s_lifecycle, memory_order_acquire) ==
             DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
     {
-        if (event->type == BLE_PORT_EVENT_CONNECT && event->status == 0)
-        {
-            s_service.client_connected = true;
-            s_service.client_conn_handle = event->conn_handle;
-            publish = true;
-        }
-        else if (event->type == BLE_PORT_EVENT_DISCONNECT &&
-                 event->conn_handle == s_service.client_conn_handle)
-        {
-            /* A late disconnect for a retired connection must not clear a
-             * newer one. */
-            s_service.client_connected = false;
-            s_service.client_conn_handle = 0U;
-            publish = true;
-        }
-        else if (event->type == BLE_PORT_EVENT_RESET)
-        {
-            s_service.client_connected = false;
-            s_service.client_conn_handle = 0U;
-            publish = true;
-        }
-        if (publish)
-        {
-            _device_link_service_refresh_snapshot_locked();
-            s_service.snapshot.generation++;
-            snapshot = s_service.snapshot;
-        }
+        _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation++;
+        snapshot = s_service.snapshot;
+    }
+    else
+    {
+        publish = false;
     }
     xSemaphoreGive(s_service.mutex);
     if (publish)
@@ -433,10 +451,18 @@ static void _device_link_service_handle_command(
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
         /* Suspend always ends with no window and the suspended flag set,
          * so an OPEN that raced into the FIFO first cannot leave a window
-         * open across standby. */
+         * open across standby. The sequence advances only here, so a
+         * suspend caller can acknowledge its own command. */
         _device_link_service_close_window_locked();
         s_service.suspended = true;
         s_service.snapshot.last_error = ESP_OK;
+        if (atomic_load_explicit(&s_suspend_sequence,
+                                 memory_order_acquire) < UINT32_MAX)
+        {
+            atomic_store_explicit(&s_suspend_sequence,
+                                  s_suspend_sequence + 1U,
+                                  memory_order_release);
+        }
         break;
     case DEVICE_LINK_SERVICE_COMMAND_RESUME:
         /* Resume only restores the pre-suspend idle state; it never opens a
@@ -926,9 +952,21 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
         return result;
     }
     /* Standby preparation needs the suspended state applied before it
-     * proceeds: wait (bounded by timeout_ms) until the worker has closed
-     * the window and set the flag. The API user count is held across the
-     * wait, so deinit cannot tear the service down underneath it. */
+     * proceeds: wait (bounded by timeout_ms) until the worker applied THIS
+     * suspend (its sequence number advanced past the one captured at
+     * enqueue), so a queued resume ahead of it cannot be acknowledged
+     * against. The API user count is held across the wait, so deinit
+     * cannot tear the service down underneath it. */
+    const uint32_t expected_sequence =
+        atomic_load_explicit(&s_suspend_sequence, memory_order_acquire) + 1U;
+
+    if (expected_sequence == 0U)
+    {
+        /* The suspend sequence exhausted: fail closed instead of
+         * acknowledging a wrap. */
+        _device_link_service_api_release();
+        return ESP_ERR_INVALID_STATE;
+    }
     TickType_t wait = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
                       portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
 
@@ -940,12 +978,8 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 
     for (;;)
     {
-        bool applied = false;
-
-        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        applied = s_service.suspended && !s_service.window_open;
-        xSemaphoreGive(s_service.mutex);
-        if (applied)
+        if (atomic_load_explicit(&s_suspend_sequence,
+                                 memory_order_acquire) >= expected_sequence)
         {
             break;
         }

@@ -803,6 +803,27 @@ static void _test_open_failure_publishes_error(void)
     _deinit_service();
 }
 
+static void _test_suspend_waits_for_its_own_command(void)
+{
+    _reset_host();
+    _init_service();
+
+    assert(device_link_service_suspend(1000U) == ESP_OK);
+    assert(_wait_for(_status_suspended, 500U));
+    /* A resume queued ahead of a second suspend must not let the second
+     * suspend acknowledge against the stale pre-resume state: the
+     * sequence-based acknowledgement waits until the worker applied the
+     * resume and then the suspend. */
+    assert(device_link_service_resume(1000U) == ESP_OK);
+    assert(device_link_service_suspend(1000U) == ESP_OK);
+    device_link_service_status_t status;
+
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED);
+    assert(!status.active);
+    _deinit_service();
+}
+
 static void _test_deinit_while_window_open(void)
 {
     _reset_host();
@@ -845,6 +866,7 @@ int main(void)
     _test_close_after_pending_open();
     _test_remaining_time_publishes_periodically();
     _test_open_failure_publishes_error();
+    _test_suspend_waits_for_its_own_command();
     _test_deinit_while_window_open();
     _test_reinit_after_deinit();
     puts("device_link_service host tests passed");
