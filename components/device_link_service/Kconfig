@@ -1,0 +1,19 @@
+menu "Device Link Service"
+
+config DEVICE_LINK_SERVICE_TASK_STACK
+    int "Device Link service worker stack size in bytes"
+    range 2048 16384
+    default 6144
+    help
+        Worker task stack for the binding window and status machinery.
+
+config DEVICE_LINK_SERVICE_QUEUE_DEPTH
+    int "Device Link service command queue depth"
+    range 4 32
+    default 8
+    help
+        Bounded command queue depth for window, publish, and teardown
+        commands. Commands are rare (window open/close, connect events),
+        so a shallow queue is sufficient.
+
+endmenu
