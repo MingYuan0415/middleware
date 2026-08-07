@@ -86,6 +86,12 @@ static esp_err_t _ble_nimble_port_security_request(
             response, response_len);
 }
 
+static esp_err_t _ble_nimble_port_sec_authenticated(void *arg)
+{
+    (void)arg;
+    return ble_link_service_on_authenticated(NULL);
+}
+
 static const ble_link_security_ops_t s_security_ops =
 {
     .handshake = _ble_nimble_port_sec_handshake,
@@ -2063,6 +2069,8 @@ static esp_err_t _ble_nimble_port_init(void)
                 .session_id = 1U,
                 .request_cb = _ble_nimble_port_security_request,
                 .request_arg = NULL,
+                .authenticated_cb = _ble_nimble_port_sec_authenticated,
+                .authenticated_arg = NULL,
             };
 
             result = device_link_security_init(&security_config);

@@ -357,18 +357,28 @@ static int _ble_link_gatt_access(
         return -1;
     }
     /* Admission is checked before any fragment enters the reassembler, so
-     * an unauthenticated peer cannot perturb reassembly state. */
+     * an unauthenticated peer cannot perturb reassembly state. A control
+     * write is additionally admitted for an already authenticated long-
+     * term session that has not yet restored its authorization: the feed
+     * runs the identity-matched authentication transition before the
+     * request dispatches. */
+    const bool control_channel = channel == BLE_LINK_SERVICE_RX_CONTROL;
     uint32_t admission_error = 0U;
 
     if (ble_link_session_query_admission(
                 facts.connection_generation,
-                (channel == BLE_LINK_SERVICE_RX_SESSION) ?
-                BLE_LINK_SESSION_CHANNEL_SESSION :
-                BLE_LINK_SESSION_CHANNEL_CONTROL,
+                control_channel ? BLE_LINK_SESSION_CHANNEL_CONTROL :
+                BLE_LINK_SESSION_CHANNEL_SESSION,
                 &admission_error) != ESP_OK ||
             admission_error != BLE_LINK_ERROR_OK)
     {
-        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        if (!control_channel ||
+                s_gatt.config->security_ops == NULL ||
+                s_gatt.config->security_ops->is_authenticated == NULL ||
+                !s_gatt.config->security_ops->is_authenticated())
+        {
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
     }
     const esp_err_t result = ble_link_service_feed(
                                  &facts, channel, context->write_data,

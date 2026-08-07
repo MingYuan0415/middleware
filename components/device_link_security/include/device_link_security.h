@@ -15,6 +15,19 @@ extern "C" {
 #define DEVICE_LINK_SECURITY_USERNAME "microtech"
 
 /**
+ * @brief Authentication transition callback.
+ *
+ * Invoked after the first successful decryption proves the SRP proof,
+ * before the request callback dispatches the plaintext. Returns ESP_OK to
+ * proceed, or an error to fail the session closed. Runs without the
+ * adapter lock (the same unlocked context as the request callback).
+ *
+ * @param[in] arg Callback argument from the configuration.
+ * @return ESP_OK, or an error to fail the session closed.
+ */
+typedef esp_err_t (*device_link_security_authenticated_fn)(void *arg);
+
+/**
  * @brief Session request callback.
  *
  * Invoked with the plaintext application envelope after the Security 2
@@ -40,6 +53,10 @@ typedef struct device_link_security_config
     uint32_t session_id; /**< Protocomm session id, e.g. connection generation. */
     device_link_security_request_fn request_cb; /**< Protected request sink. */
     void *request_arg; /**< Callback argument. */
+    device_link_security_authenticated_fn authenticated_cb; /**< Optional
+                                                             *  authentication
+                                                             *  transition. */
+    void *authenticated_arg; /**< Authentication callback argument. */
 } device_link_security_config_t;
 
 /**

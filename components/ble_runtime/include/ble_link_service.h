@@ -209,6 +209,19 @@ esp_err_t ble_link_service_publish_link_state(
     const ble_link_state_snapshot_t *link_state);
 
 /**
+ * @brief Security 2 authentication transition.
+ *
+ * Invoked by the adapter before the first protected request dispatches.
+ * Inside a pairing window only the Security 2 session opens; outside a
+ * window the committed record is identity-matched and restores the bound
+ * and authorized state. Runs in the adapter's unlocked callback context.
+ *
+ * @param[in] arg Unused.
+ * @return ESP_OK, or an error to fail the session closed.
+ */
+esp_err_t ble_link_service_on_authenticated(void *arg);
+
+/**
  * @brief Accept or deny the pending binding confirmation.
  *
  * Accepting arms the active authorize transaction so a subsequent

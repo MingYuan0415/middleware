@@ -426,6 +426,22 @@ esp_err_t device_link_security_unprotect(
      * response is encrypted, so a session replaced during the callback
      * fails closed instead of encrypting under the new session. */
     _device_link_security_unlock();
+    const device_link_security_authenticated_fn authenticated_cb =
+        s_security.config.authenticated_cb;
+    void *const authenticated_arg = s_security.config.authenticated_arg;
+
+    if (authenticated_cb != NULL)
+    {
+        result = authenticated_cb(authenticated_arg);
+        if (result != ESP_OK)
+        {
+            free(plain);
+            _device_link_security_lock();
+            _device_link_security_close_session_locked();
+            _device_link_security_unlock();
+            return result;
+        }
+    }
     uint8_t *plain_response = NULL;
     size_t plain_response_len = 0U;
 
