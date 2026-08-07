@@ -1706,10 +1706,12 @@ static esp_err_t _ble_nimble_port_init(void)
     }
     if (s_timer_owner_task == NULL)
     {
-        if (xTaskCreate(_ble_nimble_port_timer_owner,
-                        "ble_link_timer", BLE_NIMBLE_PORT_LINK_TIMER_STACK,
-                        NULL, BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY,
-                        &s_timer_owner_task) != pdPASS)
+        if (xTaskCreatePinnedToCore(
+                    _ble_nimble_port_timer_owner,
+                    "ble_link_timer", BLE_NIMBLE_PORT_LINK_TIMER_STACK,
+                    NULL, BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY,
+                    &s_timer_owner_task,
+                    BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
         {
             return ESP_ERR_NO_MEM;
         }
@@ -1838,10 +1840,12 @@ static esp_err_t _ble_nimble_port_init(void)
     }
     if (s_port.adv_task == NULL)
     {
-        if (xTaskCreate(_ble_nimble_port_adv_task, "ble_adv_ctrl",
-                        BLE_NIMBLE_PORT_ADV_TASK_STACK, NULL,
-                        BLE_NIMBLE_PORT_ADV_TASK_PRIORITY,
-                        &s_port.adv_task) != pdPASS)
+        if (xTaskCreatePinnedToCore(
+                    _ble_nimble_port_adv_task, "ble_adv_ctrl",
+                    BLE_NIMBLE_PORT_ADV_TASK_STACK, NULL,
+                    BLE_NIMBLE_PORT_ADV_TASK_PRIORITY,
+                    &s_port.adv_task,
+                    BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
         {
             return _ble_nimble_port_rollback_init(ESP_ERR_NO_MEM, true, true,
                                                   false);
@@ -1945,10 +1949,12 @@ static esp_err_t _ble_nimble_port_stop(void)
             }
         }
         s_port.stop_result = 0;
-        if (xTaskCreate(_ble_nimble_port_stop_worker, "ble_stop",
-                        BLE_NIMBLE_PORT_ADV_TASK_STACK, NULL,
-                        BLE_NIMBLE_PORT_ADV_TASK_PRIORITY,
-                        &stop_task) != pdPASS)
+        if (xTaskCreatePinnedToCore(
+                    _ble_nimble_port_stop_worker, "ble_stop",
+                    BLE_NIMBLE_PORT_ADV_TASK_STACK, NULL,
+                    BLE_NIMBLE_PORT_ADV_TASK_PRIORITY,
+                    &stop_task,
+                    BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
         {
             return ESP_ERR_NO_MEM;
         }

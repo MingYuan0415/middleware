@@ -95,6 +95,8 @@ static atomic_int s_lifecycle = ATOMIC_VAR_INIT(
 static atomic_uint s_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_uint s_worker_result = ATOMIC_VAR_INIT(0U);
 
+EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
+
 static void _device_link_service_base64url(
     const uint8_t *input, size_t input_length, char *output)
 {
