@@ -16,6 +16,7 @@ set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 
 add_executable(test_device_link_security
     test_device_link_security.c
+    "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
     "${HOST_CONNECTIVITY}/freertos_host.c"
     "${COMPONENT}/src/device_link_security.c"
 )

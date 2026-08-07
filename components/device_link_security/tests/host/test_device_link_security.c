@@ -6,6 +6,8 @@
 #include <string.h>
 
 #include "device_link_security.h"
+#include "device_link_security_auth.h"
+#include "nv_storage.h"
 #include "protocomm.h"
 #include "protocomm_security2.h"
 
@@ -25,7 +27,7 @@ static unsigned s_sec2_handle_count;
 static unsigned s_app_handle_count;
 static char s_captured_salt[64];
 static size_t s_captured_salt_len;
-static char s_captured_verifier[256];
+static char s_captured_verifier[512];
 static size_t s_captured_verifier_len;
 static char s_last_sec2_request[256];
 static size_t s_last_sec2_request_len;
@@ -49,7 +51,9 @@ esp_err_t esp_srp_gen_salt_verifier(
         return ESP_ERR_INVALID_ARG;
     }
     char *salt = malloc((size_t)salt_len);
-    char *out = malloc((size_t)pass_len + 32U);
+    /* 3072-bit group verifier: fixed 384 bytes, derived deterministically
+     * from the password for prediction. */
+    char *out = malloc(384U);
 
     if (salt == NULL || out == NULL)
     {
@@ -61,10 +65,13 @@ esp_err_t esp_srp_gen_salt_verifier(
     {
         salt[i] = (char)(0x40 + i);
     }
-    (void)snprintf(out, (size_t)pass_len + 32U, "verifier:%s", pass);
+    for (int i = 0; i < 384; ++i)
+    {
+        out[i] = (char)(pass[i % pass_len] + (i % 7));
+    }
     *bytes_salt = salt;
     *verifier = out;
-    *verifier_len = (int)strlen(out);
+    *verifier_len = 384;
     return ESP_OK;
 }
 
@@ -261,7 +268,8 @@ static void _test_bootstrap_lifecycle(void)
     assert(s_new_count == 1U);
     assert(s_captured_salt_len == 16U);
     assert(s_captured_salt[0] == 0x40);
-    assert(strcmp(s_captured_verifier, "verifier:window-pop-secret") == 0);
+    assert(s_captured_verifier_len == 384U);
+    assert(s_captured_verifier[0] == (char)(0x77U)); /* 'w' of the pop */
 
     /* Handshake opens the session and routes to the security endpoint. */
     assert(device_link_security_handshake(
@@ -384,9 +392,98 @@ static void _test_explicit_session_close(void)
     device_link_security_deinit();
 }
 
+static void _test_auth_record_persistence(void)
+{
+    nv_storage_fake_reset();
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    /* Invalid (zeroed) record is rejected. */
+    assert(device_link_security_save_auth_record(&record) ==
+           ESP_ERR_INVALID_ARG);
+    assert(device_link_security_auth_record_valid(&record) == false);
+    assert(device_link_security_load_auth_record(&record) ==
+           ESP_ERR_NVS_NOT_FOUND);
+    /* Commit a valid record. */
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x40U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        record.verifier[i] = (uint8_t)(i & 0x7fU);
+    }
+    record.peer_addr_type = 1U;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        record.peer_addr[i] = (uint8_t)(0xa0U + i);
+    }
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+    device_link_security_auth_record_t loaded;
+
+    memset(&loaded, 0, sizeof(loaded));
+    assert(device_link_security_load_auth_record(&loaded) == ESP_OK);
+    assert(memcmp(&loaded, &record, sizeof(record)) == 0);
+    /* Erase clears the record. */
+    assert(device_link_security_erase_auth_record() == ESP_OK);
+    assert(device_link_security_load_auth_record(&loaded) ==
+           ESP_ERR_NVS_NOT_FOUND);
+    /* Erasing again is a not-found. */
+    assert(device_link_security_erase_auth_record() ==
+           ESP_ERR_NVS_NOT_FOUND);
+}
+
+static void _test_long_term_verifier(void)
+{
+    nv_storage_fake_reset();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    /* No record: long-term load fails closed. */
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_NVS_NOT_FOUND);
+    assert(device_link_security_is_authenticated() == false);
+    /* Derive from an application password and commit a record. */
+    static const uint8_t password[24] =
+    {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10,
+        0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+    };
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    assert(device_link_security_derive_long_term_verifier(
+               password, sizeof(password),
+               record.salt, record.verifier) == ESP_OK);
+    assert(nv_storage_fake_blob_len() == 0U);
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+    /* Loading the long-term verifier makes the session handshakable and
+     * no bootstrap verifier is required. */
+    assert(device_link_security_load_long_term_verifier() == ESP_OK);
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+    free(out);
+    assert(device_link_security_is_authenticated() == false);
+    device_link_security_deinit();
+}
+
 int main(void)
 {
     _test_init_validation();
+    _test_auth_record_persistence();
+    _test_long_term_verifier();
     _test_bootstrap_lifecycle();
     _test_failed_handshake_closes_session();
     _test_explicit_session_close();

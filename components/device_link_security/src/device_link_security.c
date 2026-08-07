@@ -13,7 +13,10 @@
 #include "protocomm_security2.h"
 #include "esp_srp.h"
 
+#include "nv_storage.h"
+
 #include "device_link_security.h"
+#include "device_link_security_auth.h"
 
 #define DBG_TAG "device_link_security"
 #define DBG_LVL DBG_INFO
@@ -28,6 +31,7 @@ typedef enum
 {
     DEVICE_LINK_SECURITY_VERIFIER_NONE = 0,
     DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP,
+    DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM,
 } device_link_security_verifier_kind_t;
 
 typedef struct device_link_security
@@ -43,6 +47,20 @@ typedef struct device_link_security
     bool authenticated;
     bool initialized;
 } device_link_security_t;
+
+/** @brief Storage key of the committed authorization record. */
+#define DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY "dls.auth"
+
+static bool _device_link_security_record_valid(
+    const device_link_security_auth_record_t *record)
+{
+    if (record == NULL)
+    {
+        return false;
+    }
+    return record->magic == DEVICE_LINK_SECURITY_AUTH_MAGIC &&
+           record->schema_version == DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+}
 
 static device_link_security_t s_security;
 static SemaphoreHandle_t s_mutex;
@@ -449,4 +467,140 @@ void device_link_security_close_session(void)
     _device_link_security_lock();
     _device_link_security_close_session_locked();
     _device_link_security_unlock();
+}
+
+bool device_link_security_auth_record_valid(
+    const device_link_security_auth_record_t *record)
+{
+    return _device_link_security_record_valid(record);
+}
+
+esp_err_t device_link_security_save_auth_record(
+    const device_link_security_auth_record_t *record)
+{
+    if (!_device_link_security_record_valid(record))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return nv_storage_set_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
+                               record, sizeof(*record));
+}
+
+esp_err_t device_link_security_load_auth_record(
+    device_link_security_auth_record_t *record)
+{
+    if (record == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t size = sizeof(*record);
+    const esp_err_t result =
+        nv_storage_get_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
+                            record, &size);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (size != sizeof(*record) || !_device_link_security_record_valid(record))
+    {
+        _device_link_security_zeroize(record, sizeof(*record));
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t device_link_security_erase_auth_record(void)
+{
+    return nv_storage_erase_key(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY);
+}
+
+esp_err_t device_link_security_derive_long_term_verifier(
+    const uint8_t *password, size_t password_len,
+    uint8_t salt[DEVICE_LINK_SECURITY_AUTH_SALT_BYTES],
+    uint8_t verifier[DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES])
+{
+    if (password == NULL || password_len == 0U ||
+            salt == NULL || verifier == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char *srp_salt = NULL;
+    char *srp_verifier = NULL;
+    int verifier_len = 0;
+    const char *username = s_security.config.username != NULL ?
+                           s_security.config.username :
+                           DEVICE_LINK_SECURITY_USERNAME;
+    const esp_err_t result = esp_srp_gen_salt_verifier(
+                                 username, (int)strlen(username),
+                                 (const char *)password, (int)password_len,
+                                 &srp_salt, DEVICE_LINK_SECURITY_SALT_BYTES,
+                                 &srp_verifier, &verifier_len);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (srp_salt == NULL || srp_verifier == NULL ||
+            verifier_len != DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES)
+    {
+        free(srp_salt);
+        free(srp_verifier);
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(salt, srp_salt, DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    memcpy(verifier, srp_verifier,
+           DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
+    _device_link_security_zeroize(srp_salt, DEVICE_LINK_SECURITY_SALT_BYTES);
+    _device_link_security_zeroize(srp_verifier,
+                                  (size_t)verifier_len);
+    free(srp_salt);
+    free(srp_verifier);
+    return ESP_OK;
+}
+
+esp_err_t device_link_security_load_long_term_verifier(void)
+{
+    _device_link_security_lock();
+    if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    const esp_err_t load_result =
+        device_link_security_load_auth_record(&record);
+
+    if (load_result != ESP_OK)
+    {
+        _device_link_security_unlock();
+        return load_result;
+    }
+    /* Tear the old Protocomm instance down before freeing the verifier it
+     * references, then install the long-term salt and verifier. */
+    _device_link_security_teardown_protocomm();
+    _device_link_security_free_verifier();
+    s_security.salt = malloc(DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    s_security.verifier = malloc(DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
+    if (s_security.salt == NULL || s_security.verifier == NULL)
+    {
+        _device_link_security_free_verifier();
+        _device_link_security_zeroize(&record, sizeof(record));
+        _device_link_security_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(s_security.salt, record.salt,
+           DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    memcpy(s_security.verifier, record.verifier,
+           DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
+    s_security.salt_len = DEVICE_LINK_SECURITY_AUTH_SALT_BYTES;
+    s_security.verifier_len = DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES;
+    s_security.verifier_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+    _device_link_security_zeroize(&record, sizeof(record));
+    const esp_err_t result = _device_link_security_rebuild();
+
+    _device_link_security_unlock();
+    return result;
 }
