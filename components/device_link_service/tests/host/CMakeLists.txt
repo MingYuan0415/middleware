@@ -29,6 +29,7 @@ add_executable(test_device_link_service
 target_compile_features(test_device_link_service PRIVATE c_std_11)
 target_compile_definitions(test_device_link_service PRIVATE
     _POSIX_C_SOURCE=200809L
+    UNIT_TEST_HOST
     CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144
     CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
 )

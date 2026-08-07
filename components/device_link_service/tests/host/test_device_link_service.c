@@ -39,6 +39,7 @@ static uint8_t s_adv_service_data[5];
 static size_t s_adv_service_data_len;
 static unsigned s_adv_start_count;
 static unsigned s_adv_stop_count;
+static bool s_fail_adv_start;
 static bool s_port_started;
 static bool s_port_stopped;
 
@@ -64,6 +65,10 @@ static esp_err_t _fake_adv_start(const ble_port_adv_config_t *config)
     if (config == NULL)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_fail_adv_start)
+    {
+        return ESP_FAIL;
     }
     s_adv_started = true;
     s_adv_stopped = false;
@@ -155,11 +160,10 @@ static const ble_runtime_host_port_t s_test_port =
 static device_link_service_config_t s_config;
 static uint8_t s_random_counter;
 
-EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
-
 static pthread_mutex_t s_publish_lock = PTHREAD_MUTEX_INITIALIZER;
 static device_link_service_snapshot_t s_last_published;
 static bool s_published;
+static unsigned s_publish_count_value;
 
 esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
                             const void *payload, size_t payload_size,
@@ -173,8 +177,37 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
     (void)pthread_mutex_lock(&s_publish_lock);
     memcpy(&s_last_published, payload, sizeof(s_last_published));
     s_published = true;
+    s_publish_count_value++;
     (void)pthread_mutex_unlock(&s_publish_lock);
     return ESP_OK;
+}
+
+static unsigned _publish_count(void)
+{
+    (void)pthread_mutex_lock(&s_publish_lock);
+    const unsigned count = s_publish_count_value;
+
+    (void)pthread_mutex_unlock(&s_publish_lock);
+    return count;
+}
+
+static unsigned _wait_publish_count(unsigned minimum, uint32_t timeout_ms)
+{
+    for (uint32_t elapsed = 0U; elapsed < timeout_ms; elapsed += 2U)
+    {
+        if (_publish_count() >= minimum)
+        {
+            return _publish_count();
+        }
+        const struct timespec delay =
+        {
+            .tv_sec = 0,
+            .tv_nsec = 2000000L,
+        };
+
+        (void)nanosleep(&delay, NULL);
+    }
+    return _publish_count();
 }
 
 void esp_fill_random(void *buf, size_t len)
@@ -202,6 +235,7 @@ static void _reset_host(void)
     s_port_stopped = false;
     (void)pthread_mutex_lock(&s_publish_lock);
     s_published = false;
+    s_publish_count_value = 0U;
     memset(&s_last_published, 0, sizeof(s_last_published));
     (void)pthread_mutex_unlock(&s_publish_lock);
 }
@@ -224,7 +258,7 @@ static void _adv_feed_stopped(void)
     memset(&event, 0, sizeof(event));
     event.type = BLE_PORT_EVENT_ADV_STOPPED;
     event.status = 0;
-    assert(ble_adv_manager_handle_event(&event) == ESP_OK);
+    (void)ble_adv_manager_handle_event(&event);
     if (s_adv_started)
     {
         _adv_feed_started();
@@ -302,6 +336,36 @@ static bool _status_connected_now(void)
 static bool _status_disconnected(void)
 {
     return _status_connected(false);
+}
+
+static bool _status_suspended(void)
+{
+    device_link_service_status_t status;
+
+    return device_link_service_get_status(&status) == ESP_OK &&
+           status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED;
+}
+
+static bool _status_advertising(void)
+{
+    device_link_service_status_t status;
+
+    return device_link_service_get_status(&status) == ESP_OK &&
+           status.state == DEVICE_LINK_SERVICE_STATE_ADVERTISING;
+}
+
+static void _pump_ms(uint32_t ms)
+{
+    const struct timespec delay =
+    {
+        .tv_sec = 0,
+        .tv_nsec = 1000000L,
+    };
+
+    for (uint32_t elapsed = 0U; elapsed < ms; elapsed += 2U)
+    {
+        (void)nanosleep(&delay, NULL);
+    }
 }
 
 static void _init_service(void)
@@ -558,6 +622,16 @@ static void _test_connect_events(void)
     assert(status.state == DEVICE_LINK_SERVICE_STATE_CONNECTED);
     assert(device_link_service_is_busy());
 
+    /* A late disconnect for a retired handle must not clear the live
+     * connection. */
+    memset(&event, 0, sizeof(event));
+    event.type = BLE_PORT_EVENT_DISCONNECT;
+    event.conn_handle = 7U;
+    assert(ble_event_router_dispatch(&event) == ESP_OK);
+    _pump_ms(20U);
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(status.client_connected);
+
     memset(&event, 0, sizeof(event));
     event.type = BLE_PORT_EVENT_DISCONNECT;
     event.conn_handle = 1U;
@@ -579,19 +653,31 @@ static void _test_suspend_resume(void)
     assert(device_link_service_suspend(0U) == ESP_OK);
     device_link_service_status_t status;
 
+    assert(_wait_for(
+               _status_suspended, 500U));
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(status.state == DEVICE_LINK_SERVICE_STATE_SUSPENDED);
     assert(device_link_service_open_window() == ESP_ERR_INVALID_STATE);
     assert(device_link_service_resume(0U) == ESP_OK);
     assert(device_link_service_resume(0U) == ESP_OK);
+    assert(_wait_for(_status_advertising, 500U));
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.active);
+    assert(status.state == DEVICE_LINK_SERVICE_STATE_ADVERTISING);
+
+    /* Resume restores the idle state only; the window opens exclusively on
+     * an explicit user open. */
+    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
+    size_t qr_length = 0U;
+
+    assert(device_link_service_copy_qr(
+               qr, sizeof(qr), &qr_length) == ESP_ERR_NOT_FOUND);
+    assert(device_link_service_open_window() == ESP_OK);
     assert(_wait_for(_status_active, 500U));
     _adv_converge();
     assert(device_link_service_get_status(&status) == ESP_OK);
     assert(status.active);
     assert(status.state == DEVICE_LINK_SERVICE_STATE_WINDOW);
-
-    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
-    size_t qr_length = 0U;
     char first_discriminator[5];
 
     assert(device_link_service_copy_qr(qr, sizeof(qr), &qr_length) == ESP_OK);
@@ -602,14 +688,109 @@ static void _test_suspend_resume(void)
     _adv_converge();
     assert(device_link_service_suspend(0U) == ESP_OK);
     assert(device_link_service_resume(0U) == ESP_OK);
+    assert(_wait_for(_status_advertising, 500U));
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.active);
+    assert(device_link_service_copy_qr(
+               qr, sizeof(qr), &qr_length) == ESP_ERR_NOT_FOUND);
+    _deinit_service();
+}
+
+static void _test_close_after_pending_open(void)
+{
+    _reset_host();
+    _init_service();
+
+    /* A close issued immediately after an open must land after it in the
+     * worker FIFO, so the pending open can never outlive its owner. */
+    assert(device_link_service_open_window() == ESP_OK);
+    assert(device_link_service_close_window() == ESP_OK);
+    assert(_wait_for(_status_not_active, 500U));
+    device_link_service_status_t status;
+
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.active);
+    assert(!status.qr_ready);
+    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
+    size_t qr_length = 0U;
+
+    assert(device_link_service_copy_qr(
+               qr, sizeof(qr), &qr_length) == ESP_ERR_NOT_FOUND);
+    _deinit_service();
+}
+
+static void _test_remaining_time_publishes_periodically(void)
+{
+    _reset_host();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = 60000U;
+    assert(device_link_service_init(&s_config) == ESP_OK);
+    _adv_converge();
+    assert(_wait_for(_status_available, 500U));
+
+    assert(device_link_service_open_window() == ESP_OK);
     assert(_wait_for(_status_active, 500U));
     _adv_converge();
-    char second_discriminator[5];
+    const unsigned before = _publish_count();
 
-    assert(device_link_service_copy_qr(qr, sizeof(qr), &qr_length) == ESP_OK);
-    assert(_qr_field(qr, "discriminator", second_discriminator,
-                     sizeof(second_discriminator)) != NULL);
-    assert(strcmp(first_discriminator, second_discriminator) != 0);
+    host_freertos_advance_ticks(1100U);
+    const unsigned first = _wait_publish_count(before + 1U, 500U);
+
+    assert(first > before);
+    host_freertos_advance_ticks(1100U);
+    const unsigned second = _wait_publish_count(first + 1U, 500U);
+
+    assert(second > first);
+    device_link_service_status_t status;
+
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(status.window_remaining_ms > 0U);
+    assert(status.window_remaining_ms <= s_config.window_ms);
+    _deinit_service();
+}
+
+static bool _status_error_set(void)
+{
+    device_link_service_status_t status;
+
+    return device_link_service_get_status(&status) == ESP_OK &&
+           status.last_error != ESP_OK;
+}
+
+static void _test_open_failure_publishes_error(void)
+{
+    _reset_host();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = 60000U;
+    assert(device_link_service_init(&s_config) == ESP_OK);
+    _adv_converge();
+    assert(_wait_for(_status_available, 500U));
+
+    /* First open converges to a stop; the restart then fails, faulting the
+     * advertising manager. The service window is open but the advertisement
+     * is gone, so the owner closes it. */
+    s_fail_adv_start = true;
+    assert(device_link_service_open_window() == ESP_OK);
+    assert(_wait_for(_status_active, 500U));
+    _adv_feed_stopped();
+    assert(device_link_service_close_window() == ESP_OK);
+    assert(_wait_for(_status_not_active, 500U));
+
+    /* A second open now fails synchronously inside the worker and the
+     * failure is published through last_error without opening a window. */
+    assert(device_link_service_open_window() == ESP_OK);
+    assert(_wait_for(_status_error_set, 500U));
+    device_link_service_status_t status;
+
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.active);
+    assert((ble_link_session_get_state_flags() &
+            BLE_LINK_STATE_FLAG_BINDABLE) == 0U);
+    s_fail_adv_start = false;
     _deinit_service();
 }
 
@@ -652,6 +833,9 @@ int main(void)
     _test_close_window();
     _test_connect_events();
     _test_suspend_resume();
+    _test_close_after_pending_open();
+    _test_remaining_time_publishes_periodically();
+    _test_open_failure_publishes_error();
     _test_deinit_while_window_open();
     _test_reinit_after_deinit();
     puts("device_link_service host tests passed");

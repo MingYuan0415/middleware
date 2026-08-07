@@ -108,9 +108,15 @@ esp_err_t device_link_service_close_window(void);
 esp_err_t device_link_service_suspend(uint32_t timeout_ms);
 
 /**
- * @brief Reopen the binding window after standby rollback or wake.
+ * @brief Restore the idle state after suspend.
+ *
+ * Resume clears the suspended flag only; it never opens a pairing window.
+ * A window is opened exclusively by an explicit
+ * device_link_service_open_window() call from user action, so a wake or
+ * standby rollback cannot create binding material silently.
+ *
  * @param[in] timeout_ms Reserved for lifecycle symmetry.
- * @return ESP_OK when idle; otherwise a lifecycle error.
+ * @return ESP_OK when admitted; otherwise a lifecycle error.
  */
 esp_err_t device_link_service_resume(uint32_t timeout_ms);
 
@@ -141,6 +147,13 @@ bool device_link_service_is_active(void);
 
 /**
  * @brief Report whether the service blocks standby.
+ *
+ * Interim policy: any open binding window or any connected ACL blocks
+ * light sleep, because the transport cannot yet distinguish an authorized
+ * session from a public link_state reader and has no disconnect path.
+ * Once P3.3/P3.4 provide session-aware state and a disconnect API, an idle
+ * unauthenticated ACL should quiesce instead of blocking standby.
+ *
  * @return true while a window is open or a client is connected.
  */
 bool device_link_service_is_busy(void);

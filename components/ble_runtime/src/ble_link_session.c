@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -25,7 +26,9 @@ typedef struct ble_link_session
     bool authorized;
     uint32_t authorization_revision;
     bool bound;                  /**< Committed authorization record exists. */
-    bool pairing_window_open;
+    /* The pairing window is written by the project-core device-link worker
+     * and read by NimBLE host-core admission paths, so it must be atomic. */
+    atomic_bool pairing_window_open;
 } ble_link_session_t;
 
 static ble_link_session_t s_session;
@@ -33,6 +36,7 @@ static ble_link_session_t s_session;
 void ble_link_session_init(uint64_t boot_id)
 {
     memset(&s_session, 0, sizeof(s_session));
+    atomic_init(&s_session.pairing_window_open, false);
     s_session.boot_id = boot_id;
 }
 
@@ -45,6 +49,7 @@ void ble_link_session_reset(void)
     const uint32_t epoch = s_session.security2_epoch;
 
     memset(&s_session, 0, sizeof(s_session));
+    atomic_init(&s_session.pairing_window_open, false);
     s_session.boot_id = boot_id;
     s_session.security2_epoch = epoch;
 }
@@ -58,7 +63,8 @@ void ble_link_session_test_set_epoch(uint32_t value)
 
 void ble_link_session_set_pairing_window(bool open)
 {
-    s_session.pairing_window_open = open;
+    atomic_store_explicit(&s_session.pairing_window_open, open,
+                          memory_order_release);
 }
 
 void ble_link_session_clear_link_security(uint32_t generation)
@@ -354,7 +360,8 @@ uint32_t ble_link_session_get_state_flags(void)
 {
     uint32_t flags = 0U;
 
-    if (s_session.pairing_window_open)
+    if (atomic_load_explicit(&s_session.pairing_window_open,
+                             memory_order_acquire))
     {
         flags |= BLE_LINK_STATE_FLAG_BINDABLE;
     }

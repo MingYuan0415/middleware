@@ -31,6 +31,7 @@
 #define DEVICE_LINK_SERVICE_QR_SERVICE_UUID \
     "3e203192-b4bb-4e59-a28a-3d1157854ea3"
 #define DEVICE_LINK_SERVICE_WORKER_POLL_MS 100U
+#define DEVICE_LINK_SERVICE_REMAINING_PUBLISH_MS 1000U
 
 typedef enum
 {
@@ -47,7 +48,6 @@ typedef enum
     DEVICE_LINK_SERVICE_COMMAND_CLOSE,
     DEVICE_LINK_SERVICE_COMMAND_SUSPEND,
     DEVICE_LINK_SERVICE_COMMAND_RESUME,
-    DEVICE_LINK_SERVICE_COMMAND_PUBLISH,
     DEVICE_LINK_SERVICE_COMMAND_DEINIT,
 } device_link_service_command_type_t;
 
@@ -81,12 +81,14 @@ typedef struct device_link_service
     bool bindable_lease_held;
     uint8_t bindable_lease_id;
     bool client_connected;
+    uint16_t client_conn_handle; /**< Accepted ACL handle, 0 when idle. */
     bool suspended;
     bool qr_ready;
     uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
     uint8_t pop[DEVICE_LINK_SERVICE_POP_BYTES];
     char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
     TickType_t window_deadline;
+    TickType_t last_remaining_publish;
 } device_link_service_t;
 
 static device_link_service_t s_service;
@@ -94,8 +96,19 @@ static atomic_int s_lifecycle = ATOMIC_VAR_INIT(
                                     DEVICE_LINK_SERVICE_LIFECYCLE_UNINITIALIZED);
 static atomic_uint s_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_uint s_worker_result = ATOMIC_VAR_INIT(0U);
+static atomic_bool s_worker_exited = ATOMIC_VAR_INIT(false);
 
 EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
+
+static void _device_link_service_zeroize(void *data, size_t size)
+{
+    volatile uint8_t *bytes = (volatile uint8_t *)data;
+
+    for (size_t i = 0U; i < size; ++i)
+    {
+        bytes[i] = 0U;
+    }
+}
 
 static void _device_link_service_base64url(
     const uint8_t *input, size_t input_length, char *output)
@@ -138,9 +151,10 @@ static void _device_link_service_base64url(
 
 static void _device_link_service_zero_secrets(void)
 {
-    memset(s_service.discriminator, 0, sizeof(s_service.discriminator));
-    memset(s_service.pop, 0, sizeof(s_service.pop));
-    memset(s_service.qr, 0, sizeof(s_service.qr));
+    _device_link_service_zeroize(s_service.discriminator,
+                                 sizeof(s_service.discriminator));
+    _device_link_service_zeroize(s_service.pop, sizeof(s_service.pop));
+    _device_link_service_zeroize(s_service.qr, sizeof(s_service.qr));
 }
 
 static bool _device_link_service_api_acquire(void)
@@ -175,12 +189,6 @@ static void _device_link_service_publish_now(
         DEVICE_LINK_SERVICE_MSG,
         DEVICE_LINK_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT,
         snapshot, sizeof(*snapshot), EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
-}
-
-static void _device_link_service_publish_locked(void)
-{
-    s_service.snapshot.generation++;
-    _device_link_service_publish_now(&s_service.snapshot);
 }
 
 static bool _device_link_service_tick_reached(TickType_t now,
@@ -239,6 +247,10 @@ static esp_err_t _device_link_service_open_window_locked(void)
     }
     uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
     uint8_t pop[DEVICE_LINK_SERVICE_POP_BYTES];
+    char discriminator_b64[5];
+    char pop_b64[23];
+    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
+    esp_err_t result = ESP_OK;
 
     esp_fill_random(discriminator, sizeof(discriminator));
     esp_fill_random(pop, sizeof(pop));
@@ -257,13 +269,9 @@ static esp_err_t _device_link_service_open_window_locked(void)
     {
         pop[sizeof(pop) - 1U] = 0x5aU;
     }
-    char discriminator_b64[5];
-    char pop_b64[23];
-
     _device_link_service_base64url(
         discriminator, sizeof(discriminator), discriminator_b64);
     _device_link_service_base64url(pop, sizeof(pop), pop_b64);
-    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
     const int qr_length = snprintf(
                               qr, sizeof(qr),
                               "{\"ver\":\"%s\",\"name\":\"%s\","
@@ -277,21 +285,30 @@ static esp_err_t _device_link_service_open_window_locked(void)
 
     if (qr_length <= 0 || (size_t)qr_length >= sizeof(qr))
     {
-        return ESP_ERR_INVALID_SIZE;
+        result = ESP_ERR_INVALID_SIZE;
+        goto exit;
     }
-    ble_adv_lease_t lease;
-
-    esp_err_t result = ble_adv_manager_acquire_lease(
-                           &lease, BLE_ADV_MANAGER_MODE_FAST, true,
-                           discriminator);
-
-    if (result != ESP_OK)
     {
-        return result;
+        ble_adv_lease_t lease;
+
+        memset(&lease, 0, sizeof(lease));
+        result = ble_adv_manager_acquire_lease(
+                     &lease, BLE_ADV_MANAGER_MODE_FAST, true, discriminator);
+        if (result != ESP_OK)
+        {
+            /* The manager may have installed the lease before reporting a
+             * convergence error; release it so no bindable advertisement
+             * outlives the failed window. */
+            if (lease.lease_id != 0U)
+            {
+                (void)ble_adv_manager_release_lease(lease.lease_id);
+            }
+            goto exit;
+        }
+        ble_link_session_set_pairing_window(true);
+        s_service.bindable_lease_held = true;
+        s_service.bindable_lease_id = lease.lease_id;
     }
-    ble_link_session_set_pairing_window(true);
-    s_service.bindable_lease_held = true;
-    s_service.bindable_lease_id = lease.lease_id;
     memcpy(s_service.discriminator, discriminator,
            sizeof(s_service.discriminator));
     memcpy(s_service.pop, pop, sizeof(s_service.pop));
@@ -301,8 +318,18 @@ static esp_err_t _device_link_service_open_window_locked(void)
     s_service.suspended = false;
     s_service.window_deadline =
         xTaskGetTickCount() + pdMS_TO_TICKS(s_service.config.window_ms);
+    s_service.last_remaining_publish = xTaskGetTickCount();
     s_service.snapshot.last_error = ESP_OK;
-    return ESP_OK;
+
+exit:
+    /* The worker stack is static and long-lived: every secret-bearing
+     * temporary must be erased on every path, success or failure. */
+    _device_link_service_zeroize(discriminator, sizeof(discriminator));
+    _device_link_service_zeroize(pop, sizeof(pop));
+    _device_link_service_zeroize(discriminator_b64, sizeof(discriminator_b64));
+    _device_link_service_zeroize(pop_b64, sizeof(pop_b64));
+    _device_link_service_zeroize(qr, sizeof(qr));
+    return result;
 }
 
 static void _device_link_service_close_window_locked(void)
@@ -327,10 +354,12 @@ static void _device_link_service_ble_event(
     const ble_port_event_t *event, void *arg)
 {
     (void)arg;
+    device_link_service_snapshot_t snapshot;
     bool publish = false;
 
     if (event->type != BLE_PORT_EVENT_CONNECT &&
-            event->type != BLE_PORT_EVENT_DISCONNECT)
+            event->type != BLE_PORT_EVENT_DISCONNECT &&
+            event->type != BLE_PORT_EVENT_RESET)
     {
         return;
     }
@@ -345,67 +374,124 @@ static void _device_link_service_ble_event(
         if (event->type == BLE_PORT_EVENT_CONNECT && event->status == 0)
         {
             s_service.client_connected = true;
+            s_service.client_conn_handle = event->conn_handle;
             publish = true;
         }
-        else if (event->type == BLE_PORT_EVENT_DISCONNECT)
+        else if (event->type == BLE_PORT_EVENT_DISCONNECT &&
+                 event->conn_handle == s_service.client_conn_handle)
+        {
+            /* A late disconnect for a retired connection must not clear a
+             * newer one. */
+            s_service.client_connected = false;
+            s_service.client_conn_handle = 0U;
+            publish = true;
+        }
+        else if (event->type == BLE_PORT_EVENT_RESET)
         {
             s_service.client_connected = false;
+            s_service.client_conn_handle = 0U;
             publish = true;
         }
         if (publish)
         {
             _device_link_service_refresh_snapshot_locked();
-            _device_link_service_publish_locked();
+            s_service.snapshot.generation++;
+            snapshot = s_service.snapshot;
         }
     }
     xSemaphoreGive(s_service.mutex);
+    if (publish)
+    {
+        _device_link_service_publish_now(&snapshot);
+    }
     _device_link_service_api_release();
 }
 
-static esp_err_t _device_link_service_handle_command(
+static void _device_link_service_handle_command(
     const device_link_service_command_t *command)
 {
-    esp_err_t result = ESP_OK;
-
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     switch (command->type)
     {
     case DEVICE_LINK_SERVICE_COMMAND_OPEN:
-        result = _device_link_service_open_window_locked();
-        if (result != ESP_OK)
-        {
-            s_service.snapshot.last_error = result;
-        }
+    {
+        const esp_err_t open_result =
+            _device_link_service_open_window_locked();
+
+        s_service.snapshot.last_error = open_result;
         break;
+    }
     case DEVICE_LINK_SERVICE_COMMAND_CLOSE:
         _device_link_service_close_window_locked();
+        s_service.snapshot.last_error = ESP_OK;
         break;
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
-        s_service.suspended = true;
-        break;
-    case DEVICE_LINK_SERVICE_COMMAND_RESUME:
-        s_service.suspended = false;
-        result = _device_link_service_open_window_locked();
-        if (result != ESP_OK)
+        if (s_service.window_open)
         {
-            s_service.snapshot.last_error = result;
+            s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
+        }
+        else
+        {
+            s_service.suspended = true;
+            s_service.snapshot.last_error = ESP_OK;
         }
         break;
-    case DEVICE_LINK_SERVICE_COMMAND_PUBLISH:
+    case DEVICE_LINK_SERVICE_COMMAND_RESUME:
+        /* Resume only restores the pre-suspend idle state; it never opens a
+         * pairing window. A window is opened only by an explicit user
+         * action through device_link_service_open_window(). */
+        s_service.suspended = false;
+        s_service.snapshot.last_error = ESP_OK;
         break;
     case DEVICE_LINK_SERVICE_COMMAND_DEINIT:
         break;
     default:
-        result = ESP_ERR_INVALID_ARG;
+        s_service.snapshot.last_error = ESP_ERR_INVALID_ARG;
         break;
     }
-    if (result == ESP_OK)
+    _device_link_service_refresh_snapshot_locked();
+    s_service.snapshot.generation++;
+    {
+        device_link_service_snapshot_t snapshot = s_service.snapshot;
+
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+    }
+}
+
+static void _device_link_service_worker_tick(void)
+{
+    bool publish = false;
+    device_link_service_snapshot_t snapshot;
+
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (s_service.window_open)
+    {
+        const TickType_t now = xTaskGetTickCount();
+
+        if (_device_link_service_tick_reached(now, s_service.window_deadline))
+        {
+            _device_link_service_close_window_locked();
+            publish = true;
+        }
+        else if (now - s_service.last_remaining_publish >=
+                 pdMS_TO_TICKS(DEVICE_LINK_SERVICE_REMAINING_PUBLISH_MS))
+        {
+            s_service.last_remaining_publish = now;
+            publish = true;
+        }
+    }
+    if (publish)
     {
         _device_link_service_refresh_snapshot_locked();
-        _device_link_service_publish_locked();
+        s_service.snapshot.generation++;
+        snapshot = s_service.snapshot;
     }
     xSemaphoreGive(s_service.mutex);
-    return result;
+    if (publish)
+    {
+        _device_link_service_publish_now(&snapshot);
+    }
 }
 
 static void _device_link_service_worker(void *arg)
@@ -423,19 +509,10 @@ static void _device_link_service_worker(void *arg)
             {
                 break;
             }
-            (void)_device_link_service_handle_command(&command);
+            _device_link_service_handle_command(&command);
+            continue;
         }
-        /* The poll tick also serves the binding window deadline. */
-        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        if (s_service.window_open &&
-                _device_link_service_tick_reached(
-                    xTaskGetTickCount(), s_service.window_deadline))
-        {
-            _device_link_service_close_window_locked();
-            _device_link_service_refresh_snapshot_locked();
-            _device_link_service_publish_locked();
-        }
-        xSemaphoreGive(s_service.mutex);
+        _device_link_service_worker_tick();
     }
     /* DEINIT: release every lease and clear secrets before the runtime
      * teardown that follows worker exit. */
@@ -448,12 +525,24 @@ static void _device_link_service_worker(void *arg)
     }
     s_service.snapshot.available = false;
     _device_link_service_refresh_snapshot_locked();
-    _device_link_service_publish_locked();
-    xSemaphoreGive(s_service.mutex);
+    s_service.snapshot.generation++;
+    {
+        device_link_service_snapshot_t snapshot = s_service.snapshot;
+
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+    }
     atomic_store_explicit(&s_worker_result, ESP_OK,
                           memory_order_release);
+    atomic_store_explicit(&s_worker_exited, true, memory_order_release);
     xSemaphoreGive(s_service.stopped);
+#ifdef UNIT_TEST_HOST
+    /* The host FreeRTOS fake needs the caller-side vTaskDelete to join the
+     * worker thread; on the device the task must delete itself. */
+    return;
+#else
     vTaskDelete(NULL);
+#endif
 }
 
 static esp_err_t _device_link_service_runtime_teardown(void)
@@ -472,7 +561,18 @@ static void _device_link_service_release_resources(void)
 {
     if (s_service.task != NULL)
     {
+#ifdef UNIT_TEST_HOST
+        /* The worker returned from its entry; this vTaskDelete joins its
+         * thread. It is idempotent for an already-joined task. */
         vTaskDelete(s_service.task);
+#else
+        if (!atomic_load_explicit(&s_worker_exited, memory_order_acquire))
+        {
+            /* Rollback path only: the worker never processed DEINIT and is
+             * still alive; the normal path has already self-deleted. */
+            vTaskDelete(s_service.task);
+        }
+#endif
     }
     if (s_service.queue != NULL)
     {
@@ -490,6 +590,7 @@ static void _device_link_service_release_resources(void)
     s_service.queue = NULL;
     s_service.stopped = NULL;
     s_service.mutex = NULL;
+    atomic_store_explicit(&s_worker_exited, false, memory_order_release);
 }
 
 static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
@@ -587,6 +688,7 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         ble_adv_lease_t lease;
 
+        memset(&lease, 0, sizeof(lease));
         result = ble_adv_manager_acquire_lease(
                      &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL);
         if (result == ESP_OK)
@@ -619,8 +721,12 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     s_service.snapshot.available = true;
     s_service.snapshot.state = DEVICE_LINK_SERVICE_STATE_ADVERTISING;
     s_service.snapshot.window_remaining_ms = 0U;
-    _device_link_service_publish_locked();
-    xSemaphoreGive(s_service.mutex);
+    {
+        device_link_service_snapshot_t snapshot = s_service.snapshot;
+
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+    }
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
     return ESP_OK;
 }
@@ -689,9 +795,14 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
     }
     esp_err_t result = ESP_OK;
 
-    if (xSemaphoreTake(s_service.stopped, timeout) != pdTRUE)
+    if (!atomic_load_explicit(&s_worker_exited, memory_order_acquire))
     {
-        return ESP_ERR_TIMEOUT;
+        if (xSemaphoreTake(s_service.stopped, timeout) != pdTRUE)
+        {
+            /* The worker never exited: keep STOPPING so a retry can wait
+             * again instead of resuming a half-torn-down service. */
+            return ESP_ERR_TIMEOUT;
+        }
     }
     result = atomic_load_explicit(&s_worker_result,
                                   memory_order_acquire);
@@ -718,9 +829,8 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
                               memory_order_release);
         return ESP_OK;
     }
-    atomic_store_explicit(&s_lifecycle,
-                          DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
-                          memory_order_release);
+    /* The worker is gone; keep STOPPING so APIs reject access and deinit
+     * can be retried without touching a dead worker. */
     return result;
 }
 
@@ -763,65 +873,21 @@ esp_err_t device_link_service_open_window(void)
 
 esp_err_t device_link_service_close_window(void)
 {
-    if (!_device_link_service_api_acquire())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    bool open = false;
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    open = s_service.window_open;
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_api_release();
-    if (!open)
-    {
-        return ESP_OK;
-    }
+    /* The command is always enqueued: the FIFO ordering guarantees a close
+     * issued after an open always lands after it in the worker, so a
+     * pending open can never outlive its owner's close. */
     return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_CLOSE);
 }
 
 esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 {
     (void)timeout_ms;
-    if (!_device_link_service_api_acquire())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t result = ESP_OK;
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (s_service.window_open)
-    {
-        result = ESP_ERR_INVALID_STATE;
-    }
-    else
-    {
-        s_service.suspended = true;
-        _device_link_service_refresh_snapshot_locked();
-        _device_link_service_publish_locked();
-    }
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_api_release();
-    return result;
+    return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_SUSPEND);
 }
 
 esp_err_t device_link_service_resume(uint32_t timeout_ms)
 {
     (void)timeout_ms;
-    if (!_device_link_service_api_acquire())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    bool suspended = false;
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    suspended = s_service.suspended;
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_api_release();
-    if (!suspended)
-    {
-        return ESP_OK;
-    }
     return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_RESUME);
 }
 
@@ -901,6 +967,9 @@ bool device_link_service_is_busy(void)
         return false;
     }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    /* Interim standby admission: any window or ACL blocks light sleep.
+     * Once P3.3/P3.4 provide session-aware state and a disconnect path, an
+     * idle authenticated-free ACL should quiesce instead of blocking. */
     busy = s_service.window_open || s_service.client_connected;
     xSemaphoreGive(s_service.mutex);
     _device_link_service_api_release();
