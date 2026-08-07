@@ -100,7 +100,13 @@ esp_err_t device_link_security_handshake(
  * The input is the AES-GCM ciphertext of an Envelope. The adapter
  * decrypts it, invokes the request callback with the plaintext, encrypts
  * the callback response, and returns it in @p output (freed by the
- * caller). Requires an AUTHENTICATED session.
+ * caller). Requires an AUTHENTICATED session; the first successful
+ * decrypt is the AUTHENTICATED transition. Ciphertext of 16 bytes or
+ * fewer is malformed and closes the session.
+ *
+ * All adapter entry points are serialized by an internal mutex; the
+ * request callback runs while the lock is held and must not call back
+ * into the adapter.
  *
  * @param[in] input Ciphertext.
  * @param[in] input_len Ciphertext length (must exceed the 16-byte tag).

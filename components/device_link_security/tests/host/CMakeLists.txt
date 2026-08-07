@@ -16,6 +16,7 @@ set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 
 add_executable(test_device_link_security
     test_device_link_security.c
+    "${HOST_CONNECTIVITY}/freertos_host.c"
     "${COMPONENT}/src/device_link_security.c"
 )
 target_compile_features(test_device_link_security PRIVATE c_std_11)

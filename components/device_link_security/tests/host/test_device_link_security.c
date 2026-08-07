@@ -244,7 +244,7 @@ static void _test_bootstrap_lifecycle(void)
 
     assert(device_link_security_handshake(
                (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
-           ESP_ERR_INVALID_ARG);
+           ESP_ERR_INVALID_STATE);
 
     /* Open the window: the adapter rebuilds protocomm with the POP
      * derived salt and verifier. */
@@ -272,10 +272,10 @@ static void _test_bootstrap_lifecycle(void)
     /* A protected frame routes through the app endpoint and the request
      * callback; success marks the session authenticated. */
     assert(device_link_security_unprotect(
-               (const uint8_t *)"cipher", 6U, &out, &out_len) == ESP_OK);
+               (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) == ESP_OK);
     assert(s_app_handle_count == 1U);
-    assert(out_len == 7U);
-    assert(out[6] == 0x7f);
+    assert(out_len == 23U);
+    assert(out[22] == 0x7f);
     assert(device_link_security_is_authenticated());
     free(out);
 
@@ -286,10 +286,10 @@ static void _test_bootstrap_lifecycle(void)
     assert(device_link_security_is_authenticated() == false);
     assert(device_link_security_handshake(
                (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
-           ESP_ERR_INVALID_ARG);
+           ESP_ERR_INVALID_STATE);
     assert(device_link_security_unprotect(
                (const uint8_t *)"cipher", 6U, &out, &out_len) ==
-           ESP_ERR_INVALID_STATE);
+           ESP_ERR_INVALID_ARG);
     device_link_security_deinit();
     /* The close_bootstrap teardown already deleted the instance. */
     assert(s_delete_count == 1U);
@@ -321,7 +321,7 @@ static void _test_failed_handshake_closes_session(void)
     assert(s_close_session_count == 1U);
     assert(!device_link_security_is_authenticated());
     assert(device_link_security_unprotect(
-               (const uint8_t *)"cipher", 6U, &out, &out_len) ==
+               (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
     device_link_security_deinit();
 }
@@ -346,14 +346,18 @@ static void _test_explicit_session_close(void)
                (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
     free(out);
     assert(device_link_security_unprotect(
-               (const uint8_t *)"cipher", 6U, &out, &out_len) == ESP_OK);
+               (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) == ESP_OK);
     free(out);
     device_link_security_close_session();
     assert(s_close_session_count == 1U);
     assert(!device_link_security_is_authenticated());
     assert(device_link_security_unprotect(
-               (const uint8_t *)"cipher", 6U, &out, &out_len) ==
+               (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
+    /* A ciphertext of 16 bytes or fewer is malformed even with a session. */
+    assert(device_link_security_unprotect(
+               (const uint8_t *)"short", 5U, &out, &out_len) ==
+           ESP_ERR_INVALID_ARG);
     device_link_security_deinit();
 }
 
