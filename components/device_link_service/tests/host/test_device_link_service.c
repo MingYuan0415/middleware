@@ -521,20 +521,23 @@ static void _test_start_failure_rolls_back(void)
     assert(host_freertos_live_tasks() == 0U);
 }
 
-static void _test_rollback_runtime_never_initialized(void)
+static void _test_rollback_port_start_failure(void)
 {
     _reset_host();
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
     s_config.window_ms = TEST_WINDOW_MS;
+    /* The port init runs inside ble_runtime_start, so this exercises an
+     * initialized runtime whose port start fails: the rollback must tear
+     * the runtime down and leave a deinit/re-init viable lifecycle. (The
+     * runtime-never-initialized branch of the teardown is defensive only
+     * and is unreachable through the public API.) */
     s_fail_port_init = true;
     assert(device_link_service_init(&s_config) == ESP_FAIL);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
     assert(host_freertos_live_semaphores() == 0U);
-    /* A failed init with no runtime must not wedge the lifecycle: deinit
-     * returns OK and a retry init succeeds. */
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_port_init = false;
@@ -909,7 +912,7 @@ int main(void)
 {
     _test_bad_configuration();
     _test_start_failure_rolls_back();
-    _test_rollback_runtime_never_initialized();
+    _test_rollback_port_start_failure();
     _test_rollback_lease_failure_retryable();
     _test_window_lifecycle();
     _test_close_window();

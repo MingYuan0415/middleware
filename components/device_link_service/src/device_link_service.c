@@ -810,6 +810,13 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
             s_service.slow_lease_held = true;
             s_service.slow_lease_id = lease.lease_id;
         }
+        else if (lease.lease_id != 0U)
+        {
+            /* The manager may have installed the lease before reporting a
+             * convergence error; release it so the rollback does not leak
+             * an installed lease. */
+            (void)ble_adv_manager_release_lease(lease.lease_id);
+        }
     }
     if (result == ESP_OK)
     {
