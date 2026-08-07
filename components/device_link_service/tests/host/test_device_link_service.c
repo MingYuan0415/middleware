@@ -40,6 +40,7 @@ static size_t s_adv_service_data_len;
 static unsigned s_adv_start_count;
 static unsigned s_adv_stop_count;
 static bool s_fail_adv_start;
+static bool s_fail_port_init;
 static bool s_port_started;
 static bool s_port_stopped;
 
@@ -106,6 +107,10 @@ static const ble_runtime_host_port_t s_test_port;
 
 static esp_err_t _fake_port_init(void)
 {
+    if (s_fail_port_init)
+    {
+        return ESP_FAIL;
+    }
     memset(&s_adv_config, 0, sizeof(s_adv_config));
     s_adv_config.fast_interval_ms = TEST_FAST_INTERVAL_MS;
     s_adv_config.slow_interval_ms = TEST_SLOW_INTERVAL_MS;
@@ -231,6 +236,8 @@ static void _reset_host(void)
     s_adv_service_data_len = 0U;
     s_adv_start_count = 0U;
     s_adv_stop_count = 0U;
+    s_fail_adv_start = false;
+    s_fail_port_init = false;
     s_port_started = false;
     s_port_stopped = false;
     (void)pthread_mutex_lock(&s_publish_lock);
@@ -512,6 +519,49 @@ static void _test_start_failure_rolls_back(void)
     assert(device_link_service_init(&s_config) == ESP_ERR_INVALID_ARG);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
+}
+
+static void _test_rollback_runtime_never_initialized(void)
+{
+    _reset_host();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = TEST_WINDOW_MS;
+    s_fail_port_init = true;
+    assert(device_link_service_init(&s_config) == ESP_FAIL);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_tasks() == 0U);
+    assert(host_freertos_live_semaphores() == 0U);
+    /* A failed init with no runtime must not wedge the lifecycle: deinit
+     * returns OK and a retry init succeeds. */
+    assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
+           ESP_OK);
+    s_fail_port_init = false;
+    _init_service();
+    _deinit_service();
+}
+
+static void _test_rollback_lease_failure_retryable(void)
+{
+    _reset_host();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = TEST_WINDOW_MS;
+    /* The slow lease installs, then the convergence restart fails, so the
+     * init rollback must release the lease and tear down the runtime. */
+    s_fail_adv_start = true;
+    assert(device_link_service_init(&s_config) == ESP_FAIL);
+    assert(!s_port_started);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_tasks() == 0U);
+    assert(host_freertos_live_semaphores() == 0U);
+    assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
+           ESP_OK);
+    s_fail_adv_start = false;
+    _init_service();
+    _deinit_service();
 }
 
 static void _test_window_lifecycle(void)
@@ -859,6 +909,8 @@ int main(void)
 {
     _test_bad_configuration();
     _test_start_failure_rolls_back();
+    _test_rollback_runtime_never_initialized();
+    _test_rollback_lease_failure_retryable();
     _test_window_lifecycle();
     _test_close_window();
     _test_connect_events();

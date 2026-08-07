@@ -75,6 +75,7 @@ typedef struct device_link_service
                            sizeof(StackType_t)];
     StaticTask_t task_control;
     bool runtime_started;
+    bool runtime_initialized;
     bool router_registered;
     bool slow_lease_held;
     uint8_t slow_lease_id;
@@ -617,7 +618,17 @@ static esp_err_t _device_link_service_runtime_teardown(void)
         return result;
     }
     s_service.runtime_started = false;
-    return ble_runtime_deinit();
+    if (!s_service.runtime_initialized)
+    {
+        /* Nothing was ever initialized; deinit would be invalid. */
+        return ESP_OK;
+    }
+    result = ble_runtime_deinit();
+    if (result == ESP_OK)
+    {
+        s_service.runtime_initialized = false;
+    }
+    return result;
 }
 
 static void _device_link_service_release_resources(void)
@@ -763,11 +774,14 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     esp_err_t result = s_service.mutex != NULL && s_service.stopped != NULL &&
                        s_service.queue != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 
+    atomic_store_explicit(&s_worker_result, ESP_OK,
+                          memory_order_release);
     if (result == ESP_OK)
     {
         memset(&s_service.runtime_config, 0, sizeof(s_service.runtime_config));
         s_service.runtime_config.port = config->runtime_port;
         result = ble_runtime_init(&s_service.runtime_config);
+        s_service.runtime_initialized = result == ESP_OK;
     }
     if (result == ESP_OK)
     {
@@ -811,8 +825,6 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         return _device_link_service_rollback_init(result);
     }
-    atomic_store_explicit(&s_worker_result, ESP_OK,
-                          memory_order_release);
     /* The initial snapshot is prepared under the lock and copied before
      * RUNNING is exposed, so the publish afterwards never touches service
      * state: get_status sees a complete snapshot, a publisher-context
