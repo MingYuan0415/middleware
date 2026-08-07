@@ -661,13 +661,6 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
     atomic_store_explicit(&s_lifecycle,
                           DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
                           memory_order_release);
-    if (s_service.router_registered)
-    {
-        cleanup_result = ble_event_router_unregister(
-                             _device_link_service_ble_event, NULL);
-        s_service.router_registered =
-            cleanup_result == ESP_OK || cleanup_result == ESP_ERR_NOT_FOUND;
-    }
     while (atomic_load_explicit(&s_api_users, memory_order_acquire) != 0U)
     {
         vTaskDelay(1U);
@@ -681,6 +674,14 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
     if (cleanup_result == ESP_OK)
     {
         cleanup_result = _device_link_service_runtime_teardown();
+    }
+    if (cleanup_result == ESP_OK && s_service.router_registered)
+    {
+        /* Unregister only after the host task stopped. */
+        cleanup_result = ble_event_router_unregister(
+                             _device_link_service_ble_event, NULL);
+        s_service.router_registered =
+            cleanup_result == ESP_OK || cleanup_result == ESP_ERR_NOT_FOUND;
     }
     if (cleanup_result == ESP_OK)
     {
@@ -754,14 +755,18 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     if (result == ESP_OK)
     {
-        result = ble_runtime_start();
-        s_service.runtime_started = result == ESP_OK;
-    }
-    if (result == ESP_OK)
-    {
+        /* The router callback registers before the host task starts (the
+         * router table is unsynchronized and the production port follows
+         * the same register-before-run pattern), so registration never
+         * races a dispatch. */
         result = ble_event_router_register(
                      _device_link_service_ble_event, NULL);
         s_service.router_registered = result == ESP_OK;
+    }
+    if (result == ESP_OK)
+    {
+        result = ble_runtime_start();
+        s_service.runtime_started = result == ESP_OK;
     }
     if (result == ESP_OK)
     {
@@ -911,6 +916,12 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
                                   memory_order_acquire);
     if (result == ESP_OK)
     {
+        result = _device_link_service_runtime_teardown();
+    }
+    if (result == ESP_OK)
+    {
+        /* Unregister only after the host task stopped, so the router table
+         * is never mutated while a dispatch runs. */
         result = ble_event_router_unregister(
                      _device_link_service_ble_event, NULL);
         if (result == ESP_ERR_NOT_FOUND)
@@ -918,10 +929,6 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
             result = ESP_OK;
         }
         s_service.router_registered = false;
-    }
-    if (result == ESP_OK)
-    {
-        result = _device_link_service_runtime_teardown();
     }
     if (result == ESP_OK)
     {
@@ -994,8 +1001,14 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
      * same mutex, so concurrent suspend callers cannot reorder: the FIFO
      * application order matches the sequence order and the acknowledgement
      * always refers to this exact command. The nonblocking send cannot
-     * block while the worker briefly holds the mutex. */
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+     * block while the worker briefly holds the mutex. The take is bounded
+     * so a finite timeout also bounds this phase. */
+    if (xSemaphoreTake(s_service.mutex,
+                       pdMS_TO_TICKS(50U)) != pdTRUE)
+    {
+        _device_link_service_api_release();
+        return ESP_ERR_TIMEOUT;
+    }
     if (s_suspend_next != UINT32_MAX)
     {
         expected_sequence = ++s_suspend_next;
