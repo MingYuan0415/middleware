@@ -691,7 +691,17 @@ static void _ble_nimble_port_link_gatt_consumer(
         if (snapshot.connected &&
                 event->conn_handle == snapshot.conn_handle)
         {
-            ble_link_gatt_set_connection(generation, event->conn_handle);
+            struct ble_gap_conn_desc desc;
+            uint8_t peer_type = 0U;
+            uint8_t peer_addr[6] = {0};
+
+            if (ble_gap_conn_find(event->conn_handle, &desc) == 0)
+            {
+                peer_type = desc.peer_id_addr.type;
+                memcpy(peer_addr, desc.peer_id_addr.val, 6U);
+            }
+            ble_link_gatt_set_connection(generation, event->conn_handle,
+                                         peer_type, peer_addr);
             (void)ble_link_session_handle_event(
                 generation, BLE_LINK_SESSION_EVENT_ACL_CONNECTED);
             /* Remember the connection identity and generation; the idle
@@ -715,8 +725,12 @@ static void _ble_nimble_port_link_gatt_consumer(
             false, generation, BLE_LINK_SERVICE_RX_CONTROL);
         _ble_nimble_port_arm_indication_timeout(false, 0U, 0U);
         /* A disconnect with an unconfirmed response must not leave the
-         * transaction gate busy for the next connection. */
+         * transaction gate busy for the next connection, and the Security
+         * 2 session must not survive into the next connection (cross-
+         * connection state reuse). */
         ble_link_service_abort_transactions();
+        _ble_nimble_port_sec_close_session();
+        ble_link_service_clear_session_state();
         s_link_conn_handle = 0U;
         break;
     case BLE_PORT_EVENT_ENC_CHANGE:
@@ -1220,6 +1234,9 @@ static int _ble_nimble_port_gap_event(
                               &desc) == 0)
         {
             s_port.conn_had_bond = _ble_nimble_port_peer_has_bond(&desc);
+            ble_link_gatt_set_connection(
+                s_timer_generation, event->identity_resolved.conn_handle,
+                desc.peer_id_addr.type, desc.peer_id_addr.val);
         }
     }
     return 0;
@@ -2040,6 +2057,21 @@ static esp_err_t _ble_nimble_port_init(void)
             s_port.link_security_initialized = true;
         }
         result = ble_link_gatt_init(&gatt_config);
+        if (result == ESP_OK)
+        {
+            /* A committed authorization record grants reconnects: load
+             * the long-term verifier so an outside-window handshake can
+             * succeed after a reboot. NOT_FOUND is the unbound state. */
+            const esp_err_t long_term_result =
+                device_link_security_load_long_term_verifier();
+
+            if (long_term_result != ESP_OK &&
+                    long_term_result != ESP_ERR_NOT_FOUND)
+            {
+                ESP_LOGW(TAG, "long-term verifier load failed (%d)",
+                         long_term_result);
+            }
+        }
         if (result != ESP_OK)
         {
             return result;

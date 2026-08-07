@@ -22,6 +22,8 @@ typedef struct ble_link_gatt_config
     uint64_t boot_id;             /**< Fresh nonzero value for this boot. */
     uint32_t connection_generation; /**< Current connection generation. */
     uint16_t conn_handle;         /**< Active connection handle. */
+    uint8_t peer_addr_type;       /**< SMP peer identity address type. */
+    uint8_t peer_addr[6];         /**< SMP peer identity address. */
     uint16_t att_mtu;             /**< Negotiated ATT MTU, 23 default. */
     size_t tx_queue_depth;        /**< TX scheduler queue depth. */
     void (*publish_link_state)(const uint8_t *value, size_t len,
@@ -91,7 +93,8 @@ esp_err_t ble_link_gatt_refresh_link_state(void);
  * @param[in] conn_handle New connection handle.
  */
 void ble_link_gatt_set_connection(
-    uint32_t generation, uint16_t conn_handle);
+    uint32_t generation, uint16_t conn_handle,
+    uint8_t peer_addr_type, const uint8_t peer_addr[6]);
 
 /**
  * @brief Notify the 5000 ms reassembly idle timeout fired for a generation.

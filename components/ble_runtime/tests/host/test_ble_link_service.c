@@ -157,6 +157,10 @@ static void _set_facts(bool encrypted, bool authenticated, bool authorized)
     s_facts.session_authenticated = authenticated;
     s_facts.authorized = authorized;
     s_facts.identity_known = true;
+    s_facts.peer_addr_type = 1U;
+    memset(s_facts.peer_addr, 0, sizeof(s_facts.peer_addr));
+    s_facts.peer_addr[0] = 0x11U;
+    s_facts.peer_addr[5] = 0xaaU;
     s_facts.secure_connections_bond_verified = true;
 }
 

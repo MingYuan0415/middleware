@@ -224,6 +224,9 @@ static esp_err_t _ble_link_gatt_service_facts(
     out->authorized = session_facts.authorized;
     out->identity_known = identity_known;
     out->secure_connections_bond_verified = bond_verified;
+    out->peer_addr_type = s_gatt.config->peer_addr_type;
+    memcpy(out->peer_addr, s_gatt.config->peer_addr,
+           sizeof(out->peer_addr));
     return ESP_OK;
 }
 
@@ -495,7 +498,8 @@ esp_err_t ble_link_gatt_refresh_link_state(void)
 }
 
 void ble_link_gatt_set_connection(
-    uint32_t generation, uint16_t conn_handle)
+    uint32_t generation, uint16_t conn_handle,
+    uint8_t peer_addr_type, const uint8_t peer_addr[6])
 {
     if (s_gatt.config != NULL)
     {
@@ -504,6 +508,11 @@ void ble_link_gatt_set_connection(
 
         config->connection_generation = generation;
         config->conn_handle = conn_handle;
+        config->peer_addr_type = peer_addr_type;
+        if (peer_addr != NULL)
+        {
+            memcpy(config->peer_addr, peer_addr, 6U);
+        }
     }
 }
 

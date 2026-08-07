@@ -154,8 +154,11 @@ static void test_write_feeds_service(void)
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_handle(
                           control_rx_handle, &characteristic));
-    TEST_ASSERT_EQUAL(0, characteristic->access_cb(
-                          7U, control_rx_handle, &context, NULL));
+    const int cb_result = characteristic->access_cb(
+                              7U, control_rx_handle, &context, NULL);
+
+    fprintf(stderr, "write cb result=%d\n", cb_result);
+    TEST_ASSERT_EQUAL(0, cb_result);
 }
 
 static void test_link_state_read(void)

@@ -82,6 +82,8 @@ typedef struct ble_link_service_facts
     bool authorized;
     bool identity_known;
     bool secure_connections_bond_verified;
+    uint8_t peer_addr_type; /**< SMP peer identity address type. */
+    uint8_t peer_addr[6]; /**< SMP peer identity address. */
 } ble_link_service_facts_t;
 
 /**
@@ -161,6 +163,15 @@ void ble_link_service_abort_transactions(void);
  * Called by the transport when the final fragment's indication confirms.
  */
 void ble_link_service_response_completed(void);
+
+/**
+ * @brief Clear all per-connection session state after a disconnect.
+ *
+ * Resets the reassemblers, subscription, authorization transaction,
+ * dispatcher request ids, and the response transaction gate. The Security
+ * 2 session close is owned by the transport caller.
+ */
+void ble_link_service_clear_session_state(void);
 
 /**
  * @brief Query whether a partial frame is being reassembled on a channel.

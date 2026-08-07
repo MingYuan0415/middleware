@@ -57,8 +57,46 @@ static bool _device_link_security_record_valid(
     {
         return false;
     }
-    return record->magic == DEVICE_LINK_SECURITY_AUTH_MAGIC &&
-           record->schema_version == DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    if (record->magic != DEVICE_LINK_SECURITY_AUTH_MAGIC ||
+            record->schema_version != DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION)
+    {
+        return false;
+    }
+    /* Persisted security material must be structurally sound: a legal
+     * peer identity and nonzero identifiers, salt, and verifier. */
+    if (record->peer_addr_type > 2U)
+    {
+        return false;
+    }
+    bool peer_nonzero = false;
+    bool credential_nonzero = false;
+    bool auth_id_nonzero = false;
+    bool salt_nonzero = false;
+    bool verifier_nonzero = false;
+
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        peer_nonzero = peer_nonzero || record->peer_addr[i] != 0U;
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        credential_nonzero = credential_nonzero ||
+                             record->credential_id[i] != 0U;
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_ID_BYTES; ++i)
+    {
+        auth_id_nonzero = auth_id_nonzero || record->device_auth_id[i] != 0U;
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        salt_nonzero = salt_nonzero || record->salt[i] != 0U;
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        verifier_nonzero = verifier_nonzero || record->verifier[i] != 0U;
+    }
+    return peer_nonzero && credential_nonzero && auth_id_nonzero &&
+           salt_nonzero && verifier_nonzero;
 }
 
 static device_link_security_t s_security;
@@ -372,6 +410,12 @@ esp_err_t device_link_security_unprotect(
         _device_link_security_unlock();
         return result;
     }
+    /* The request callback runs without the adapter lock: it may invoke
+     * adapter operations (protect, close_session, verifier transitions)
+     * without re-entering the mutex. The session state is revalidated
+     * before the response is encrypted, so a concurrent close fails
+     * closed. */
+    _device_link_security_unlock();
     uint8_t *plain_response = NULL;
     size_t plain_response_len = 0U;
 
@@ -380,6 +424,7 @@ esp_err_t device_link_security_unprotect(
                  &plain_response, &plain_response_len,
                  s_security.config.request_arg);
     free(plain);
+    _device_link_security_lock();
     if (result != ESP_OK)
     {
         free(plain_response);
@@ -393,6 +438,11 @@ esp_err_t device_link_security_unprotect(
     if (plain_response == NULL || plain_response_len == 0U)
     {
         free(plain_response);
+        if (!s_security.session_open || s_security.sec_inst == NULL)
+        {
+            _device_link_security_unlock();
+            return ESP_ERR_INVALID_STATE;
+        }
         s_security.authenticated = true;
         *output = NULL;
         *output_len = 0U;
@@ -401,6 +451,14 @@ esp_err_t device_link_security_unprotect(
     }
     uint8_t *cipher = NULL;
     ssize_t cipher_len = 0;
+
+    if (!s_security.session_open || s_security.sec_inst == NULL ||
+            protocomm_security2.encrypt == NULL)
+    {
+        free(plain_response);
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     result = protocomm_security2.encrypt(
                  s_security.sec_inst, s_security.config.session_id,
                  plain_response, (ssize_t)plain_response_len,
@@ -429,6 +487,8 @@ esp_err_t device_link_security_protect(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    *cipher = NULL;
+    *cipher_len = 0U;
     _device_link_security_lock();
     if (!s_security.initialized || !s_security.session_open ||
             !s_security.authenticated || s_security.sec_inst == NULL ||

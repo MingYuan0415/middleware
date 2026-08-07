@@ -338,6 +338,14 @@ static esp_err_t _device_link_service_open_window_locked(void)
         result = ESP_ERR_INVALID_SIZE;
         goto exit;
     }
+    /* Arm the Security 2 bootstrap verifier before the window becomes
+     * visible, so a handshake can never race an armed window and no
+     * bindable advertisement outlives a failed verifier. */
+    if (device_link_security_open_bootstrap(pop, sizeof(pop)) != ESP_OK)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
     {
         ble_adv_lease_t lease;
 
@@ -348,12 +356,14 @@ static esp_err_t _device_link_service_open_window_locked(void)
         {
             /* The manager may have installed the lease before reporting a
              * convergence error; release it so no bindable advertisement
-             * outlives the failed window. */
+             * outlives the failed window, and tear the verifier down so
+             * no handshake can be attempted without a window. */
             if (lease.lease_id != 0U)
             {
                 (void)ble_adv_manager_release_lease(lease.lease_id);
             }
             _device_link_service_zeroize(&lease, sizeof(lease));
+            device_link_security_close_bootstrap();
             goto exit;
         }
         ble_link_session_set_pairing_window(true);
@@ -362,19 +372,6 @@ static esp_err_t _device_link_service_open_window_locked(void)
         /* The lease copy carries the discriminator; erase it on every
          * path, including a convergence failure that released it above. */
         _device_link_service_zeroize(&lease, sizeof(lease));
-    }
-    /* Arm the Security 2 bootstrap verifier before the window becomes
-     * visible, so a handshake can never race an armed window. */
-    if (device_link_security_open_bootstrap(pop, sizeof(pop)) != ESP_OK)
-    {
-        result = ESP_ERR_INVALID_STATE;
-        if (s_service.bindable_lease_held)
-        {
-            (void)ble_adv_manager_release_lease(s_service.bindable_lease_id);
-            s_service.bindable_lease_held = false;
-            ble_link_session_set_pairing_window(false);
-        }
-        goto exit;
     }
     memcpy(s_service.discriminator, discriminator,
            sizeof(s_service.discriminator));

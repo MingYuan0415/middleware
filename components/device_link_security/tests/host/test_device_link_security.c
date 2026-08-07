@@ -437,6 +437,10 @@ static void _test_auth_record_persistence(void)
         record.credential_id[i] = (uint8_t)(i + 1U);
         record.device_auth_id[i] = (uint8_t)(0x40U + i);
     }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        record.salt[i] = (uint8_t)(0x30U + i);
+    }
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
     {
         record.verifier[i] = (uint8_t)(i & 0x7fU);
@@ -446,6 +450,7 @@ static void _test_auth_record_persistence(void)
     {
         record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
+    assert(device_link_security_auth_record_valid(&record) == true);
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
     device_link_security_auth_record_t loaded;
 
@@ -489,6 +494,11 @@ static void _test_long_term_verifier(void)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
         record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    record.peer_addr_type = 1U;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
     /* Loading the long-term verifier makes the session handshakable and
