@@ -87,7 +87,6 @@ typedef struct ble_nimble_port
     const ble_port_ops_t *ops;
     bool started;
     bool deinitialized;
-    bool conn_had_bond; /**< Peer had a store bond at connect/identity time. */
     bool nimble_init_attempted;
     bool quiescing;
     bool deinit_failed;
@@ -100,6 +99,8 @@ static ble_nimble_port_t s_port;
 static bool _ble_nimble_port_bond_store_verified(
     const struct ble_gap_conn_desc *desc);
 static bool _ble_nimble_port_pairing_window_open(void);
+static bool _ble_nimble_port_peer_has_bond(
+    const struct ble_gap_conn_desc *desc);
 static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle);
 static int _ble_nimble_port_store_status(
     struct ble_store_status_event *event, void *arg);
@@ -675,7 +676,7 @@ static void _ble_nimble_port_link_gatt_consumer(
                 break;
             }
             if (_ble_nimble_port_pairing_window_open() ||
-                    s_port.conn_had_bond)
+                    _ble_nimble_port_peer_has_bond(&desc))
             {
                 /* The bond matches the contract and the peer is either
                  * pairing inside a window or reconnecting with a stored
@@ -980,6 +981,32 @@ static bool _ble_nimble_port_pairing_window_open(void)
             BLE_LINK_STATE_FLAG_BINDABLE) != 0U;
 }
 
+/**
+ * @brief Live bond-store lookup for the current connection identity.
+ *
+ * Queries the store by the resolved identity address at the moment of the
+ * encryption change, so an RPA peer whose identity resolved late is still
+ * recognized as a known peer instead of being misclassified as an unknown
+ * window-less pairing.
+ */
+static bool _ble_nimble_port_peer_has_bond(
+    const struct ble_gap_conn_desc *desc)
+{
+    if (desc == NULL)
+    {
+        return false;
+    }
+    struct ble_store_key_sec key;
+
+    memset(&key, 0, sizeof(key));
+    key.peer_addr = desc->peer_id_addr;
+    struct ble_store_value_sec value;
+
+    memset(&value, 0, sizeof(value));
+    return ble_store_read_peer_sec(&key, &value) == 0 &&
+           value.ltk_present;
+}
+
 static void _ble_nimble_port_delete_peer_bond(uint16_t conn_handle)
 {
     struct ble_gap_conn_desc desc;
@@ -1033,24 +1060,6 @@ static int _ble_nimble_port_gap_event(
         port_event.status = event->connect.status;
         if (event->connect.status == 0)
         {
-            /* Remember whether the peer already had a bond at connect
-             * time; an RPA peer is re-evaluated on IDENTITY_RESOLVED. */
-            struct ble_gap_conn_desc desc;
-
-            s_port.conn_had_bond = false;
-            if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0)
-            {
-                struct ble_store_key_sec key;
-
-                memset(&key, 0, sizeof(key));
-                key.peer_addr = desc.peer_id_addr;
-                struct ble_store_value_sec value;
-
-                memset(&value, 0, sizeof(value));
-                s_port.conn_had_bond =
-                    ble_store_read_peer_sec(&key, &value) == 0 &&
-                    value.ltk_present;
-            }
             _ble_nimble_port_dispatch(&port_event);
             ble_gap_manager_snapshot_t snapshot;
 
@@ -1075,7 +1084,6 @@ static int _ble_nimble_port_gap_event(
         port_event.type = BLE_PORT_EVENT_DISCONNECT;
         port_event.conn_handle = event->disconnect.conn.conn_handle;
         port_event.reason = event->disconnect.reason;
-        s_port.conn_had_bond = false;
         break;
     case BLE_GAP_EVENT_MTU:
         if (event->mtu.channel_id != BLE_L2CAP_CID_ATT)
@@ -1106,28 +1114,10 @@ static int _ble_nimble_port_gap_event(
                                 event->subscribe.cur_indicate;
         break;
     case BLE_GAP_EVENT_IDENTITY_RESOLVED:
-        /* The peer RPA resolved to a stored identity: the reconnect is a
-         * known peer, so the pairing window is not required. */
-    {
-        struct ble_gap_conn_desc desc;
-
-        s_port.conn_had_bond = false;
-        if (ble_gap_conn_find(event->identity_resolved.conn_handle,
-                              &desc) == 0)
-        {
-            struct ble_store_key_sec key;
-
-            memset(&key, 0, sizeof(key));
-            key.peer_addr = desc.peer_id_addr;
-            struct ble_store_value_sec value;
-
-            memset(&value, 0, sizeof(value));
-            s_port.conn_had_bond =
-                ble_store_read_peer_sec(&key, &value) == 0 &&
-                value.ltk_present;
-        }
-    }
-    return 0;
+        /* The peer RPA resolved; the ENC_CHANGE admission performs a live
+         * store lookup by the resolved identity, so no snapshot is kept
+         * here. */
+        return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         /* An existing bond attempts to pair again: allowed only while a
          * replacement window is open, after evicting the old bond. */

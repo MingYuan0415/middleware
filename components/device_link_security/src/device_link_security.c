@@ -192,6 +192,10 @@ esp_err_t device_link_security_open_bootstrap(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* Tear the old Protocomm instance down before freeing the verifier it
+     * references: protocomm_set_security shallow-copies the params, so the
+     * salt and verifier buffers must outlive every instance using them. */
+    _device_link_security_teardown_protocomm();
     _device_link_security_free_verifier();
     char *salt = NULL;
     char *verifier = NULL;
@@ -232,6 +236,7 @@ esp_err_t device_link_security_open_bootstrap(
 
 void device_link_security_close_bootstrap(void)
 {
+    _device_link_security_teardown_protocomm();
     _device_link_security_free_verifier();
     (void)_device_link_security_rebuild();
 }
