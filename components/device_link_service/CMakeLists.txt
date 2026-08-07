@@ -3,6 +3,7 @@ idf_component_register(
     INCLUDE_DIRS "include"
     REQUIRES
         ble_runtime
+        device_link_security
         event_bus
     PRIV_REQUIRES
         esp_hw_support

@@ -59,6 +59,7 @@ typedef struct device_link_service_status
     bool active; /**< A binding window owns the bindable advertisement. */
     bool client_connected; /**< One BLE transport client is connected. */
     bool qr_ready; /**< QR bootstrap data may be copied. */
+    bool pending_confirmation; /**< A binding awaits local confirmation. */
 } device_link_service_status_t;
 
 typedef device_link_service_status_t device_link_service_snapshot_t;
@@ -105,6 +106,28 @@ esp_err_t device_link_service_open_window(void);
  * @return ESP_OK when admitted or already idle; otherwise a lifecycle error.
  */
 esp_err_t device_link_service_close_window(void);
+
+/**
+ * @brief Accept or deny the pending binding confirmation.
+ *
+ * The decision is applied serially in the service worker, so it cannot
+ * race a window close or a disconnect. Accepting arms the active
+ * authorize transaction; denying invalidates it.
+ *
+ * @param[in] accept True to confirm the binding, false to deny it.
+ * @return ESP_OK when admitted; otherwise a lifecycle error.
+ */
+esp_err_t device_link_service_confirm_binding(bool accept);
+
+/**
+ * @brief Report whether a binding awaits local confirmation.
+ *
+ * Reads the service snapshot; the fact is refreshed by the worker.
+ *
+ * @return True while an authorize transaction is active and not yet
+ *         confirmed or denied.
+ */
+bool device_link_service_pending_confirmation(void);
 
 /**
  * @brief Close the binding window and suspend the service before standby.

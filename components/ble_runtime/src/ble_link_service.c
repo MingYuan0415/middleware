@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "esp_err.h"
 #include "esp_random.h"
 
@@ -70,6 +73,9 @@ typedef struct ble_link_service
     uint8_t response_envelope[BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
     size_t response_envelope_len;
 } ble_link_service_t;
+
+static SemaphoreHandle_t s_service_mutex;
+static StaticSemaphore_t s_service_mutex_control;
 
 static ble_link_service_t s_service;
 
@@ -659,23 +665,36 @@ static uint32_t _ble_link_service_handle_authorize_prepare(
 {
     (void)facts;
     (void)arg;
-    if (s_service.auth_txn.active)
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+    }
+    const bool txn_active = s_service.auth_txn.active;
+
+    if (!txn_active)
+    {
+        s_service.auth_txn.active = true;
+        s_service.auth_txn.committed = false;
+        s_service.auth_txn.confirmed = false;
+        s_service.auth_txn.authorization_txn_id =
+            ((uint64_t)esp_random() << 32U) | (uint64_t)esp_random();
+        if (s_service.auth_txn.authorization_txn_id == 0U)
+        {
+            s_service.auth_txn.authorization_txn_id = 1U;
+        }
+        esp_fill_random(s_service.auth_txn.credential_id,
+                        sizeof(s_service.auth_txn.credential_id));
+        esp_fill_random(s_service.auth_txn.application_password,
+                        sizeof(s_service.auth_txn.application_password));
+    }
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGive(s_service_mutex);
+    }
+    if (txn_active)
     {
         return BLE_LINK_ERROR_CONFLICT;
     }
-    s_service.auth_txn.active = true;
-    s_service.auth_txn.committed = false;
-    s_service.auth_txn.confirmed = false;
-    s_service.auth_txn.authorization_txn_id =
-        ((uint64_t)esp_random() << 32U) | (uint64_t)esp_random();
-    if (s_service.auth_txn.authorization_txn_id == 0U)
-    {
-        s_service.auth_txn.authorization_txn_id = 1U;
-    }
-    esp_fill_random(s_service.auth_txn.credential_id,
-                    sizeof(s_service.auth_txn.credential_id));
-    esp_fill_random(s_service.auth_txn.application_password,
-                    sizeof(s_service.auth_txn.application_password));
     uint8_t body[64];
     size_t body_len = 0U;
 
@@ -889,8 +908,13 @@ static uint32_t _ble_link_service_handle_authorize_commit(
 
 void ble_link_service_confirm_binding(bool accept)
 {
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+    }
     if (!s_service.auth_txn.active)
     {
+        (void)xSemaphoreGive(s_service_mutex);
         return;
     }
     if (!accept)
@@ -899,14 +923,27 @@ void ble_link_service_confirm_binding(bool accept)
          * of this transaction is rejected. */
         s_service.auth_txn.active = false;
         s_service.auth_txn.confirmed = false;
+        (void)xSemaphoreGive(s_service_mutex);
         return;
     }
     s_service.auth_txn.confirmed = true;
+    (void)xSemaphoreGive(s_service_mutex);
 }
 
 bool ble_link_service_pending_confirmation(void)
 {
-    return s_service.auth_txn.active && !s_service.auth_txn.confirmed;
+    bool pending = false;
+
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
+    }
+    pending = s_service.auth_txn.active && !s_service.auth_txn.confirmed;
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGive(s_service_mutex);
+    }
+    return pending;
 }
 
 static uint32_t _ble_link_service_handle_subscribe_events(
@@ -950,6 +987,10 @@ void ble_link_service_init(
     uint64_t boot_id, ble_link_service_output_t output, void *arg,
     const ble_link_security_ops_t *security, size_t max_pending_frames)
 {
+    if (s_service_mutex == NULL)
+    {
+        s_service_mutex = xSemaphoreCreateMutexStatic(&s_service_mutex_control);
+    }
     memset(&s_service, 0, sizeof(s_service));
     s_service.boot_id = boot_id;
     s_service.output = output;

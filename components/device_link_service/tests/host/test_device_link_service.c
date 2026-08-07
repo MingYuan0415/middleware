@@ -17,6 +17,7 @@
 #include "ble_port_ops.h"
 #include "ble_runtime.h"
 #include "device_link_service.h"
+#include "device_link_security.h"
 #include "event_bus.h"
 
 #define TEST_WINDOW_MS 200U
@@ -217,13 +218,20 @@ static unsigned _wait_publish_count(unsigned minimum, uint32_t timeout_ms)
     return _publish_count();
 }
 
+uint32_t esp_random(void)
+{
+    /* Incrementing LCG; the byte stream stays deterministic. */
+    s_random_counter += 0x9e3779b9U;
+    return s_random_counter;
+}
+
 void esp_fill_random(void *buf, size_t len)
 {
     uint8_t *bytes = buf;
 
     for (size_t i = 0U; i < len; ++i)
     {
-        bytes[i] = s_random_counter++;
+        bytes[i] = (uint8_t)(s_random_counter++);
     }
 }
 
@@ -378,8 +386,29 @@ static void _pump_ms(uint32_t ms)
     }
 }
 
+static esp_err_t _sec_stub_request(
+    const uint8_t *request, size_t request_len,
+    uint8_t **response, size_t *response_len, void *arg)
+{
+    (void)request;
+    (void)request_len;
+    (void)arg;
+    *response = NULL;
+    *response_len = 0U;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 static void _init_service(void)
 {
+    const device_link_security_config_t security_config =
+    {
+        .username = "microtech",
+        .session_id = 1U,
+        .request_cb = _sec_stub_request,
+        .request_arg = NULL,
+    };
+
+    assert(device_link_security_init(&security_config) == ESP_OK);
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
@@ -413,7 +442,8 @@ static void _deinit_service(void)
     assert(s_port_stopped);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    assert(host_freertos_live_semaphores() == 0U);
+    /* device_link_security keeps its boot-lifetime mutex alive. */
+    assert(host_freertos_live_semaphores() <= 1U);
 }
 
 static const char *_qr_field(const char *qr, const char *name, char *output,
@@ -538,7 +568,8 @@ static void _test_rollback_port_init_failure(void)
     assert(device_link_service_init(&s_config) == ESP_FAIL);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    assert(host_freertos_live_semaphores() == 0U);
+    /* device_link_security keeps its boot-lifetime mutex alive. */
+    assert(host_freertos_live_semaphores() <= 1U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_port_init = false;
@@ -561,7 +592,8 @@ static void _test_rollback_runtime_never_initialized(void)
     assert(device_link_service_init(&s_config) == ESP_ERR_NO_MEM);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    assert(host_freertos_live_semaphores() == 0U);
+    /* device_link_security keeps its boot-lifetime mutex alive. */
+    assert(host_freertos_live_semaphores() <= 1U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     _init_service();
@@ -587,11 +619,26 @@ static void _test_rollback_lease_failure_retryable(void)
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    assert(host_freertos_live_semaphores() == 0U);
+    /* device_link_security keeps its boot-lifetime mutex alive. */
+    assert(host_freertos_live_semaphores() <= 1U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_adv_start = false;
     _init_service();
+    _deinit_service();
+}
+
+static void _test_binding_confirmation(void)
+{
+    _reset_host();
+    _init_service();
+
+    /* No transaction: nothing pending, confirmation is a no-op. */
+    assert(!device_link_service_pending_confirmation());
+    assert(device_link_service_confirm_binding(true) == ESP_OK);
+    assert(!device_link_service_pending_confirmation());
+    assert(device_link_service_confirm_binding(false) == ESP_OK);
+    assert(!device_link_service_pending_confirmation());
     _deinit_service();
 }
 
@@ -917,7 +964,8 @@ static void _test_deinit_while_window_open(void)
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    assert(host_freertos_live_semaphores() == 0U);
+    /* device_link_security keeps its boot-lifetime mutex alive. */
+    assert(host_freertos_live_semaphores() <= 1U);
     assert((ble_link_session_get_state_flags() &
             BLE_LINK_STATE_FLAG_BINDABLE) == 0U);
     device_link_service_status_t status;
@@ -943,6 +991,7 @@ int main(void)
     _test_rollback_port_init_failure();
     _test_rollback_runtime_never_initialized();
     _test_rollback_lease_failure_retryable();
+    _test_binding_confirmation();
     _test_window_lifecycle();
     _test_close_window();
     _test_connect_events();

@@ -16,6 +16,9 @@
 #include "ble_adv_manager.h"
 #include "ble_link_session.h"
 #include "ble_port_ops.h"
+#include "ble_link_service.h"
+
+#include "device_link_security.h"
 #include "ble_runtime.h"
 #include "device_link_service.h"
 #include "event_bus.h"
@@ -46,6 +49,7 @@ typedef enum
 {
     DEVICE_LINK_SERVICE_COMMAND_OPEN = 0,
     DEVICE_LINK_SERVICE_COMMAND_CLOSE,
+    DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING,
     DEVICE_LINK_SERVICE_COMMAND_SUSPEND,
     DEVICE_LINK_SERVICE_COMMAND_RESUME,
     DEVICE_LINK_SERVICE_COMMAND_DEINIT,
@@ -55,6 +59,7 @@ typedef struct device_link_service_command
 {
     device_link_service_command_type_t type;
     uint32_t sequence; /**< Suspend acknowledgement sequence. */
+    bool accept_binding; /**< Confirm (true) or deny (false). */
 } device_link_service_command_t;
 
 typedef struct device_link_service
@@ -275,6 +280,8 @@ static void _device_link_service_refresh_snapshot_locked(void)
 {
     s_service.snapshot.state = _device_link_service_derive_state();
     s_service.snapshot.active = s_service.window_open;
+    s_service.snapshot.pending_confirmation =
+        ble_link_service_pending_confirmation();
     s_service.snapshot.client_connected = s_service.client_connected;
     s_service.snapshot.qr_ready = s_service.qr_ready;
     s_service.snapshot.window_remaining_ms =
@@ -356,6 +363,19 @@ static esp_err_t _device_link_service_open_window_locked(void)
          * path, including a convergence failure that released it above. */
         _device_link_service_zeroize(&lease, sizeof(lease));
     }
+    /* Arm the Security 2 bootstrap verifier before the window becomes
+     * visible, so a handshake can never race an armed window. */
+    if (device_link_security_open_bootstrap(pop, sizeof(pop)) != ESP_OK)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        if (s_service.bindable_lease_held)
+        {
+            (void)ble_adv_manager_release_lease(s_service.bindable_lease_id);
+            s_service.bindable_lease_held = false;
+            ble_link_session_set_pairing_window(false);
+        }
+        goto exit;
+    }
     memcpy(s_service.discriminator, discriminator,
            sizeof(s_service.discriminator));
     memcpy(s_service.pop, pop, sizeof(s_service.pop));
@@ -394,6 +414,7 @@ static void _device_link_service_close_window_locked(void)
     s_service.window_open = false;
     s_service.qr_ready = false;
     s_service.window_deadline = 0U;
+    device_link_security_close_bootstrap();
     _device_link_service_zero_secrets();
 }
 
@@ -477,6 +498,11 @@ static void _device_link_service_handle_command(
     }
     case DEVICE_LINK_SERVICE_COMMAND_CLOSE:
         _device_link_service_close_window_locked();
+        s_service.snapshot.last_error = ESP_OK;
+        break;
+    case DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING:
+        ble_link_service_confirm_binding(command->accept_binding);
+        _device_link_service_refresh_snapshot_locked();
         s_service.snapshot.last_error = ESP_OK;
         break;
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
@@ -1012,6 +1038,36 @@ esp_err_t device_link_service_close_window(void)
      * issued after an open always lands after it in the worker, so a
      * pending open can never outlive its owner's close. */
     return _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_CLOSE);
+}
+
+esp_err_t device_link_service_confirm_binding(bool accept)
+{
+    if (!_device_link_service_api_acquire())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const device_link_service_command_t command =
+    {
+        .type = DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING,
+        .accept_binding = accept,
+    };
+    const esp_err_t result = xQueueSend(s_service.queue, &command, 0U) ==
+                             pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+
+    _device_link_service_api_release();
+    return result;
+}
+
+bool device_link_service_pending_confirmation(void)
+{
+    bool pending = false;
+
+    if (xSemaphoreTake(s_service.mutex, portMAX_DELAY) == pdTRUE)
+    {
+        pending = s_service.snapshot.pending_confirmation;
+        xSemaphoreGive(s_service.mutex);
+    }
+    return pending;
 }
 
 esp_err_t device_link_service_suspend(uint32_t timeout_ms)

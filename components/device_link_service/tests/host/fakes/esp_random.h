@@ -1,5 +1,5 @@
-#ifndef __HOST_ESP_RANDOM_H__
-#define __HOST_ESP_RANDOM_H__
+#ifndef __HOST_BLE_RUNTIME_ESP_RANDOM_H__
+#define __HOST_BLE_RUNTIME_ESP_RANDOM_H__
 
 #include <stddef.h>
 #include <stdint.h>
@@ -8,16 +8,13 @@
 extern "C" {
 #endif
 
-/**
- * @brief Deterministic host fake for esp_fill_random().
- *
- * The fake feeds a monotonically increasing byte counter, so successive
- * binding windows always produce different discriminator and POP values.
- */
+/* Deterministic xorshift32 so tests can predict random draws. */
+uint32_t esp_random(void);
 void esp_fill_random(void *buf, size_t len);
+void esp_random_fake_reset(uint32_t seed);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __HOST_ESP_RANDOM_H__ */
+#endif /* __HOST_BLE_RUNTIME_ESP_RANDOM_H__ */
