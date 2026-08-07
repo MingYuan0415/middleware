@@ -521,18 +521,16 @@ static void _test_start_failure_rolls_back(void)
     assert(host_freertos_live_tasks() == 0U);
 }
 
-static void _test_rollback_port_start_failure(void)
+static void _test_rollback_port_init_failure(void)
 {
     _reset_host();
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
     s_config.window_ms = TEST_WINDOW_MS;
-    /* The port init runs inside ble_runtime_start, so this exercises an
-     * initialized runtime whose port start fails: the rollback must tear
-     * the runtime down and leave a deinit/re-init viable lifecycle. (The
-     * runtime-never-initialized branch of the teardown is defensive only
-     * and is unreachable through the public API.) */
+    /* The fake port init runs inside ble_runtime_start, so this exercises
+     * an initialized runtime whose port init fails: the rollback must
+     * tear the runtime down and leave a deinit/re-init viable lifecycle. */
     s_fail_port_init = true;
     assert(device_link_service_init(&s_config) == ESP_FAIL);
     assert(host_freertos_live_queues() == 0U);
@@ -541,6 +539,28 @@ static void _test_rollback_port_start_failure(void)
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_port_init = false;
+    _init_service();
+    _deinit_service();
+}
+
+static void _test_rollback_runtime_never_initialized(void)
+{
+    _reset_host();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = TEST_WINDOW_MS;
+    /* A resource creation failure before ble_runtime_init reaches the
+     * runtime-never-initialized teardown branch: the rollback must not
+     * call ble_runtime_deinit on an uninitialized runtime and must leave
+     * a deinit/re-init viable lifecycle. */
+    host_freertos_fail_next_queue_creates(1U);
+    assert(device_link_service_init(&s_config) == ESP_ERR_NO_MEM);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_tasks() == 0U);
+    assert(host_freertos_live_semaphores() == 0U);
+    assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
+           ESP_OK);
     _init_service();
     _deinit_service();
 }
@@ -556,6 +576,9 @@ static void _test_rollback_lease_failure_retryable(void)
      * init rollback must release the lease and tear down the runtime. */
     s_fail_adv_start = true;
     assert(device_link_service_init(&s_config) == ESP_FAIL);
+    /* The installed slow lease must have been released: in a fresh
+     * manager the release leaves STOPPED with no port operation. */
+    assert(ble_adv_manager_get_state() == BLE_ADV_MANAGER_STATE_STOPPED);
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
@@ -912,7 +935,8 @@ int main(void)
 {
     _test_bad_configuration();
     _test_start_failure_rolls_back();
-    _test_rollback_port_start_failure();
+    _test_rollback_port_init_failure();
+    _test_rollback_runtime_never_initialized();
     _test_rollback_lease_failure_retryable();
     _test_window_lifecycle();
     _test_close_window();
