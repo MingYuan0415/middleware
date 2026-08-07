@@ -51,9 +51,11 @@ static size_t s_outbound_len;
 
 static ble_link_service_facts_t s_facts;
 
-static void _capture(const uint8_t *value, size_t len,
-                     ble_link_service_tx_channel_t channel, void *arg)
+static esp_err_t _capture(const uint8_t *value, size_t len,
+                          ble_link_service_tx_channel_t channel,
+                          bool is_last, void *arg)
 {
+    (void)is_last;
     (void)arg;
     TEST_ASSERT_TRUE(s_capture_count < 16U);
     TEST_ASSERT_TRUE(len <= sizeof(s_capture[0]));
@@ -61,6 +63,11 @@ static void _capture(const uint8_t *value, size_t len,
     s_capture_lens[s_capture_count] = len;
     s_capture_channels[s_capture_count] = channel;
     s_capture_count++;
+    if (is_last)
+    {
+        ble_link_service_response_completed();
+    }
+    return ESP_OK;
 }
 
 /**
@@ -149,6 +156,8 @@ static void _establish_session(void)
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
                           GEN, &epoch));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          GEN, true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
                           true, 1U));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
@@ -163,7 +172,7 @@ static void _reset(void)
     memset(s_capture_channels, 0, sizeof(s_capture_channels));
     s_capture_count = 0U;
     ble_link_service_reset();
-    ble_link_service_init(BOOT_ID, _capture, NULL);
+    ble_link_service_init(BOOT_ID, _capture, NULL, true, 32U);
     ble_link_events_init();
     _establish_session();
 }
@@ -183,7 +192,7 @@ static void test_capabilities_request(void)
     _reset();
     _feed_single(request, sizeof(request));
     TEST_ASSERT_EQUAL(1U, s_capture_count);
-    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TX_CONTROL,
+    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TX_CONTROL_RESPONSE,
                       s_capture_channels[0]);
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
@@ -647,6 +656,8 @@ static void test_generation_change_resets_state(void)
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
                           2U, &epoch));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          2U, true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
                           true, 1U));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
@@ -860,6 +871,8 @@ static void test_stale_feed_ignored(void)
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
                           2U, &epoch));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          2U, true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
                           true, 1U));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
@@ -933,6 +946,103 @@ static void test_channel_mismatch_rejected(void)
                           framed,
                           8U + sizeof(prepare)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
+}
+
+static void test_boot_mismatch_closes_session(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+
+    _reset();
+    _establish_session();
+    _set_facts(true, true, true);
+    /* A foreign boot id in the envelope is terminal: the session is
+     * closed, no response is emitted. */
+    s_facts.active_boot_id = BOOT_ID ^ 1U;
+    uint8_t framed[512];
+
+    memset(framed, 0, sizeof(framed));
+    framed[0] = 1U;
+    framed[1] = 3U;
+    framed[2] = 0x01U;
+    framed[4] = (uint8_t)(sizeof(request) & 0xffU);
+    framed[5] = (uint8_t)((sizeof(request) >> 8U) & 0xffU);
+    memcpy(&framed[8], request, sizeof(request));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
+                          &s_facts,
+                          BLE_LINK_SERVICE_RX_CONTROL,
+                          framed,
+                          8U + sizeof(request)));
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
+    uint32_t error = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_query_admission(
+                          GEN, BLE_LINK_SESSION_CHANNEL_CONTROL,
+                          &error));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED, error);
+}
+
+static void test_one_transaction_at_a_time(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+    _reset();
+    _establish_session();
+    _set_facts(true, true, true);
+    /* MTU 23 makes the response multi-fragment; the synchronous sink
+     * completes the transaction at the last fragment, so the gate is
+     * released and a second request is served (not BUSY). */
+    s_facts.preferred_att_mtu = 23U;
+    _feed_single_channel(request, sizeof(request),
+                         BLE_LINK_SERVICE_RX_CONTROL);
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+    _feed_single_channel(request, sizeof(request),
+                         BLE_LINK_SERVICE_RX_CONTROL);
+    /* Both requests were served (two multi-fragment responses). */
+    TEST_ASSERT_TRUE(s_capture_count > 2U);
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+}
+
+static void test_authorize_disabled_in_production(void)
+{
+    /* Production passes authorize_enabled=false: the fake authorize flow is
+     * rejected with UNSUPPORTED_OPERATION and no fake credentials leave. */
+    static const uint8_t prepare[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
+    };
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL, false, 32U);
+    memset(s_capture, 0, sizeof(s_capture));
+    memset(s_capture_lens, 0, sizeof(s_capture_lens));
+    memset(s_capture_channels, 0, sizeof(s_capture_channels));
+    s_capture_count = 0U;
+    ble_link_session_init(BOOT_ID);
+    _establish_session();
+    _set_facts(true, true, true);
+    _feed_single_channel(prepare, sizeof(prepare),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNSUPPORTED_OPERATION, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
 }
 
 static void test_session_channel_reassembly(void)
@@ -1063,6 +1173,9 @@ int main(void)
     test_channel_mismatch_rejected();
     test_low_mtu_multi_fragment();
     test_session_channel_reassembly();
+    test_authorize_disabled_in_production();
+    test_one_transaction_at_a_time();
+    test_boot_mismatch_closes_session();
     printf("ble_link_service: all tests passed\n");
     return 0;
 }

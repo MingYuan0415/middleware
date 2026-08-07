@@ -34,24 +34,31 @@ extern "C" {
 /** @brief Authorization txn expiry (frozen authorize-prepare-response). */
 #define BLE_LINK_SERVICE_AUTH_EXPIRES_MS 600000U
 
-/** @brief TX characteristic the framed value belongs on. */
+/** @brief TX characteristic and PDU kind for the framed value. */
 typedef enum
 {
-    BLE_LINK_SERVICE_TX_SESSION = 0,
-    BLE_LINK_SERVICE_TX_CONTROL,
+    BLE_LINK_SERVICE_TX_SESSION = 0,    /**< session_tx, indication. */
+    BLE_LINK_SERVICE_TX_CONTROL_RESPONSE, /**< control_tx, indication. */
+    BLE_LINK_SERVICE_TX_CONTROL_EVENT,    /**< control_tx, notification. */
 } ble_link_service_tx_channel_t;
 
 /**
  * @brief Output sink for one fully framed outbound value.
  *
+ * Returns ESP_OK when the fragment was accepted for transmission, or an
+ * error to abort the outbound transaction (the caller stops emitting
+ * further fragments and the framing contract closes the associated
+ * session).
+ *
  * @param[in] value   Framed value bytes.
  * @param[in] len     Value length.
  * @param[in] channel TX characteristic channel.
  * @param[in] arg     Argument from service init.
+ * @return ESP_OK, or an error to abort the transaction.
  */
-typedef void (*ble_link_service_output_t)(
+typedef esp_err_t (*ble_link_service_output_t)(
     const uint8_t *value, size_t len,
-    ble_link_service_tx_channel_t channel, void *arg);
+    ble_link_service_tx_channel_t channel, bool is_last, void *arg);
 
 /**
  * @brief Runtime facts the service needs per request.
@@ -71,12 +78,19 @@ typedef struct ble_link_service_facts
 /**
  * @brief Initialize the service.
  *
- * @param[in] boot_id Fresh nonzero value for this boot.
- * @param[in] output  Outbound sink, required.
- * @param[in] arg     Sink argument.
+ * @param[in] boot_id   Fresh nonzero value for this boot.
+ * @param[in] output    Outbound sink, required.
+ * @param[in] arg       Sink argument.
+ * @param[in] authorize_enabled True when the fake authorize flow may run.
+ *                              Production leaves this false until real
+ *                              Security 2 and confirmation are wired.
+ * @param[in] max_pending_frames Max frames one response may need in the
+ *                              TX queue; a response requiring more fails
+ *                              closed (the session is terminated).
  */
 void ble_link_service_init(
-    uint64_t boot_id, ble_link_service_output_t output, void *arg);
+    uint64_t boot_id, ble_link_service_output_t output, void *arg,
+    bool authorize_enabled, size_t max_pending_frames);
 
 /**
  * @brief Reset the service (new boot or full teardown).
@@ -114,6 +128,39 @@ esp_err_t ble_link_service_feed(
     const ble_link_service_facts_t *facts,
     ble_link_service_rx_channel_t channel,
     const uint8_t *value, size_t len);
+
+/**
+ * @brief Whether a response transaction is in flight (waiting for the
+ * final indication confirmation).
+ *
+ * The contract requires one transaction at a time: a new request is
+ * rejected with BUSY while the previous response has not confirmed.
+ */
+bool ble_link_service_response_in_flight(void);
+
+/**
+ * @brief Abort all pending response transactions.
+ *
+ * Called on a transmission failure or disconnect; clears the transaction
+ * gate so later requests are not stuck BUSY.
+ */
+void ble_link_service_abort_transactions(void);
+
+/**
+ * @brief Complete the response transaction.
+ *
+ * Called by the transport when the final fragment's indication confirms.
+ */
+void ble_link_service_response_completed(void);
+
+/**
+ * @brief Query whether a partial frame is being reassembled on a channel.
+ *
+ * @param[in] channel RX channel to inspect.
+ * @return True when a partial frame exists on the channel.
+ */
+bool ble_link_service_has_partial_frame(
+    ble_link_service_rx_channel_t channel);
 
 /**
  * @brief Handle the reassembly idle timeout (5000 ms without a fragment).

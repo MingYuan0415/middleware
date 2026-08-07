@@ -162,6 +162,16 @@ esp_err_t ble_link_session_handle_event(
     uint32_t generation, ble_link_session_event_t event);
 
 /**
+ * @brief Clear the link security facts (encryption dropped).
+ *
+ * Called when the link is no longer encrypted; the Security 2 session and
+ * authorization are closed separately by the caller.
+ *
+ * @param[in] generation Current connection generation.
+ */
+void ble_link_session_clear_link_security(uint32_t generation);
+
+/**
  * @brief Open or close the local pairing window.
  *
  * An unknown peer may pair only while the window is open.
@@ -200,6 +210,31 @@ ble_link_session_state_t ble_link_session_get_state(uint32_t generation);
  */
 esp_err_t ble_link_session_get_facts(
     uint32_t generation, ble_link_dispatcher_facts_t *facts);
+
+/**
+ * @brief Set whether the peer identity is known and matched.
+ *
+ * Production calls this after the bond store identity/SC/LTK verification
+ * completes; the session channel admission requires it (fail closed).
+ *
+ * @param[in] generation Current connection generation.
+ * @param[in] known      True when the peer identity was verified.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE.
+ */
+esp_err_t ble_link_session_set_identity_known(
+    uint32_t generation, bool known);
+
+/**
+ * @brief Security facts not carried by the dispatcher facts.
+ *
+ * @param[in]  generation Current connection generation.
+ * @param[out] out_bond_verified SC bond verified for the connection.
+ * @param[out] out_identity_known Peer identity known and matched.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE without a matching session.
+ */
+esp_err_t ble_link_session_get_security_facts(
+    uint32_t generation, bool *out_bond_verified,
+    bool *out_identity_known);
 
 /**
  * @brief Current PublicLinkState flags for the boot.

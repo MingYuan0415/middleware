@@ -19,6 +19,7 @@ typedef struct ble_link_session
     bool active;                 /**< ACL connected for the current gen. */
     bool encrypted;
     bool bond_verified;
+    bool identity_known;
     uint32_t security2_epoch;    /**< Last accepted Security 2 epoch. */
     bool security2_open;
     bool authorized;
@@ -37,11 +38,14 @@ void ble_link_session_init(uint64_t boot_id)
 
 void ble_link_session_reset(void)
 {
-    /* The epoch allocator is boot-scoped and survives a full teardown;
-     * only a fresh boot via init() resets it. */
+    /* The boot id and epoch allocator are boot-scoped and survive a full
+     * teardown (a runtime restart keeps them); only a fresh boot via
+     * init() resets them. */
+    const uint64_t boot_id = s_session.boot_id;
     const uint32_t epoch = s_session.security2_epoch;
 
     memset(&s_session, 0, sizeof(s_session));
+    s_session.boot_id = boot_id;
     s_session.security2_epoch = epoch;
 }
 
@@ -57,11 +61,23 @@ void ble_link_session_set_pairing_window(bool open)
     s_session.pairing_window_open = open;
 }
 
+void ble_link_session_clear_link_security(uint32_t generation)
+{
+    if (generation != s_session.generation || !s_session.active)
+    {
+        return;
+    }
+    s_session.encrypted = false;
+    s_session.bond_verified = false;
+    s_session.identity_known = false;
+}
+
 static void _ble_link_session_clear_connection(void)
 {
     s_session.active = false;
     s_session.encrypted = false;
     s_session.bond_verified = false;
+    s_session.identity_known = false;
     /* The epoch allocator is boot-scoped and never resets on disconnect. */
     s_session.security2_open = false;
     s_session.authorized = false;
@@ -86,6 +102,7 @@ esp_err_t ble_link_session_handle_event(
         s_session.active = true;
         s_session.encrypted = false;
         s_session.bond_verified = false;
+        s_session.identity_known = false;
         s_session.security2_open = false;
         s_session.authorized = false;
         return ESP_OK;
@@ -230,7 +247,8 @@ esp_err_t ble_link_session_query_admission(
         *out_error = BLE_LINK_ERROR_OK;
         break;
     case BLE_LINK_SESSION_CHANNEL_SESSION:
-        if (s_session.encrypted && s_session.bond_verified)
+        if (s_session.encrypted && s_session.bond_verified &&
+                s_session.identity_known)
         {
             *out_error = BLE_LINK_ERROR_OK;
         }
@@ -242,7 +260,7 @@ esp_err_t ble_link_session_query_admission(
     case BLE_LINK_SESSION_CHANNEL_CONTROL:
     case BLE_LINK_SESSION_CHANNEL_EVENT:
         if (!s_session.encrypted || !s_session.bond_verified ||
-                !s_session.security2_open)
+                !s_session.identity_known || !s_session.security2_open)
         {
             *out_error = BLE_LINK_ERROR_UNAUTHENTICATED;
         }
@@ -296,6 +314,39 @@ esp_err_t ble_link_session_get_facts(
     facts->encrypted = s_session.encrypted;
     facts->session_authenticated = s_session.security2_open;
     facts->authorized = s_session.authorized;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_session_set_identity_known(
+    uint32_t generation, bool known)
+{
+    if (generation != s_session.generation || !s_session.active)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_session.identity_known = known;
+    if (!known)
+    {
+        /* An unverified identity revokes the current session match. */
+        s_session.authorized = false;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ble_link_session_get_security_facts(
+    uint32_t generation, bool *out_bond_verified,
+    bool *out_identity_known)
+{
+    if (out_bond_verified == NULL || out_identity_known == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (generation != s_session.generation || !s_session.active)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_bond_verified = s_session.bond_verified;
+    *out_identity_known = s_session.identity_known;
     return ESP_OK;
 }
 

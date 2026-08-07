@@ -154,8 +154,10 @@ static void test_consumer_limit_enforced(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_event_router_register(_callback_b, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, ble_event_router_register(_callback_a, (void *)1));
     TEST_ASSERT_EQUAL(ESP_OK, ble_event_router_register(_callback_b, (void *)1));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_event_router_register(_callback_a, (void *)2));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_event_router_register(_callback_b, (void *)2));
     TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM,
-                      ble_event_router_register(_callback_a, (void *)2));
+                      ble_event_router_register(_callback_a, (void *)3));
 }
 
 static void test_dispatch_snapshot_is_stable(void)

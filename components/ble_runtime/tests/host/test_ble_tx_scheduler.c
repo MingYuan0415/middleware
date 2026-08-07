@@ -183,7 +183,10 @@ static void _emit_notify_tx(uint16_t conn_handle, uint16_t attr_handle,
     event.attr_handle = attr_handle;
     event.indication = indication;
     event.tx_result = tx_result;
-    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_handle_notify_tx(&event));
+    const esp_err_t result = ble_tx_scheduler_handle_notify_tx(&event);
+
+    TEST_ASSERT_TRUE(result == ESP_OK || result == ESP_ERR_NOT_FOUND ||
+                     result == ESP_FAIL);
 }
 
 static void _init_scheduler(size_t depth)
@@ -201,6 +204,7 @@ static void _init_scheduler(size_t depth)
     };
 
     ble_tx_scheduler_deinit();
+    s_completion_in_ops_violations = 0U;
     s_notify_calls = 0U;
     s_indicate_calls = 0U;
     s_completions = 0U;
@@ -229,7 +233,7 @@ static void test_idle_submit_sends_immediately(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(1U, s_notify_calls);
     TEST_ASSERT_EQUAL(0U, s_indicate_calls);
     TEST_ASSERT_EQUAL(4U, s_notify_data_len);
@@ -244,13 +248,13 @@ static void test_one_in_flight_serializes(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     /* The synchronous NOTIFY_TX completes each frame in order. */
     TEST_ASSERT_EQUAL(3U, s_notify_calls);
     TEST_ASSERT_EQUAL(3U, s_completions);
@@ -264,7 +268,7 @@ static void test_indicate_waits_for_confirmation(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(1U, s_indicate_calls);
     TEST_ASSERT_TRUE(s_indicate_active);
     _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_CONFIRMED);
@@ -281,7 +285,7 @@ static void test_indicate_timeout_completes_with_timeout(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_TIMEOUT);
     TEST_ASSERT_EQUAL(1U, s_completions);
     TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, s_last_completion_status);
@@ -294,7 +298,7 @@ static void test_unrelated_notify_tx_ignored(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(0U, s_completions);
     _emit_notify_tx(8U, 9U, true, BLE_PORT_TX_CONFIRMED);
     _emit_notify_tx(7U, 10U, true, BLE_PORT_TX_CONFIRMED);
@@ -313,22 +317,22 @@ static void test_queue_full_reports_no_mem(void)
     /* An in-flight indication holds the queue so notifications queue up. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U,
-                          9U, payload, sizeof(payload)));
+                          9U, payload, sizeof(payload), true));
     _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_CONFIRMED);
     /* The two queued notifications drained synchronously. */
     TEST_ASSERT_EQUAL(2U, s_notify_calls);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(3U, s_notify_calls);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
 }
@@ -340,10 +344,10 @@ static void test_reset_drops_queue_and_completes_in_flight(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     ble_tx_scheduler_reset();
     TEST_ASSERT_EQUAL(1U, s_reset_completions);
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, s_last_completion_status);
@@ -351,7 +355,7 @@ static void test_reset_drops_queue_and_completes_in_flight(void)
     TEST_ASSERT_EQUAL(0U, s_notify_calls);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(1U, s_notify_calls);
 }
 
@@ -362,10 +366,10 @@ static void test_sync_notify_tx_reentrant(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(2U, s_notify_calls);
     TEST_ASSERT_EQUAL(2U, s_completions);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
@@ -383,7 +387,7 @@ static void test_sync_indicate_sent_keeps_in_flight(void)
     _init_scheduler(4U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(1U, s_indicate_calls);
     TEST_ASSERT_EQUAL(0U, s_completions);
     TEST_ASSERT_TRUE(ble_tx_scheduler_is_busy());
@@ -391,6 +395,102 @@ static void test_sync_indicate_sent_keeps_in_flight(void)
     TEST_ASSERT_EQUAL(1U, s_completions);
     TEST_ASSERT_EQUAL(ESP_OK, s_last_completion_status);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
+}
+
+static void test_indication_timeout_completes_frame(void)
+{
+    const uint8_t payload[2] = {0x01, 0x02};
+
+    _init_scheduler(4U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
+                          payload, sizeof(payload), true));
+    TEST_ASSERT_EQUAL(1U, s_indicate_calls);
+    TEST_ASSERT_EQUAL(0U, s_completions);
+    TEST_ASSERT_TRUE(ble_tx_scheduler_is_busy());
+    const uint32_t token = ble_tx_scheduler_get_in_flight_token();
+
+    TEST_ASSERT_TRUE(token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_tx_scheduler_handle_indication_timeout(token));
+    TEST_ASSERT_EQUAL(1U, s_completions);
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, s_last_completion_status);
+    TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
+}
+
+static void test_timeout_aborts_further_submits(void)
+{
+    const uint8_t payload[2] = {0x01, 0x02};
+
+    _init_scheduler(4U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
+                          payload, sizeof(payload), true));
+    /* The indication times out: the transaction is aborted. */
+    _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_TIMEOUT);
+    TEST_ASSERT_EQUAL(1U, s_completions);
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, s_last_completion_status);
+    /* Further submissions fail closed. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY,
+                          7U, 9U, payload,
+                          sizeof(payload), true));
+    /* Reset restores the scheduler. */
+    ble_tx_scheduler_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
+                          payload, sizeof(payload), true));
+}
+
+static void test_timer_timeout_aborts_further_submits(void)
+{
+    const uint8_t payload[2] = {0x01, 0x02};
+
+    _init_scheduler(4U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
+                          payload, sizeof(payload), true));
+    const uint32_t token = ble_tx_scheduler_get_in_flight_token();
+
+    /* The 2 s timer expiry path. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_tx_scheduler_handle_indication_timeout(token));
+    TEST_ASSERT_EQUAL(1U, s_completions);
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, s_last_completion_status);
+    /* Further submissions fail closed. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY,
+                          7U, 9U, payload,
+                          sizeof(payload), true));
+    ble_tx_scheduler_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
+                          payload, sizeof(payload), true));
+}
+
+static void test_stale_indication_timeout_ignored(void)
+{
+    const uint8_t payload[2] = {0x01, 0x02};
+
+    _init_scheduler(4U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
+                          payload, sizeof(payload), true));
+    const uint32_t first_token = ble_tx_scheduler_get_in_flight_token();
+
+    /* Confirm the first indication. */
+    _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_CONFIRMED);
+    TEST_ASSERT_EQUAL(1U, s_completions);
+    /* A second indication starts. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
+                          payload, sizeof(payload), true));
+    /* A late timeout for the first indication is rejected. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_tx_scheduler_handle_indication_timeout(
+                          first_token));
+    TEST_ASSERT_EQUAL(1U, s_completions);
+    TEST_ASSERT_TRUE(ble_tx_scheduler_is_busy());
 }
 
 static void test_frame_slot_reused_with_larger_payload(void)
@@ -402,10 +502,10 @@ static void test_frame_slot_reused_with_larger_payload(void)
     _init_scheduler(1U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          small, sizeof(small)));
+                          small, sizeof(small), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          large, sizeof(large)));
+                          large, sizeof(large), true));
     TEST_ASSERT_EQUAL(60U, s_notify_data_len);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
 }
@@ -428,13 +528,15 @@ static void test_consecutive_failures_all_complete(void)
     config.lock_arg = NULL;
     ble_tx_scheduler_deinit();
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_init(&config));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+    /* The synchronous failure is returned to the submit that caused it. */
+    TEST_ASSERT_EQUAL(ESP_FAIL, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          payload, sizeof(payload), true));
+    /* The fatal error is latched: later submissions fail closed. */
+    TEST_ASSERT_EQUAL(ESP_FAIL, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL(2U, s_completions);
+                          payload, sizeof(payload), true));
+    TEST_ASSERT_EQUAL(1U, s_completions);
     TEST_ASSERT_EQUAL(ESP_FAIL, s_last_completion_status);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
 }
@@ -459,23 +561,41 @@ static void test_queued_failures_all_complete_after_confirm(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_init(&config));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_INDICATE, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
-                          payload, sizeof(payload)));
+                          payload, sizeof(payload), true));
     TEST_ASSERT_EQUAL(0U, s_completions);
     _emit_notify_tx(7U, 9U, true, BLE_PORT_TX_CONFIRMED);
-    TEST_ASSERT_EQUAL(3U, s_completions);
+    /* The indicate confirms, then the first failing notify ends the
+     * transaction: the remaining queued frame is dropped. */
+    TEST_ASSERT_EQUAL(2U, s_completions);
     TEST_ASSERT_EQUAL(ESP_FAIL, s_last_completion_status);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
     TEST_ASSERT_EQUAL(0U, s_completion_in_ops_violations);
-    TEST_ASSERT_EQUAL(3U, s_completion_sequence_count);
+    TEST_ASSERT_EQUAL(2U, s_completion_sequence_count);
     TEST_ASSERT_EQUAL(ESP_OK, s_completion_sequence[0]);
     TEST_ASSERT_EQUAL(ESP_FAIL, s_completion_sequence[1]);
-    TEST_ASSERT_EQUAL(ESP_FAIL, s_completion_sequence[2]);
+}
+
+static void test_token_exhaustion_rejects_submit(void)
+{
+    const uint8_t payload[2] = {0x01, 0x02};
+
+    _init_scheduler(4U);
+    ble_tx_scheduler_test_set_token(UINT32_MAX - 2U);
+    /* One fresh token (MAX-1) remains allocatable. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY, 7U, 9U,
+                          payload, sizeof(payload), true));
+    /* The next submission cannot be assigned a fresh token. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_tx_scheduler_submit(
+                          BLE_TX_SCHEDULER_KIND_NOTIFY,
+                          7U, 9U, payload,
+                          sizeof(payload), true));
 }
 
 static void test_invalid_arguments_rejected(void)
@@ -486,23 +606,23 @@ static void test_invalid_arguments_rejected(void)
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_tx_scheduler_submit(
                           (ble_tx_scheduler_kind_t)99U,
                           7U, 9U, payload,
-                          sizeof(payload)));
+                          sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY,
-                          7U, 9U, NULL, 2U));
+                          7U, 9U, NULL, 2U, true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY,
-                          7U, 9U, payload, 0U));
+                          7U, 9U, payload, 0U, true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY,
-                          7U, 9U, payload, 101U));
+                          7U, 9U, payload, 101U, true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       ble_tx_scheduler_handle_notify_tx(NULL));
     ble_tx_scheduler_deinit();
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_tx_scheduler_submit(
                           BLE_TX_SCHEDULER_KIND_NOTIFY,
                           7U, 9U, payload,
-                          sizeof(payload)));
+                          sizeof(payload), true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
                       ble_tx_scheduler_handle_notify_tx(&(ble_port_event_t)
     {
@@ -522,6 +642,11 @@ int main(void)
     test_reset_drops_queue_and_completes_in_flight();
     test_sync_notify_tx_reentrant();
     test_sync_indicate_sent_keeps_in_flight();
+    test_indication_timeout_completes_frame();
+    test_token_exhaustion_rejects_submit();
+    test_stale_indication_timeout_ignored();
+    test_timer_timeout_aborts_further_submits();
+    test_timeout_aborts_further_submits();
     test_frame_slot_reused_with_larger_payload();
     test_consecutive_failures_all_complete();
     test_queued_failures_all_complete_after_confirm();

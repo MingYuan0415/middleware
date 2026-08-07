@@ -27,15 +27,18 @@ config BLE_RUNTIME_ADV_FAST_WINDOW_MS
 
 config BLE_RUNTIME_TX_QUEUE_DEPTH
     int "TX scheduler queue depth"
-    range 1 32
+    range 2 32
     default 8
     help
         Bounded number of pending frames the TX scheduler holds per
         connection. Full queues report ESP_ERR_NO_MEM so callers back off.
+        The service submits one whole response at a time: at the mandatory
+        MTU of 23 a capabilities response needs about 6 frames, so depths
+        below 6 are not guaranteed to deliver MTU-23 responses.
 
 config BLE_RUNTIME_TX_FRAME_BYTES
     int "TX scheduler max frame payload"
-    range 1 512
+    range 20 512
     default 495
     help
         Maximum payload of one notified or indicated frame. 495 bytes fits

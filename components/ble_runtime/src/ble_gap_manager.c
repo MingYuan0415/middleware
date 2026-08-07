@@ -151,6 +151,24 @@ esp_err_t ble_gap_manager_handle_event(
     }
 }
 
+bool ble_gap_manager_is_subscribed(
+    uint16_t conn_handle, uint16_t attr_handle)
+{
+    if (!s_manager.snapshot.connected ||
+            conn_handle != s_manager.snapshot.conn_handle)
+    {
+        return false;
+    }
+    for (size_t i = 0U; i < s_manager.subscribed_count; ++i)
+    {
+        if (s_manager.subscribed_handles[i] == attr_handle)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 esp_err_t ble_gap_manager_get_snapshot(ble_gap_manager_snapshot_t *out)
 {
     if (out == NULL)

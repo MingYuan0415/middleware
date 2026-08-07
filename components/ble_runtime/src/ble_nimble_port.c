@@ -12,6 +12,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 
 #include "host/ble_gap.h"
@@ -27,6 +28,8 @@
 #include "ble_nimble_port.h"
 #include "ble_port_ops.h"
 #include "ble_response_cache.h"
+#include "ble_link_gatt.h"
+#include "ble_link_session.h"
 #include "ble_runtime.h"
 #include "ble_tx_scheduler.h"
 
@@ -34,12 +37,16 @@
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
+#define BLE_NIMBLE_PORT_REASSEMBLY_IDLE_MS 5000U
+#define BLE_NIMBLE_PORT_INDICATION_TIMEOUT_MS 2000U
 #define BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS 10000U
 #define BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS 2000U
 #define BLE_NIMBLE_PORT_ACCESS_BUFFER_BYTES 512U
 #define BLE_NIMBLE_PORT_ADV_QUEUE_DEPTH 4U
 #define BLE_NIMBLE_PORT_ADV_TASK_STACK 2048U
 #define BLE_NIMBLE_PORT_ADV_TASK_PRIORITY 2U
+#define BLE_NIMBLE_PORT_LINK_TIMER_STACK 1024U
+#define BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY 1U
 
 #if CONFIG_BT_NIMBLE_PINNED_TO_CORE == 0
     #define BLE_NIMBLE_PORT_HOST_CORE 0
@@ -75,6 +82,7 @@ typedef struct ble_nimble_port
     QueueHandle_t adv_queue;
     struct ble_gap_event_listener listener;
     bool listener_registered;
+    bool link_gatt_initialized;
     const ble_port_ops_t *ops;
     bool started;
     bool deinitialized;
@@ -96,6 +104,23 @@ static esp_err_t _ble_nimble_port_production_notify(
 static esp_err_t _ble_nimble_port_production_indicate(
     uint16_t conn_handle, uint16_t value_handle,
     const uint8_t *data, size_t len);
+
+static void _ble_nimble_port_tx_completed(
+    const ble_tx_scheduler_result_t *result, void *arg)
+{
+    (void)arg;
+    if (result == NULL)
+    {
+        return;
+    }
+    /* The final fragment's confirmed completion releases the service
+     * transaction gate. A failure closes the session separately through
+     * the TX consumer. */
+    if (result->is_last && result->status == ESP_OK)
+    {
+        (void)ble_link_service_response_completed();
+    }
+}
 
 static const ble_port_ops_t s_production_ops =
 {
@@ -154,10 +179,524 @@ static void _ble_nimble_port_gap_consumer(
     (void)ble_gap_manager_handle_event(&manager_event);
 }
 
+static void _ble_nimble_port_publish_link_state(
+    const uint8_t *value, size_t len, void *arg)
+{
+    (void)arg;
+    const uint16_t handle = ble_link_gatt_link_state_handle();
+
+    if (handle == 0U)
+    {
+        return;
+    }
+    ble_gap_manager_snapshot_t snapshot;
+
+    if (ble_gap_manager_get_snapshot(&snapshot) != ESP_OK ||
+            !snapshot.connected)
+    {
+        return;
+    }
+    /* tx_admission: authorized; the link_state CCCD must be enabled. */
+    uint32_t admission_error = 0U;
+
+    if (ble_link_session_query_admission(
+                snapshot.generation, BLE_LINK_SESSION_CHANNEL_EVENT,
+                &admission_error) != ESP_OK ||
+            admission_error != BLE_LINK_ERROR_OK ||
+            !ble_gap_manager_is_subscribed(snapshot.conn_handle, handle))
+    {
+        return;
+    }
+    /* The raw link_state notification is not a service transaction: its
+     * completion must not release the service response gate. */
+    (void)ble_tx_scheduler_submit(
+        BLE_TX_SCHEDULER_KIND_NOTIFY, snapshot.conn_handle, handle, value,
+        len, false);
+}
+
+/* One-shot timers for reassembly idle and indication confirmation. The
+ * timer state is owned by a dedicated task; callbacks only enqueue an
+ * immutable timer id (epoch and kind encoded in the esp_timer argument), so
+ * a stale callback can never act on a newer arm. */
+#define BLE_NIMBLE_PORT_TIMER_KIND_SESSION 0U
+#define BLE_NIMBLE_PORT_TIMER_KIND_CONTROL 1U
+#define BLE_NIMBLE_PORT_TIMER_KIND_INDICATION 2U
+#define BLE_NIMBLE_PORT_TIMER_KINDS 3U
+
+/* The timer identity is encoded in the esp_timer callback argument:
+ * kind in the low bits, epoch shifted above. The argument is immutable
+ * for the timer lifetime, so a callback always carries the identity of the
+ * exact arm that created it; no shared record is read at fire time. */
+#define BLE_NIMBLE_PORT_TIMER_ID_KIND_SHIFT 0U
+#define BLE_NIMBLE_PORT_TIMER_ID_KIND_MASK 0x3U
+#define BLE_NIMBLE_PORT_TIMER_ID_EPOCH_SHIFT 2U
+#define BLE_NIMBLE_PORT_TIMER_ID_EPOCH_MASK 0x3fffffffU
+
+typedef struct ble_nimble_port_timer_command
+{
+    bool command;   /**< True: arm/disarm/quit; False: timer tick. */
+    bool armed;
+    unsigned int kind;
+    uint32_t generation;
+    uint32_t token;
+    uint32_t timer_id; /**< Encoded (epoch << 2) | kind. */
+} ble_nimble_port_timer_command_t;
+
+/* The command queue is statically allocated and never freed, so a timer
+ * callback that fires during teardown can always enqueue safely. */
+static StaticQueue_t s_timer_queue_storage;
+static ble_nimble_port_timer_command_t s_timer_queue_items[16];
+static QueueHandle_t s_timer_command_queue;
+static TaskHandle_t s_timer_owner_task;
+static SemaphoreHandle_t s_timer_exit;
+static uint32_t s_timer_generation;
+static uint16_t s_link_conn_handle;
+
+/* Per-kind state, updated under s_link_state_lock by the host task and
+ * read by the owner task. The epoch advances synchronously with the arm,
+ * so a stale tick is rejected as soon as it is dequeued. */
+static uint32_t s_timer_epochs[BLE_NIMBLE_PORT_TIMER_KINDS];
+static bool s_timer_exhausted[BLE_NIMBLE_PORT_TIMER_KINDS];
+static esp_timer_handle_t s_timer_handles[BLE_NIMBLE_PORT_TIMER_KINDS];
+static uint32_t s_timer_generations[BLE_NIMBLE_PORT_TIMER_KINDS];
+static uint32_t s_timer_tokens[BLE_NIMBLE_PORT_TIMER_KINDS];
+static uint64_t s_timer_deadlines[BLE_NIMBLE_PORT_TIMER_KINDS];
+static bool s_timer_armed[BLE_NIMBLE_PORT_TIMER_KINDS];
+
+/* Serializes every link session/service access between the NimBLE host
+ * task (GATT feed) and the timer owner task (idle/indication expiry). */
+static SemaphoreHandle_t s_link_state_lock;
+
+static void _ble_nimble_port_timer_cb(void *arg)
+{
+    /* Only the statically allocated queue is touched, so this is safe
+     * even while the owner task is being torn down. The immutable timer id
+     * identifies the exact arm that created this timer. */
+    const ble_nimble_port_timer_command_t tick =
+    {
+        .command = false,
+        .timer_id = (uint32_t)(uintptr_t)arg,
+    };
+
+    if (s_timer_command_queue != NULL)
+    {
+        if (xQueueSend(s_timer_command_queue, &tick, 0U) != pdTRUE)
+        {
+            /* A dropped tick loses this expiry; the next arm or the
+             * connection teardown re-establishes the window. */
+        }
+    }
+}
+
+static uint32_t _ble_nimble_port_timer_epoch_advance(unsigned int kind)
+{
+    if (s_timer_exhausted[kind])
+    {
+        return 0U;
+    }
+    if (s_timer_epochs[kind] >= BLE_NIMBLE_PORT_TIMER_ID_EPOCH_MASK)
+    {
+        /* The epoch no longer fits the immutable timer id: fail closed
+         * before the encoded value would wrap. */
+        s_timer_exhausted[kind] = true;
+        return 0U;
+    }
+    s_timer_epochs[kind]++;
+    return s_timer_epochs[kind];
+}
+
+static void _ble_nimble_port_timer_free_handle(unsigned int kind)
+{
+    if (s_timer_handles[kind] != NULL)
+    {
+        esp_timer_stop(s_timer_handles[kind]);
+        esp_timer_delete(s_timer_handles[kind]);
+        s_timer_handles[kind] = NULL;
+    }
+}
+
+static void _ble_nimble_port_timer_fail_closed(
+    unsigned int kind, uint32_t generation, uint32_t token)
+{
+    s_timer_armed[kind] = false;
+    if (kind == BLE_NIMBLE_PORT_TIMER_KIND_INDICATION)
+    {
+        /* End the in-flight indication and drop the queued transaction;
+         * only a token match closes the session and the transaction gate. */
+        if (ble_tx_scheduler_handle_indication_timeout(token) == ESP_OK)
+        {
+            (void)ble_link_session_security2_close_current(generation);
+            ble_link_service_abort_transactions();
+        }
+    }
+    else
+    {
+        /* Abort the reassembly slot for this channel. */
+        ble_link_gatt_on_reassembly_idle_generation(generation);
+    }
+}
+
+static void _ble_nimble_port_timer_rebuild(
+    const ble_nimble_port_timer_command_t *command)
+{
+    /* The epoch and deadline were fixed by the host task under the lock;
+     * the owner rebuilds the esp_timer with the remaining time. A stale
+     * command (superseded by a newer arm) is dropped. */
+    const unsigned int kind = command->kind;
+    const uint32_t command_epoch =
+        (command->timer_id >> BLE_NIMBLE_PORT_TIMER_ID_EPOCH_SHIFT) &
+        BLE_NIMBLE_PORT_TIMER_ID_EPOCH_MASK;
+
+    if (command_epoch != s_timer_epochs[kind])
+    {
+        return;
+    }
+    const uint64_t now = esp_timer_get_time();
+    uint64_t remaining_us = 0U;
+
+    if (s_timer_deadlines[kind] > now)
+    {
+        remaining_us = s_timer_deadlines[kind] - now;
+    }
+    _ble_nimble_port_timer_free_handle(kind);
+    esp_timer_create_args_t args;
+
+    memset(&args, 0, sizeof(args));
+    args.callback = _ble_nimble_port_timer_cb;
+    args.arg = (void *)(uintptr_t)command->timer_id;
+    args.name = (kind == BLE_NIMBLE_PORT_TIMER_KIND_INDICATION) ?
+                "ble_ind_tmo" : "ble_reasm_idle";
+    if (remaining_us == 0U ||
+            esp_timer_create(&args, &s_timer_handles[kind]) != ESP_OK ||
+            esp_timer_start_once(s_timer_handles[kind], remaining_us) != ESP_OK)
+    {
+        /* Fail closed: without the timer the timeout contract cannot be
+         * met, so the transaction and session are terminated; a
+         * reassembly slot is aborted through the idle path. */
+        _ble_nimble_port_timer_free_handle(kind);
+        s_timer_armed[kind] = false;
+        _ble_nimble_port_timer_fail_closed(
+            kind, command->generation, command->token);
+    }
+}
+
+static void _ble_nimble_port_timer_check_deadlines(void)
+{
+    /* Any wakeup checks every armed kind; a lost tick cannot strand an
+     * indication. Runs with s_link_state_lock held. */
+    const uint64_t now = esp_timer_get_time();
+
+    for (unsigned int kind = 0U; kind < BLE_NIMBLE_PORT_TIMER_KINDS; ++kind)
+    {
+        if (!s_timer_armed[kind] || s_timer_deadlines[kind] > now)
+        {
+            continue;
+        }
+        const uint32_t generation = s_timer_generations[kind];
+        const uint32_t token = s_timer_tokens[kind];
+
+        s_timer_armed[kind] = false;
+        if (kind == BLE_NIMBLE_PORT_TIMER_KIND_INDICATION)
+        {
+            if (ble_tx_scheduler_handle_indication_timeout(token) == ESP_OK)
+            {
+                (void)ble_link_session_security2_close_current(generation);
+                ble_link_service_abort_transactions();
+            }
+        }
+        else
+        {
+            ble_link_gatt_on_reassembly_idle_generation(generation);
+        }
+    }
+}
+
+static void _ble_nimble_port_timer_teardown(void)
+{
+    /* Free live timer handles and clear per-kind runtime state. Safe from
+     * the owner task or from teardown when the owner had to be deleted. */
+    for (unsigned int kind = 0U; kind < BLE_NIMBLE_PORT_TIMER_KINDS; ++kind)
+    {
+        _ble_nimble_port_timer_free_handle(kind);
+        s_timer_armed[kind] = false;
+        s_timer_deadlines[kind] = 0U;
+    }
+    /* Drain stale commands so a restarted owner cannot act on them. The
+     * queue may not exist yet during partial initialization. */
+    if (s_timer_command_queue != NULL)
+    {
+        ble_nimble_port_timer_command_t stale;
+
+        while (xQueueReceive(s_timer_command_queue, &stale, 0U) == pdTRUE)
+        {
+        }
+    }
+}
+
+static void _ble_nimble_port_timer_owner(void *arg)
+{
+    (void)arg;
+    ble_nimble_port_timer_command_t command;
+
+    for (;;)
+    {
+        if (xQueueReceive(s_timer_command_queue, &command, portMAX_DELAY) !=
+                pdTRUE)
+        {
+            continue;
+        }
+        if (s_link_state_lock == NULL ||
+                xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+        if (command.command)
+        {
+            if (!command.armed)
+            {
+                if (command.kind >= BLE_NIMBLE_PORT_TIMER_KINDS)
+                {
+                    /* Quit. */
+                    xSemaphoreGiveRecursive(s_link_state_lock);
+                    break;
+                }
+                _ble_nimble_port_timer_free_handle(command.kind);
+            }
+            else
+            {
+                _ble_nimble_port_timer_rebuild(&command);
+            }
+        }
+        /* A tick only wakes us up; the deadline sweep below is the actual
+         * expiry check, so a lost or stale tick is harmless. */
+        _ble_nimble_port_timer_check_deadlines();
+        xSemaphoreGiveRecursive(s_link_state_lock);
+    }
+    _ble_nimble_port_timer_teardown();
+    if (s_timer_exit != NULL)
+    {
+        xSemaphoreGive(s_timer_exit);
+    }
+    vTaskDelete(NULL);
+}
+
+static bool _ble_nimble_port_timer_send(
+    bool armed, unsigned int kind, uint32_t generation, uint32_t token)
+{
+    if (s_timer_command_queue == NULL ||
+            (s_link_state_lock != NULL &&
+             xSemaphoreTakeRecursive(s_link_state_lock,
+                                     portMAX_DELAY) != pdTRUE))
+    {
+        return false;
+    }
+    /* Advance the epoch synchronously so a stale tick cannot pass. */
+    if (armed)
+    {
+        const uint32_t epoch = _ble_nimble_port_timer_epoch_advance(kind);
+
+        if (epoch == 0U)
+        {
+            /* Exhausted: fail closed so the timeout contract is not
+             * silently dropped. */
+            s_timer_armed[kind] = false;
+            if (s_link_state_lock != NULL)
+            {
+                xSemaphoreGiveRecursive(s_link_state_lock);
+            }
+            _ble_nimble_port_timer_fail_closed(kind, generation, token);
+            return false;
+        }
+        s_timer_generations[kind] = generation;
+        s_timer_tokens[kind] = token;
+        s_timer_deadlines[kind] =
+            esp_timer_get_time() +
+            ((kind == BLE_NIMBLE_PORT_TIMER_KIND_INDICATION) ?
+             (uint64_t)BLE_NIMBLE_PORT_INDICATION_TIMEOUT_MS * 1000U :
+             (uint64_t)BLE_NIMBLE_PORT_REASSEMBLY_IDLE_MS * 1000U);
+        s_timer_armed[kind] = true;
+        const ble_nimble_port_timer_command_t command =
+        {
+            .command = true,
+            .armed = true,
+            .kind = kind,
+            .generation = generation,
+            .token = token,
+            .timer_id = (epoch << BLE_NIMBLE_PORT_TIMER_ID_EPOCH_SHIFT) |
+            (kind & BLE_NIMBLE_PORT_TIMER_ID_KIND_MASK),
+        };
+
+        if (xQueueSend(s_timer_command_queue, &command, 0U) != pdTRUE)
+        {
+            LOG_E("link timer arm dropped kind=%u", (unsigned int)kind);
+            _ble_nimble_port_timer_fail_closed(kind, generation, token);
+            if (s_link_state_lock != NULL)
+            {
+                xSemaphoreGiveRecursive(s_link_state_lock);
+            }
+            return false;
+        }
+    }
+    else
+    {
+        const uint32_t epoch = _ble_nimble_port_timer_epoch_advance(kind);
+
+        (void)epoch;
+        s_timer_armed[kind] = false;
+        const ble_nimble_port_timer_command_t command =
+        {
+            .command = true,
+            .armed = false,
+            .kind = kind,
+        };
+
+        if (xQueueSend(s_timer_command_queue, &command, 0U) != pdTRUE)
+        {
+            LOG_E("link timer disarm dropped kind=%u", (unsigned int)kind);
+        }
+    }
+    if (s_link_state_lock != NULL)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+    }
+    return true;
+}
+
+static void _ble_nimble_port_arm_reassembly_idle(
+    bool armed, uint32_t generation,
+    ble_link_service_rx_channel_t channel)
+{
+    /* Each RX characteristic has its own 5000 ms idle window. */
+    const unsigned int kind =
+        (channel == BLE_LINK_SERVICE_RX_SESSION) ?
+        BLE_NIMBLE_PORT_TIMER_KIND_SESSION :
+        BLE_NIMBLE_PORT_TIMER_KIND_CONTROL;
+
+    _ble_nimble_port_timer_send(armed, kind, generation, 0U);
+}
+
+static bool _ble_nimble_port_arm_indication_timeout(
+    bool armed, uint32_t generation, uint32_t token)
+{
+    return _ble_nimble_port_timer_send(
+               armed, BLE_NIMBLE_PORT_TIMER_KIND_INDICATION, generation,
+               token);
+}
+
+static void _ble_nimble_port_link_gatt_consumer(
+    const ble_port_event_t *event, void *arg)
+{
+    (void)arg;
+    ble_gap_manager_snapshot_t snapshot;
+    uint32_t generation = 0U;
+    uint16_t mtu = 23U;
+
+    if (ble_gap_manager_get_snapshot(&snapshot) == ESP_OK)
+    {
+        generation = snapshot.generation;
+        mtu = snapshot.mtu;
+    }
+    switch (event->type)
+    {
+    case BLE_PORT_EVENT_CONNECT:
+    case BLE_PORT_EVENT_DISCONNECT:
+    case BLE_PORT_EVENT_ENC_CHANGE:
+    case BLE_PORT_EVENT_MTU:
+        break;
+    default:
+        /* Events that never touch the link session do not take the lock. */
+        return;
+    }
+    if (s_link_state_lock != NULL &&
+            xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY) != pdTRUE)
+    {
+        return;
+    }
+    switch (event->type)
+    {
+    case BLE_PORT_EVENT_CONNECT:
+        if (snapshot.connected &&
+                event->conn_handle == snapshot.conn_handle)
+        {
+            ble_link_gatt_set_connection(generation, event->conn_handle);
+            (void)ble_link_session_handle_event(
+                generation, BLE_LINK_SESSION_EVENT_ACL_CONNECTED);
+            /* Remember the connection identity and generation; the idle
+             * timer arms only while a partial frame exists. */
+            s_link_conn_handle = event->conn_handle;
+            s_timer_generation = generation;
+        }
+        break;
+    case BLE_PORT_EVENT_DISCONNECT:
+        /* The gap consumer runs first and already cleared the snapshot;
+         * compare against the remembered connection identity. */
+        if (s_link_conn_handle != event->conn_handle)
+        {
+            break;
+        }
+        (void)ble_link_session_handle_event(
+            generation, BLE_LINK_SESSION_EVENT_ACL_DISCONNECTED);
+        _ble_nimble_port_arm_reassembly_idle(
+            false, generation, BLE_LINK_SERVICE_RX_SESSION);
+        _ble_nimble_port_arm_reassembly_idle(
+            false, generation, BLE_LINK_SERVICE_RX_CONTROL);
+        _ble_nimble_port_arm_indication_timeout(false, 0U, 0U);
+        /* A disconnect with an unconfirmed response must not leave the
+         * transaction gate busy for the next connection. */
+        ble_link_service_abort_transactions();
+        s_link_conn_handle = 0U;
+        break;
+    case BLE_PORT_EVENT_ENC_CHANGE:
+        if (s_link_conn_handle != event->conn_handle)
+        {
+            break;
+        }
+        if (event->encrypted)
+        {
+            (void)ble_link_session_handle_event(
+                generation, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED);
+            /* SC_BOND_VERIFIED is not reported until the bond store and
+             * peer identity are actually verified on device; the session
+             * then stays unauthenticated (fail closed). */
+        }
+        else
+        {
+            (void)ble_link_session_clear_link_security(generation);
+            (void)ble_link_session_security2_close_current(generation);
+        }
+        break;
+    case BLE_PORT_EVENT_MTU:
+        if (s_link_conn_handle != event->conn_handle)
+        {
+            break;
+        }
+        ble_link_gatt_set_att_mtu(event->mtu);
+        break;
+    default:
+        break;
+    }
+    (void)ble_link_gatt_refresh_link_state();
+    if (s_link_state_lock != NULL)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+    }
+}
+
 static void _ble_nimble_port_adv_consumer(
     const ble_port_event_t *event, void *arg)
 {
     (void)arg;
+    if (event->type == BLE_PORT_EVENT_DISCONNECT)
+    {
+        /* Only the current connection's disconnect stops advertising. */
+        ble_gap_manager_snapshot_t snapshot;
+
+        if (ble_gap_manager_get_snapshot(&snapshot) == ESP_OK &&
+                snapshot.conn_handle != event->conn_handle)
+        {
+            return;
+        }
+    }
     const esp_err_t result = ble_adv_manager_handle_event(event);
 
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
@@ -174,15 +713,59 @@ static void _ble_nimble_port_tx_consumer(
     {
     case BLE_PORT_EVENT_NOTIFY_TX:
     {
+        /* The scheduler serializes the TX path with its own lock and is
+         * safe against synchronous re-entrant events; the link state lock
+         * is deliberately NOT taken here because NimBLE may deliver
+         * NOTIFY_TX synchronously inside an ops call that already holds
+         * it, which would self-deadlock. Any rearm triggered by the
+         * scheduler (production_indicate) takes the lock itself. */
         const esp_err_t result = ble_tx_scheduler_handle_notify_tx(event);
 
-        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+        if (result == ESP_OK &&
+                (event->tx_result == BLE_PORT_TX_TIMEOUT ||
+                 event->tx_result == BLE_PORT_TX_ERROR))
         {
+            /* The scheduler confirmed this event completed the in-flight
+             * frame with a failure: close the Security 2 session per the
+             * framing contract and release the transaction gate (a failed
+             * notification also drops queued service frames). */
+            ble_gap_manager_snapshot_t snapshot;
+
+            if (ble_gap_manager_get_snapshot(&snapshot) == ESP_OK &&
+                    snapshot.conn_handle == event->conn_handle)
+            {
+                (void)ble_link_session_security2_close_current(
+                    snapshot.generation);
+                ble_link_service_abort_transactions();
+            }
+        }
+        else if (result != ESP_OK && result != ESP_ERR_NOT_FOUND &&
+                 result != ESP_ERR_INVALID_STATE)
+        {
+            /* The scheduler surfaced a synchronous failure of a queued
+             * fragment: close the session for the current connection and
+             * release the transaction gate. */
+            ble_gap_manager_snapshot_t snapshot;
+
+            if (ble_gap_manager_get_snapshot(&snapshot) == ESP_OK &&
+                    snapshot.conn_handle == event->conn_handle)
+            {
+                (void)ble_link_session_security2_close_current(
+                    snapshot.generation);
+                ble_link_service_abort_transactions();
+            }
             LOG_E("tx scheduler event failed result=%d", result);
         }
         break;
     }
     case BLE_PORT_EVENT_DISCONNECT:
+        /* Only the current connection's disconnect resets the scheduler. */
+        if (s_link_conn_handle != event->conn_handle)
+        {
+            break;
+        }
+        ble_tx_scheduler_reset();
+        break;
     case BLE_PORT_EVENT_RESET:
         ble_tx_scheduler_reset();
         break;
@@ -279,7 +862,7 @@ static esp_err_t _ble_nimble_port_tx_manager_init(void)
         .queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH,
         .max_frame_bytes = CONFIG_BLE_RUNTIME_TX_FRAME_BYTES,
         .ops = NULL,
-        .completed = NULL,
+        .completed = _ble_nimble_port_tx_completed,
         .completed_arg = NULL,
         .lock = _ble_nimble_port_tx_lock_cb,
         .unlock = _ble_nimble_port_tx_unlock_cb,
@@ -445,6 +1028,49 @@ static void _ble_nimble_port_on_reset(int reason)
     _ble_nimble_port_dispatch(&event);
 }
 
+static bool _ble_nimble_port_is_link_rx(
+    const ble_gatt_registry_characteristic_t *characteristic)
+{
+    static const uint8_t session_rx_uuid[16] =
+    {
+        0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
+        0xd8, 0x4d, 0xcb, 0x4c, 0x43, 0xe6, 0x01, 0x48,
+    };
+    static const uint8_t control_rx_uuid[16] =
+    {
+        0xc8, 0x13, 0x3d, 0x40, 0xfb, 0x3d, 0x0c, 0x8e,
+        0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
+    };
+
+    return memcmp(characteristic->uuid, session_rx_uuid, 16U) == 0 ||
+           memcmp(characteristic->uuid, control_rx_uuid, 16U) == 0;
+}
+
+static ble_link_service_rx_channel_t _ble_nimble_port_link_rx_channel(
+    const ble_gatt_registry_characteristic_t *characteristic)
+{
+    static const uint8_t session_rx_uuid[16] =
+    {
+        0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
+        0xd8, 0x4d, 0xcb, 0x4c, 0x43, 0xe6, 0x01, 0x48,
+    };
+    static const uint8_t control_rx_uuid[16] =
+    {
+        0xc8, 0x13, 0x3d, 0x40, 0xfb, 0x3d, 0x0c, 0x8e,
+        0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
+    };
+
+    if (memcmp(characteristic->uuid, session_rx_uuid, 16U) == 0)
+    {
+        return BLE_LINK_SERVICE_RX_SESSION;
+    }
+    if (memcmp(characteristic->uuid, control_rx_uuid, 16U) == 0)
+    {
+        return BLE_LINK_SERVICE_RX_CONTROL;
+    }
+    return BLE_LINK_SERVICE_RX_CONTROL;
+}
+
 static int _ble_nimble_port_access_bridge(
     uint16_t conn_handle, uint16_t attr_handle,
     struct ble_gatt_access_ctxt *context, void *arg)
@@ -495,9 +1121,37 @@ static int _ble_nimble_port_access_bridge(
     default:
         return BLE_ATT_ERR_UNLIKELY;
     }
-    const int result = characteristic->access_cb(
-                           conn_handle, attr_handle, &port_context,
-                           characteristic->arg);
+    int result;
+
+    if (s_link_state_lock != NULL &&
+            xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY) != pdTRUE)
+    {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    result = characteristic->access_cb(
+                 conn_handle, attr_handle, &port_context,
+                 characteristic->arg);
+    if (result == 0 &&
+            port_context.op == BLE_GATT_REGISTRY_OP_WRITE_CHR &&
+            s_timer_generation != 0U &&
+            _ble_nimble_port_is_link_rx(characteristic))
+    {
+        /* After an accepted feed, keep the idle timer only while a partial
+         * frame remains on this RX channel. Rejected writes never restart
+         * the window, and other characteristics never touch it. This runs
+         * while the link state lock is held, so the partial state cannot
+         * change concurrently. */
+        const ble_link_service_rx_channel_t channel =
+            _ble_nimble_port_link_rx_channel(characteristic);
+
+        _ble_nimble_port_arm_reassembly_idle(
+            ble_link_service_has_partial_frame(channel),
+            s_timer_generation, channel);
+    }
+    if (s_link_state_lock != NULL)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+    }
     if (result == 0 &&
             port_context.op == BLE_GATT_REGISTRY_OP_READ_CHR &&
             read_len > 0U)
@@ -532,6 +1186,7 @@ static void _ble_nimble_port_gatts_register(
             LOG_W("handle assignment failed result=%d", result);
         }
     }
+    ble_link_gatt_update_handles();
 }
 
 static esp_err_t _ble_nimble_port_register_database(void)
@@ -853,7 +1508,30 @@ static esp_err_t _ble_nimble_port_production_indicate(
     {
         return ESP_ERR_NO_MEM;
     }
+    /* The 2000 ms confirmation window starts at submission, bound to the
+     * scheduler's in-flight token. */
+    const uint32_t token = ble_tx_scheduler_get_in_flight_token();
+    ble_gap_manager_snapshot_t snapshot;
+
+    if (ble_gap_manager_get_snapshot(&snapshot) != ESP_OK)
+    {
+        snapshot.generation = 0U;
+    }
+    if (token != 0U &&
+            !_ble_nimble_port_arm_indication_timeout(true,
+                    snapshot.generation,
+                    token))
+    {
+        /* The confirmation timer could not be armed: do not send an
+         * indication that can never time out, and release the mbuf. */
+        os_mbuf_free_chain(om);
+        return ESP_FAIL;
+    }
     result = ble_gatts_indicate_custom(conn_handle, value_handle, om);
+    if (result != 0)
+    {
+        _ble_nimble_port_arm_indication_timeout(false, 0U, 0U);
+    }
     return result == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -919,6 +1597,41 @@ static esp_err_t _ble_nimble_port_rollback_init(
         vSemaphoreDelete(s_port.adv_exit_semaphore);
         s_port.adv_exit_semaphore = NULL;
     }
+    if (s_timer_owner_task != NULL)
+    {
+        const ble_nimble_port_timer_command_t quit =
+        {
+            .command = true,
+            .armed = false,
+            .kind = BLE_NIMBLE_PORT_TIMER_KINDS,
+        };
+
+        if (s_timer_command_queue != NULL)
+        {
+            (void)xQueueSend(s_timer_command_queue, &quit, 0U);
+        }
+        if (s_timer_exit != NULL &&
+                xSemaphoreTake(s_timer_exit,
+                               pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
+                pdTRUE)
+        {
+            vTaskDelete(s_timer_owner_task);
+        }
+        s_timer_owner_task = NULL;
+    }
+    _ble_nimble_port_timer_teardown();
+    /* The command queue is statically allocated and stays for the module
+     * lifetime; the lock and exit semaphore are recycled. */
+    if (s_link_state_lock != NULL)
+    {
+        vSemaphoreDelete(s_link_state_lock);
+        s_link_state_lock = NULL;
+    }
+    if (s_timer_exit != NULL)
+    {
+        vSemaphoreDelete(s_timer_exit);
+        s_timer_exit = NULL;
+    }
     const esp_err_t cleanup = s_port.nimble_init_attempted
                               ? nimble_port_deinit()
                               : ESP_OK;
@@ -960,6 +1673,53 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         return result;
     }
+    if (s_timer_command_queue == NULL)
+    {
+        /* Statically allocated and never freed: a timer callback that
+         * fires during teardown can always enqueue safely. */
+        s_timer_command_queue = xQueueCreateStatic(
+                                    16U, sizeof(ble_nimble_port_timer_command_t),
+                                    (uint8_t *)s_timer_queue_items, &s_timer_queue_storage);
+        if (s_timer_command_queue == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_timer_exit == NULL)
+    {
+        s_timer_exit = xSemaphoreCreateBinary();
+        if (s_timer_exit == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_link_state_lock == NULL)
+    {
+        /* Recursive: the bridge holds the lock while feeding, and NimBLE
+         * may deliver NOTIFY_TX synchronously inside the same ops call, so
+         * the TX consumer and the rearm path re-enter the same task. */
+        s_link_state_lock = xSemaphoreCreateRecursiveMutex();
+        if (s_link_state_lock == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_timer_owner_task == NULL)
+    {
+        if (xTaskCreate(_ble_nimble_port_timer_owner,
+                        "ble_link_timer", BLE_NIMBLE_PORT_LINK_TIMER_STACK,
+                        NULL, BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY,
+                        &s_timer_owner_task) != pdPASS)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    result = ble_event_router_register(
+                 _ble_nimble_port_link_gatt_consumer, NULL);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     if (s_port.ops == NULL)
     {
         s_port.ops = &s_production_ops;
@@ -975,6 +1735,48 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         return result;
     }
+    if (!s_port.link_gatt_initialized)
+    {
+        static ble_link_gatt_config_t gatt_config;
+
+        memset(&gatt_config, 0, sizeof(gatt_config));
+        gatt_config.boot_id = esp_random();
+        if (gatt_config.boot_id == 0U)
+        {
+            gatt_config.boot_id = 1U;
+        }
+        gatt_config.att_mtu = 23U;
+        gatt_config.tx_queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH;
+        gatt_config.publish_link_state = _ble_nimble_port_publish_link_state;
+        result = ble_link_gatt_init(&gatt_config);
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+        if (!ble_gatt_registry_is_sealed())
+        {
+            const esp_err_t seal_result = ble_gatt_registry_seal();
+
+            if (seal_result != ESP_OK)
+            {
+                return seal_result;
+            }
+        }
+        s_port.link_gatt_initialized = true;
+    }
+    else
+    {
+        /* A runtime restart re-initializes the transport service (the
+         * deinit cleared its per-connection state and dispatcher) and
+         * clears the connection facts so the fresh GAP generation is
+         * accepted. The boot id, epoch allocator, and registry services
+         * are preserved. */
+        result = ble_link_gatt_restart();
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+    }
     s_port.nimble_init_attempted = true;
     result = nimble_port_init();
     if (result != ESP_OK)
@@ -988,9 +1790,18 @@ static esp_err_t _ble_nimble_port_init(void)
     ble_hs_cfg.gatts_register_cb = _ble_nimble_port_gatts_register;
     ble_hs_cfg.store_status_cb = NULL;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
-    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 0;
+    ble_hs_cfg.sm_sc = 1;
+    /* Identity keys are distributed so the peer identity can be verified
+     * on device. The bond-store identity/SC/LTK verification is NOT yet
+     * implemented: SC_BOND_VERIFIED and identity_known stay false and the
+     * session admission remains fail-closed until that verification lands
+     * in the ENC_CHANGE path. */
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                 BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                   BLE_SM_PAIR_KEY_DIST_ID;
     if (!s_port.listener_registered)
     {
         const int register_result = ble_gap_event_listener_register(
@@ -1219,6 +2030,51 @@ static esp_err_t _ble_nimble_port_deinit(void)
     {
         vSemaphoreDelete(s_port.stop_done_semaphore);
         s_port.stop_done_semaphore = NULL;
+    }
+    /* Timers are per-arm handles created by the owner task; there is no
+     * persistent timer to stop here. The callback only wakes the owner task
+     * through xQueueSend to a statically allocated queue that is never
+     * freed, so teardown cannot race it: the owner task is stopped first,
+     * and any callback that fires afterwards enqueues harmlessly into the
+     * still-valid static queue. */
+    if (s_timer_owner_task != NULL)
+    {
+        /* Quit: kind >= KINDS signals the owner to stop, free its timers,
+         * signal exit, and delete itself. */
+        const ble_nimble_port_timer_command_t quit =
+        {
+            .command = true,
+            .armed = false,
+            .kind = BLE_NIMBLE_PORT_TIMER_KINDS,
+        };
+
+        (void)xQueueSend(s_timer_command_queue, &quit, 0U);
+        if (s_timer_exit != NULL &&
+                xSemaphoreTake(s_timer_exit,
+                               pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
+                pdTRUE)
+        {
+            /* Fallback: the owner may have died already. */
+            vTaskDelete(s_timer_owner_task);
+        }
+        s_timer_owner_task = NULL;
+    }
+    _ble_nimble_port_timer_teardown();
+    /* Runtime restart: clear per-connection transport state (partial
+     * frames, subscriptions, transactions, feed generation) while keeping
+     * the boot-scoped session facts and epoch allocator. */
+    ble_link_gatt_reset();
+    ble_link_session_reset();
+    if (s_link_state_lock != NULL)
+    {
+        vSemaphoreDelete(s_link_state_lock);
+        s_link_state_lock = NULL;
+    }
+    /* The static queue and exit semaphore live for the module lifetime. */
+    if (s_timer_exit != NULL)
+    {
+        vSemaphoreDelete(s_timer_exit);
+        s_timer_exit = NULL;
     }
     ble_used_id_set_deinit();
     ble_response_cache_deinit();

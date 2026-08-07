@@ -11,7 +11,7 @@
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"
 
-#define BLE_EVENT_ROUTER_MAX_CONSUMERS 4U
+#define BLE_EVENT_ROUTER_MAX_CONSUMERS 6U
 
 typedef struct ble_event_router
 {

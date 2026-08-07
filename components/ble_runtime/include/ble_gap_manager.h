@@ -88,6 +88,16 @@ esp_err_t ble_gap_manager_handle_event(
     const ble_gap_manager_event_t *event);
 
 /**
+ * @brief Query whether a characteristic is currently subscribed.
+ *
+ * @param[in] conn_handle Connection handle.
+ * @param[in] attr_handle Characteristic value handle.
+ * @return True when subscribed for the current connection.
+ */
+bool ble_gap_manager_is_subscribed(
+    uint16_t conn_handle, uint16_t attr_handle);
+
+/**
  * @brief Copy the current connection snapshot.
  *
  * Must be called from the same task that feeds events (the host task), or

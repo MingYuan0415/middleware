@@ -56,6 +56,8 @@ static void _authenticate(uint32_t generation)
                           BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
                           generation, &s_auth_epoch));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          generation, true));
 }
 
 static void _authorize(uint32_t generation, uint32_t revision)
@@ -110,11 +112,16 @@ static void test_admission_progression(void)
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_SESSION));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
-    /* Encrypted + bond: session admitted, control still gated. */
+    /* Encrypted + bond: session still gated until identity is verified. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
+                      _query(GEN1, BLE_LINK_SESSION_CHANNEL_SESSION));
+    /* Identity verified: session admitted, control still gated. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          GEN1, true));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_SESSION));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,

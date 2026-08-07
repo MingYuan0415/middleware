@@ -104,15 +104,17 @@ esp_err_t ble_link_dispatcher_handle_request(
         return ESP_ERR_INVALID_ARG;
     }
     *out_error = 0U;
-    if (envelope->protocol_major != BLE_LINK_CODEC_PROTOCOL_MAJOR)
-    {
-        *out_error = BLE_LINK_ERROR_UNSUPPORTED_VERSION;
-        return ESP_OK;
-    }
+    /* Boot id validation precedes the protocol check: a foreign boot is
+     * terminal per the lifecycle contract. */
     if (facts->active_boot_id == 0U ||
             envelope->boot_id != facts->active_boot_id)
     {
         *out_error = BLE_LINK_ERROR_UNAVAILABLE;
+        return ESP_OK;
+    }
+    if (envelope->protocol_major != BLE_LINK_CODEC_PROTOCOL_MAJOR)
+    {
+        *out_error = BLE_LINK_ERROR_UNSUPPORTED_VERSION;
         return ESP_OK;
     }
     for (size_t i = 0U; i < envelope->flags_count; ++i)
