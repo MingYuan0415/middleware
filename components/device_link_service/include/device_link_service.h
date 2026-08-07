@@ -71,6 +71,12 @@ typedef device_link_service_status_t device_link_service_snapshot_t;
  * acquired, and the binding window machinery becomes available. A failed
  * start releases everything and returns the error; init may be retried.
  *
+ * Lifecycle admission is exclusive but all init/deinit calls must come
+ * from a single owner task (the runtime owner), as with ble_runtime.
+ * Status snapshots carry a monotonic generation; consumers must ignore
+ * generations that do not advance, because the initial publication may
+ * race a subsequent worker publication in arrival order.
+ *
  * @param[in] config Service policy, copied before the worker starts.
  * @return ESP_OK on success; otherwise an argument, lifecycle, or port error.
  */
@@ -107,7 +113,9 @@ esp_err_t device_link_service_close_window(void);
  * queue first is closed by the suspend itself; the service then has no
  * window and the suspended flag is set. The call waits (bounded by
  * timeout_ms, or forever with DEVICE_LINK_SERVICE_WAIT_FOREVER) until the
- * worker applied the state, so standby preparation can rely on it.
+ * worker applied the state, so standby preparation can rely on it. On
+ * timeout the command may still be applied later (it only ever closes the
+ * window); the caller must treat the result as unknown and re-check.
  *
  * @param[in] timeout_ms Maximum wait for the state to be applied.
  * @return ESP_OK when applied, ESP_ERR_TIMEOUT, or a queue error.

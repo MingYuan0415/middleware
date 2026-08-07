@@ -303,6 +303,7 @@ static esp_err_t _device_link_service_open_window_locked(void)
             {
                 (void)ble_adv_manager_release_lease(lease.lease_id);
             }
+            _device_link_service_zeroize(&lease, sizeof(lease));
             goto exit;
         }
         ble_link_session_set_pairing_window(true);
@@ -729,25 +730,26 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     atomic_store_explicit(&s_worker_result, ESP_OK,
                           memory_order_release);
-    /* The initial snapshot is prepared and RUNNING is exposed before the
-     * publish: get_status sees a complete snapshot, and a publisher-context
-     * subscriber that re-enters the service API during the publish sees a
-     * running service. */
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    s_service.snapshot.generation = 1U;
-    s_service.snapshot.available = true;
-    s_service.snapshot.state = DEVICE_LINK_SERVICE_STATE_ADVERTISING;
-    s_service.snapshot.window_remaining_ms = 0U;
-    xSemaphoreGive(s_service.mutex);
-    atomic_store_explicit(&s_lifecycle,
-                          DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
-                          memory_order_release);
+    /* The initial snapshot is prepared under the lock and copied before
+     * RUNNING is exposed, so the publish afterwards never touches service
+     * state: get_status sees a complete snapshot, a publisher-context
+     * subscriber that re-enters the API sees a running service, and no
+     * teardown can race the publication. Consumers apply generation
+     * filtering (the setup pages do), so a concurrent worker publication
+     * arriving first is harmless. */
     {
         device_link_service_snapshot_t snapshot;
 
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.snapshot.generation = 1U;
+        s_service.snapshot.available = true;
+        s_service.snapshot.state = DEVICE_LINK_SERVICE_STATE_ADVERTISING;
+        s_service.snapshot.window_remaining_ms = 0U;
         snapshot = s_service.snapshot;
         xSemaphoreGive(s_service.mutex);
+        atomic_store_explicit(&s_lifecycle,
+                              DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING,
+                              memory_order_release);
         _device_link_service_publish_now(&snapshot);
     }
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
@@ -907,16 +909,26 @@ esp_err_t device_link_service_close_window(void)
 
 esp_err_t device_link_service_suspend(uint32_t timeout_ms)
 {
-    const esp_err_t result =
-        _device_link_service_enqueue(DEVICE_LINK_SERVICE_COMMAND_SUSPEND);
+    if (!_device_link_service_api_acquire())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const device_link_service_command_t command =
+    {
+        .type = DEVICE_LINK_SERVICE_COMMAND_SUSPEND,
+    };
+    esp_err_t result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
+                       ESP_OK : ESP_ERR_NO_MEM;
 
     if (result != ESP_OK)
     {
+        _device_link_service_api_release();
         return result;
     }
     /* Standby preparation needs the suspended state applied before it
      * proceeds: wait (bounded by timeout_ms) until the worker has closed
-     * the window and set the flag. */
+     * the window and set the flag. The API user count is held across the
+     * wait, so deinit cannot tear the service down underneath it. */
     TickType_t wait = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
                       portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
 
@@ -935,15 +947,18 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
         xSemaphoreGive(s_service.mutex);
         if (applied)
         {
-            return ESP_OK;
+            break;
         }
         if (timeout_ms != DEVICE_LINK_SERVICE_WAIT_FOREVER &&
                 xTaskGetTickCount() - started >= wait)
         {
-            return ESP_ERR_TIMEOUT;
+            result = ESP_ERR_TIMEOUT;
+            break;
         }
         vTaskDelay(1U);
     }
+    _device_link_service_api_release();
+    return result;
 }
 
 esp_err_t device_link_service_resume(uint32_t timeout_ms)
