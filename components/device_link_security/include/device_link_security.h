@@ -171,6 +171,14 @@ esp_err_t device_link_security_protect(
 bool device_link_security_is_authenticated(void);
 
 /**
+ * @brief Report whether a Security 2 session is established.
+ *
+ * True once a handshake opened the transport session; the session is
+ * AUTHENTICATED only after a protected frame decrypts.
+ */
+bool device_link_security_session_open(void);
+
+/**
  * @brief Close the current Protocomm session.
  */
 void device_link_security_close_session(void);

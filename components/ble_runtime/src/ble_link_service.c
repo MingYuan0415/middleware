@@ -875,24 +875,18 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (replay)
     {
         /* Idempotent replay of a committed transaction. The credential
-         * and auth id are snapshotted under the lock. */
+         * and auth id are snapshotted in the same locked section that
+         * established the replay eligibility, so a concurrent clear
+         * cannot tear them between two lock acquisitions. */
         uint8_t replay_body[64];
         size_t replay_body_len = 0U;
         uint8_t replay_credential[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
         uint8_t replay_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
 
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-        }
         memcpy(replay_credential, s_service.auth_txn.credential_id,
                sizeof(replay_credential));
         memcpy(replay_auth_id, s_service.auth_txn.device_auth_id,
                sizeof(replay_auth_id));
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
         _ble_link_service_encode_authorization_result(
             replay_body, &replay_body_len,
             replay_credential, replay_auth_id);
@@ -973,14 +967,13 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     memcpy(local_password, s_service.auth_txn.application_password,
            sizeof(local_password));
     s_service.auth_txn.committing = true;
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
     memcpy(record.credential_id, local_credential,
            DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES);
     memcpy(record.device_auth_id, local_device_auth_id,
            DEVICE_LINK_SECURITY_AUTH_ID_BYTES);
+    /* The mutex stays held across derivation, persistence, and the state
+     * publication: a window close or disconnect cannot clear the
+     * transaction underneath a durable commit. */
     /* The committed record must carry the normalized SMP identity of the
      * authenticated connection; an unknown or invalid identity is
      * refused. */
@@ -998,6 +991,10 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (!s_service.current_facts.identity_known || !peer_valid)
     {
         commit_error = BLE_LINK_ERROR_INVALID_ARGUMENT;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
         goto commit_exit;
     }
     record.peer_addr_type = s_service.current_facts.peer_addr_type;
@@ -1011,6 +1008,10 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (derive_result != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
         goto commit_exit;
     }
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
@@ -1018,11 +1019,11 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (device_link_security_save_auth_record(&record) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_STORAGE;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
         goto commit_exit;
-    }
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
     }
     s_service.auth_txn.committed = true;
     s_service.auth_txn.committing = false;
@@ -1038,9 +1039,9 @@ static uint32_t _ble_link_service_handle_authorize_commit(
      * survives a response abort so a committed record always takes
      * effect. */
     s_service.switch_long_term_pending = true;
-    if (ble_link_session_set_authorization(true, 1U) != ESP_OK ||
+    if (ble_link_session_set_authorization(true, 0U) != ESP_OK ||
             ble_link_session_report_session_match_current(
-                facts->connection_generation, 1U) != ESP_OK)
+                facts->connection_generation, 0U) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
         goto commit_exit;
@@ -1117,12 +1118,12 @@ esp_err_t ble_link_service_on_authenticated(void *arg)
         return ESP_ERR_INVALID_STATE;
     }
     _ble_link_service_zeroize(&record, sizeof(record));
-    if (ble_link_session_set_authorization(true, 1U) != ESP_OK ||
+    if (ble_link_session_set_authorization(true, 0U) != ESP_OK ||
             ble_link_session_security2_open(
                 s_service.current_facts.connection_generation,
                 &epoch) != ESP_OK ||
             ble_link_session_report_session_match_current(
-                s_service.current_facts.connection_generation, 1U) != ESP_OK)
+                s_service.current_facts.connection_generation, 0U) != ESP_OK)
     {
         return ESP_ERR_INVALID_STATE;
     }

@@ -425,13 +425,27 @@ esp_err_t device_link_security_unprotect(
      * epoch) is snapshotted under the lock and revalidated before the
      * response is encrypted, so a session replaced during the callback
      * fails closed instead of encrypting under the new session. */
-    _device_link_security_unlock();
     const device_link_security_authenticated_fn authenticated_cb =
         s_security.config.authenticated_cb;
     void *const authenticated_arg = s_security.config.authenticated_arg;
+    _device_link_security_unlock();
+    uint8_t *plain_response = NULL;
+    size_t plain_response_len = 0U;
 
     if (authenticated_cb != NULL)
     {
+        /* Validate the session again before the transition runs. */
+        _device_link_security_lock();
+        const bool session_current =
+            s_security.session_epoch == session_epoch &&
+            s_security.sec_inst == session_instance;
+
+        _device_link_security_unlock();
+        if (!session_current)
+        {
+            free(plain);
+            return ESP_ERR_INVALID_STATE;
+        }
         result = authenticated_cb(authenticated_arg);
         if (result != ESP_OK)
         {
@@ -442,9 +456,18 @@ esp_err_t device_link_security_unprotect(
             return result;
         }
     }
-    uint8_t *plain_response = NULL;
-    size_t plain_response_len = 0U;
+    _device_link_security_lock();
+    const bool session_current =
+        s_security.session_epoch == session_epoch &&
+        s_security.sec_inst == session_instance;
 
+    _device_link_security_unlock();
+    if (!session_current)
+    {
+        /* The session was replaced while the transition ran. */
+        free(plain);
+        return ESP_ERR_INVALID_STATE;
+    }
     result = request_cb(
                  plain, (size_t)plain_len,
                  &plain_response, &plain_response_len,
@@ -559,6 +582,17 @@ bool device_link_security_is_authenticated(void)
                     s_security.authenticated && s_security.session_open;
     _device_link_security_unlock();
     return authenticated;
+}
+
+bool device_link_security_session_open(void)
+{
+    bool open = false;
+
+    _device_link_security_lock();
+    open = s_security.initialized && s_security.session_open &&
+           s_security.sec_inst != NULL;
+    _device_link_security_unlock();
+    return open;
 }
 
 static void _device_link_security_close_session_locked(void)

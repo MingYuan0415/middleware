@@ -169,6 +169,13 @@ esp_err_t ble_link_session_security2_open(
 esp_err_t ble_link_session_set_authorization(
     bool committed, uint32_t revision)
 {
+    if (revision == 0U)
+    {
+        /* Revision 0 means "next revision": the caller does not track
+         * the current revision, and a revoke must always take effect
+         * even after a revision 1 was installed. */
+        revision = s_session.authorization_revision + 1U;
+    }
     if (revision <= s_session.authorization_revision)
     {
         return ESP_OK;
@@ -216,7 +223,9 @@ esp_err_t ble_link_session_report_session_match(
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_session.bound || revision != s_session.authorization_revision)
+    if (!s_session.bound ||
+            (revision != 0U &&
+             revision != s_session.authorization_revision))
     {
         return ESP_ERR_INVALID_STATE;
     }

@@ -374,8 +374,17 @@ static int _ble_link_gatt_access(
     {
         if (!control_channel ||
                 s_gatt.config->security_ops == NULL ||
-                s_gatt.config->security_ops->is_authenticated == NULL ||
-                !s_gatt.config->security_ops->is_authenticated())
+                s_gatt.config->security_ops->is_authenticated == NULL)
+        {
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        /* An already authenticated long-term session, or an established
+         * (handshake-started) session that still needs its first
+         * protected frame to complete the transition, is admitted; a
+         * failed decrypt closes the session. */
+        if (!s_gatt.config->security_ops->is_authenticated() &&
+                (s_gatt.config->security_ops->session_open == NULL ||
+                 !s_gatt.config->security_ops->session_open()))
         {
             return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
         }

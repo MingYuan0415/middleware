@@ -36,6 +36,10 @@ typedef struct ble_link_security_ops
     /** @brief Whether the current session is AUTHENTICATED. */
     bool (*is_authenticated)(void);
 
+    /** @brief Whether a Security 2 session is established (handshake
+     *  started); protected frames then decrypt under it or fail closed. */
+    bool (*session_open)(void);
+
     /** @brief Close the current session. */
     void (*close_session)(void);
 } ble_link_security_ops_t;

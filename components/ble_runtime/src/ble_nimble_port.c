@@ -72,6 +72,11 @@ static bool _ble_nimble_port_sec_is_authenticated(void)
     return device_link_security_is_authenticated();
 }
 
+static bool _ble_nimble_port_sec_session_open(void)
+{
+    return device_link_security_session_open();
+}
+
 static void _ble_nimble_port_sec_close_session(void)
 {
     device_link_security_close_session();
@@ -98,6 +103,7 @@ static const ble_link_security_ops_t s_security_ops =
     .unprotect = _ble_nimble_port_sec_unprotect,
     .protect = _ble_nimble_port_sec_protect,
     .is_authenticated = _ble_nimble_port_sec_is_authenticated,
+    .session_open = _ble_nimble_port_sec_session_open,
     .close_session = _ble_nimble_port_sec_close_session,
 };
 #include "ble_response_cache.h"
@@ -1277,6 +1283,10 @@ static int _ble_nimble_port_gap_event(
                          delete_result);
                 return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
+            /* The durable record and bond are gone: clear the in-memory
+             * session facts so no stale authorization admission survives
+             * into the replacement bootstrap. */
+            ble_link_service_clear_session_state();
             return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
         return BLE_GAP_REPEAT_PAIRING_IGNORE;
