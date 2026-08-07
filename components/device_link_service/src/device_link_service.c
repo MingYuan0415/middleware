@@ -652,12 +652,14 @@ static void _device_link_service_release_resources(void)
 
 static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
 {
-    esp_err_t cleanup_result = ESP_OK;
+    esp_err_t first_error = ESP_OK;
+    esp_err_t step_result = ESP_OK;
 
-    /* STOPPING rejects any new early admission; unregister stops new
-     * dispatches; the drain then waits for in-flight callbacks that were
-     * already admitted, so the mutex can never be released underneath
-     * one. */
+    /* STOPPING rejects any new early admission; the drain then waits for
+     * in-flight callbacks that were already admitted, so the mutex can
+     * never be released underneath one. Every cleanup step runs
+     * unconditionally afterwards so a failed step cannot abandon a live
+     * runtime, callback registration, or resources. */
     atomic_store_explicit(&s_lifecycle,
                           DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
                           memory_order_release);
@@ -665,33 +667,47 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
     {
         vTaskDelay(1U);
     }
-    if (cleanup_result == ESP_OK && s_service.slow_lease_held)
+    if (s_service.slow_lease_held)
     {
-        cleanup_result = ble_adv_manager_release_lease(
-                             s_service.slow_lease_id);
-        s_service.slow_lease_held = cleanup_result != ESP_OK;
+        step_result = ble_adv_manager_release_lease(
+                          s_service.slow_lease_id);
+        s_service.slow_lease_held = false;
+        if (first_error == ESP_OK && step_result != ESP_OK)
+        {
+            first_error = step_result;
+        }
     }
-    if (cleanup_result == ESP_OK)
+    step_result = _device_link_service_runtime_teardown();
+    if (first_error == ESP_OK && step_result != ESP_OK)
     {
-        cleanup_result = _device_link_service_runtime_teardown();
+        first_error = step_result;
     }
-    if (cleanup_result == ESP_OK && s_service.router_registered)
+    if (s_service.router_registered)
     {
         /* Unregister only after the host task stopped. */
-        cleanup_result = ble_event_router_unregister(
-                             _device_link_service_ble_event, NULL);
-        s_service.router_registered =
-            cleanup_result == ESP_OK || cleanup_result == ESP_ERR_NOT_FOUND;
+        step_result = ble_event_router_unregister(
+                          _device_link_service_ble_event, NULL);
+        if (step_result == ESP_ERR_NOT_FOUND)
+        {
+            step_result = ESP_OK;
+        }
+        s_service.router_registered = step_result != ESP_OK;
+        if (first_error == ESP_OK && step_result != ESP_OK)
+        {
+            first_error = step_result;
+        }
     }
-    if (cleanup_result == ESP_OK)
-    {
-        _device_link_service_release_resources();
-    }
+    _device_link_service_release_resources();
     _device_link_service_zero_secrets();
-    atomic_store_explicit(&s_lifecycle,
-                          DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED,
-                          memory_order_release);
-    return cleanup_result != ESP_OK ? cleanup_result : primary_error;
+    if (first_error == ESP_OK)
+    {
+        atomic_store_explicit(&s_lifecycle,
+                              DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED,
+                              memory_order_release);
+    }
+    /* On incomplete cleanup the lifecycle stays STOPPING so deinit can
+     * retry the outstanding teardown; the caller must not re-init. */
+    return first_error != ESP_OK ? first_error : primary_error;
 }
 
 esp_err_t device_link_service_init(const device_link_service_config_t *config)
@@ -889,13 +905,14 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
     }
     esp_err_t result = ESP_OK;
 
-    if (!command_admitted ||
-            !atomic_load_explicit(&s_worker_exited, memory_order_acquire))
+    if (s_service.task != NULL && (!command_admitted ||
+                                   !atomic_load_explicit(&s_worker_exited, memory_order_acquire)))
     {
         /* The first deinit always waits for the worker's exit signal: the
          * give happens-before the take returns, so the worker can no
          * longer touch the semaphore afterwards. A retry skips the wait
-         * because the signal was already consumed. */
+         * because the signal was already consumed; a rollback that never
+         * created the worker has no signal to wait for. */
         if (xSemaphoreTake(s_service.stopped, timeout) != pdTRUE)
         {
             /* The worker never exited: keep STOPPING so a retry can wait
@@ -1001,10 +1018,23 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
      * same mutex, so concurrent suspend callers cannot reorder: the FIFO
      * application order matches the sequence order and the acknowledgement
      * always refers to this exact command. The nonblocking send cannot
-     * block while the worker briefly holds the mutex. The take is bounded
-     * so a finite timeout also bounds this phase. */
-    if (xSemaphoreTake(s_service.mutex,
-                       pdMS_TO_TICKS(50U)) != pdTRUE)
+     * block while the worker briefly holds the mutex. One deadline covers
+     * the take and the acknowledgement loop, so a finite timeout bounds
+     * the whole call and WAIT_FOREVER never times out. */
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t deadline = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
+                                0U : now + pdMS_TO_TICKS(timeout_ms);
+    TickType_t take_wait = portMAX_DELAY;
+
+    if (timeout_ms != DEVICE_LINK_SERVICE_WAIT_FOREVER)
+    {
+        take_wait = pdMS_TO_TICKS(50U);
+        if (deadline - now < take_wait)
+        {
+            take_wait = deadline - now;
+        }
+    }
+    if (xSemaphoreTake(s_service.mutex, take_wait) != pdTRUE)
     {
         _device_link_service_api_release();
         return ESP_ERR_TIMEOUT;
@@ -1029,15 +1059,6 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
         _device_link_service_api_release();
         return result;
     }
-    TickType_t wait = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
-                      portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-
-    if (timeout_ms > 0U && wait == 0U)
-    {
-        wait = 1U;
-    }
-    const TickType_t started = xTaskGetTickCount();
-
     for (;;)
     {
         if (atomic_load_explicit(&s_suspend_applied,
@@ -1046,7 +1067,8 @@ esp_err_t device_link_service_suspend(uint32_t timeout_ms)
             break;
         }
         if (timeout_ms != DEVICE_LINK_SERVICE_WAIT_FOREVER &&
-                xTaskGetTickCount() - started >= wait)
+                _device_link_service_tick_reached(xTaskGetTickCount(),
+                        deadline))
         {
             result = ESP_ERR_TIMEOUT;
             break;
