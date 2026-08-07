@@ -173,8 +173,12 @@ static void _device_link_security_teardown_sec(void)
     s_security.authenticated = false;
     /* A teardown retires the session generation: the epoch advances so
      * any in-flight unlocked callback of the old session fails closed,
-     * even if a rebuild reallocates the same instance address (ABA). */
-    s_session_epoch++;
+     * even if a rebuild reallocates the same instance address (ABA). The
+     * epoch saturates at the exhausted maximum. */
+    if (s_session_epoch < UINT32_MAX)
+    {
+        s_session_epoch++;
+    }
 }
 
 static esp_err_t _device_link_security_rebuild(void)
@@ -333,6 +337,13 @@ esp_err_t device_link_security_handshake(
     }
     if (!s_security.session_open)
     {
+        if (s_session_epoch == UINT32_MAX)
+        {
+            /* The session generation space is exhausted: every retired
+             * session would be indistinguishable from a new one. */
+            _device_link_security_unlock();
+            return ESP_ERR_INVALID_STATE;
+        }
         if (protocomm_security2.new_transport_session == NULL)
         {
             _device_link_security_unlock();
@@ -617,8 +628,12 @@ static void _device_link_security_close_session_locked(void)
     }
     if (s_security.session_open)
     {
-        /* The closure retires the session generation. */
-        s_session_epoch++;
+        /* The closure retires the session generation; the epoch
+         * saturates at the exhausted maximum. */
+        if (s_session_epoch < UINT32_MAX)
+        {
+            s_session_epoch++;
+        }
     }
     s_security.session_open = false;
     s_security.authenticated = false;

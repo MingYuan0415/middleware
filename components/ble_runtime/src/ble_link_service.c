@@ -971,6 +971,18 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     memcpy(local_password, s_service.auth_txn.application_password,
            sizeof(local_password));
     s_service.auth_txn.committing = true;
+    /* The authorization revision space is checked before anything is
+     * persisted: at exhaustion a commit fails closed without installing
+     * durable credentials. */
+    if (ble_link_session_set_authorization(true, 0U) != ESP_OK)
+    {
+        commit_error = BLE_LINK_ERROR_UNAVAILABLE;
+        if (s_service_mutex != NULL)
+        {
+            (void)xSemaphoreGive(s_service_mutex);
+        }
+        goto commit_exit;
+    }
     memcpy(record.credential_id, local_credential,
            DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES);
     memcpy(record.device_auth_id, local_device_auth_id,
@@ -1042,8 +1054,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
      * disconnect cannot clear the transaction between the persistence
      * and the publication. */
     s_service.switch_long_term_pending = true;
-    if (ble_link_session_set_authorization(true, 0U) != ESP_OK ||
-            ble_link_session_report_session_match_current(
+    if (ble_link_session_report_session_match_current(
                 facts->connection_generation, 0U) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
@@ -1506,13 +1517,13 @@ esp_err_t ble_link_service_feed(
                 return ESP_ERR_INVALID_STATE;
             }
             /* The adapter tore the bootstrap session down: close the
-             * external Security 2 epoch and clear the authorization
-             * admission so no GATT path admits traffic the adapter
-             * cannot serve. The client re-handshakes under the long-term
-             * verifier on the next request. */
+             * external Security 2 epoch so no GATT path admits traffic
+             * the adapter cannot serve. The persistent bound fact stays
+             * set (the record was just committed); the client re-
+             * handshakes under the long-term verifier on the next
+             * request and restores session authorization. */
             (void)ble_link_session_security2_close_current(
                 facts->connection_generation);
-            (void)ble_link_session_set_authorization(false, 0U);
             s_service.sec2_opened = false;
         }
         return ESP_OK;

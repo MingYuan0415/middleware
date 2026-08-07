@@ -1273,6 +1273,12 @@ static int _ble_nimble_port_gap_event(
                          erase_result);
                 return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
+            /* The durable record is invalidated: revoke the in-memory
+             * session facts, including the persistent bound fact, before
+             * the bond deletion, so a deletion failure cannot leave
+             * stale authorization admission active. */
+            ble_link_service_clear_session_state();
+            (void)ble_link_session_set_authorization(false, 0U);
             const esp_err_t delete_result =
                 _ble_nimble_port_delete_peer_bond(
                     event->repeat_pairing.conn_handle);
@@ -1283,12 +1289,6 @@ static int _ble_nimble_port_gap_event(
                          delete_result);
                 return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
-            /* The durable record and bond are gone: clear the in-memory
-             * session facts, including the persistent bound fact, so no
-             * stale authorization admission survives into the
-             * replacement bootstrap. */
-            ble_link_service_clear_session_state();
-            (void)ble_link_session_set_authorization(false, 0U);
             return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
         return BLE_GAP_REPEAT_PAIRING_IGNORE;
