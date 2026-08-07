@@ -43,6 +43,7 @@ static bool s_fail_adv_start;
 static bool s_fail_port_init;
 static bool s_port_started;
 static bool s_port_stopped;
+static ble_adv_manager_state_t s_adv_state_before_deinit;
 
 static void _adv_lock_cb(void *arg)
 {
@@ -150,6 +151,7 @@ static esp_err_t _fake_port_stop(void)
 
 static esp_err_t _fake_port_deinit(void)
 {
+    s_adv_state_before_deinit = ble_adv_manager_get_state();
     ble_adv_manager_deinit();
     return ESP_OK;
 }
@@ -240,6 +242,7 @@ static void _reset_host(void)
     s_fail_port_init = false;
     s_port_started = false;
     s_port_stopped = false;
+    s_adv_state_before_deinit = BLE_ADV_MANAGER_STATE_STOPPED;
     (void)pthread_mutex_lock(&s_publish_lock);
     s_published = false;
     s_publish_count_value = 0U;
@@ -577,8 +580,10 @@ static void _test_rollback_lease_failure_retryable(void)
     s_fail_adv_start = true;
     assert(device_link_service_init(&s_config) == ESP_FAIL);
     /* The installed slow lease must have been released: in a fresh
-     * manager the release leaves STOPPED with no port operation. */
-    assert(ble_adv_manager_get_state() == BLE_ADV_MANAGER_STATE_STOPPED);
+     * manager the release leaves STOPPED with no port operation. The
+     * state is captured by the fake port right before the manager is
+     * deinitialized, so a leaked lease would surface as FAULTED. */
+    assert(s_adv_state_before_deinit == BLE_ADV_MANAGER_STATE_STOPPED);
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
