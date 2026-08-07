@@ -174,11 +174,15 @@ esp_err_t ble_link_session_set_authorization(
         /* Revision 0 means "next revision": the caller does not track
          * the current revision, and a revoke must always take effect
          * even after a revision 1 was installed. At the exhausted
-         * maximum the monotonic space cannot advance; a revoke still
-         * applies. */
+         * maximum the monotonic space cannot advance: a revoke still
+         * applies, but a commit fails closed (no resurrection). */
         if (s_session.authorization_revision == UINT32_MAX)
         {
-            s_session.bound = committed;
+            if (committed)
+            {
+                return ESP_ERR_INVALID_STATE;
+            }
+            s_session.bound = false;
             s_session.authorized = false;
             return ESP_OK;
         }

@@ -1285,10 +1285,12 @@ void ble_link_service_clear_session_state(void)
     {
         (void)xSemaphoreGive(s_service_mutex);
     }
-    /* Sync the external link-session facts with the adapter teardown. */
+    /* Sync the external link-session facts with the adapter teardown.
+     * The committed authorization record survives a disconnect: only the
+     * session-level authorization (security2_open/authorized) is
+     * cleared, never the persistent bound fact. */
     (void)ble_link_session_security2_close_current(
         s_service.current_facts.connection_generation);
-    (void)ble_link_session_set_authorization(false, 0U);
 }
 
 bool ble_link_service_has_partial_frame(

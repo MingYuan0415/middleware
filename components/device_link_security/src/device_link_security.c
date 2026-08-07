@@ -47,8 +47,12 @@ typedef struct device_link_security
     bool session_open;
     bool authenticated;
     bool initialized;
-    uint32_t session_epoch;
 } device_link_security_t;
+
+/* Boot-lifetime session generation: survives init/deinit resets (which
+ * memset the state) and never wraps, so a retired session can never be
+ * mistaken for a new one (address ABA included). */
+static uint32_t s_session_epoch;
 
 /** @brief Storage key of the committed authorization record. */
 #define DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY "dls.auth"
@@ -170,7 +174,7 @@ static void _device_link_security_teardown_sec(void)
     /* A teardown retires the session generation: the epoch advances so
      * any in-flight unlocked callback of the old session fails closed,
      * even if a rebuild reallocates the same instance address (ABA). */
-    s_security.session_epoch++;
+    s_session_epoch++;
 }
 
 static esp_err_t _device_link_security_rebuild(void)
@@ -345,7 +349,10 @@ esp_err_t device_link_security_handshake(
         }
         s_security.session_open = true;
         s_security.authenticated = false;
-        s_security.session_epoch++;
+        if (s_session_epoch < UINT32_MAX)
+        {
+            s_session_epoch++;
+        }
     }
     uint8_t *response = NULL;
     ssize_t response_len = 0;
@@ -406,7 +413,7 @@ esp_err_t device_link_security_unprotect(
     }
     uint8_t *plain = NULL;
     ssize_t plain_len = 0;
-    const uint32_t session_epoch = s_security.session_epoch;
+    const uint32_t session_epoch = s_session_epoch;
     const protocomm_security_handle_t session_instance = s_security.sec_inst;
     const device_link_security_request_fn request_cb =
         s_security.config.request_cb;
@@ -441,7 +448,7 @@ esp_err_t device_link_security_unprotect(
         /* Validate the session again before the transition runs. */
         _device_link_security_lock();
         const bool session_current =
-            s_security.session_epoch == session_epoch &&
+            s_session_epoch == session_epoch &&
             s_security.sec_inst == session_instance;
 
         _device_link_security_unlock();
@@ -462,7 +469,7 @@ esp_err_t device_link_security_unprotect(
     }
     _device_link_security_lock();
     const bool session_current =
-        s_security.session_epoch == session_epoch &&
+        s_session_epoch == session_epoch &&
         s_security.sec_inst == session_instance;
 
     _device_link_security_unlock();
@@ -478,7 +485,7 @@ esp_err_t device_link_security_unprotect(
                  request_arg);
     free(plain);
     _device_link_security_lock();
-    if (s_security.session_epoch != session_epoch ||
+    if (s_session_epoch != session_epoch ||
             s_security.sec_inst != session_instance)
     {
         /* The session was replaced while the callback ran. */
@@ -611,7 +618,7 @@ static void _device_link_security_close_session_locked(void)
     if (s_security.session_open)
     {
         /* The closure retires the session generation. */
-        s_security.session_epoch++;
+        s_session_epoch++;
     }
     s_security.session_open = false;
     s_security.authenticated = false;

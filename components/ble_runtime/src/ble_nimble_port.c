@@ -1284,9 +1284,11 @@ static int _ble_nimble_port_gap_event(
                 return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
             /* The durable record and bond are gone: clear the in-memory
-             * session facts so no stale authorization admission survives
-             * into the replacement bootstrap. */
+             * session facts, including the persistent bound fact, so no
+             * stale authorization admission survives into the
+             * replacement bootstrap. */
             ble_link_service_clear_session_state();
+            (void)ble_link_session_set_authorization(false, 0U);
             return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
         return BLE_GAP_REPEAT_PAIRING_IGNORE;
