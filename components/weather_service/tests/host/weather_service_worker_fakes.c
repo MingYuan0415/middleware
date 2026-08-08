@@ -236,6 +236,31 @@ void weather_host_set_location_status(int status_code)
     atomic_store(&s_location_status_code, status_code);
 }
 
+void weather_host_set_location_district(const char *district)
+{
+    memset(s_fake_location.district, 0, sizeof(s_fake_location.district));
+    if (district != NULL)
+    {
+        memcpy(s_fake_location.district, district, strlen(district) + 1U);
+    }
+}
+
+void weather_host_set_weather_location_district(const char *district)
+{
+    /* Echo the located scope unchanged apart from the district, so a
+       weather response can carry a different district under the same
+       location_key. */
+    s_fake_weather_location = s_fake_location;
+    memset(s_fake_weather_location.district, 0,
+           sizeof(s_fake_weather_location.district));
+    if (district != NULL)
+    {
+        memcpy(s_fake_weather_location.district, district,
+               strlen(district) + 1U);
+    }
+    s_weather_location_override = true;
+}
+
 void weather_host_fail_weather_transport(weather_service_kind_t kind,
         unsigned count)
 {
@@ -609,6 +634,8 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                 &s_fake_weather_location : &s_fake_location;
             memcpy(snapshot->location.city, echo->city,
                    sizeof(snapshot->location.city));
+            memcpy(snapshot->location.district, echo->district,
+                   sizeof(snapshot->location.district));
             memcpy(snapshot->location.region, echo->region,
                    sizeof(snapshot->location.region));
             memcpy(snapshot->location.country, echo->country,
@@ -626,6 +653,9 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
         {
             memcpy(snapshot->location.city, s_fake_weather_location.city,
                    sizeof(snapshot->location.city));
+            memcpy(snapshot->location.district,
+                   s_fake_weather_location.district,
+                   sizeof(snapshot->location.district));
             memcpy(snapshot->location.region, s_fake_weather_location.region,
                    sizeof(snapshot->location.region));
             memcpy(snapshot->location.country,

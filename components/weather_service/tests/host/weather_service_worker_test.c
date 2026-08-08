@@ -1047,6 +1047,76 @@ static void _test_auth_recovery_after_force(void)
     _stop();
 }
 
+static void _test_district_not_identity(void)
+{
+    _start();
+    weather_host_set_location_district("Futian");
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        assert(weather_host_weather_requests(kind) == 1U);
+    }
+    const weather_service_snapshot_t *first = NULL;
+    assert(weather_service_snapshot_acquire(&first) == ESP_OK);
+    assert(strcmp(first->location.district, "Futian") == 0);
+    weather_service_snapshot_release(first);
+
+    assert(weather_service_set_network_ready(false, 0U) == ESP_OK);
+    weather_host_set_weather_location_district("Nanshan");
+    weather_host_set_now(1061);
+    assert(weather_service_set_network_ready(true, UINT32_C(0x05060708)) ==
+           ESP_OK);
+    _wait_for_worker_cycle();
+    assert(weather_service_request_refresh() == ESP_OK);
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        assert(weather_host_weather_requests(kind) == 2U);
+    }
+    const weather_service_snapshot_t *snapshot = NULL;
+    assert(weather_service_snapshot_acquire(&snapshot) == ESP_OK);
+    assert(strcmp(snapshot->location.location_key, "9f4a2b3c8d1e5f06") == 0);
+    assert(strcmp(snapshot->location.district, "Nanshan") == 0);
+    weather_service_snapshot_release(snapshot);
+    _stop();
+}
+
+static void _test_district_drift_by_key_only(void)
+{
+    _start();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        assert(weather_host_weather_requests(kind) == 1U);
+    }
+
+    assert(weather_service_set_network_ready(false, 0U) == ESP_OK);
+    weather_host_set_weather_location_district("Nanshan");
+    weather_host_set_weather_location_skip(1U);
+    weather_host_set_now(1061);
+    assert(weather_service_set_network_ready(true, UINT32_C(0x05060708)) ==
+           ESP_OK);
+    _wait_for_worker_cycle();
+    assert(weather_service_request_refresh() == ESP_OK);
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        assert(weather_host_weather_requests(kind) == 2U);
+    }
+    const weather_service_snapshot_t *snapshot = NULL;
+    assert(weather_service_snapshot_acquire(&snapshot) == ESP_OK);
+    assert(strcmp(snapshot->location.location_key, "9f4a2b3c8d1e5f06") == 0);
+    assert(strcmp(snapshot->location.district, "Nanshan") == 0);
+    weather_service_snapshot_release(snapshot);
+    _stop();
+}
+
 static void _test_new_session_refreshes_all_scopes(void)
 {
     _start();
@@ -1184,6 +1254,8 @@ int main(void)
     _test_monotonic_scheduling_and_expiration();
     _test_weather_location_drift();
     _test_key_only_identity_change();
+    _test_district_not_identity();
+    _test_district_drift_by_key_only();
     _test_non_current_drift_aborts_cycle();
     _test_pending_scope_blocks_until_current();
     _test_account_limit_survives_session();

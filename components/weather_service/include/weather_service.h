@@ -100,11 +100,15 @@ typedef struct weather_service_dataset_meta
     bool expired;                       /**< Local maximum stale age elapsed. */
 } weather_service_dataset_meta_t;
 
-/** @brief Coarse city-level position retained by the device. */
+/** @brief Coarse display-safe location metadata retained by the device. */
 typedef struct weather_service_location
 {
     char city[WEATHER_SERVICE_CITY_BYTES];
-    char district[WEATHER_SERVICE_DISTRICT_BYTES];
+    char district[WEATHER_SERVICE_DISTRICT_BYTES]; /**< Optional localized
+                                                        district name,
+                                                        display only, not
+                                                        an identity field
+                                                        and not persisted. */
     char region[WEATHER_SERVICE_REGION_BYTES];
     char country[WEATHER_SERVICE_COUNTRY_BYTES];
     char timezone[WEATHER_SERVICE_TIMEZONE_BYTES];

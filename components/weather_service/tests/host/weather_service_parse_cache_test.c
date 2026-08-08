@@ -260,6 +260,12 @@ static void _test_location(void)
         "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
         "{\"schema_version\":1.5,\"location\":{\"source\":\"ip\","
         "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+        "\"district\":\"\\u0085Nanshan\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+        "\"district\":\"Nans\\u009Fhan\"}}",
         "{\"schema_version\":1,\"location\":{\"source\":\"gps\","
         "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
         "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
@@ -428,6 +434,19 @@ static void _test_weather(void)
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)fractional_version,
                                         strlen(fractional_version), &snapshot,
+                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+
+    const char c1_district[] =
+        "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
+        "\"location\":{\"source\":\"ip\",\"provider\":\"maxmind\","
+        "\"precision\":\"coarse\",\"district\":\"Nans\\u0085han\"},"
+        "\"fetched_at\":\"2026-08-05T00:00:00Z\","
+        "\"updated_at\":\"2026-08-05T07:55:00+08:00\","
+        "\"valid_until\":\"2026-08-05T08:20:00+08:00\",\"stale\":false,"
+        "\"data\":{}}";
+    CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
+                                        (const uint8_t *)c1_district,
+                                        strlen(c1_district), &snapshot,
                                         &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char wrong_provider[] =

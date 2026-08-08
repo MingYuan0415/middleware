@@ -148,6 +148,7 @@ static bool _weather_parse_utf8(const char *text, size_t length)
                 (continuation == 2U && codepoint < 0x800U) ||
                 (continuation == 3U && codepoint < 0x10000U) ||
                 codepoint > 0x10FFFFU ||
+                (codepoint >= 0x80U && codepoint <= 0x9FU) ||
                 (codepoint >= 0xD800U && codepoint <= 0xDFFFU))
         {
             return false;

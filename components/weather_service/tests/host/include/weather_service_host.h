@@ -50,6 +50,12 @@ void weather_host_fail_location_transport(unsigned count);
 /** @brief Set the HTTP status returned by the location endpoint. */
 void weather_host_set_location_status(int status_code);
 
+/** @brief Set the district on the location returned by the next locate. */
+void weather_host_set_location_district(const char *district);
+
+/** @brief Set the district echoed by weather responses. */
+void weather_host_set_weather_location_district(const char *district);
+
 /** @brief Fail the next number of dataset HTTP requests. */
 void weather_host_fail_weather_transport(weather_service_kind_t kind,
         unsigned count);
