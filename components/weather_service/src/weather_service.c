@@ -719,6 +719,9 @@ static bool _weather_location_same_identity(
     {
         return strcmp(left->location_key, right->location_key) == 0;
     }
+    /* The district field is a localization artifact the server may add or
+       drop independently of the grid, so it must not drive the display
+       fallback comparison. */
     return strcmp(left->city, right->city) == 0 &&
            strcmp(left->region, right->region) == 0 &&
            strcmp(left->country, right->country) == 0 &&

@@ -210,9 +210,10 @@ static void _weather_cache_encode_location(weather_cache_writer_t *writer,
                               sizeof(location->provider));
     /* Two padding slots preserve the legacy latitude/longitude layout so
        v1 files written before coordinate removal remain readable. The
-       location_key is intentionally not persisted: every new network
-       session re-locates and refreshes the weather scope, so a cached
-       location without a key only exists until the first refresh. */
+       location_key and the district display name are intentionally not
+       persisted: every new network session re-locates and refreshes the
+       weather scope, so a cached location without them only exists until
+       the first refresh, and the v1 wire format stays stable. */
     _weather_cache_put_u16(writer, 0U);
     _weather_cache_put_u16(writer, 0U);
     _weather_cache_put_u64(writer, (uint64_t)location->acquired_at);

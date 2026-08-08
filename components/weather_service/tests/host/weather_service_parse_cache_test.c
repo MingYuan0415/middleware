@@ -43,7 +43,7 @@ static void _check(bool condition, const char *expression, int line)
 
 static const char s_location_json[] =
     "{\"schema_version\":1,\"location\":{\"city\":\"Shenzhen\","
-    "\"region\":\"Guangdong\",\"country\":\"CN\","
+    "\"district\":\"Nanshan\",\"region\":\"Guangdong\",\"country\":\"CN\","
     "\"timezone\":\"Asia/Shanghai\",\"source\":\"ip\","
     "\"provider\":\"maxmind\",\"precision\":\"coarse\","
     "\"location_key\":\"9f4a2b3c8d1e5f06\"},"
@@ -51,7 +51,8 @@ static const char s_location_json[] =
 
 static const char s_envelope_prefix[] =
     "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
-    "\"location\":{\"city\":\"Shenzhen\",\"region\":\"Guangdong\","
+    "\"location\":{\"city\":\"Shenzhen\",\"district\":\"Nanshan\","
+    "\"region\":\"Guangdong\","
     "\"country\":\"CN\",\"timezone\":\"Asia/Shanghai\","
     "\"source\":\"ip\",\"provider\":\"maxmind\","
     "\"precision\":\"coarse\",\"location_key\":\"9f4a2b3c8d1e5f06\"},"
@@ -218,6 +219,7 @@ static void _test_location(void)
                                          &location) == ESP_OK);
     CHECK(location.available);
     CHECK(strcmp(location.city, "Shenzhen") == 0);
+    CHECK(strcmp(location.district, "Nanshan") == 0);
     CHECK(strcmp(location.region, "Guangdong") == 0);
     CHECK(strcmp(location.country, "CN") == 0);
     CHECK(strcmp(location.timezone, "Asia/Shanghai") == 0);
@@ -232,6 +234,25 @@ static void _test_location(void)
                                          strlen(no_key), 0, &location) ==
           ESP_OK);
     CHECK(location.location_key[0] == '\0');
+    CHECK(location.district[0] == '\0');
+
+    char long_district[WEATHER_SERVICE_DISTRICT_BYTES + 32U];
+    memset(long_district, 'x', sizeof(long_district) - 1U);
+    long_district[sizeof(long_district) - 1U] = '\0';
+    char district_json[320];
+    int district_count = snprintf(
+                             district_json, sizeof(district_json),
+                             "{\"schema_version\":1,\"location\":{"
+                             "\"source\":\"ip\",\"provider\":\"maxmind\","
+                             "\"precision\":\"coarse\","
+                             "\"district\":\"%s\"}}", long_district);
+    CHECK(district_count > 0 && (size_t)district_count <
+          sizeof(district_json));
+    CHECK(weather_service_parse_location(
+              (const uint8_t *)district_json, (size_t)district_count, 0,
+              &location) == ESP_OK);
+    CHECK(strlen(location.district) ==
+          WEATHER_SERVICE_DISTRICT_BYTES - 1U);
 
     static const char *const invalid[] =
     {
@@ -445,6 +466,7 @@ static void _test_cache(void)
                             WEATHER_SERVICE_DATA_CURRENT;
     source.location.available = true;
     memcpy(source.location.city, "Shenzhen", sizeof("Shenzhen"));
+    memcpy(source.location.district, "Nanshan", sizeof("Nanshan"));
     memcpy(source.location.provider, "maxmind", sizeof("maxmind"));
     memcpy(source.location.location_key, "9f4a2b3c8d1e5f06",
            sizeof("9f4a2b3c8d1e5f06"));
@@ -465,6 +487,7 @@ static void _test_cache(void)
     CHECK(loaded.current.temperature_tenths_c == 320);
     CHECK(strcmp(loaded.location.city, "Shenzhen") == 0);
     CHECK(loaded.location.location_key[0] == '\0');
+    CHECK(loaded.location.district[0] == '\0');
 
     char path[128];
     int count = snprintf(path, sizeof(path), "%s/weather_b.bin", directory);

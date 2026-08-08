@@ -21,6 +21,7 @@ extern "C" {
 #define WEATHER_SERVICE_MAX_DAYS           7U
 #define WEATHER_SERVICE_MAX_ALERTS         16U
 #define WEATHER_SERVICE_CITY_BYTES         64U
+#define WEATHER_SERVICE_DISTRICT_BYTES     64U
 #define WEATHER_SERVICE_REGION_BYTES       64U
 #define WEATHER_SERVICE_COUNTRY_BYTES      4U
 #define WEATHER_SERVICE_TIMEZONE_BYTES     48U
@@ -103,6 +104,7 @@ typedef struct weather_service_dataset_meta
 typedef struct weather_service_location
 {
     char city[WEATHER_SERVICE_CITY_BYTES];
+    char district[WEATHER_SERVICE_DISTRICT_BYTES];
     char region[WEATHER_SERVICE_REGION_BYTES];
     char country[WEATHER_SERVICE_COUNTRY_BYTES];
     char timezone[WEATHER_SERVICE_TIMEZONE_BYTES];

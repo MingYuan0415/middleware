@@ -488,6 +488,8 @@ static bool _weather_parse_location_object(const cJSON *object,
            sizeof(location->location_key));
     return _weather_parse_copy_text(object, "city", location->city,
                                     sizeof(location->city), false, NULL) &&
+           _weather_parse_copy_text(object, "district", location->district,
+                                    sizeof(location->district), false, NULL) &&
            _weather_parse_copy_text(object, "region", location->region,
                                     sizeof(location->region), false, NULL) &&
            _weather_parse_copy_text(object, "country", location->country,
