@@ -117,27 +117,8 @@ static esp_err_t _host_get(size_t response_limit,
                            weather_service_http_result_t *result)
 {
     return weather_service_port_http_get(
-               "https://weather.example.com/current", "test-token", NULL,
-               response_limit, 1000U,
-               weather_service_port_cancel_generation(), result);
-}
-
-static esp_err_t _host_get_with_location(
-    weather_service_http_result_t *result)
-{
-    weather_service_location_t location =
-    {
-        .latitude_tenths = 225,
-        .longitude_tenths = 1141,
-    };
-    memcpy(location.provider, "ipapi.is", sizeof("ipapi.is"));
-    memcpy(location.city, "Shenzhen", sizeof("Shenzhen"));
-    memcpy(location.region, "Guangdong", sizeof("Guangdong"));
-    memcpy(location.country, "CN", sizeof("CN"));
-    memcpy(location.timezone, "Asia/Shanghai", sizeof("Asia/Shanghai"));
-    return weather_service_port_http_get(
                "https://weather.example.com/current", "test-token",
-               &location, 128U, 1000U,
+               response_limit, 1000U,
                weather_service_port_cancel_generation(), result);
 }
 
@@ -246,17 +227,23 @@ static void _test_cancel_cleanup(void)
 
 static void _test_header_failures(void)
 {
-    for (unsigned header = 1U; header <= 10U; ++header)
+    for (unsigned header = 1U; header <= 3U; ++header)
     {
         _host_response_reset();
         s_header_failure = header;
         weather_service_http_result_t result;
-        assert(_host_get_with_location(&result) == ESP_ERR_INVALID_ARG);
+        assert(_host_get(128U, &result) == ESP_ERR_INVALID_ARG);
         assert(result.body == NULL);
         assert(s_header_count == header);
         assert(s_perform_count == 0U);
         assert(s_cleanup_count == 1U);
     }
+
+    _host_response_reset();
+    weather_service_http_result_t result;
+    assert(_host_get(128U, &result) == ESP_OK);
+    assert(s_header_count == 3U);
+    weather_service_port_http_result_release(&result);
 }
 
 static void _test_stale_cancel_generation(void)
@@ -266,7 +253,7 @@ static void _test_stale_cancel_generation(void)
     weather_service_port_cancel();
     weather_service_http_result_t result;
     assert(weather_service_port_http_get(
-               "https://weather.example.com/current", "test-token", NULL,
+               "https://weather.example.com/current", "test-token",
                128U, 1000U, generation, &result) == ESP_ERR_INVALID_STATE);
     assert(s_psram_allocations == 0U);
     assert(s_cleanup_count == 0U);

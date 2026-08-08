@@ -42,17 +42,20 @@ static void _check(bool condition, const char *expression, int line)
 }
 
 static const char s_location_json[] =
-    "{\"ip\":\"192.0.2.1\",\"asn\":{\"asn\":64500},"
-    "\"location\":{\"city\":\"Shenzhen\",\"state\":\"Guangdong\","
-    "\"country_code\":\"CN\",\"timezone\":\"Asia/Shanghai\","
-    "\"latitude\":22.5431,\"longitude\":114.0579}}";
+    "{\"schema_version\":1,\"location\":{\"city\":\"Shenzhen\","
+    "\"region\":\"Guangdong\",\"country\":\"CN\","
+    "\"timezone\":\"Asia/Shanghai\",\"source\":\"ip\","
+    "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+    "\"location_key\":\"9f4a2b3c8d1e5f06\"},"
+    "\"accuracy_radius_km\":50}";
 
 static const char s_envelope_prefix[] =
     "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
     "\"location\":{\"city\":\"Shenzhen\",\"region\":\"Guangdong\","
     "\"country\":\"CN\",\"timezone\":\"Asia/Shanghai\","
-    "\"source\":\"device\",\"provider\":\"ipapi.is\","
-    "\"precision\":\"city\"},\"fetched_at\":\"2026-08-05T00:00:00Z\","
+    "\"source\":\"ip\",\"provider\":\"maxmind\","
+    "\"precision\":\"coarse\",\"location_key\":\"9f4a2b3c8d1e5f06\"},"
+    "\"fetched_at\":\"2026-08-05T00:00:00Z\","
     "\"updated_at\":\"2026-08-05T07:55:00+08:00\","
     "\"valid_until\":\"2026-08-05T08:20:00+08:00\",\"stale\":false,"
     "\"data\":";
@@ -214,21 +217,81 @@ static void _test_location(void)
                                          strlen(s_location_json), 12345,
                                          &location) == ESP_OK);
     CHECK(location.available);
-    CHECK(location.latitude_tenths == 225);
-    CHECK(location.longitude_tenths == 1141);
     CHECK(strcmp(location.city, "Shenzhen") == 0);
     CHECK(strcmp(location.region, "Guangdong") == 0);
     CHECK(strcmp(location.country, "CN") == 0);
     CHECK(strcmp(location.timezone, "Asia/Shanghai") == 0);
-    CHECK(strcmp(location.provider, "ipapi.is") == 0);
+    CHECK(strcmp(location.provider, "maxmind") == 0);
+    CHECK(strcmp(location.location_key, "9f4a2b3c8d1e5f06") == 0);
     CHECK(location.acquired_at == 12345);
 
-    const char invalid[] =
-        "{\"location\":{\"latitude\":91,\"longitude\":0,"
-        "\"country_code\":\"CN\",\"timezone\":\"Asia/Shanghai\"}}";
-    CHECK(weather_service_parse_location((const uint8_t *)invalid,
-                                         strlen(invalid), 0, &location) ==
-          ESP_ERR_INVALID_RESPONSE);
+    const char no_key[] =
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}";
+    CHECK(weather_service_parse_location((const uint8_t *)no_key,
+                                         strlen(no_key), 0, &location) ==
+          ESP_OK);
+    CHECK(location.location_key[0] == '\0');
+
+    static const char *const invalid[] =
+    {
+        "{\"schema_version\":2,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1.5,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"gps\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"exact\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"MaxMind\",\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"precision\":\"coarse\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+        "\"location_key\":\"9f4a2b3c8d1e5f0\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+        "\"location_key\":\"9F4A2B3C8D1E5F06\"}}",
+        "{\"schema_version\":1,\"location\":{\"source\":\"ip\","
+        "\"provider\":\"maxmind\",\"precision\":\"coarse\","
+        "\"location_key\":\"9f4a2b3c8d1e5f0g\"}}",
+        "{\"schema_version\":1}",
+        "{}",
+    };
+    for (size_t index = 0U;
+            index < sizeof(invalid) / sizeof(invalid[0]); ++index)
+    {
+        CHECK(weather_service_parse_location(
+                  (const uint8_t *)invalid[index], strlen(invalid[index]),
+                  0, &location) == ESP_ERR_INVALID_RESPONSE);
+    }
+
+    static const size_t provider_lengths[] = {15U, 16U, 32U, 33U};
+    for (size_t index = 0U;
+            index < sizeof(provider_lengths) / sizeof(provider_lengths[0]);
+            ++index)
+    {
+        size_t length = provider_lengths[index];
+        char provider[40];
+        memset(provider, 'a', length);
+        provider[length] = '\0';
+        char json[192];
+        int count = snprintf(json, sizeof(json),
+                             "{\"schema_version\":1,\"location\":{"
+                             "\"source\":\"ip\",\"provider\":\"%s\","
+                             "\"precision\":\"coarse\"}}", provider);
+        CHECK(count > 0 && (size_t)count < sizeof(json));
+        esp_err_t expected = length <= 32U ? ESP_OK :
+                             ESP_ERR_INVALID_RESPONSE;
+        CHECK(weather_service_parse_location((const uint8_t *)json,
+                                             (size_t)count, 0, &location) ==
+              expected);
+        if (expected == ESP_OK)
+        {
+            CHECK(strlen(location.provider) == length);
+        }
+    }
 }
 
 static void _test_weather(void)
@@ -332,6 +395,44 @@ static void _test_weather(void)
                                         (const uint8_t *)wrong_source,
                                         strlen(wrong_source), &snapshot,
                                         &changed) == ESP_ERR_INVALID_RESPONSE);
+
+    const char fractional_version[] =
+        "{\"schema_version\":1.5,\"source\":{\"id\":\"qweather\"},"
+        "\"location\":{\"source\":\"ip\",\"provider\":\"maxmind\","
+        "\"precision\":\"coarse\"},"
+        "\"fetched_at\":\"2026-08-05T00:00:00Z\","
+        "\"updated_at\":\"2026-08-05T07:55:00+08:00\","
+        "\"valid_until\":\"2026-08-05T08:20:00+08:00\",\"stale\":false,"
+        "\"data\":{}}";
+    CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
+                                        (const uint8_t *)fractional_version,
+                                        strlen(fractional_version), &snapshot,
+                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+
+    const char wrong_provider[] =
+        "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
+        "\"location\":{\"source\":\"ip\",\"provider\":\"Max Mind\","
+        "\"precision\":\"coarse\"},"
+        "\"fetched_at\":\"2026-08-05T00:00:00Z\","
+        "\"updated_at\":\"2026-08-05T07:55:00+08:00\","
+        "\"valid_until\":\"2026-08-05T08:20:00+08:00\",\"stale\":false,"
+        "\"data\":{}}";
+    CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
+                                        (const uint8_t *)wrong_provider,
+                                        strlen(wrong_provider), &snapshot,
+                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+
+    const char missing_source[] =
+        "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
+        "\"location\":{\"provider\":\"maxmind\"},"
+        "\"fetched_at\":\"2026-08-05T00:00:00Z\","
+        "\"updated_at\":\"2026-08-05T07:55:00+08:00\","
+        "\"valid_until\":\"2026-08-05T08:20:00+08:00\",\"stale\":false,"
+        "\"data\":{}}";
+    CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
+                                        (const uint8_t *)missing_source,
+                                        strlen(missing_source), &snapshot,
+                                        &changed) == ESP_ERR_INVALID_RESPONSE);
 }
 
 static void _test_cache(void)
@@ -343,10 +444,10 @@ static void _test_cache(void)
     source.available_mask = WEATHER_SERVICE_DATA_LOCATION |
                             WEATHER_SERVICE_DATA_CURRENT;
     source.location.available = true;
-    source.location.latitude_tenths = 225;
-    source.location.longitude_tenths = 1141;
     memcpy(source.location.city, "Shenzhen", sizeof("Shenzhen"));
-    memcpy(source.location.provider, "ipapi.is", sizeof("ipapi.is"));
+    memcpy(source.location.provider, "maxmind", sizeof("maxmind"));
+    memcpy(source.location.location_key, "9f4a2b3c8d1e5f06",
+           sizeof("9f4a2b3c8d1e5f06"));
     source.current.meta.available = true;
     source.current.temperature_tenths_c = 312;
     memcpy(source.current.condition_text, "Cloudy", sizeof("Cloudy"));
@@ -363,6 +464,7 @@ static void _test_cache(void)
     CHECK(loaded.generation == 8U);
     CHECK(loaded.current.temperature_tenths_c == 320);
     CHECK(strcmp(loaded.location.city, "Shenzhen") == 0);
+    CHECK(loaded.location.location_key[0] == '\0');
 
     char path[128];
     int count = snprintf(path, sizeof(path), "%s/weather_b.bin", directory);
@@ -411,6 +513,116 @@ static void _test_cache(void)
           ESP_ERR_INVALID_SIZE);
 }
 
+static uint32_t _crc32(const uint8_t *data, size_t size)
+{
+    uint32_t crc = UINT32_MAX;
+    for (size_t index = 0U; index < size; ++index)
+    {
+        crc ^= data[index];
+        for (unsigned bit = 0U; bit < 8U; ++bit)
+        {
+            uint32_t mask = (uint32_t) - (int32_t)(crc & 1U);
+            crc = (crc >> 1U) ^ (UINT32_C(0xEDB88320) & mask);
+        }
+    }
+    return ~crc;
+}
+
+static void _test_cache_legacy_coordinate_slots(void)
+{
+    char directory[] = "/tmp/mt-weather-legacy-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    weather_service_snapshot_t source = {0};
+    source.generation = 7U;
+    source.available_mask = WEATHER_SERVICE_DATA_LOCATION |
+                            WEATHER_SERVICE_DATA_CURRENT;
+    source.location.available = true;
+    memcpy(source.location.city, "Shenzhen", sizeof("Shenzhen"));
+    memcpy(source.location.region, "Guangdong", sizeof("Guangdong"));
+    memcpy(source.location.country, "CN", sizeof("CN"));
+    memcpy(source.location.timezone, "Asia/Shanghai",
+           sizeof("Asia/Shanghai"));
+    memcpy(source.location.provider, "maxmind", sizeof("maxmind"));
+    source.location.acquired_at = 1000;
+    source.current.meta.available = true;
+    source.current.temperature_tenths_c = 312;
+    memcpy(source.current.condition_text, "Cloudy", sizeof("Cloudy"));
+    CHECK(weather_service_cache_store(directory, &source, 1U) == ESP_OK);
+
+    char path[128];
+    int count = snprintf(path, sizeof(path), "%s/weather_a.bin", directory);
+    CHECK(count > 0 && (size_t)count < sizeof(path));
+    int descriptor = open(path, O_RDONLY);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0)
+    {
+        return;
+    }
+    struct stat info;
+    CHECK(fstat(descriptor, &info) == 0);
+    size_t file_size = (size_t)info.st_size;
+    uint8_t *file = malloc(file_size);
+    CHECK(file != NULL);
+    if (file != NULL)
+    {
+        CHECK(read(descriptor, file, file_size) == (ssize_t)file_size);
+    }
+    (void)close(descriptor);
+    if (file == NULL)
+    {
+        return;
+    }
+    const size_t header_bytes = 24U;
+    size_t latitude_offset = header_bytes + 8U + 4U;
+    latitude_offset += 2U + strlen("Shenzhen");
+    latitude_offset += 2U + strlen("Guangdong");
+    latitude_offset += 2U + strlen("CN");
+    latitude_offset += 2U + strlen("Asia/Shanghai");
+    latitude_offset += 2U + strlen("maxmind");
+    file[latitude_offset] = (uint8_t)225U;
+    file[latitude_offset + 1U] = (uint8_t)(225U >> 8U);
+    file[latitude_offset + 2U] = (uint8_t)1141U;
+    file[latitude_offset + 3U] = (uint8_t)(1141U >> 8U);
+    size_t payload_size = file_size - header_bytes;
+    uint32_t crc = _crc32(file + header_bytes, payload_size);
+    file[20U] = (uint8_t)crc;
+    file[21U] = (uint8_t)(crc >> 8U);
+    file[22U] = (uint8_t)(crc >> 16U);
+    file[23U] = (uint8_t)(crc >> 24U);
+    descriptor = open(path, O_WRONLY | O_TRUNC);
+    CHECK(descriptor >= 0 && write(descriptor, file, file_size) ==
+          (ssize_t)file_size);
+    (void)close(descriptor);
+    free(file);
+
+    weather_service_snapshot_t loaded = {0};
+    uint64_t sequence = 0U;
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) == ESP_OK);
+    CHECK(sequence == 1U);
+    CHECK(strcmp(loaded.location.city, "Shenzhen") == 0);
+    CHECK(strcmp(loaded.location.provider, "maxmind") == 0);
+    CHECK(loaded.location.acquired_at == 1000);
+    CHECK(loaded.location.available);
+    CHECK(loaded.location.location_key[0] == '\0');
+    CHECK(loaded.current.temperature_tenths_c == 312);
+    CHECK((loaded.available_mask & WEATHER_SERVICE_DATA_CURRENT) != 0U);
+
+    CHECK(weather_service_cache_store(directory, &loaded, 2U) == ESP_OK);
+    memset(&loaded, 0, sizeof(loaded));
+    sequence = 0U;
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) == ESP_OK);
+    CHECK(sequence == 2U);
+    CHECK(strcmp(loaded.location.provider, "maxmind") == 0);
+    CHECK(loaded.location.acquired_at == 1000);
+    CHECK(loaded.current.temperature_tenths_c == 312);
+
+    (void)snprintf(path, sizeof(path), "%s/weather_a.bin", directory);
+    (void)unlink(path);
+    (void)snprintf(path, sizeof(path), "%s/weather_b.bin", directory);
+    (void)unlink(path);
+    CHECK(rmdir(directory) == 0);
+}
+
 int main(void)
 {
     weather_service_parse_init();
@@ -418,6 +630,7 @@ int main(void)
     _test_weather();
     _test_alert_boundaries();
     _test_cache();
+    _test_cache_legacy_coordinate_slots();
     printf("weather service: %u checks, %u failures\n", s_checks, s_failures);
     return s_failures == 0U ? 0 : 1;
 }

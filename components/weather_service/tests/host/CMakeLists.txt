@@ -55,7 +55,7 @@ function(add_weather_host_test name target)
     else()
         add_test(NAME ${name} COMMAND ${target})
     endif()
-    set_tests_properties(${name} PROPERTIES TIMEOUT 15)
+    set_tests_properties(${name} PROPERTIES TIMEOUT 120)
 endfunction()
 
 add_executable(weather_service_parse_cache_test

@@ -208,8 +208,13 @@ static void _weather_cache_encode_location(weather_cache_writer_t *writer,
                               sizeof(location->timezone));
     _weather_cache_put_string(writer, location->provider,
                               sizeof(location->provider));
-    _weather_cache_put_u16(writer, (uint16_t)location->latitude_tenths);
-    _weather_cache_put_u16(writer, (uint16_t)location->longitude_tenths);
+    /* Two padding slots preserve the legacy latitude/longitude layout so
+       v1 files written before coordinate removal remain readable. The
+       location_key is intentionally not persisted: every new network
+       session re-locates and refreshes the weather scope, so a cached
+       location without a key only exists until the first refresh. */
+    _weather_cache_put_u16(writer, 0U);
+    _weather_cache_put_u16(writer, 0U);
     _weather_cache_put_u64(writer, (uint64_t)location->acquired_at);
     _weather_cache_put_u8(writer, location->available ? 1U : 0U);
     _weather_cache_put_u8(writer, location->reused ? 1U : 0U);
@@ -227,8 +232,8 @@ static void _weather_cache_decode_location(weather_cache_reader_t *reader,
                               sizeof(location->timezone));
     _weather_cache_get_string(reader, location->provider,
                               sizeof(location->provider));
-    location->latitude_tenths = (int16_t)_weather_cache_get_u16(reader);
-    location->longitude_tenths = (int16_t)_weather_cache_get_u16(reader);
+    (void)_weather_cache_get_u16(reader);
+    (void)_weather_cache_get_u16(reader);
     location->acquired_at = (int64_t)_weather_cache_get_u64(reader);
     location->available = _weather_cache_get_u8(reader) != 0U;
     location->reused = _weather_cache_get_u8(reader) != 0U;

@@ -404,19 +404,88 @@ static bool _weather_parse_meta(const cJSON *root,
     return true;
 }
 
-static bool _weather_parse_public_location(const cJSON *root,
-        weather_service_location_t *location)
+static bool _weather_parse_provider(const char *text)
 {
-    const cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "location");
-    bool truncated = false;
-    char provider[WEATHER_SERVICE_PROVIDER_BYTES];
-    if (!cJSON_IsObject(object) ||
-            !_weather_parse_copy_text(object, "provider", provider,
-                                      sizeof(provider), true, &truncated) ||
-            strcmp(provider, "ipapi.is") != 0 || truncated)
+    if (text == NULL || text[0] == '\0')
     {
         return false;
     }
+    size_t length = 0U;
+    for (const char *cursor = text; *cursor != '\0'; ++cursor)
+    {
+        char character = *cursor;
+        bool alnum = (character >= 'a' && character <= 'z') ||
+                     (character >= '0' && character <= '9');
+        bool symbol = character == '.' || character == '_' ||
+                      character == '-';
+        if (!alnum && !symbol)
+        {
+            return false;
+        }
+        if (length == 0U && !alnum)
+        {
+            return false;
+        }
+        ++length;
+        if (length > 32U)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool _weather_parse_location_key(const char *text)
+{
+    if (text == NULL || text[0] == '\0')
+    {
+        return true;
+    }
+    if (strlen(text) != 16U)
+    {
+        return false;
+    }
+    for (size_t index = 0U; index < 16U; ++index)
+    {
+        char character = text[index];
+        if (!((character >= '0' && character <= '9') ||
+                (character >= 'a' && character <= 'f')))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool _weather_parse_location_object(const cJSON *object,
+        weather_service_location_t *location)
+{
+    bool truncated = false;
+    char provider[WEATHER_SERVICE_PROVIDER_BYTES];
+    char location_key[17];
+    const cJSON *source = cJSON_GetObjectItemCaseSensitive(object, "source");
+    const cJSON *precision = cJSON_GetObjectItemCaseSensitive(object,
+                             "precision");
+    if (!cJSON_IsObject(object) || !cJSON_IsString(source) ||
+            source->valuestring == NULL ||
+            (strcmp(source->valuestring, "ip") != 0 &&
+             strcmp(source->valuestring, "device") != 0) ||
+            !cJSON_IsString(precision) || precision->valuestring == NULL ||
+            (strcmp(precision->valuestring, "coarse") != 0 &&
+             strcmp(precision->valuestring, "city") != 0) ||
+            !_weather_parse_copy_text(object, "provider", provider,
+                                      sizeof(provider), true, &truncated) ||
+            truncated || !_weather_parse_provider(provider) ||
+            !_weather_parse_copy_text(object, "location_key", location_key,
+                                      sizeof(location_key), false,
+                                      &truncated) || truncated ||
+            !_weather_parse_location_key(location_key))
+    {
+        return false;
+    }
+    memcpy(location->provider, provider, sizeof(location->provider));
+    memcpy(location->location_key, location_key,
+           sizeof(location->location_key));
     return _weather_parse_copy_text(object, "city", location->city,
                                     sizeof(location->city), false, NULL) &&
            _weather_parse_copy_text(object, "region", location->region,
@@ -425,6 +494,13 @@ static bool _weather_parse_public_location(const cJSON *root,
                                     sizeof(location->country), false, NULL) &&
            _weather_parse_copy_text(object, "timezone", location->timezone,
                                     sizeof(location->timezone), false, NULL);
+}
+
+static bool _weather_parse_public_location(const cJSON *root,
+        weather_service_location_t *location)
+{
+    const cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "location");
+    return _weather_parse_location_object(object, location);
 }
 
 esp_err_t weather_service_parse_location(const uint8_t *body,
@@ -436,59 +512,17 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
         return ESP_ERR_INVALID_ARG;
     }
     cJSON *root = cJSON_ParseWithLength((const char *)body, body_size);
-    if (!cJSON_IsObject(root))
-    {
-        LOG_W("location JSON rejected: root object; bytes=%u",
-              (unsigned)body_size);
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "location");
-    double latitude = 0.0;
-    double longitude = 0.0;
+    const cJSON *version = cJSON_IsObject(root) ?
+                           cJSON_GetObjectItemCaseSensitive(root,
+                               "schema_version") : NULL;
+    const cJSON *object = cJSON_IsObject(root) ?
+                          cJSON_GetObjectItemCaseSensitive(root, "location") :
+                          NULL;
     weather_service_location_t parsed = {0};
-    const char *rejected_field = NULL;
-    if (!cJSON_IsObject(object))
-    {
-        rejected_field = "location object";
-    }
-    else if (!_weather_parse_number(object, "latitude", -90.0, 90.0,
-                                    &latitude, true))
-    {
-        rejected_field = "latitude";
-    }
-    else if (!_weather_parse_number(object, "longitude", -180.0, 180.0,
-                                    &longitude, true))
-    {
-        rejected_field = "longitude";
-    }
-    else if (!_weather_parse_copy_text(object, "city", parsed.city,
-                                       sizeof(parsed.city), false, NULL))
-    {
-        rejected_field = "city";
-    }
-    else if (!_weather_parse_copy_text(object, "state", parsed.region,
-                                       sizeof(parsed.region), false, NULL))
-    {
-        rejected_field = "state";
-    }
-    else if (!_weather_parse_copy_text(object, "country_code",
-                                       parsed.country,
-                                       sizeof(parsed.country), true, NULL))
-    {
-        rejected_field = "country_code";
-    }
-    else if (!_weather_parse_copy_text(object, "timezone", parsed.timezone,
-                                       sizeof(parsed.timezone), true, NULL))
-    {
-        rejected_field = "timezone";
-    }
-    bool valid = rejected_field == NULL;
+    bool valid = cJSON_IsNumber(version) && version->valuedouble == 1.0 &&
+                 _weather_parse_location_object(object, &parsed);
     if (valid)
     {
-        parsed.latitude_tenths = _weather_parse_signed_tenths(latitude);
-        parsed.longitude_tenths = _weather_parse_signed_tenths(longitude);
-        memcpy(parsed.provider, "ipapi.is", sizeof("ipapi.is"));
         parsed.acquired_at = acquired_at;
         parsed.available = true;
         *location = parsed;
@@ -496,7 +530,8 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
     }
     else
     {
-        LOG_W("location JSON rejected: %s", rejected_field);
+        LOG_W("location JSON rejected: bytes=%u",
+              (unsigned)body_size);
     }
     cJSON_Delete(root);
     return valid ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
@@ -843,7 +878,7 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                              cJSON_GetObjectItemCaseSensitive(source, "id") : NULL;
     const cJSON *data = cJSON_IsObject(root) ?
                         cJSON_GetObjectItemCaseSensitive(root, "data") : NULL;
-    bool valid = cJSON_IsNumber(version) && version->valueint == 1 &&
+    bool valid = cJSON_IsNumber(version) && version->valuedouble == 1.0 &&
                  cJSON_IsString(source_id) && source_id->valuestring != NULL &&
                  strcmp(source_id->valuestring, "qweather") == 0 &&
                  cJSON_IsObject(data) &&

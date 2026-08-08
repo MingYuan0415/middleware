@@ -24,9 +24,25 @@ void weather_host_advance_milliseconds(int64_t milliseconds);
 /** @brief Set the deterministic random value used by jitter policies. */
 void weather_host_set_random(uint32_t value);
 
-/** @brief Set the location returned by the next location parse. */
-void weather_host_set_location(int16_t latitude_tenths,
-                               int16_t longitude_tenths);
+/** @brief Change the location scope: provider, city, and location_key. */
+void weather_host_set_location(const char *provider, const char *city);
+
+/** @brief Change the weather echo scope: provider, city, and location_key. */
+void weather_host_set_weather_location(const char *provider,
+                                       const char *city);
+
+/** @brief Skip the weather echo override for the next parse calls. */
+void weather_host_set_weather_location_skip(unsigned count);
+
+/** @brief Alternate the weather echo override between parse calls. */
+void weather_host_set_weather_location_alternate(const char *provider,
+        const char *city);
+
+/** @brief Return the number of published snapshot events. */
+unsigned weather_host_event_count(void);
+
+/** @brief Copy the last snapshot event; false when none was published. */
+bool weather_host_last_event(weather_service_event_t *event);
 
 /** @brief Fail the next number of location HTTP requests. */
 void weather_host_fail_location_transport(unsigned count);
@@ -62,6 +78,18 @@ unsigned weather_host_cache_writes(void);
 
 /** @brief Return snapshot allocations which requested PSRAM. */
 unsigned weather_host_psram_allocations(void);
+
+/** @brief Report whether the location endpoint path was requested. */
+bool weather_host_location_path_seen(void);
+
+/** @brief Report whether one weather dataset path was requested. */
+bool weather_host_weather_path_seen(weather_service_kind_t kind);
+
+/** @brief Report whether a request carried the expected device token. */
+bool weather_host_token_seen(void);
+
+/** @brief Report whether any request used an unexpected path or token. */
+bool weather_host_unexpected_request(void);
 
 /** @brief Fail one PSRAM allocation after the requested successful calls. */
 void weather_host_fail_psram_after(unsigned successful_allocations);

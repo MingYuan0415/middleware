@@ -28,11 +28,11 @@ typedef struct weather_service_fetch_result
     esp_err_t error;
     int status_code;
     uint32_t retry_after_seconds;
+    bool scope_drifted;
 } weather_service_fetch_result_t;
 
 esp_err_t weather_service_port_http_get(
-    const char *url, const char *token,
-    const weather_service_location_t *location, size_t response_limit,
+    const char *url, const char *token, size_t response_limit,
     uint32_t timeout_ms, uint64_t cancel_generation,
     weather_service_http_result_t *result);
 void weather_service_port_http_result_release(

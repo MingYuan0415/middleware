@@ -143,73 +143,6 @@ static esp_err_t _weather_port_set_header(esp_http_client_handle_t client,
     return esp_http_client_set_header(client, name, value);
 }
 
-static esp_err_t _weather_port_set_location_headers(
-    esp_http_client_handle_t client,
-    const weather_service_location_t *location)
-{
-    char latitude[16];
-    char longitude[16];
-    int latitude_value = location->latitude_tenths;
-    int longitude_value = location->longitude_tenths;
-    (void)snprintf(latitude, sizeof(latitude), "%s%d.%d",
-                   latitude_value < 0 ? "-" : "",
-                   abs(latitude_value) / 10, abs(latitude_value) % 10);
-    (void)snprintf(longitude, sizeof(longitude), "%s%d.%d",
-                   longitude_value < 0 ? "-" : "",
-                   abs(longitude_value) / 10, abs(longitude_value) % 10);
-    esp_err_t result = _weather_port_set_header(
-                           client, "X-MT-Location-Latitude", latitude);
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-    result = _weather_port_set_header(
-                 client, "X-MT-Location-Longitude", longitude);
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-    result = _weather_port_set_header(
-                 client, "X-MT-Location-Provider", location->provider);
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-    if (location->city[0] != '\0')
-    {
-        result = _weather_port_set_header(
-                     client, "X-MT-Location-City", location->city);
-        if (result != ESP_OK)
-        {
-            return result;
-        }
-    }
-    if (location->region[0] != '\0')
-    {
-        result = _weather_port_set_header(
-                     client, "X-MT-Location-Region", location->region);
-        if (result != ESP_OK)
-        {
-            return result;
-        }
-    }
-    if (location->country[0] != '\0')
-    {
-        result = _weather_port_set_header(
-                     client, "X-MT-Location-Country", location->country);
-        if (result != ESP_OK)
-        {
-            return result;
-        }
-    }
-    if (location->timezone[0] != '\0')
-    {
-        result = _weather_port_set_header(
-                     client, "X-MT-Location-Timezone", location->timezone);
-    }
-    return result;
-}
-
 static bool _weather_port_json_content_type(const weather_http_context_t *context)
 {
     static const char expected[] = "application/json";
@@ -263,8 +196,7 @@ static uint32_t _weather_port_retry_after(
 }
 
 esp_err_t weather_service_port_http_get(
-    const char *url, const char *token,
-    const weather_service_location_t *location, size_t response_limit,
+    const char *url, const char *token, size_t response_limit,
     uint32_t timeout_ms, uint64_t cancel_generation,
     weather_service_http_result_t *result)
 {
@@ -338,17 +270,7 @@ esp_err_t weather_service_port_http_get(
         error = ESP_ERR_INVALID_ARG;
         goto exit;
     }
-    if (location != NULL)
-    {
-        error = _weather_port_set_location_headers(client, location);
-        if (error != ESP_OK)
-        {
-            error = ESP_ERR_INVALID_ARG;
-            goto exit;
-        }
-    }
-    LOG_D("HTTP request started: class=%s limit=%u timeout_ms=%u",
-          location == NULL ? "location" : "weather",
+    LOG_D("HTTP request started: limit=%u timeout_ms=%u",
           (unsigned)response_limit, (unsigned)timeout_ms);
     atomic_store_explicit(&s_active_client, (uintptr_t)client,
                           memory_order_release);

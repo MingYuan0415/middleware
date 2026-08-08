@@ -23,8 +23,15 @@ typedef struct weather_host_dataset
 static atomic_llong s_now;
 static atomic_llong s_now_milliseconds;
 static atomic_uint s_random;
-static atomic_int s_latitude_tenths;
-static atomic_int s_longitude_tenths;
+static weather_service_location_t s_fake_location;
+static weather_service_location_t s_fake_weather_location;
+static bool s_weather_location_override;
+static bool s_weather_location_alternate;
+static bool s_weather_location_alternate_state;
+static atomic_uint s_weather_location_override_skip;
+static weather_service_event_t s_last_event;
+static bool s_event_seen;
+static atomic_uint s_event_count;
 static atomic_uint s_location_requests;
 static atomic_uint s_location_transport_failures;
 static atomic_int s_location_status_code;
@@ -33,6 +40,10 @@ static atomic_uint s_psram_allocations;
 static atomic_ullong s_cancel_generation;
 static atomic_uint s_psram_failure_at;
 static atomic_int s_cache_load_result;
+static atomic_uint s_location_path_seen;
+static atomic_uint s_weather_path_seen[WEATHER_SERVICE_KIND_COUNT];
+static atomic_uint s_token_seen;
+static atomic_uint s_unexpected_request;
 static weather_service_snapshot_t s_cached_snapshot;
 static pthread_mutex_t s_http_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_http_condition = PTHREAD_COND_INITIALIZER;
@@ -55,21 +66,24 @@ static bool _weather_host_consume(atomic_uint *remaining)
     return false;
 }
 
-static weather_service_kind_t _weather_host_kind(const char *url)
+static weather_service_kind_t _weather_host_weather_path(const char *path)
 {
-    if (strstr(url, "/alerts") != NULL)
+    static const char *const paths[WEATHER_SERVICE_KIND_COUNT] =
     {
-        return WEATHER_SERVICE_KIND_ALERTS;
-    }
-    if (strstr(url, "/hourly") != NULL)
+        "/api/v1/weather/current",
+        "/api/v1/weather/alerts",
+        "/api/v1/weather/hourly",
+        "/api/v1/weather/daily",
+    };
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
     {
-        return WEATHER_SERVICE_KIND_HOURLY;
+        if (strcmp(path, paths[kind]) == 0)
+        {
+            return kind;
+        }
     }
-    if (strstr(url, "/daily") != NULL)
-    {
-        return WEATHER_SERVICE_KIND_DAILY;
-    }
-    return WEATHER_SERVICE_KIND_CURRENT;
+    return WEATHER_SERVICE_KIND_COUNT;
 }
 
 void weather_host_reset(void)
@@ -77,8 +91,23 @@ void weather_host_reset(void)
     atomic_store(&s_now, 1000);
     atomic_store(&s_now_milliseconds, 1000000);
     atomic_store(&s_random, 0U);
-    atomic_store(&s_latitude_tenths, 225);
-    atomic_store(&s_longitude_tenths, 1141);
+    memset(&s_fake_location, 0, sizeof(s_fake_location));
+    memcpy(s_fake_location.city, "Shenzhen", sizeof("Shenzhen"));
+    memcpy(s_fake_location.region, "Guangdong", sizeof("Guangdong"));
+    memcpy(s_fake_location.country, "CN", sizeof("CN"));
+    memcpy(s_fake_location.timezone, "Asia/Shanghai",
+           sizeof("Asia/Shanghai"));
+    memcpy(s_fake_location.provider, "maxmind", sizeof("maxmind"));
+    memcpy(s_fake_location.location_key, "9f4a2b3c8d1e5f06",
+           sizeof("9f4a2b3c8d1e5f06"));
+    memset(&s_fake_weather_location, 0, sizeof(s_fake_weather_location));
+    s_weather_location_override = false;
+    s_weather_location_alternate = false;
+    s_weather_location_alternate_state = true;
+    atomic_store(&s_weather_location_override_skip, 0U);
+    memset(&s_last_event, 0, sizeof(s_last_event));
+    s_event_seen = false;
+    atomic_store(&s_event_count, 0U);
     atomic_store(&s_location_requests, 0U);
     atomic_store(&s_location_transport_failures, 0U);
     atomic_store(&s_location_status_code, 200);
@@ -87,6 +116,14 @@ void weather_host_reset(void)
     atomic_store(&s_cancel_generation, 0U);
     atomic_store(&s_psram_failure_at, 0U);
     atomic_store(&s_cache_load_result, ESP_ERR_NOT_FOUND);
+    atomic_store(&s_location_path_seen, 0U);
+    atomic_store(&s_token_seen, 0U);
+    atomic_store(&s_unexpected_request, 0U);
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        atomic_store(&s_weather_path_seen[kind], 0U);
+    }
     memset(&s_cached_snapshot, 0, sizeof(s_cached_snapshot));
     pthread_mutex_lock(&s_http_mutex);
     s_http_block_next = false;
@@ -130,11 +167,63 @@ void weather_host_set_random(uint32_t value)
     atomic_store(&s_random, value);
 }
 
-void weather_host_set_location(int16_t latitude_tenths,
-                               int16_t longitude_tenths)
+void weather_host_set_location(const char *provider, const char *city)
 {
-    atomic_store(&s_latitude_tenths, latitude_tenths);
-    atomic_store(&s_longitude_tenths, longitude_tenths);
+    memset(s_fake_location.provider, 0, sizeof(s_fake_location.provider));
+    memset(s_fake_location.city, 0, sizeof(s_fake_location.city));
+    memcpy(s_fake_location.location_key, "1a2b3c4d5e6f7080",
+           sizeof("1a2b3c4d5e6f7080"));
+    if (provider != NULL)
+    {
+        memcpy(s_fake_location.provider, provider, strlen(provider) + 1U);
+    }
+    if (city != NULL)
+    {
+        memcpy(s_fake_location.city, city, strlen(city) + 1U);
+    }
+}
+
+void weather_host_set_weather_location(const char *provider,
+                                       const char *city)
+{
+    memset(&s_fake_weather_location, 0, sizeof(s_fake_weather_location));
+    memcpy(s_fake_weather_location.location_key, "1a2b3c4d5e6f7080",
+           sizeof("1a2b3c4d5e6f7080"));
+    if (provider != NULL)
+    {
+        memcpy(s_fake_weather_location.provider, provider,
+               strlen(provider) + 1U);
+    }
+    if (city != NULL)
+    {
+        memcpy(s_fake_weather_location.city, city, strlen(city) + 1U);
+    }
+    s_weather_location_override = true;
+}
+
+void weather_host_set_weather_location_skip(unsigned count)
+{
+    atomic_store(&s_weather_location_override_skip, count);
+}
+
+void weather_host_set_weather_location_alternate(const char *provider,
+        const char *city)
+{
+    memset(&s_fake_weather_location, 0, sizeof(s_fake_weather_location));
+    memcpy(s_fake_weather_location.location_key, "1a2b3c4d5e6f7080",
+           sizeof("1a2b3c4d5e6f7080"));
+    if (provider != NULL)
+    {
+        memcpy(s_fake_weather_location.provider, provider,
+               strlen(provider) + 1U);
+    }
+    if (city != NULL)
+    {
+        memcpy(s_fake_weather_location.city, city, strlen(city) + 1U);
+    }
+    s_weather_location_override = true;
+    s_weather_location_alternate = true;
+    s_weather_location_alternate_state = true;
 }
 
 void weather_host_fail_location_transport(unsigned count)
@@ -191,6 +280,27 @@ unsigned weather_host_cache_writes(void)
 unsigned weather_host_psram_allocations(void)
 {
     return atomic_load(&s_psram_allocations);
+}
+
+bool weather_host_location_path_seen(void)
+{
+    return atomic_load(&s_location_path_seen) != 0U;
+}
+
+bool weather_host_weather_path_seen(weather_service_kind_t kind)
+{
+    return kind < WEATHER_SERVICE_KIND_COUNT &&
+           atomic_load(&s_weather_path_seen[kind]) != 0U;
+}
+
+bool weather_host_token_seen(void)
+{
+    return atomic_load(&s_token_seen) != 0U;
+}
+
+bool weather_host_unexpected_request(void)
+{
+    return atomic_load(&s_unexpected_request) != 0U;
 }
 
 void weather_host_fail_psram_after(unsigned successful_allocations)
@@ -277,19 +387,36 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
 {
     (void)msg_id;
     (void)sub_type;
-    (void)payload;
-    (void)payload_size;
     (void)flags;
+    if (payload != NULL && payload_size == sizeof(weather_service_event_t))
+    {
+        s_last_event = *(const weather_service_event_t *)payload;
+        s_event_seen = true;
+    }
+    atomic_fetch_add(&s_event_count, 1U);
     return ESP_OK;
 }
 
+unsigned weather_host_event_count(void)
+{
+    return atomic_load(&s_event_count);
+}
+
+bool weather_host_last_event(weather_service_event_t *event)
+{
+    if (event == NULL || !s_event_seen)
+    {
+        return false;
+    }
+    *event = s_last_event;
+    return true;
+}
+
 esp_err_t weather_service_port_http_get(
-    const char *url, const char *token,
-    const weather_service_location_t *location, size_t response_limit,
+    const char *url, const char *token, size_t response_limit,
     uint32_t timeout_ms, uint64_t cancel_generation,
     weather_service_http_result_t *result)
 {
-    (void)token;
     (void)response_limit;
     (void)timeout_ms;
     memset(result, 0, sizeof(*result));
@@ -314,8 +441,31 @@ esp_err_t weather_service_port_http_get(
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (location == NULL)
+    if (token == NULL || strcmp(token, "test-token") != 0)
     {
+        atomic_store(&s_unexpected_request, 1U);
+    }
+    else
+    {
+        atomic_store(&s_token_seen, 1U);
+    }
+    const char *path = strstr(url, "/api/v1/");
+    if (path == NULL)
+    {
+        atomic_store(&s_unexpected_request, 1U);
+        result->body = malloc(2U);
+        if (result->body == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+        result->body[0] = '{';
+        result->body[1] = '}';
+        result->body_size = 2U;
+        return ESP_OK;
+    }
+    if (strcmp(path, "/api/v1/location") == 0)
+    {
+        atomic_store(&s_location_path_seen, 1U);
         atomic_fetch_add(&s_location_requests, 1U);
         if (_weather_host_consume(&s_location_transport_failures))
         {
@@ -325,7 +475,16 @@ esp_err_t weather_service_port_http_get(
     }
     else
     {
-        weather_service_kind_t kind = _weather_host_kind(url);
+        weather_service_kind_t kind = _weather_host_weather_path(path);
+        if (kind >= WEATHER_SERVICE_KIND_COUNT)
+        {
+            atomic_store(&s_unexpected_request, 1U);
+            kind = WEATHER_SERVICE_KIND_CURRENT;
+        }
+        else
+        {
+            atomic_store(&s_weather_path_seen[kind], 1U);
+        }
         weather_host_dataset_t *dataset = &s_datasets[kind];
         atomic_fetch_add(&dataset->requests, 1U);
         if (_weather_host_consume(&dataset->transport_failures))
@@ -388,14 +547,7 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
 {
     (void)body;
     (void)body_size;
-    memset(location, 0, sizeof(*location));
-    memcpy(location->city, "Shenzhen", sizeof("Shenzhen"));
-    memcpy(location->region, "Guangdong", sizeof("Guangdong"));
-    memcpy(location->country, "CN", sizeof("CN"));
-    memcpy(location->timezone, "Asia/Shanghai", sizeof("Asia/Shanghai"));
-    memcpy(location->provider, "ipapi.is", sizeof("ipapi.is"));
-    location->latitude_tenths = (int16_t)atomic_load(&s_latitude_tenths);
-    location->longitude_tenths = (int16_t)atomic_load(&s_longitude_tenths);
+    *location = s_fake_location;
     location->acquired_at = acquired_at;
     location->available = true;
     return ESP_OK;
@@ -441,6 +593,55 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
     }
     metadata->available = true;
     metadata->fetched_at.epoch_seconds = atomic_load(&s_now);
+    if (s_weather_location_override)
+    {
+        unsigned skip = atomic_load(&s_weather_location_override_skip);
+        if (skip != 0U)
+        {
+            atomic_store(&s_weather_location_override_skip, skip - 1U);
+        }
+        else if (s_weather_location_alternate)
+        {
+            /* Alternate between the override scope and the located scope
+               so consecutive parses oscillate between two location keys. */
+            const weather_service_location_t *echo =
+                s_weather_location_alternate_state ?
+                &s_fake_weather_location : &s_fake_location;
+            memcpy(snapshot->location.city, echo->city,
+                   sizeof(snapshot->location.city));
+            memcpy(snapshot->location.region, echo->region,
+                   sizeof(snapshot->location.region));
+            memcpy(snapshot->location.country, echo->country,
+                   sizeof(snapshot->location.country));
+            memcpy(snapshot->location.timezone, echo->timezone,
+                   sizeof(snapshot->location.timezone));
+            memcpy(snapshot->location.provider, echo->provider,
+                   sizeof(snapshot->location.provider));
+            memcpy(snapshot->location.location_key, echo->location_key,
+                   sizeof(snapshot->location.location_key));
+            s_weather_location_alternate_state =
+                !s_weather_location_alternate_state;
+        }
+        else
+        {
+            memcpy(snapshot->location.city, s_fake_weather_location.city,
+                   sizeof(snapshot->location.city));
+            memcpy(snapshot->location.region, s_fake_weather_location.region,
+                   sizeof(snapshot->location.region));
+            memcpy(snapshot->location.country,
+                   s_fake_weather_location.country,
+                   sizeof(snapshot->location.country));
+            memcpy(snapshot->location.timezone,
+                   s_fake_weather_location.timezone,
+                   sizeof(snapshot->location.timezone));
+            memcpy(snapshot->location.provider,
+                   s_fake_weather_location.provider,
+                   sizeof(snapshot->location.provider));
+            memcpy(snapshot->location.location_key,
+                   s_fake_weather_location.location_key,
+                   sizeof(snapshot->location.location_key));
+        }
+    }
     snapshot->available_mask |= mask | WEATHER_SERVICE_DATA_LOCATION;
     *changed_mask = mask | WEATHER_SERVICE_DATA_LOCATION;
     return ESP_OK;

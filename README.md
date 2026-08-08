@@ -18,7 +18,7 @@
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
-| `weather_service` | 每个 IPv4 会话完成一次城市级定位，顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
+| `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
 | `device_link` | Device Link v1 协议原语：framing 重组、冻结契约的 protobuf-c 消费代码与可复现生成校验；不拥有 NimBLE/Protocomm | `protobuf-c`（私有） |
 
 ## 目录结构
@@ -52,7 +52,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
-- `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
+- `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。天气响应携带的 `location_key` 是服务端按 0.1° 网格派生的不透明作用域标识：同一网格恒定、不暴露坐标，key 变化即清空旧数据集并按“实时优先”全量刷新，避免跨网格的陈旧或混合快照；缓存不落盘 key，重启后由会话定位重新建立。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 

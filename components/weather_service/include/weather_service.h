@@ -24,7 +24,7 @@ extern "C" {
 #define WEATHER_SERVICE_REGION_BYTES       64U
 #define WEATHER_SERVICE_COUNTRY_BYTES      4U
 #define WEATHER_SERVICE_TIMEZONE_BYTES     48U
-#define WEATHER_SERVICE_PROVIDER_BYTES     16U
+#define WEATHER_SERVICE_PROVIDER_BYTES     33U
 #define WEATHER_SERVICE_CONDITION_BYTES    40U
 #define WEATHER_SERVICE_DIRECTION_BYTES    24U
 #define WEATHER_SERVICE_SCALE_BYTES        16U
@@ -107,8 +107,7 @@ typedef struct weather_service_location
     char country[WEATHER_SERVICE_COUNTRY_BYTES];
     char timezone[WEATHER_SERVICE_TIMEZONE_BYTES];
     char provider[WEATHER_SERVICE_PROVIDER_BYTES];
-    int16_t latitude_tenths;
-    int16_t longitude_tenths;
+    char location_key[17]; /**< Opaque grid scope identity, 16 lowercase hex. */
     int64_t acquired_at;
     bool available;
     bool reused;
@@ -244,7 +243,6 @@ typedef struct weather_service_config
 {
     const char *server_base_url;  /**< HTTPS mt-server Origin, or empty. */
     const char *device_token;     /**< Bearer token, or empty. */
-    const char *location_url;     /**< HTTPS IP location endpoint. */
     const char *cache_directory;  /**< Mounted writable cache directory. */
     uint32_t task_priority;
     uint32_t current_refresh_seconds;
@@ -270,8 +268,10 @@ esp_err_t weather_service_resume(uint32_t timeout_ms);
 /**
  * @brief Notify the service of the current IPv4 connectivity level.
  *
- * A false-to-true transition starts one new location session. Repeated true
- * notifications do not repeat location lookup.
+ * A false-to-true transition starts one new location session, as does a
+ * ready-state notification whose ipv4_address differs from the previous
+ * one. Repeated notifications for the same ready state and address do not
+ * repeat location lookup.
  */
 esp_err_t weather_service_set_network_ready(bool ready,
         uint32_t ipv4_address);
