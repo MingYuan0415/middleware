@@ -11,6 +11,11 @@
 #include "ble_link_security_ops.h"
 #include "device_link_security_auth.h"
 
+#ifdef UNIT_TEST_HOST
+    /** @brief Test-only seam: force the authorize deadline value. */
+    void ble_link_service_test_set_auth_deadline_ticks(uint32_t ticks);
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,12 +38,6 @@ extern "C" {
 /** @brief Authorization credential length (matches the auth record). */
 #define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES \
     DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES
-
-/** @brief Fixed fake event key length while encrypted events are deferred. */
-#define BLE_LINK_SERVICE_EVENT_KEY_BYTES 16U
-
-/** @brief Fixed fake nonce prefix length. */
-#define BLE_LINK_SERVICE_NONCE_PREFIX_BYTES 4U
 
 /** @brief Authorization txn expiry (frozen authorize-prepare-response). */
 #define BLE_LINK_SERVICE_AUTH_EXPIRES_MS 600000U
@@ -95,9 +94,9 @@ typedef struct ble_link_service_facts
  * @param[in] security Security 2 operations, or NULL when no session is
  *                     wired (host test harness); requests then run in
  *                     plaintext and responses are sent plaintext.
- * @param[in] max_pending_frames Max frames one response may need in the
- *                              TX queue; a response requiring more fails
- *                              closed (the session is terminated).
+ * @param[in] max_pending_frames Reserved; outbound responses stream one
+ *                              fragment at a time and no longer depend on
+ *                              the TX queue depth.
  */
 void ble_link_service_init(
     uint64_t boot_id, ble_link_service_output_t output, void *arg,
@@ -115,17 +114,25 @@ typedef enum
     BLE_LINK_SERVICE_RX_CONTROL,
 } ble_link_service_rx_channel_t;
 
+/** @brief Opaque completed ingress message transferred to a worker. */
+typedef struct ble_link_work ble_link_work_t;
+
+/** @brief Submit one completed ingress message to its execution worker. */
+typedef esp_err_t (*ble_link_work_submit_fn)(ble_link_work_t *work, void *arg);
+
 /**
  * @brief Feed one raw characteristic write value.
  *
  * Runs the production path: fragment parse and reassembly, envelope and
  * request decode, channel admission, request dispatch, and response
- * framing through the output sink. Control requests require an authorized
- * session; the bootstrap authorize_prepare/authorize_commit flow is
- * admitted with an authenticated session only. Intermediate fragments
- * return ESP_ERR_NOT_FINISHED without side effects. A connection
- * generation change discards the partial frame, subscription, and pending
- * authorization transaction.
+ * framing through the output sink. The bootstrap flow
+ * (authorize_prepare/authorize_commit/get_authorization) and the
+ * capabilities/snapshot reads are admitted on the session channel with an
+ * authenticated session; control requests require an authorized session;
+ * capabilities and snapshot are also admitted on the control channel.
+ * Intermediate fragments return ESP_ERR_NOT_FINISHED without side effects.
+ * A connection generation change discards the partial frame,
+ * subscription, and pending authorization transaction.
  *
  * @param[in] facts   Runtime connection facts.
  * @param[in] channel RX characteristic channel.
@@ -139,6 +146,25 @@ esp_err_t ble_link_service_feed(
     const ble_link_service_facts_t *facts,
     ble_link_service_rx_channel_t channel,
     const uint8_t *value, size_t len);
+
+/**
+ * @brief Validate and reassemble one GATT fragment without executing protocol work.
+ *
+ * A completed message is copied into worker-owned memory. The caller owns
+ * `out_work` on success and must execute or release it. Incomplete frames
+ * return ESP_ERR_NOT_FINISHED with a NULL work item.
+ */
+esp_err_t ble_link_service_accept(
+    const ble_link_service_facts_t *facts,
+    ble_link_service_rx_channel_t channel,
+    const uint8_t *value, size_t len,
+    ble_link_work_t **out_work);
+
+/** @brief Execute one completed message in the protocol worker context. */
+esp_err_t ble_link_service_execute(ble_link_work_t *work);
+
+/** @brief Zeroize and release a completed ingress message. */
+void ble_link_service_release_work(ble_link_work_t *work);
 
 /**
  * @brief Whether a response transaction is in flight (waiting for the
@@ -168,10 +194,21 @@ void ble_link_service_response_completed(void);
  * @brief Clear all per-connection session state after a disconnect.
  *
  * Resets the reassemblers, subscription, authorization transaction,
- * dispatcher request ids, and the response transaction gate. The Security
- * 2 session close is owned by the transport caller.
+ * dispatcher request ids, and the response transaction gate. The external
+ * Security 2 close runs inside the same critical section as the state
+ * reset, so a stale clear can never close a newer generation's session.
  */
 void ble_link_service_clear_session_state(void);
+
+/**
+ * @brief Expire the active authorize transaction when its deadline passed.
+ *
+ * Called periodically by the device-link worker tick so the UI snapshot
+ * state converges to BOOTSTRAP_AUTHENTICATED after `expires_in_ms`.
+ *
+ * @return ESP_OK.
+ */
+esp_err_t ble_link_service_auth_expiry_tick(void);
 
 /**
  * @brief Query whether a partial frame is being reassembled on a channel.
@@ -193,6 +230,15 @@ bool ble_link_service_has_partial_frame(
  * @param[in] generation Current connection generation.
  */
 void ble_link_service_idle_timeout(uint32_t generation);
+
+/** @brief Apply an idle timeout only to the matching ingress epoch. */
+void ble_link_service_idle_timeout_epoch(
+    uint32_t generation, uint32_t epoch);
+
+/** @brief Snapshot one reassembly slot and its invalidation epoch. */
+esp_err_t ble_link_service_get_reassembly_state(
+    ble_link_service_rx_channel_t channel,
+    bool *out_partial, uint32_t *out_epoch);
 
 /**
  * @brief Publish a link_state_changed event to the current subscriber.

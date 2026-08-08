@@ -41,7 +41,8 @@ typedef enum {
   MICROTECH__LINK__V1__REQUEST__BODY_GET_LINK_SNAPSHOT = 11,
   MICROTECH__LINK__V1__REQUEST__BODY_AUTHORIZE_PREPARE = 12,
   MICROTECH__LINK__V1__REQUEST__BODY_AUTHORIZE_COMMIT = 13,
-  MICROTECH__LINK__V1__REQUEST__BODY_SUBSCRIBE_EVENTS = 14
+  MICROTECH__LINK__V1__REQUEST__BODY_SUBSCRIBE_EVENTS = 14,
+  MICROTECH__LINK__V1__REQUEST__BODY_GET_AUTHORIZATION = 15
     PROTOBUF_C__FORCE_ENUM_TO_BE_INT_SIZE(MICROTECH__LINK__V1__REQUEST__BODY__CASE)
 } Microtech__Link__V1__Request__BodyCase;
 
@@ -56,6 +57,7 @@ struct  Microtech__Link__V1__Request
     Microtech__Link__V1__AuthorizePrepareRequest *authorize_prepare;
     Microtech__Link__V1__AuthorizeCommitRequest *authorize_commit;
     Microtech__Link__V1__SubscribeEventsRequest *subscribe_events;
+    Microtech__Link__V1__GetAuthorizationRequest *get_authorization;
   };
 };
 #define MICROTECH__LINK__V1__REQUEST__INIT \

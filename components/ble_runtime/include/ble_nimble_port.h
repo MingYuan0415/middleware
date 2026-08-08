@@ -1,8 +1,6 @@
 #ifndef __BLE_NIMBLE_PORT_H__
 #define __BLE_NIMBLE_PORT_H__
 
-#include "host/ble_gap.h"
-
 #include "ble_port_ops.h"
 #include "ble_runtime.h"
 
@@ -63,6 +61,19 @@ const ble_port_ops_t *ble_nimble_port_get_ops(void);
  * @brief Get the host port implementation for the runtime.
  */
 const ble_runtime_host_port_t *ble_nimble_port_get(void);
+
+/**
+ * @brief Request a local binding revoke (bond/CCCD deletion on the host
+ * core).
+ *
+ * The caller must journal the revoke intent and erase the authorization
+ * record first; the port deletes the stored bond and CCCDs asynchronously
+ * and clears the journal. The startup continuation resumes an interrupted
+ * revoke before advertising.
+ *
+ * @return ESP_OK when the deletion was queued, otherwise a state error.
+ */
+esp_err_t ble_nimble_port_revoke_binding(void);
 
 #ifdef __cplusplus
 }

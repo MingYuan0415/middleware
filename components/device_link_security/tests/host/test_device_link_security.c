@@ -14,6 +14,18 @@
 #define TEST_POP "window-pop-secret"
 #define TEST_USERNAME "microtech"
 
+/* Peer identity used by the committed record in the selection tests. */
+static const uint8_t TEST_PEER_ADDR[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES] =
+{0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5};
+
+static void _select_bootstrap(void)
+{
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP);
+}
+
 #define FAKE_SESSION (protocomm_security_handle_t)(uintptr_t)0x2000U
 #define FAKE_TAG_BYTES 16U
 
@@ -198,6 +210,7 @@ esp_err_t esp_srp_gen_salt_verifier(
 
 static void _reset_fakes(void)
 {
+    nv_storage_fake_reset();
     s_new_count = 0U;
     s_delete_count = 0U;
     s_open_session_count = 0U;
@@ -283,10 +296,19 @@ static void _test_bootstrap_lifecycle(void)
                (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
 
-    /* Open the window: the adapter rebuilds protocomm with the POP
-     * derived salt and verifier. */
+    /* Open the window: the adapter keeps the POP-derived salt and
+     * verifier in the bootstrap slot; the instance is only configured
+     * once the verifier is selected for a handshake. */
     assert(device_link_security_open_bootstrap(
                (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    assert(s_new_count == 0U);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+
+    /* Select the bootstrap verifier for an unknown peer inside the
+     * window: the protocomm instance is rebuilt with the POP-derived
+     * salt and verifier. */
+    _select_bootstrap();
     assert(s_new_count == 1U);
 
     /* Handshake opens the session, passes the POP-derived salt and
@@ -343,12 +365,11 @@ static void _test_bootstrap_lifecycle(void)
                (const uint8_t *)"pop", 3U) == ESP_OK);
     assert(device_link_security_is_authenticated() == false);
     device_link_security_deinit();
-    /* The re-init instance is torn down on deinit; double deinit is a
-     * no-op. */
-    assert(s_delete_count == 2U);
+    /* No instance was configured (no selection), so no teardown is added. */
+    assert(s_delete_count == 1U);
     device_link_security_deinit();
     assert(device_link_security_is_authenticated() == false);
-    assert(s_delete_count == 2U);
+    assert(s_delete_count == 1U);
 }
 
 static void _test_failed_handshake_closes_session(void)
@@ -364,6 +385,7 @@ static void _test_failed_handshake_closes_session(void)
     assert(device_link_security_init(&config) == ESP_OK);
     assert(device_link_security_open_bootstrap(
                (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
     uint8_t *out = NULL;
     size_t out_len = 0U;
 
@@ -395,6 +417,7 @@ static void _test_explicit_session_close(void)
     assert(device_link_security_init(&config) == ESP_OK);
     assert(device_link_security_open_bootstrap(
                (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
     uint8_t *out = NULL;
     size_t out_len = 0U;
 
@@ -514,6 +537,115 @@ static void _test_long_term_verifier(void)
     device_link_security_deinit();
 }
 
+static void _test_verifier_selection(void)
+{
+    nv_storage_fake_reset();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+
+    /* No record, no window: no verifier; the handshake is not admitted. */
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+           ESP_ERR_INVALID_STATE);
+
+    /* Open a window: an unknown peer inside the window selects the
+     * bootstrap verifier. */
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+    free(out);
+    device_link_security_close_session();
+
+    /* Commit a record for TEST_PEER_ADDR: the matching peer keeps the
+     * long-term verifier even while the window stays open (replacement
+     * window semantics). */
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    static const uint8_t password[24] =
+    {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10,
+        0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+    };
+    assert(device_link_security_derive_long_term_verifier(
+               password, sizeof(password),
+               record.salt, record.verifier) == ESP_OK);
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    record.peer_addr_type = 1U;
+    memcpy(record.peer_addr, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR));
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+    /* Load the long-term slot so the record material backs the instance. */
+    assert(device_link_security_load_long_term_verifier() == ESP_OK);
+
+    /* Bound peer inside the open window: LONG_TERM. */
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM);
+    /* The long-term record salt/verifier back the instance. */
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+    assert(s_captured_salt_len == DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    assert(memcmp(s_captured_salt, record.salt,
+                  DEVICE_LINK_SECURITY_AUTH_SALT_BYTES) == 0);
+    free(out);
+    device_link_security_close_session();
+
+    /* A different peer inside the open window selects the bootstrap
+     * verifier (replacement flow for the new peer). */
+    static const uint8_t other_peer[6] = {0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5};
+
+    assert(device_link_security_select_verifier(
+               1U, other_peer, sizeof(other_peer), true) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP);
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+    free(out);
+    device_link_security_close_session();
+
+    /* Window closed, matching record still present: LONG_TERM survives. */
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM);
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+    free(out);
+    device_link_security_close_session();
+
+    /* Window closed, no matching record: not admitted. */
+    assert(device_link_security_select_verifier(
+               1U, other_peer, sizeof(other_peer), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    assert(device_link_security_handshake(
+               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+           ESP_ERR_INVALID_STATE);
+
+    /* Invalid selection arguments fail closed. */
+    assert(device_link_security_select_verifier(
+               3U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) ==
+           ESP_ERR_INVALID_ARG);
+    assert(device_link_security_select_verifier(
+               1U, NULL, 0U, true) == ESP_ERR_INVALID_ARG);
+    device_link_security_deinit();
+}
+
 static void _test_protect_requires_authentication(void)
 {
     _reset_fakes();
@@ -527,6 +659,7 @@ static void _test_protect_requires_authentication(void)
            ESP_ERR_INVALID_STATE);
     assert(device_link_security_open_bootstrap(
                (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
     uint8_t *out = NULL;
     size_t out_len = 0U;
 
@@ -550,11 +683,62 @@ static void _test_protect_requires_authentication(void)
     device_link_security_deinit();
 }
 
+static void _test_revoke_journal(void)
+{
+    nv_storage_fake_reset();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+
+    /* No marker initially. */
+    assert(!device_link_security_revoke_pending());
+    /* Begin journals the intent; the committed record coexists until the
+     * revoke completes (multi-key storage). */
+    assert(device_link_security_begin_revoke() == ESP_OK);
+    assert(device_link_security_revoke_pending());
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        record.salt[i] = (uint8_t)(0x30U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        record.verifier[i] = (uint8_t)(i & 0x7fU);
+    }
+    record.peer_addr_type = 1U;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        record.peer_addr[i] = (uint8_t)(0xa0U + i);
+    }
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+    assert(device_link_security_revoke_pending());
+    assert(device_link_security_load_auth_record(&record) == ESP_OK);
+
+    /* End clears the marker without touching the record. */
+    assert(device_link_security_end_revoke() == ESP_OK);
+    assert(!device_link_security_revoke_pending());
+    assert(device_link_security_load_auth_record(&record) == ESP_OK);
+    /* Erasing a missing marker is a no-op success. */
+    assert(device_link_security_end_revoke() == ESP_OK);
+    assert(device_link_security_erase_auth_record() == ESP_OK);
+    assert(device_link_security_end_revoke() == ESP_OK);
+    device_link_security_deinit();
+}
+
 int main(void)
 {
     _test_init_validation();
     _test_auth_record_persistence();
     _test_long_term_verifier();
+    _test_verifier_selection();
+    _test_revoke_journal();
     _test_protect_requires_authentication();
     _test_bootstrap_lifecycle();
     _test_failed_handshake_closes_session();

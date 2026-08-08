@@ -7,8 +7,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "esp_err.h"
+#ifndef UNIT_TEST_HOST
+    #include "esp_heap_caps.h"
+#endif
 #include "esp_random.h"
 
 #include "ble_link_codec.h"
@@ -41,19 +45,22 @@ typedef struct ble_link_service
     uint64_t boot_id;
     ble_link_service_output_t output;
     void *output_arg;
-    ble_link_reassembler_t reassembler[2];
-    uint8_t reassembly_buffer[2][BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES];
-    uint32_t feed_generation;
+    uint32_t execution_generation;
     uint16_t outbound_frame_id;
-    uint32_t next_subscription_id;
     struct
     {
-        bool active;
+        bool active;                 /**< A multi-fragment stream is pending. */
+        uint8_t *payload;            /**< Owned PSRAM payload copy. */
+        size_t payload_len;
+        size_t next_offset;          /**< Next fragment start offset. */
+        uint32_t att_mtu;
+        ble_link_service_tx_channel_t channel;
+        uint16_t frame_id;
+    } stream;
+    struct
+    {
+        bool active; /**< Never set in v1: events are not advertised. */
         uint32_t generation;
-        uint32_t subscription_id;
-        uint64_t sequence_baseline;
-        uint8_t event_key[BLE_LINK_SERVICE_EVENT_KEY_BYTES];
-        uint8_t nonce_prefix[BLE_LINK_SERVICE_NONCE_PREFIX_BYTES];
     } subscriber;
     struct
     {
@@ -65,6 +72,7 @@ typedef struct ble_link_service
         uint8_t credential_id[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
         uint8_t application_password[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
         uint8_t device_auth_id[BLE_LINK_SERVICE_AUTH_ID_BYTES];
+        uint32_t deadline_ms; /**< Absolute expiry in the adapter clock. */
     } auth_txn;
     bool switch_long_term_pending; /**< Survives abort: a committed
                                     *  record must take effect on every
@@ -75,38 +83,130 @@ typedef struct ble_link_service
     bool handshake_active;
     bool sec2_opened;
     unsigned int pending_transactions;
-    size_t max_pending_frames;
     uint8_t response_envelope[BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
     size_t response_envelope_len;
 } ble_link_service_t;
 
+typedef struct ble_link_ingress
+{
+    ble_link_reassembler_t reassembler[2];
+    uint8_t session_buffer[BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
+    uint8_t control_buffer[BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES];
+    uint32_t generation;
+    uint32_t epoch;
+    bool exhausted;
+} ble_link_ingress_t;
+
+struct ble_link_work
+{
+    ble_link_service_facts_t facts;
+    ble_link_service_rx_channel_t channel;
+    uint32_t epoch;
+    uint8_t transport_type;
+    size_t message_len;
+    uint8_t message[];
+};
+
 static SemaphoreHandle_t s_service_mutex;
 static StaticSemaphore_t s_service_mutex_control;
 
+static void _ble_link_service_lock(void)
+{
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreTakeRecursive(s_service_mutex, portMAX_DELAY);
+    }
+}
+
+static void _ble_link_service_unlock(void)
+{
+    if (s_service_mutex != NULL)
+    {
+        (void)xSemaphoreGiveRecursive(s_service_mutex);
+    }
+}
+
 static bool _ble_link_service_pairing_window_open(void);
 static void _ble_link_service_clear_auth_txn(void);
+static void _ble_link_service_abort_session(uint32_t generation);
 static void _ble_link_service_zeroize(void *data, size_t size);
+static void _ble_link_service_reset_ingress(void);
 static esp_err_t _ble_link_service_take_response(
     uint8_t **response, size_t *response_len);
+static esp_err_t _ble_link_service_accept_locked(
+    const ble_link_service_facts_t *facts,
+    ble_link_service_rx_channel_t channel,
+    const uint8_t *value, size_t len,
+    ble_link_work_t **out_work);
+static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work);
+static esp_err_t _ble_link_service_publish_link_state_locked(
+    const ble_link_service_facts_t *facts,
+    const ble_link_state_snapshot_t *link_state);
 
 static ble_link_service_t s_service;
+static ble_link_ingress_t s_ingress;
 
 bool ble_link_service_response_in_flight(void)
 {
-    return s_service.pending_transactions > 0U;
+    _ble_link_service_lock();
+    const bool in_flight = s_service.pending_transactions > 0U;
+
+    _ble_link_service_unlock();
+    return in_flight;
 }
+
+static void *_ble_link_service_stream_alloc(size_t size)
+{
+#ifdef UNIT_TEST_HOST
+    return malloc(size);
+#else
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+}
+
+static void _ble_link_service_stream_free(void)
+{
+    if (s_service.stream.payload != NULL)
+    {
+        _ble_link_service_zeroize(s_service.stream.payload,
+                                  s_service.stream.payload_len);
+        free(s_service.stream.payload);
+    }
+    s_service.stream.payload = NULL;
+    s_service.stream.payload_len = 0U;
+    s_service.stream.next_offset = 0U;
+    s_service.stream.active = false;
+}
+
+static bool _ble_link_service_stream_emit_locked(void);
 
 void ble_link_service_response_completed(void)
 {
-    if (s_service.pending_transactions > 0U)
+    _ble_link_service_lock();
+    if (s_service.stream.active)
+    {
+        /* One fragment confirmed: stream the next one. The transaction
+         * gate stays busy until the final fragment's confirmation. */
+        if (!_ble_link_service_stream_emit_locked())
+        {
+            s_service.stream.active = false;
+            s_service.pending_transactions = 0U;
+            _ble_link_service_abort_session(
+                s_service.current_facts.connection_generation);
+        }
+    }
+    else if (s_service.pending_transactions > 0U)
     {
         s_service.pending_transactions--;
     }
+    _ble_link_service_unlock();
 }
 
 void ble_link_service_abort_transactions(void)
 {
+    _ble_link_service_lock();
     s_service.pending_transactions = 0U;
+    _ble_link_service_unlock();
 }
 
 /**
@@ -123,12 +223,12 @@ static void _ble_link_service_abort_session(uint32_t generation)
         return;
     }
     s_service.pending_transactions = 0U;
-    ble_link_reassembler_reset(&s_service.reassembler[0]);
-    ble_link_reassembler_reset(&s_service.reassembler[1]);
+    _ble_link_service_reset_ingress();
     s_service.subscriber.active = false;
     s_service.handshake_active = false;
     s_service.sec2_opened = false;
     _ble_link_service_clear_auth_txn();
+    _ble_link_service_stream_free();
     ble_link_dispatcher_clear_session();
     if (s_service.security != NULL)
     {
@@ -171,7 +271,48 @@ static void _ble_link_service_clear_auth_txn(void)
     s_service.auth_txn.confirmed = false;
     s_service.auth_txn.committing = false;
     s_service.auth_txn.authorization_txn_id = 0U;
+    s_service.auth_txn.deadline_ms = 0U;
 }
+
+/**
+ * @brief Whether the active authorize transaction expired.
+ *
+ * Caller holds the service lock. A committed transaction never expires:
+ * its replay window outlives the prepare deadline so a client can always
+ * retrieve the AuthorizationResult for the exact Commit it sent.
+ */
+static bool _ble_link_service_auth_txn_expired(void)
+{
+    return s_service.auth_txn.active && !s_service.auth_txn.committed &&
+           s_service.auth_txn.deadline_ms != 0U &&
+           (int32_t)(xTaskGetTickCount() -
+                     s_service.auth_txn.deadline_ms) >= 0;
+}
+
+/**
+ * @brief Expire the active authorize transaction when its deadline passed.
+ *
+ * Returns true when a transaction was cleared, so the device-link worker
+ * can republish the snapshot. Caller holds the service lock.
+ */
+static bool _ble_link_service_auth_expiry_tick_locked(void)
+{
+    if (_ble_link_service_auth_txn_expired())
+    {
+        _ble_link_service_clear_auth_txn();
+        return true;
+    }
+    return false;
+}
+
+#ifdef UNIT_TEST_HOST
+void ble_link_service_test_set_auth_deadline_ticks(uint32_t ticks)
+{
+    _ble_link_service_lock();
+    s_service.auth_txn.deadline_ms = ticks;
+    _ble_link_service_unlock();
+}
+#endif
 
 static bool _ble_link_service_pairing_window_open(void)
 {
@@ -187,6 +328,31 @@ static void _ble_link_service_zeroize(void *data, size_t size)
     {
         bytes[i] = 0U;
     }
+}
+
+static void _ble_link_service_reset_ingress(void)
+{
+    ble_link_reassembler_reset(&s_ingress.reassembler[0]);
+    ble_link_reassembler_reset(&s_ingress.reassembler[1]);
+    if (s_ingress.epoch < UINT32_MAX)
+    {
+        s_ingress.epoch++;
+    }
+    else
+    {
+        s_ingress.exhausted = true;
+    }
+}
+
+static ble_link_work_t *_ble_link_service_allocate_work(size_t message_len)
+{
+    const size_t size = sizeof(ble_link_work_t) + message_len;
+
+#ifdef UNIT_TEST_HOST
+    return malloc(size);
+#else
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
 }
 
 static void _ble_link_service_write_varint(uint8_t *out, size_t *pos,
@@ -211,15 +377,6 @@ static void _ble_link_service_write_fixed64(uint8_t *out, size_t *pos,
         uint64_t value)
 {
     for (unsigned int i = 0U; i < 8U; ++i)
-    {
-        out[(*pos)++] = (uint8_t)(value >> (8U * i));
-    }
-}
-
-static void _ble_link_service_write_fixed32(uint8_t *out, size_t *pos,
-        uint32_t value)
-{
-    for (unsigned int i = 0U; i < 4U; ++i)
     {
         out[(*pos)++] = (uint8_t)(value >> (8U * i));
     }
@@ -274,8 +431,30 @@ static void _ble_link_service_build_link_state(
     }
     else if (facts->session_authenticated)
     {
-        out->authorization_state =
-            BLE_LINK_AUTHORIZATION_BOOTSTRAP_AUTHENTICATED;
+        /* Bootstrap or long-term authenticated: refine with the local
+         * authorize transaction state. A prepared transaction that is
+         * not yet confirmed is CONFIRMATION_PENDING; a confirmed
+         * transaction that has not committed is PREPARED. */
+        _ble_link_service_lock();
+        if (s_service.auth_txn.active &&
+                !_ble_link_service_auth_txn_expired())
+        {
+            if (s_service.auth_txn.confirmed)
+            {
+                out->authorization_state = BLE_LINK_AUTHORIZATION_PREPARED;
+            }
+            else
+            {
+                out->authorization_state =
+                    BLE_LINK_AUTHORIZATION_CONFIRMATION_PENDING;
+            }
+        }
+        else
+        {
+            out->authorization_state =
+                BLE_LINK_AUTHORIZATION_BOOTSTRAP_AUTHENTICATED;
+        }
+        _ble_link_service_unlock();
     }
     else
     {
@@ -430,112 +609,126 @@ static void _ble_link_service_encode_authorization_result(
                                    BLE_LINK_AUTHORIZATION_AUTHORIZED);
 }
 
-static void _ble_link_service_encode_event_subscription(
-    uint8_t *out, size_t *pos, const ble_link_service_facts_t *facts)
-{
-    ble_link_state_snapshot_t link_state;
-
-    _ble_link_service_build_link_state(facts, &link_state);
-    uint8_t snapshot_bytes[64];
-    const size_t snapshot_len = _ble_link_service_encode_snapshot(
-                                    snapshot_bytes, sizeof(snapshot_bytes),
-                                    s_service.subscriber.sequence_baseline,
-                                    &link_state);
-
-    _ble_link_service_write_tag(out, pos, 1U, 2U);
-    _ble_link_service_write_bytes(out, pos, s_service.subscriber.event_key,
-                                  BLE_LINK_SERVICE_EVENT_KEY_BYTES);
-    _ble_link_service_write_tag(out, pos, 2U, 2U);
-    _ble_link_service_write_bytes(out, pos,
-                                  s_service.subscriber.nonce_prefix,
-                                  BLE_LINK_SERVICE_NONCE_PREFIX_BYTES);
-    _ble_link_service_write_tag(out, pos, 3U, 5U);
-    _ble_link_service_write_fixed32(out, pos,
-                                    s_service.subscriber.subscription_id);
-    _ble_link_service_write_tag(out, pos, 4U, 1U);
-    _ble_link_service_write_fixed64(out, pos,
-                                    s_service.subscriber.sequence_baseline);
-    _ble_link_service_write_tag(out, pos, 5U, 2U);
-    _ble_link_service_write_bytes(out, pos, snapshot_bytes, snapshot_len);
-}
-
 /**
- * @brief Emit one message payload split into fragments for the negotiated
- * ATT MTU.
+ * @brief Max payload of one fragment for a negotiated ATT MTU.
  */
-static bool _ble_link_service_emit_fragments(
-    const uint8_t *payload, size_t payload_len, uint32_t att_mtu,
-    ble_link_service_tx_channel_t channel)
+static size_t _ble_link_service_max_fragment_payload(uint32_t att_mtu)
 {
-    /* The fragment buffer only needs to hold one ATT value plus the
-     * framing header; the source message lives elsewhere. */
-    uint8_t fragment[BLE_LINK_FRAMING_HEADER_BYTES +
-                     BLE_LINK_SERVICE_PREFERRED_ATT_MTU];
     size_t max_payload = 0U;
 
     if (att_mtu >= BLE_LINK_FRAMING_HEADER_BYTES + 3U)
     {
         max_payload = att_mtu - 3U - BLE_LINK_FRAMING_HEADER_BYTES;
     }
-    /* The chunk must fit the local fragment array. */
-    if (max_payload > sizeof(fragment) - BLE_LINK_FRAMING_HEADER_BYTES)
+    /* The fragment buffer only needs to hold one ATT value plus the
+     * framing header; the source message lives in the stream buffer. */
+    if (max_payload > BLE_LINK_SERVICE_PREFERRED_ATT_MTU)
     {
-        max_payload = sizeof(fragment) - BLE_LINK_FRAMING_HEADER_BYTES;
+        max_payload = BLE_LINK_SERVICE_PREFERRED_ATT_MTU;
     }
-    if (max_payload == 0U)
+    return max_payload;
+}
+
+/**
+ * @brief Build and emit the fragment at the stream's next offset.
+ *
+ * Caller holds the service lock. Returns false when the output sink
+ * rejected the fragment (the caller fails the transaction closed).
+ */
+static bool _ble_link_service_stream_emit_locked(void)
+{
+    uint8_t fragment[BLE_LINK_FRAMING_HEADER_BYTES +
+                     BLE_LINK_SERVICE_PREFERRED_ATT_MTU];
+    const size_t max_payload = _ble_link_service_max_fragment_payload(
+                                   s_service.stream.att_mtu);
+
+    if (max_payload == 0U || s_service.stream.next_offset >=
+            s_service.stream.payload_len)
     {
         return false;
     }
-    const size_t fragment_count =
-        (payload_len + max_payload - 1U) / max_payload;
+    const size_t remaining = s_service.stream.payload_len -
+                             s_service.stream.next_offset;
+    const size_t chunk = (remaining > max_payload) ? max_payload : remaining;
+    const size_t offset = s_service.stream.next_offset;
+    const uint8_t *payload = s_service.stream.payload;
+    const uint16_t frame_id = s_service.stream.frame_id;
+    uint8_t flags = 0U;
 
-    if (fragment_count > s_service.max_pending_frames)
+    if (offset == 0U)
     {
-        /* The TX queue cannot hold this response: fail closed. */
+        flags |= BLE_LINK_FRAMING_FLAG_START;
+    }
+    if (offset + chunk == s_service.stream.payload_len)
+    {
+        flags |= BLE_LINK_FRAMING_FLAG_END;
+    }
+    fragment[0] = 1U;
+    fragment[1] = flags;
+    fragment[2] = (uint8_t)(frame_id & 0xffU);
+    fragment[3] = (uint8_t)(frame_id >> 8U);
+    fragment[4] = (uint8_t)(s_service.stream.payload_len & 0xffU);
+    fragment[5] = (uint8_t)((s_service.stream.payload_len >> 8U) & 0xffU);
+    fragment[6] = (uint8_t)(offset & 0xffU);
+    fragment[7] = (uint8_t)((offset >> 8U) & 0xffU);
+    memcpy(&fragment[BLE_LINK_FRAMING_HEADER_BYTES], &payload[offset],
+           chunk);
+    s_service.stream.next_offset = offset + chunk;
+    if (s_service.stream.next_offset == s_service.stream.payload_len)
+    {
+        /* The final fragment is in flight: the stream completes when its
+         * indication confirms (the transaction gate then releases). */
+        s_service.stream.active = false;
+    }
+    return s_service.output(
+               fragment, BLE_LINK_FRAMING_HEADER_BYTES + chunk,
+               s_service.stream.channel,
+               s_service.stream.next_offset == s_service.stream.payload_len,
+               s_service.output_arg) == ESP_OK;
+}
+
+/**
+ * @brief Start one outbound message streamed fragment by fragment.
+ *
+ * The payload is copied into an owned PSRAM buffer and only the first
+ * fragment is handed to the transport; each following fragment is emitted
+ * when the previous indication confirms (ble_link_service_response_
+ * completed), so a response completes at any negotiated ATT MTU down to
+ * 23 independent of the local TX queue depth.
+ */
+static bool _ble_link_service_emit_fragments(
+    const uint8_t *payload, size_t payload_len, uint32_t att_mtu,
+    ble_link_service_tx_channel_t channel)
+{
+    if (payload == NULL || payload_len == 0U ||
+            _ble_link_service_max_fragment_payload(att_mtu) == 0U)
+    {
         return false;
     }
-    size_t offset = 0U;
-    uint16_t frame_id;
+    uint8_t *copy = _ble_link_service_stream_alloc(payload_len);
 
+    if (copy == NULL)
+    {
+        return false;
+    }
+    memcpy(copy, payload, payload_len);
+    _ble_link_service_stream_free();
+    s_service.stream.payload = copy;
+    s_service.stream.payload_len = payload_len;
+    s_service.stream.next_offset = 0U;
+    s_service.stream.att_mtu = att_mtu;
+    s_service.stream.channel = channel;
     s_service.outbound_frame_id++;
     if (s_service.outbound_frame_id == 0U)
     {
         s_service.outbound_frame_id = 1U;
     }
-    frame_id = s_service.outbound_frame_id;
-    while (offset < payload_len)
+    s_service.stream.frame_id = s_service.outbound_frame_id;
+    s_service.stream.active = true;
+    if (!_ble_link_service_stream_emit_locked())
     {
-        const size_t remaining = payload_len - offset;
-        const size_t chunk = (remaining > max_payload) ?
-                             max_payload : remaining;
-        uint8_t flags = 0U;
-
-        if (offset == 0U)
-        {
-            flags |= BLE_LINK_FRAMING_FLAG_START;
-        }
-        if (offset + chunk == payload_len)
-        {
-            flags |= BLE_LINK_FRAMING_FLAG_END;
-        }
-        fragment[0] = 1U;
-        fragment[1] = flags;
-        fragment[2] = (uint8_t)(frame_id & 0xffU);
-        fragment[3] = (uint8_t)(frame_id >> 8U);
-        fragment[4] = (uint8_t)(payload_len & 0xffU);
-        fragment[5] = (uint8_t)((payload_len >> 8U) & 0xffU);
-        fragment[6] = (uint8_t)(offset & 0xffU);
-        fragment[7] = (uint8_t)((offset >> 8U) & 0xffU);
-        memcpy(&fragment[BLE_LINK_FRAMING_HEADER_BYTES], &payload[offset],
-               chunk);
-        const bool is_last = (offset + chunk == payload_len);
-
-        if (s_service.output(fragment, BLE_LINK_FRAMING_HEADER_BYTES + chunk,
-                             channel, is_last, s_service.output_arg) != ESP_OK)
-        {
-            return false;
-        }
-        offset += chunk;
+        _ble_link_service_stream_free();
+        return false;
     }
     return true;
 }
@@ -708,12 +901,15 @@ static uint32_t _ble_link_service_handle_authorize_prepare(
 {
     (void)facts;
     (void)arg;
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
-    const bool txn_active = s_service.auth_txn.active;
+    _ble_link_service_lock();
+    bool txn_active = s_service.auth_txn.active;
+    const bool txn_expired = _ble_link_service_auth_txn_expired();
 
+    if (txn_expired)
+    {
+        _ble_link_service_clear_auth_txn();
+        txn_active = false;
+    }
     if (!txn_active)
     {
         s_service.auth_txn.active = true;
@@ -731,15 +927,11 @@ static uint32_t _ble_link_service_handle_authorize_prepare(
                         sizeof(s_service.auth_txn.credential_id));
         esp_fill_random(s_service.auth_txn.application_password,
                         sizeof(s_service.auth_txn.application_password));
+        s_service.auth_txn.deadline_ms =
+            (uint32_t)xTaskGetTickCount() +
+            (uint32_t)pdMS_TO_TICKS(BLE_LINK_SERVICE_AUTH_EXPIRES_MS);
     }
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
-    if (txn_active)
-    {
-        return BLE_LINK_ERROR_CONFLICT;
-    }
+    _ble_link_service_unlock();
     uint8_t body[64];
     size_t body_len = 0U;
 
@@ -848,11 +1040,15 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     bool confirmed = false;
     bool txn_active = false;
 
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
+    _ble_link_service_lock();
     txn_active = s_service.auth_txn.active;
+    if (txn_active && _ble_link_service_auth_txn_expired())
+    {
+        /* The prepare deadline passed: the transaction no longer exists
+         * and must not be committed. */
+        _ble_link_service_clear_auth_txn();
+        txn_active = false;
+    }
     if (txn_active &&
             _ble_link_service_parse_authorize_commit(
                 request->body_data, request->body_len, &txn_id,
@@ -881,10 +1077,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
         memcpy(replay_auth_id, s_service.auth_txn.device_auth_id,
                sizeof(replay_auth_id));
     }
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
+    _ble_link_service_unlock();
     if (replay)
     {
         /* Idempotent replay of a committed transaction. */
@@ -951,18 +1144,12 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     uint32_t commit_error = BLE_LINK_ERROR_OK;
 
     memset(&record, 0, sizeof(record));
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
+    _ble_link_service_lock();
     if (!s_service.auth_txn.active || !s_service.auth_txn.confirmed ||
             s_service.auth_txn.committing)
     {
         commit_error = BLE_LINK_ERROR_UNAVAILABLE;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
     esp_fill_random(local_device_auth_id, sizeof(local_device_auth_id));
@@ -977,10 +1164,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (ble_link_session_authorization_exhausted())
     {
         commit_error = BLE_LINK_ERROR_UNAVAILABLE;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
     memcpy(record.credential_id, local_credential,
@@ -1007,10 +1191,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (!s_service.current_facts.identity_known || !peer_valid)
     {
         commit_error = BLE_LINK_ERROR_INVALID_ARGUMENT;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
     record.peer_addr_type = s_service.current_facts.peer_addr_type;
@@ -1024,10 +1205,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (derive_result != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
@@ -1035,10 +1213,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     if (device_link_security_save_auth_record(&record) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_STORAGE;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
     s_service.auth_txn.committed = true;
@@ -1059,16 +1234,10 @@ static uint32_t _ble_link_service_handle_authorize_commit(
                 facts->connection_generation, 0U) != ESP_OK)
     {
         commit_error = BLE_LINK_ERROR_INTERNAL;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         goto commit_exit;
     }
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
+    _ble_link_service_unlock();
     uint8_t body_bytes[64];
     size_t body_len_bytes = 0U;
 
@@ -1089,18 +1258,125 @@ commit_exit:
                               sizeof(local_device_auth_id));
     if (commit_error != BLE_LINK_ERROR_OK)
     {
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-        }
+        _ble_link_service_lock();
         s_service.auth_txn.committing = false;
-        if (s_service_mutex != NULL)
-        {
-            (void)xSemaphoreGive(s_service_mutex);
-        }
+        _ble_link_service_unlock();
         return commit_error;
     }
     return BLE_LINK_ERROR_OK;
+}
+
+/**
+ * @brief Parse a GetAuthorizationRequest body with strict bounds.
+ *
+ * Fields: 1 bytes credential_id of exactly
+ * BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES.
+ */
+static bool _ble_link_service_parse_get_authorization(
+    const uint8_t *body, size_t body_len, uint8_t *out_credential)
+{
+    size_t pos = 0U;
+    bool saw_credential = false;
+
+    while (pos < body_len)
+    {
+        const uint64_t tag = body[pos];
+
+        if (tag >= 0x80U)
+        {
+            return false;
+        }
+        pos++;
+        const uint64_t field = tag >> 3U;
+        const uint64_t wire = tag & 7U;
+
+        if (field == 1U && wire == 2U) /* length-delimited credential_id */
+        {
+            if (pos >= body_len || body[pos] >= 0x80U)
+            {
+                return false;
+            }
+            const size_t len = body[pos];
+
+            pos++;
+            if (body_len - pos < len)
+            {
+                return false;
+            }
+            if (len == BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES)
+            {
+                memcpy(out_credential, &body[pos], len);
+                saw_credential = true;
+            }
+            pos += len;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return saw_credential;
+}
+
+static uint32_t _ble_link_service_handle_get_authorization(
+    const ble_link_codec_request_t *request,
+    const ble_link_dispatcher_facts_t *facts, void *arg)
+{
+    (void)arg;
+    /* The recovery query is only meaningful under the RECOVERY_QUERY
+     * envelope flag; the dispatcher surfaced it in the facts. */
+    if (!facts->recovery_query || !facts->authorized ||
+            !facts->session_authenticated)
+    {
+        return BLE_LINK_ERROR_INVALID_ARGUMENT;
+    }
+    uint8_t credential_id[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES];
+
+    memset(credential_id, 0, sizeof(credential_id));
+    if (!_ble_link_service_parse_get_authorization(
+                request->body_data, request->body_len, credential_id))
+    {
+        return BLE_LINK_ERROR_INVALID_ARGUMENT;
+    }
+    /* The committed record must match the credential ID and the resolved
+     * peer identity; the session was already authenticated with the
+     * long-term credential of the record (on_authenticated verified the
+     * identity), so this is a consistency re-check against a record that
+     * could have been revoked mid-session. */
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    if (device_link_security_load_auth_record(&record) != ESP_OK ||
+            !device_link_security_auth_record_valid(&record) ||
+            memcmp(record.credential_id, credential_id,
+                   BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES) != 0 ||
+            record.peer_addr_type != s_service.current_facts.peer_addr_type ||
+            memcmp(record.peer_addr, s_service.current_facts.peer_addr, 6U) != 0)
+    {
+        _ble_link_service_zeroize(&record, sizeof(record));
+        return BLE_LINK_ERROR_NOT_FOUND;
+    }
+    uint8_t body[64];
+    size_t body_len = 0U;
+
+    _ble_link_service_encode_authorization_result(
+        body, &body_len, record.credential_id, record.device_auth_id);
+    _ble_link_service_zeroize(&record, sizeof(record));
+    _ble_link_service_emit_response(
+        request->request_id, BLE_LINK_ERROR_OK,
+        BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT, body, body_len,
+
+        s_service.current_facts.preferred_att_mtu,
+        _ble_link_service_response_channel());
+    return BLE_LINK_ERROR_OK;
+}
+
+esp_err_t ble_link_service_auth_expiry_tick(void)
+{
+    _ble_link_service_lock();
+    (void)_ble_link_service_auth_expiry_tick_locked();
+    _ble_link_service_unlock();
+    return ESP_OK;
 }
 
 esp_err_t ble_link_service_on_authenticated(void *arg)
@@ -1110,13 +1386,24 @@ esp_err_t ble_link_service_on_authenticated(void *arg)
     {
         return ESP_OK;
     }
+    /* The verifier kind was pinned by select_verifier when the handshake
+     * started: it, not the pairing-window flag, decides bootstrap versus
+     * long-term recovery. A bound peer keeps the long-term credential
+     * during a replacement window; an unknown peer only ever reaches
+     * bootstrap inside an open window. */
+    device_link_security_verifier_kind_t kind =
+        DEVICE_LINK_SECURITY_VERIFIER_NONE;
     uint32_t epoch = 0U;
 
-    if (_ble_link_service_pairing_window_open())
+    if (s_service.security != NULL &&
+            s_service.security->selected_verifier != NULL)
     {
-        /* Bootstrap session inside a pairing window: mark only the
-         * Security 2 authentication; authorization is established by the
-         * commit. */
+        kind = s_service.security->selected_verifier();
+    }
+    if (kind == DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
+    {
+        /* Bootstrap session: mark only the Security 2 authentication;
+         * authorization is established by the commit. */
         if (ble_link_session_security2_open(
                     s_service.current_facts.connection_generation,
                     &epoch) != ESP_OK)
@@ -1125,6 +1412,12 @@ esp_err_t ble_link_service_on_authenticated(void *arg)
         }
         s_service.sec2_opened = true;
         return ESP_OK;
+    }
+    if (kind != DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM)
+    {
+        /* No verifier was selected (window closed, no record): the
+         * handshake should not have succeeded; fail closed. */
+        return ESP_ERR_INVALID_STATE;
     }
     /* Long-term reconnect: the committed record must match the resolved
      * identity, and the record restores the bound/authorized state
@@ -1156,13 +1449,10 @@ esp_err_t ble_link_service_on_authenticated(void *arg)
 
 void ble_link_service_confirm_binding(bool accept)
 {
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
+    _ble_link_service_lock();
     if (!s_service.auth_txn.active)
     {
-        (void)xSemaphoreGive(s_service_mutex);
+        _ble_link_service_unlock();
         return;
     }
     if (!accept)
@@ -1174,64 +1464,21 @@ void ble_link_service_confirm_binding(bool accept)
         {
             _ble_link_service_clear_auth_txn();
         }
-        (void)xSemaphoreGive(s_service_mutex);
+        _ble_link_service_unlock();
         return;
     }
     s_service.auth_txn.confirmed = true;
-    (void)xSemaphoreGive(s_service_mutex);
+    _ble_link_service_unlock();
 }
 
 bool ble_link_service_pending_confirmation(void)
 {
     bool pending = false;
 
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
+    _ble_link_service_lock();
     pending = s_service.auth_txn.active && !s_service.auth_txn.confirmed;
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
+    _ble_link_service_unlock();
     return pending;
-}
-
-static uint32_t _ble_link_service_handle_subscribe_events(
-    const ble_link_codec_request_t *request,
-    const ble_link_dispatcher_facts_t *facts, void *arg)
-{
-    (void)facts;
-    (void)arg;
-    if (s_service.subscriber.active)
-    {
-        return BLE_LINK_ERROR_CONFLICT;
-    }
-    s_service.subscriber.active = true;
-    s_service.subscriber.generation = facts->connection_generation;
-    s_service.subscriber.subscription_id = s_service.next_subscription_id;
-    s_service.next_subscription_id++;
-    s_service.subscriber.sequence_baseline = ble_link_events_baseline();
-    for (size_t i = 0U; i < BLE_LINK_SERVICE_EVENT_KEY_BYTES; ++i)
-    {
-        s_service.subscriber.event_key[i] = 0xabU;
-    }
-    for (size_t i = 0U; i < BLE_LINK_SERVICE_NONCE_PREFIX_BYTES; ++i)
-    {
-        s_service.subscriber.nonce_prefix[i] = (uint8_t)(0x10U + i);
-    }
-    uint8_t body[128];
-    size_t body_len = 0U;
-
-    _ble_link_service_encode_event_subscription(
-        body, &body_len, &s_service.current_facts);
-    _ble_link_service_emit_response(
-        request->request_id, BLE_LINK_ERROR_OK,
-        BLE_LINK_CODEC_RESPONSE_EVENT_SUBSCRIPTION, body, body_len,
-
-        s_service.current_facts.preferred_att_mtu,
-        _ble_link_service_response_channel());
-    return BLE_LINK_ERROR_OK;
 }
 
 void ble_link_service_init(
@@ -1240,22 +1487,23 @@ void ble_link_service_init(
 {
     if (s_service_mutex == NULL)
     {
-        s_service_mutex = xSemaphoreCreateMutexStatic(&s_service_mutex_control);
+        s_service_mutex = xSemaphoreCreateRecursiveMutexStatic(
+                              &s_service_mutex_control);
     }
     memset(&s_service, 0, sizeof(s_service));
+    memset(&s_ingress, 0, sizeof(s_ingress));
     s_service.boot_id = boot_id;
     s_service.output = output;
     s_service.output_arg = arg;
-    s_service.next_subscription_id = 1U;
     s_service.security = security;
-    s_service.max_pending_frames = (max_pending_frames > 0U) ?
-                                   max_pending_frames : 1U;
-    ble_link_reassembler_init(&s_service.reassembler[0],
-                              s_service.reassembly_buffer[0],
+    (void)max_pending_frames;
+    ble_link_reassembler_init(&s_ingress.reassembler[0],
+                              s_ingress.session_buffer,
                               BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES);
-    ble_link_reassembler_init(&s_service.reassembler[1],
-                              s_service.reassembly_buffer[1],
+    ble_link_reassembler_init(&s_ingress.reassembler[1],
+                              s_ingress.control_buffer,
                               BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES);
+    s_ingress.epoch = 1U;
     ble_link_dispatcher_register_request(
         BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES,
         _ble_link_service_handle_capabilities, NULL);
@@ -1269,40 +1517,44 @@ void ble_link_service_init(
         BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT,
         _ble_link_service_handle_authorize_commit, NULL);
     ble_link_dispatcher_register_request(
-        BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS,
-        _ble_link_service_handle_subscribe_events, NULL);
+        BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION,
+        _ble_link_service_handle_get_authorization, NULL);
+    /* SubscribeEvents is deliberately not registered: v1 does not
+     * advertise encrypted events, so the dispatcher answers with
+     * LINK_ERROR_UNSUPPORTED_OPERATION. */
 }
 
 void ble_link_service_reset(void)
 {
     ble_link_dispatcher_reset();
+    _ble_link_service_stream_free();
     memset(&s_service, 0, sizeof(s_service));
+    memset(&s_ingress, 0, sizeof(s_ingress));
 }
 
 void ble_link_service_clear_session_state(void)
 {
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreTake(s_service_mutex, portMAX_DELAY);
-    }
+    _ble_link_service_lock();
     s_service.pending_transactions = 0U;
-    ble_link_reassembler_reset(&s_service.reassembler[0]);
-    ble_link_reassembler_reset(&s_service.reassembler[1]);
+    _ble_link_service_reset_ingress();
     s_service.subscriber.active = false;
     s_service.handshake_active = false;
     s_service.sec2_opened = false;
     _ble_link_service_clear_auth_txn();
+    _ble_link_service_stream_free();
     ble_link_dispatcher_clear_session();
-    if (s_service_mutex != NULL)
-    {
-        (void)xSemaphoreGive(s_service_mutex);
-    }
     /* Sync the external link-session facts with the adapter teardown.
-     * The committed authorization record survives a disconnect: only the
+     * The generation snapshot and the close run inside the same service
+     * critical section: a worker executing a new generation's handshake
+     * cannot interleave a current_facts update between the snapshot and
+     * the close, so a stale clear can never close a newer session. The
+     * committed authorization record survives a disconnect: only the
      * session-level authorization (security2_open/authorized) is
-     * cleared, never the persistent bound fact. */
+     * cleared, never the persistent bound fact. The close itself
+     * validates the generation and is a no-op for a retired one. */
     (void)ble_link_session_security2_close_current(
         s_service.current_facts.connection_generation);
+    _ble_link_service_unlock();
 }
 
 bool ble_link_service_has_partial_frame(
@@ -1313,14 +1565,48 @@ bool ble_link_service_has_partial_frame(
     {
         return false;
     }
-    return s_service.reassembler[channel].started;
+    _ble_link_service_lock();
+    const bool partial = s_ingress.reassembler[channel].started;
+
+    _ble_link_service_unlock();
+    return partial;
+}
+
+esp_err_t ble_link_service_get_reassembly_state(
+    ble_link_service_rx_channel_t channel,
+    bool *out_partial, uint32_t *out_epoch)
+{
+    if ((channel != BLE_LINK_SERVICE_RX_SESSION &&
+            channel != BLE_LINK_SERVICE_RX_CONTROL) ||
+            out_partial == NULL || out_epoch == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    *out_partial = s_ingress.reassembler[channel].started;
+    *out_epoch = s_ingress.epoch;
+    _ble_link_service_unlock();
+    return ESP_OK;
 }
 
 void ble_link_service_idle_timeout(uint32_t generation)
 {
+    _ble_link_service_lock();
     /* close_current validates the generation; a stale timeout has no
      * effect. */
     _ble_link_service_abort_session(generation);
+    _ble_link_service_unlock();
+}
+
+void ble_link_service_idle_timeout_epoch(
+    uint32_t generation, uint32_t epoch)
+{
+    _ble_link_service_lock();
+    if (!s_ingress.exhausted && epoch == s_ingress.epoch)
+    {
+        _ble_link_service_abort_session(generation);
+    }
+    _ble_link_service_unlock();
 }
 
 esp_err_t ble_link_service_feed(
@@ -1328,31 +1614,68 @@ esp_err_t ble_link_service_feed(
     ble_link_service_rx_channel_t channel,
     const uint8_t *value, size_t len)
 {
+    ble_link_work_t *work = NULL;
+    esp_err_t result = ble_link_service_accept(facts, channel, value, len,
+                       &work);
+
+    if (result == ESP_OK && work != NULL)
+    {
+        result = ble_link_service_execute(work);
+    }
+    ble_link_service_release_work(work);
+    return result;
+}
+
+esp_err_t ble_link_service_accept(
+    const ble_link_service_facts_t *facts,
+    ble_link_service_rx_channel_t channel,
+    const uint8_t *value, size_t len,
+    ble_link_work_t **out_work)
+{
+    if (out_work == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_work = NULL;
+    _ble_link_service_lock();
+    const esp_err_t result = _ble_link_service_accept_locked(
+                                 facts, channel, value, len, out_work);
+
+    _ble_link_service_unlock();
+    return result;
+}
+
+static esp_err_t _ble_link_service_accept_locked(
+    const ble_link_service_facts_t *facts,
+    ble_link_service_rx_channel_t channel,
+    const uint8_t *value, size_t len,
+    ble_link_work_t **out_work)
+{
     if (facts == NULL || value == NULL || s_service.output == NULL ||
             (channel != BLE_LINK_SERVICE_RX_SESSION &&
              channel != BLE_LINK_SERVICE_RX_CONTROL))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (facts->connection_generation != s_service.feed_generation)
+    if (s_ingress.exhausted)
     {
-        if (facts->connection_generation < s_service.feed_generation)
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (facts->connection_generation != s_ingress.generation)
+    {
+        if (facts->connection_generation < s_ingress.generation)
         {
             /* A stale feed from a retired generation has no effect. */
             return ESP_OK;
         }
-        /* A new connection generation discards the partial frame, the
-         * subscription, the transaction, and the session ids. The Security
-         * 2 session close is owned by the caller's disconnect handling. */
-        ble_link_reassembler_reset(&s_service.reassembler[0]);
-        ble_link_reassembler_reset(&s_service.reassembler[1]);
-        s_service.subscriber.active = false;
-        _ble_link_service_clear_auth_txn();
-        s_service.pending_transactions = 0U;
-        ble_link_dispatcher_clear_session();
-        s_service.feed_generation = facts->connection_generation;
+        _ble_link_service_reset_ingress();
+        if (s_ingress.exhausted)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_ingress.generation = facts->connection_generation;
     }
-    ble_link_reassembler_t *slot = &s_service.reassembler[channel];
+    ble_link_reassembler_t *slot = &s_ingress.reassembler[channel];
     const size_t slot_capacity =
         (channel == BLE_LINK_SERVICE_RX_SESSION) ?
         BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES :
@@ -1397,6 +1720,71 @@ esp_err_t ble_link_service_feed(
     const uint8_t *message = &slot->buffer[1];
     const size_t message_len = total_length - 1U;
 
+    ble_link_work_t *work = _ble_link_service_allocate_work(message_len);
+
+    if (work == NULL)
+    {
+        _ble_link_service_abort_session(facts->connection_generation);
+        return ESP_ERR_NO_MEM;
+    }
+    work->facts = *facts;
+    work->channel = channel;
+    work->epoch = s_ingress.epoch;
+    work->transport_type = transport_type;
+    work->message_len = message_len;
+    memcpy(work->message, message, message_len);
+    *out_work = work;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_execute(ble_link_work_t *work)
+{
+    if (work == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    const esp_err_t result = _ble_link_service_execute_locked(work);
+
+    _ble_link_service_unlock();
+    return result;
+}
+
+void ble_link_service_release_work(ble_link_work_t *work)
+{
+    if (work != NULL)
+    {
+        _ble_link_service_zeroize(work, sizeof(*work) + work->message_len);
+        free(work);
+    }
+}
+
+static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work)
+{
+    if (s_ingress.exhausted || work->epoch != s_ingress.epoch)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const ble_link_service_facts_t *facts = &work->facts;
+    const ble_link_service_rx_channel_t channel = work->channel;
+    const uint8_t transport_type = work->transport_type;
+    const uint8_t *message = work->message;
+    const size_t message_len = work->message_len;
+
+    if (facts->connection_generation != s_service.execution_generation)
+    {
+        if (facts->connection_generation < s_service.execution_generation)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_service.subscriber.active = false;
+        _ble_link_service_clear_auth_txn();
+        s_service.pending_transactions = 0U;
+        _ble_link_service_stream_free();
+        ble_link_dispatcher_clear_session();
+        s_service.execution_generation = facts->connection_generation;
+    }
+
     s_service.current_facts = *facts;
     s_service.current_channel = channel;
     if (transport_type == BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE)
@@ -1413,9 +1801,34 @@ esp_err_t ble_link_service_feed(
             /* A genuinely new handshake (command 0) replaces the current
              * session: abort the outstanding protected transaction,
              * subscription, dispatcher request ids, and authorization
-             * transaction first. Continuation frames (command 1) keep
-             * the SRP state established by command 0. */
+             * transaction first. The verifier for this handshake is
+             * selected and pinned by the peer identity before any SRP
+             * work: a bound peer keeps the long-term credential even
+             * while a replacement window is open, an unknown peer inside
+             * a window uses the window POP, and anything else is not
+             * admitted. Continuation frames (command 1) keep the SRP
+             * state established by command 0. */
             _ble_link_service_abort_session(facts->connection_generation);
+            if (s_ingress.exhausted)
+            {
+                return ESP_ERR_INVALID_STATE;
+            }
+            if (s_service.security != NULL &&
+                    s_service.security->select_verifier != NULL)
+            {
+                const esp_err_t select_result =
+                    s_service.security->select_verifier(
+                        facts->peer_addr_type, facts->peer_addr,
+                        sizeof(facts->peer_addr),
+                        _ble_link_service_pairing_window_open());
+
+                if (select_result != ESP_OK)
+                {
+                    _ble_link_service_abort_session(
+                        facts->connection_generation);
+                    return select_result;
+                }
+            }
             s_service.handshake_active = true;
         }
         uint8_t *out = NULL;
@@ -1615,25 +2028,51 @@ esp_err_t ble_link_service_process_plaintext(
             _ble_link_service_response_channel());
         return _ble_link_service_take_response(response, response_len);
     }
-    /* The bootstrap authorize flow is reachable before authorization and
-     * arrives on the session channel; every other request is a control
-     * request. A request on the wrong channel is rejected. */
-    const bool bootstrap =
+    /* The bootstrap authorize/recovery flow runs on the session channel
+     * before authorization; capabilities and snapshot are admitted on the
+     * session channel after authentication too (and on the control
+     * channel when authorized). Every other request is a control request
+     * and requires authorization. A request on the wrong channel is
+     * rejected. */
+    const bool session_admitted =
         (request.body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE ||
-         request.body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT);
+         request.body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT ||
+         request.body == BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION ||
+         request.body == BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES ||
+         request.body == BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT);
     const ble_link_service_rx_channel_t channel = s_service.current_channel;
+    ble_link_session_channel_t admission_channel;
 
-    if ((bootstrap && channel != BLE_LINK_SERVICE_RX_SESSION) ||
-            (!bootstrap && channel != BLE_LINK_SERVICE_RX_CONTROL))
+    if (session_admitted && channel == BLE_LINK_SERVICE_RX_SESSION)
+    {
+        admission_channel = BLE_LINK_SESSION_CHANNEL_SESSION;
+    }
+    else if (session_admitted && channel == BLE_LINK_SERVICE_RX_CONTROL)
+    {
+        /* Capabilities and snapshot may also be read on the control
+         * channel once authorized; prepare/commit/get_authorization on
+         * the control channel are rejected below. */
+        if (request.body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE ||
+                request.body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT ||
+                request.body == BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION)
+        {
+            _ble_link_service_abort_session(
+                s_service.current_facts.connection_generation);
+            return ESP_ERR_INVALID_STATE;
+        }
+        admission_channel = BLE_LINK_SESSION_CHANNEL_CONTROL;
+    }
+    else if (channel == BLE_LINK_SERVICE_RX_CONTROL)
+    {
+        admission_channel = BLE_LINK_SESSION_CHANNEL_CONTROL;
+    }
+    else
     {
         _ble_link_service_abort_session(
             s_service.current_facts.connection_generation);
         return ESP_ERR_INVALID_STATE;
     }
     uint32_t admission_error = 0U;
-    const ble_link_session_channel_t admission_channel =
-        bootstrap ? BLE_LINK_SESSION_CHANNEL_SESSION :
-        BLE_LINK_SESSION_CHANNEL_CONTROL;
 
     if (ble_link_session_query_admission(
                 s_service.current_facts.connection_generation,
@@ -1693,6 +2132,18 @@ esp_err_t ble_link_service_process_plaintext(
 }
 
 esp_err_t ble_link_service_publish_link_state(
+    const ble_link_service_facts_t *facts,
+    const ble_link_state_snapshot_t *link_state)
+{
+    _ble_link_service_lock();
+    const esp_err_t result = _ble_link_service_publish_link_state_locked(
+                                 facts, link_state);
+
+    _ble_link_service_unlock();
+    return result;
+}
+
+static esp_err_t _ble_link_service_publish_link_state_locked(
     const ble_link_service_facts_t *facts,
     const ble_link_state_snapshot_t *link_state)
 {

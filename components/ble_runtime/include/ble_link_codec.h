@@ -44,6 +44,7 @@ typedef enum
     BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE = 12,
     BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT = 13,
     BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS = 14,
+    BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION = 15,
 } ble_link_codec_request_tag_t;
 
 /** @brief Response body tags, frozen by microtech.link.v1.Response. */

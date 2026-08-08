@@ -20,6 +20,7 @@ typedef enum
     BLE_GAP_MANAGER_EVENT_ENCRYPT_CHANGE,
     BLE_GAP_MANAGER_EVENT_SUBSCRIBE,
     BLE_GAP_MANAGER_EVENT_ADV_COMPLETE,
+    BLE_GAP_MANAGER_EVENT_RESET,
 } ble_gap_manager_event_type_t;
 
 /** @brief One translated GAP event. */

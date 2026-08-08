@@ -27,6 +27,8 @@ add_executable(test_device_link_service
                "${BLE_RUNTIME}/src/ble_link_session.c"
                "${BLE_RUNTIME}/src/ble_event_router.c"
                "${BLE_RUNTIME}/src/ble_link_service.c"
+               "${BLE_RUNTIME}/src/ble_link_gatt.c"
+               "${BLE_RUNTIME}/src/ble_tx_scheduler.c"
                "${BLE_RUNTIME}/src/ble_link_codec.c"
                "${BLE_RUNTIME}/src/ble_link_dispatcher.c"
                "${BLE_RUNTIME}/src/ble_link_state.c"

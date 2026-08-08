@@ -27,23 +27,25 @@
 #define DEVICE_LINK_SECURITY_ENDPOINT_APP "dl"
 #define DEVICE_LINK_SECURITY_SALT_BYTES 16U
 
-typedef enum
-{
-    DEVICE_LINK_SECURITY_VERIFIER_NONE = 0,
-    DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP,
-    DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM,
-} device_link_security_verifier_kind_t;
-
 typedef struct device_link_security
 {
     device_link_security_config_t config;
     protocomm_security_handle_t sec_inst;
     protocomm_security2_params_t sec_params;
-    device_link_security_verifier_kind_t verifier_kind;
-    char *salt;
-    size_t salt_len;
-    char *verifier;
-    size_t verifier_len;
+    /* Long-term slot: committed authorization record. */
+    char *lt_salt;
+    size_t lt_salt_len;
+    char *lt_verifier;
+    size_t lt_verifier_len;
+    /* Bootstrap slot: POP of the currently open pairing window. */
+    char *bt_salt;
+    size_t bt_salt_len;
+    char *bt_verifier;
+    size_t bt_verifier_len;
+    /* Selection pinned for the current Security 2 session. */
+    device_link_security_verifier_kind_t selected_kind;
+    uint8_t selected_peer_type;
+    uint8_t selected_peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES];
     bool session_open;
     bool authenticated;
     bool initialized;
@@ -56,6 +58,9 @@ static uint32_t s_session_epoch;
 
 /** @brief Storage key of the committed authorization record. */
 #define DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY "dls.auth"
+
+/** @brief Storage key of the local-revoke journal marker. */
+#define DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY "dls.revoke"
 
 static bool _device_link_security_record_valid(
     const device_link_security_auth_record_t *record)
@@ -138,24 +143,60 @@ static void _device_link_security_zeroize(void *data, size_t size)
     }
 }
 
-static void _device_link_security_free_verifier(void)
+static void _device_link_security_free_long_term(void)
 {
-    if (s_security.salt != NULL)
+    if (s_security.lt_salt != NULL)
     {
-        _device_link_security_zeroize(s_security.salt, s_security.salt_len);
-        free(s_security.salt);
+        _device_link_security_zeroize(s_security.lt_salt,
+                                      s_security.lt_salt_len);
+        free(s_security.lt_salt);
     }
-    if (s_security.verifier != NULL)
+    if (s_security.lt_verifier != NULL)
     {
-        _device_link_security_zeroize(s_security.verifier,
-                                      s_security.verifier_len);
-        free(s_security.verifier);
+        _device_link_security_zeroize(s_security.lt_verifier,
+                                      s_security.lt_verifier_len);
+        free(s_security.lt_verifier);
     }
-    s_security.salt = NULL;
-    s_security.salt_len = 0U;
-    s_security.verifier = NULL;
-    s_security.verifier_len = 0U;
-    s_security.verifier_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+    s_security.lt_salt = NULL;
+    s_security.lt_salt_len = 0U;
+    s_security.lt_verifier = NULL;
+    s_security.lt_verifier_len = 0U;
+}
+
+static void _device_link_security_free_bootstrap(void)
+{
+    if (s_security.bt_salt != NULL)
+    {
+        _device_link_security_zeroize(s_security.bt_salt,
+                                      s_security.bt_salt_len);
+        free(s_security.bt_salt);
+    }
+    if (s_security.bt_verifier != NULL)
+    {
+        _device_link_security_zeroize(s_security.bt_verifier,
+                                      s_security.bt_verifier_len);
+        free(s_security.bt_verifier);
+    }
+    s_security.bt_salt = NULL;
+    s_security.bt_salt_len = 0U;
+    s_security.bt_verifier = NULL;
+    s_security.bt_verifier_len = 0U;
+}
+
+/**
+ * @brief Whether the slot backing the pinned selection has material.
+ */
+static bool _device_link_security_selection_loaded(void)
+{
+    switch (s_security.selected_kind)
+    {
+    case DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP:
+        return s_security.bt_salt != NULL && s_security.bt_verifier != NULL;
+    case DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM:
+        return s_security.lt_salt != NULL && s_security.lt_verifier != NULL;
+    default:
+        return false;
+    }
 }
 
 static void _device_link_security_teardown_sec(void)
@@ -183,7 +224,8 @@ static void _device_link_security_teardown_sec(void)
 
 static esp_err_t _device_link_security_rebuild(void)
 {
-    if (s_security.verifier_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE ||
+            !_device_link_security_selection_loaded())
     {
         /* No verifier: no session can be established (fail closed). */
         _device_link_security_teardown_sec();
@@ -201,10 +243,22 @@ static esp_err_t _device_link_security_rebuild(void)
         s_security.sec_inst = NULL;
         return result;
     }
-    s_security.sec_params.salt = (const char *)s_security.salt;
-    s_security.sec_params.salt_len = (uint16_t)s_security.salt_len;
-    s_security.sec_params.verifier = s_security.verifier;
-    s_security.sec_params.verifier_len = (uint16_t)s_security.verifier_len;
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
+    {
+        s_security.sec_params.salt = (const char *)s_security.bt_salt;
+        s_security.sec_params.salt_len = (uint16_t)s_security.bt_salt_len;
+        s_security.sec_params.verifier = s_security.bt_verifier;
+        s_security.sec_params.verifier_len =
+            (uint16_t)s_security.bt_verifier_len;
+    }
+    else
+    {
+        s_security.sec_params.salt = (const char *)s_security.lt_salt;
+        s_security.sec_params.salt_len = (uint16_t)s_security.lt_salt_len;
+        s_security.sec_params.verifier = s_security.lt_verifier;
+        s_security.sec_params.verifier_len =
+            (uint16_t)s_security.lt_verifier_len;
+    }
     return ESP_OK;
 }
 
@@ -229,7 +283,8 @@ esp_err_t device_link_security_init(const device_link_security_config_t *config)
         /* Idempotent re-init: tear the previous instance down first so
          * no verifier or session state survives across configurations. */
         _device_link_security_teardown_sec();
-        _device_link_security_free_verifier();
+        _device_link_security_free_long_term();
+        _device_link_security_free_bootstrap();
     }
     memset(&s_security, 0, sizeof(s_security));
     s_security.config = *config;
@@ -244,7 +299,8 @@ void device_link_security_deinit(void)
     if (s_security.initialized)
     {
         _device_link_security_teardown_sec();
-        _device_link_security_free_verifier();
+        _device_link_security_free_long_term();
+        _device_link_security_free_bootstrap();
         memset(&s_security, 0, sizeof(s_security));
     }
     _device_link_security_unlock();
@@ -265,9 +321,8 @@ esp_err_t device_link_security_open_bootstrap(
     }
     /* Tear the old security instance down before freeing the verifier it
      * references: the SRP context shallow-copies the params, so the salt
-     * and verifier buffers must outlive every instance using them. */
-    _device_link_security_teardown_sec();
-    _device_link_security_free_verifier();
+     * and verifier buffers must outlive every instance using them. The
+     * long-term slot is preserved so a bound peer keeps its credential. */
     char *salt = NULL;
     char *verifier = NULL;
     int verifier_len = 0;
@@ -294,15 +349,21 @@ esp_err_t device_link_security_open_bootstrap(
         _device_link_security_unlock();
         return ESP_ERR_NO_MEM;
     }
-    s_security.salt = salt;
-    s_security.salt_len = DEVICE_LINK_SECURITY_SALT_BYTES;
-    s_security.verifier = verifier;
-    s_security.verifier_len = (size_t)verifier_len;
-    s_security.verifier_kind = DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP;
-    result = _device_link_security_rebuild();
-    if (result != ESP_OK)
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
     {
-        _device_link_security_free_verifier();
+        /* The instance references the old bootstrap buffers: replace them
+         * only after the teardown. */
+        _device_link_security_teardown_sec();
+    }
+    _device_link_security_free_bootstrap();
+    s_security.bt_salt = salt;
+    s_security.bt_salt_len = DEVICE_LINK_SECURITY_SALT_BYTES;
+    s_security.bt_verifier = verifier;
+    s_security.bt_verifier_len = (size_t)verifier_len;
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP ||
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
+    {
+        result = _device_link_security_rebuild();
     }
     _device_link_security_unlock();
     return result;
@@ -313,11 +374,89 @@ void device_link_security_close_bootstrap(void)
     _device_link_security_lock();
     if (s_security.initialized)
     {
-        _device_link_security_teardown_sec();
-        _device_link_security_free_verifier();
+        if (s_security.selected_kind ==
+                DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
+        {
+            _device_link_security_teardown_sec();
+        }
+        _device_link_security_free_bootstrap();
+        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+        if (s_security.lt_salt != NULL || s_security.lt_verifier != NULL)
+        {
+            s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+        }
         (void)_device_link_security_rebuild();
     }
     _device_link_security_unlock();
+}
+
+esp_err_t device_link_security_select_verifier(
+    uint8_t peer_addr_type, const uint8_t *peer_addr, size_t peer_addr_len,
+    bool pairing_window_open)
+{
+    if (peer_addr == NULL ||
+            peer_addr_len != DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES ||
+            peer_addr_type > 2U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _device_link_security_lock();
+    if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    device_link_security_verifier_kind_t kind =
+        DEVICE_LINK_SECURITY_VERIFIER_NONE;
+
+    /* A committed record whose identity matches the peer always selects
+     * the long-term verifier, window open or not: a bound peer keeps its
+     * credential during a replacement window. */
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    if (device_link_security_load_auth_record(&record) == ESP_OK &&
+            _device_link_security_record_valid(&record) &&
+            record.peer_addr_type == peer_addr_type &&
+            memcmp(record.peer_addr, peer_addr,
+                   DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES) == 0)
+    {
+        kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+    }
+    else if (pairing_window_open && s_security.bt_salt != NULL &&
+             s_security.bt_verifier != NULL)
+    {
+        kind = DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP;
+    }
+    _device_link_security_zeroize(&record, sizeof(record));
+
+    const bool changed = kind != s_security.selected_kind;
+
+    s_security.selected_kind = kind;
+    s_security.selected_peer_type = peer_addr_type;
+    memcpy(s_security.selected_peer_addr, peer_addr,
+           DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES);
+    if (kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
+    {
+        _device_link_security_teardown_sec();
+    }
+    else if (changed || s_security.sec_inst == NULL)
+    {
+        (void)_device_link_security_rebuild();
+    }
+    _device_link_security_unlock();
+    return ESP_OK;
+}
+
+device_link_security_verifier_kind_t device_link_security_selected_verifier(void)
+{
+    device_link_security_verifier_kind_t kind =
+        DEVICE_LINK_SECURITY_VERIFIER_NONE;
+
+    _device_link_security_lock();
+    kind = s_security.selected_kind;
+    _device_link_security_unlock();
+    return kind;
 }
 
 esp_err_t device_link_security_handshake(
@@ -703,6 +842,36 @@ esp_err_t device_link_security_erase_auth_record(void)
     return result;
 }
 
+static const uint8_t s_revoke_marker[1] = {1U};
+
+esp_err_t device_link_security_begin_revoke(void)
+{
+    return nv_storage_set_blob(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY,
+                               s_revoke_marker, sizeof(s_revoke_marker));
+}
+
+esp_err_t device_link_security_end_revoke(void)
+{
+    const esp_err_t result =
+        nv_storage_erase_key(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        /* Normalize the storage not-found class for callers. */
+        return ESP_OK;
+    }
+    return result;
+}
+
+bool device_link_security_revoke_pending(void)
+{
+    uint8_t marker = 0U;
+    size_t size = sizeof(marker);
+
+    return nv_storage_get_blob(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY,
+                               &marker, &size) == ESP_OK;
+}
+
 esp_err_t device_link_security_derive_long_term_verifier(
     const uint8_t *password, size_t password_len,
     uint8_t salt[DEVICE_LINK_SECURITY_AUTH_SALT_BYTES],
@@ -766,29 +935,47 @@ esp_err_t device_link_security_load_long_term_verifier(void)
         _device_link_security_unlock();
         return load_result;
     }
-    /* Tear the old Protocomm instance down before freeing the verifier it
-     * references, then install the long-term salt and verifier. */
-    _device_link_security_teardown_sec();
-    _device_link_security_free_verifier();
-    s_security.salt = malloc(DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
-    s_security.verifier = malloc(DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
-    if (s_security.salt == NULL || s_security.verifier == NULL)
+    /* Replace the long-term slot material. The bootstrap slot and any
+     * instance currently configured from it are preserved; the rebuild
+     * below only reruns when the long-term slot backs the active
+     * selection. */
+    char *salt = malloc(DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    char *verifier = malloc(DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
+    if (salt == NULL || verifier == NULL)
     {
-        _device_link_security_free_verifier();
+        free(salt);
+        free(verifier);
         _device_link_security_zeroize(&record, sizeof(record));
         _device_link_security_unlock();
         return ESP_ERR_NO_MEM;
     }
-    memcpy(s_security.salt, record.salt,
-           DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
-    memcpy(s_security.verifier, record.verifier,
+    memcpy(salt, record.salt, DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
+    memcpy(verifier, record.verifier,
            DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES);
-    s_security.salt_len = DEVICE_LINK_SECURITY_AUTH_SALT_BYTES;
-    s_security.verifier_len = DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES;
-    s_security.verifier_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
     _device_link_security_zeroize(&record, sizeof(record));
-    const esp_err_t result = _device_link_security_rebuild();
+    const bool rebuild =
+        s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM ||
+        s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE;
 
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM)
+    {
+        /* The instance references the old long-term buffers: replace them
+         * only after the teardown. */
+        _device_link_security_teardown_sec();
+    }
+    _device_link_security_free_long_term();
+    s_security.lt_salt = salt;
+    s_security.lt_salt_len = DEVICE_LINK_SECURITY_AUTH_SALT_BYTES;
+    s_security.lt_verifier = verifier;
+    s_security.lt_verifier_len = DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES;
+    if (rebuild)
+    {
+        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+        const esp_err_t result = _device_link_security_rebuild();
+
+        _device_link_security_unlock();
+        return result;
+    }
     _device_link_security_unlock();
-    return result;
+    return ESP_OK;
 }

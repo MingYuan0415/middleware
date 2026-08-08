@@ -53,6 +53,7 @@ typedef struct ble_link_dispatcher_facts
     bool encrypted;             /**< Link encrypted. */
     bool session_authenticated; /**< Security 2 session authenticated. */
     bool authorized;            /**< Session matches the committed record. */
+    bool recovery_query;        /**< Envelope carried RECOVERY_QUERY. */
 } ble_link_dispatcher_facts_t;
 
 /**

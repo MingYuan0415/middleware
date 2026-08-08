@@ -142,6 +142,51 @@ void   microtech__link__v1__get_link_snapshot_request__free_unpacked
   assert(message->base.descriptor == &microtech__link__v1__get_link_snapshot_request__descriptor);
   protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
 }
+void   microtech__link__v1__get_authorization_request__init
+                     (Microtech__Link__V1__GetAuthorizationRequest         *message)
+{
+  static const Microtech__Link__V1__GetAuthorizationRequest init_value = MICROTECH__LINK__V1__GET_AUTHORIZATION_REQUEST__INIT;
+  *message = init_value;
+}
+size_t microtech__link__v1__get_authorization_request__get_packed_size
+                     (const Microtech__Link__V1__GetAuthorizationRequest *message)
+{
+  assert(message->base.descriptor == &microtech__link__v1__get_authorization_request__descriptor);
+  return protobuf_c_message_get_packed_size ((const ProtobufCMessage*)(message));
+}
+size_t microtech__link__v1__get_authorization_request__pack
+                     (const Microtech__Link__V1__GetAuthorizationRequest *message,
+                      uint8_t       *out)
+{
+  assert(message->base.descriptor == &microtech__link__v1__get_authorization_request__descriptor);
+  return protobuf_c_message_pack ((const ProtobufCMessage*)message, out);
+}
+size_t microtech__link__v1__get_authorization_request__pack_to_buffer
+                     (const Microtech__Link__V1__GetAuthorizationRequest *message,
+                      ProtobufCBuffer *buffer)
+{
+  assert(message->base.descriptor == &microtech__link__v1__get_authorization_request__descriptor);
+  return protobuf_c_message_pack_to_buffer ((const ProtobufCMessage*)message, buffer);
+}
+Microtech__Link__V1__GetAuthorizationRequest *
+       microtech__link__v1__get_authorization_request__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data)
+{
+  return (Microtech__Link__V1__GetAuthorizationRequest *)
+     protobuf_c_message_unpack (&microtech__link__v1__get_authorization_request__descriptor,
+                                allocator, len, data);
+}
+void   microtech__link__v1__get_authorization_request__free_unpacked
+                     (Microtech__Link__V1__GetAuthorizationRequest *message,
+                      ProtobufCAllocator *allocator)
+{
+  if(!message)
+    return;
+  assert(message->base.descriptor == &microtech__link__v1__get_authorization_request__descriptor);
+  protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
+}
 void   microtech__link__v1__authorize_prepare_request__init
                      (Microtech__Link__V1__AuthorizePrepareRequest         *message)
 {
@@ -544,6 +589,44 @@ const ProtobufCMessageDescriptor microtech__link__v1__get_link_snapshot_request_
   microtech__link__v1__get_link_snapshot_request__field_indices_by_name,
   0,  microtech__link__v1__get_link_snapshot_request__number_ranges,
   (ProtobufCMessageInit) microtech__link__v1__get_link_snapshot_request__init,
+  NULL,NULL,NULL    /* reserved[123] */
+};
+static const ProtobufCFieldDescriptor microtech__link__v1__get_authorization_request__field_descriptors[1] =
+{
+  {
+    "credential_id",
+    1,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_BYTES,
+    0,   /* quantifier_offset */
+    offsetof(Microtech__Link__V1__GetAuthorizationRequest, credential_id),
+    NULL,
+    NULL,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+};
+static const unsigned microtech__link__v1__get_authorization_request__field_indices_by_name[] = {
+  0,   /* field[0] = credential_id */
+};
+static const ProtobufCIntRange microtech__link__v1__get_authorization_request__number_ranges[1 + 1] =
+{
+  { 1, 0 },
+  { 0, 1 }
+};
+const ProtobufCMessageDescriptor microtech__link__v1__get_authorization_request__descriptor =
+{
+  PROTOBUF_C__MESSAGE_DESCRIPTOR_MAGIC,
+  "microtech.link.v1.GetAuthorizationRequest",
+  "GetAuthorizationRequest",
+  "Microtech__Link__V1__GetAuthorizationRequest",
+  "microtech.link.v1",
+  sizeof(Microtech__Link__V1__GetAuthorizationRequest),
+  1,
+  microtech__link__v1__get_authorization_request__field_descriptors,
+  microtech__link__v1__get_authorization_request__field_indices_by_name,
+  1,  microtech__link__v1__get_authorization_request__number_ranges,
+  (ProtobufCMessageInit) microtech__link__v1__get_authorization_request__init,
   NULL,NULL,NULL    /* reserved[123] */
 };
 #define microtech__link__v1__authorize_prepare_request__field_descriptors NULL

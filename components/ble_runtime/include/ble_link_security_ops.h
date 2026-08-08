@@ -7,6 +7,8 @@
 
 #include "esp_err.h"
 
+#include "device_link_security.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,6 +22,16 @@ extern "C" {
  */
 typedef struct ble_link_security_ops
 {
+    /** @brief Select and pin the verifier for the next handshake.
+     *  See device_link_security_select_verifier(). */
+    esp_err_t (*select_verifier)(uint8_t peer_addr_type,
+                                 const uint8_t *peer_addr,
+                                 size_t peer_addr_len,
+                                 bool pairing_window_open);
+
+    /** @brief Kind of the verifier pinned to the current session. */
+    device_link_security_verifier_kind_t (*selected_verifier)(void);
+
     /** @brief Process one handshake frame; response is allocated. */
     esp_err_t (*handshake)(const uint8_t *input, size_t input_len,
                            uint8_t **output, size_t *output_len);

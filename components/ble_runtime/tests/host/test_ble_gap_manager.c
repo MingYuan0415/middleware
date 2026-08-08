@@ -332,6 +332,35 @@ static void test_handle_reuse_after_reconnect(void)
     TEST_ASSERT_FALSE(snapshot.connected);
 }
 
+static void test_reset_retires_connection(void)
+{
+    ble_gap_manager_snapshot_t snapshot;
+    ble_gap_manager_event_t event;
+
+    ble_gap_manager_init();
+    memset(&event, 0, sizeof(event));
+    event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
+    event.conn_handle = 5U;
+    _feed(&event);
+    event.type = BLE_GAP_MANAGER_EVENT_MTU;
+    event.mtu = 185U;
+    _feed(&event);
+    event.type = BLE_GAP_MANAGER_EVENT_RESET;
+    _feed(&event);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    TEST_ASSERT_FALSE(snapshot.connected);
+    TEST_ASSERT_EQUAL(0U, snapshot.conn_handle);
+    TEST_ASSERT_EQUAL(23U, snapshot.mtu);
+    TEST_ASSERT_EQUAL(1U, snapshot.generation);
+
+    event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
+    event.conn_handle = 6U;
+    _feed(&event);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    TEST_ASSERT_TRUE(snapshot.connected);
+    TEST_ASSERT_EQUAL(2U, snapshot.generation);
+}
+
 int main(void)
 {
     test_connect_disconnect_cycle();
@@ -345,6 +374,7 @@ int main(void)
     test_events_ignored_while_disconnected();
     test_encrypt_failure_keeps_state();
     test_handle_reuse_after_reconnect();
+    test_reset_retires_connection();
     printf("ble_gap_manager: all tests passed\n");
     return 0;
 }

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/task.h"
 #include "esp_err.h"
 
 #include "ble_link_codec.h"
@@ -14,6 +15,7 @@
 #include "esp_random.h"
 
 #include "device_link_security.h"
+#include "nv_storage.h"
 
 static esp_err_t _sec_stub_request(
     const uint8_t *request, size_t request_len,
@@ -87,10 +89,10 @@ static esp_err_t _capture(const uint8_t *value, size_t len,
     s_capture_lens[s_capture_count] = len;
     s_capture_channels[s_capture_count] = channel;
     s_capture_count++;
-    if (is_last)
-    {
-        ble_link_service_response_completed();
-    }
+    /* Model the transport: every frame confirmation advances the
+     * outbound stream (the service emits the next fragment); the final
+     * confirmation releases the transaction gate. */
+    ble_link_service_response_completed();
     return ESP_OK;
 }
 
@@ -483,9 +485,11 @@ static void test_authorize_commit_wrong_credential(void)
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
 }
 
-static void test_subscribe_then_publish(void)
+static void test_subscribe_events_unadvertised(void)
 {
-    /* subscribe_events, request_id=4. */
+    /* subscribe_events is not advertised in v1: the device answers with
+     * LINK_ERROR_UNSUPPORTED_OPERATION instead of creating a
+     * subscription. */
     static const uint8_t subscribe[] =
     {
         0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
@@ -503,11 +507,10 @@ static void test_subscribe_then_publish(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
                           envelope.body_data, envelope.body_len,
                           &response));
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_EVENT_SUBSCRIPTION,
-                      response.body);
-    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNSUPPORTED_OPERATION, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
 
-    /* Publish a link_state change. */
+    /* No subscriber exists: publishing produces no output. */
     ble_link_state_snapshot_t link_state;
 
     memset(&link_state, 0, sizeof(link_state));
@@ -521,14 +524,7 @@ static void test_subscribe_then_publish(void)
     s_capture_count = 0U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_publish_link_state(
                           &s_facts, &link_state));
-    TEST_ASSERT_EQUAL(1U, s_capture_count);
-    _reassemble_captured();
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
-                          s_outbound, s_outbound_len, &envelope));
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_BODY_EVENT, envelope.body);
-    /* Event: sequence fixed64 == 1. */
-    TEST_ASSERT_EQUAL(0x09U, envelope.body_data[0]);
-    TEST_ASSERT_EQUAL(0x01U, envelope.body_data[1]);
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
 static void test_no_subscriber_no_output(void)
@@ -807,21 +803,12 @@ static void test_generation_change_resets_state(void)
 
 static void test_event_wire_structure(void)
 {
-    /* Event { sequence=1; link_state_changed=10 { link_state=1 {...} } } */
-    ble_link_codec_envelope_t envelope;
-
-    _reset();
-    /* Subscribe first. */
-    static const uint8_t subscribe[] =
-    {
-        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
-        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x04, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x00,
-    };
-
-    _feed_single(subscribe, sizeof(subscribe));
+    /* Events are not advertised in v1: without a subscriber the publish
+     * path produces no output, so the event wire structure is covered by
+     * the link-events codec tests instead. */
     ble_link_state_snapshot_t link_state;
 
+    _reset();
     memset(&link_state, 0, sizeof(link_state));
     link_state.boot_id = BOOT_ID;
     link_state.binding_state = BLE_LINK_BINDING_BOUND;
@@ -829,19 +816,9 @@ static void test_event_wire_structure(void)
     link_state.encrypted = true;
     link_state.secure_connections_bond_verified = true;
     link_state.identity_known = true;
-    memset(s_capture, 0, sizeof(s_capture));
-    s_capture_count = 0U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_publish_link_state(
                           &s_facts, &link_state));
-    _reassemble_captured();
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
-                          s_outbound, s_outbound_len, &envelope));
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_BODY_EVENT, envelope.body);
-    /* Event: 09 <seq> 52 <len> 0a <len> 09 <boot64> ... */
-    TEST_ASSERT_EQUAL(0x09U, envelope.body_data[0]);
-    TEST_ASSERT_EQUAL(0x01U, envelope.body_data[1]);
-    TEST_ASSERT_EQUAL(0x52U, envelope.body_data[9]);
-    TEST_ASSERT_EQUAL(0x0aU, envelope.body_data[11]);
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
 static void test_publish_after_revoke_no_output(void)
@@ -995,9 +972,9 @@ static void test_stale_feed_ignored(void)
     TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
-static void test_channel_mismatch_rejected(void)
+static void test_channel_routing(void)
 {
-    static const uint8_t request[] =
+    static const uint8_t capabilities[] =
     {
         0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
         0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x01, 0x00,
@@ -1006,20 +983,48 @@ static void test_channel_mismatch_rejected(void)
     uint8_t framed[512];
 
     _reset();
-    /* A control request on the session channel is rejected. */
+    _establish_session();
+    _set_facts(true, true, true);
+    /* GetCapabilities is admitted on the session channel during the
+     * bootstrap flow, before authorization. */
     memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x01U;
-    framed[4] = (uint8_t)((sizeof(request) + 1U) & 0xffU);
-    framed[5] = (uint8_t)(((sizeof(request) + 1U) >> 8U) & 0xffU);
+    framed[4] = (uint8_t)((sizeof(capabilities) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(capabilities) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
-    memcpy(&framed[9], request, sizeof(request));
+    memcpy(&framed[9], capabilities, sizeof(capabilities));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
+                          &s_facts,
+                          BLE_LINK_SERVICE_RX_SESSION,
+                          framed,
+                          9U + sizeof(capabilities)));
+    TEST_ASSERT_TRUE(s_capture_count > 0U);
+    /* A control-only request (subscribe_events) on the session channel is
+     * rejected. */
+    static const uint8_t subscribe[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x00,
+    };
+
+    memset(framed, 0, sizeof(framed));
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    framed[0] = 1U;
+    framed[1] = 3U;
+    framed[2] = 0x02U;
+    framed[4] = (uint8_t)((sizeof(subscribe) + 1U) & 0xffU);
+    framed[5] = (uint8_t)(((sizeof(subscribe) + 1U) >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], subscribe, sizeof(subscribe));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_feed(
                           &s_facts,
                           BLE_LINK_SERVICE_RX_SESSION,
                           framed,
-                          9U + sizeof(request)));
+                          9U + sizeof(subscribe)));
     TEST_ASSERT_EQUAL(0U, s_capture_count);
     /* The reverse direction: a bootstrap request on the control channel. */
     static const uint8_t prepare[] =
@@ -1030,9 +1035,11 @@ static void test_channel_mismatch_rejected(void)
     };
 
     memset(framed, 0, sizeof(framed));
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
     framed[0] = 1U;
     framed[1] = 3U;
-    framed[2] = 0x02U;
+    framed[2] = 0x03U;
     framed[4] = (uint8_t)((sizeof(prepare) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(prepare) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
@@ -1249,15 +1256,360 @@ static void test_idle_timeout_clears_state(void)
     TEST_ASSERT_EQUAL(0U, s_capture_count);
 }
 
+static void test_stale_ingress_epoch_timeout_is_ignored(void)
+{
+    uint8_t framed[20] = {0};
+    bool partial = false;
+    uint32_t stale_epoch = 0U;
+    uint32_t current_epoch = 0U;
+    ble_link_work_t *work = NULL;
+
+    _reset();
+    framed[0] = 1U;
+    framed[1] = 1U;
+    framed[2] = 1U;
+    framed[4] = 40U;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_service_accept(
+                          &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
+                          framed, sizeof(framed), &work));
+    TEST_ASSERT_TRUE(work == NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_get_reassembly_state(
+                          BLE_LINK_SERVICE_RX_CONTROL,
+                          &partial, &stale_epoch));
+    TEST_ASSERT_TRUE(partial);
+
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_service_accept(
+                          &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
+                          framed, sizeof(framed), &work));
+    TEST_ASSERT_TRUE(work == NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_get_reassembly_state(
+                          BLE_LINK_SERVICE_RX_CONTROL,
+                          &partial, &current_epoch));
+    TEST_ASSERT_TRUE(partial);
+    TEST_ASSERT_TRUE(current_epoch != stale_epoch);
+
+    ble_link_service_idle_timeout_epoch(GEN, stale_epoch);
+    TEST_ASSERT_TRUE(ble_link_service_has_partial_frame(
+                         BLE_LINK_SERVICE_RX_CONTROL));
+    ble_link_service_idle_timeout_epoch(GEN, current_epoch);
+    TEST_ASSERT_TRUE(!ble_link_service_has_partial_frame(
+                         BLE_LINK_SERVICE_RX_CONTROL));
+}
+
+static void test_completed_work_is_copied_and_deferred(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x21, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+    uint8_t framed[64] = {0};
+    const size_t total = sizeof(request) + 1U;
+
+    _reset();
+    framed[0] = 1U;
+    framed[1] = 3U;
+    framed[2] = 1U;
+    framed[4] = (uint8_t)total;
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
+    ble_link_work_t *work = NULL;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
+                          framed, 8U + total, &work));
+    TEST_ASSERT_TRUE(work != NULL);
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
+    memset(framed, 0xa5, sizeof(framed));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(work));
+    ble_link_service_release_work(work);
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+}
+
+static void test_clear_retires_queued_work(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x22, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+    uint8_t framed[64] = {0};
+    const size_t total = sizeof(request) + 1U;
+
+    _reset();
+    framed[0] = 1U;
+    framed[1] = 3U;
+    framed[2] = 1U;
+    framed[4] = (uint8_t)total;
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&framed[9], request, sizeof(request));
+    ble_link_work_t *work = NULL;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
+                          framed, 8U + total, &work));
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_execute(work));
+    ble_link_service_release_work(work);
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
+}
+
+static void _commit_auth_record(void)
+{
+    device_link_security_auth_record_t record;
+
+    memset(&record, 0, sizeof(record));
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x40U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        record.salt[i] = (uint8_t)(0x30U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        record.verifier[i] = (uint8_t)(i & 0x7fU);
+    }
+    record.peer_addr_type = 1U;
+    record.peer_addr[0] = 0x11U;
+    record.peer_addr[5] = 0xaaU;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_save_auth_record(&record));
+}
+
+/**
+ * @brief Build a GetAuthorizationRequest envelope with RECOVERY_QUERY.
+ */
+static size_t _build_recovery_query(
+    uint8_t *out, size_t capacity, uint64_t request_id,
+    const uint8_t *credential, size_t credential_len)
+{
+    size_t pos = 0U;
+
+    out[pos++] = 0x08U; /* protocol_major=1 */
+    out[pos++] = 0x01U;
+    out[pos++] = 0x19U; /* boot_id fixed64 */
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        out[pos++] = (uint8_t)(BOOT_ID >> (8U * i));
+    }
+    out[pos++] = 0x20U; /* flags=[RECOVERY_QUERY] */
+    out[pos++] = 0x01U;
+    out[pos++] = 0x52U; /* request submessage */
+    const size_t request_start = pos;
+
+    pos++;
+    out[pos++] = 0x09U; /* request_id fixed64 */
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        out[pos++] = (uint8_t)(request_id >> (8U * i));
+    }
+    out[pos++] = 0x7aU; /* get_authorization field 15 */
+    out[pos++] = (uint8_t)(2U + credential_len);
+    out[pos++] = 0x0aU; /* credential_id field 1 */
+    out[pos++] = (uint8_t)credential_len;
+    TEST_ASSERT_TRUE(pos < capacity);
+    memcpy(&out[pos], credential, credential_len);
+    pos += credential_len;
+    out[request_start] = (uint8_t)(pos - request_start - 1U);
+    return pos;
+}
+
+static void test_get_authorization_recovery(void)
+{
+    uint8_t request[64];
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+
+    _reset();
+    nv_storage_fake_reset();
+    _commit_auth_record();
+    static const uint8_t credential[16] =
+    {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    };
+    const size_t request_len = _build_recovery_query(
+                                   request, sizeof(request), 4U,
+                                   credential, sizeof(credential));
+
+    _feed_single_channel(request, request_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(4U, response.request_id);
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT,
+                      response.body);
+    /* Body: field 1 credential_id (16 bytes), field 2 device_auth_id
+     * (16 bytes, 0x40..0x4f of the committed record), field 3 state. */
+    TEST_ASSERT_EQUAL(0x0aU, response.body_data[0]);
+    TEST_ASSERT_EQUAL(0x10U, response.body_data[1]);
+    TEST_ASSERT_EQUAL(0x40U, response.body_data[20]);
+    TEST_ASSERT_EQUAL(0x4fU, response.body_data[35]);
+    TEST_ASSERT_EQUAL(0x18U, response.body_data[36]);
+    TEST_ASSERT_EQUAL(0x05U, response.body_data[37]);
+
+    /* A wrong credential is rejected with NOT_FOUND. */
+    static const uint8_t wrong[16] = {0x00};
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    const size_t wrong_len = _build_recovery_query(
+                                 request, sizeof(request), 5U,
+                                 wrong, sizeof(wrong));
+
+    _feed_single_channel(request, wrong_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_NOT_FOUND, response.error);
+    nv_storage_fake_reset();
+}
+
+static void test_get_authorization_requires_recovery_flag(void)
+{
+    uint8_t request[64];
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+
+    _reset();
+    nv_storage_fake_reset();
+    _commit_auth_record();
+    static const uint8_t credential[16] =
+    {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    };
+    size_t pos = 0U;
+
+    request[pos++] = 0x08U;
+    request[pos++] = 0x01U;
+    request[pos++] = 0x19U;
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        request[pos++] = (uint8_t)(BOOT_ID >> (8U * i));
+    }
+    request[pos++] = 0x52U;
+    const size_t request_start = pos;
+
+    pos++;
+    request[pos++] = 0x09U;
+    {
+        const uint64_t request_id = 6U;
+
+        for (size_t i = 0U; i < 8U; ++i)
+        {
+            request[pos++] = (uint8_t)(request_id >> (8U * i));
+        }
+    }
+    request[pos++] = 0x7aU;
+    request[pos++] = (uint8_t)(2U + sizeof(credential));
+    request[pos++] = 0x0aU;
+    request[pos++] = (uint8_t)sizeof(credential);
+    memcpy(&request[pos], credential, sizeof(credential));
+    pos += sizeof(credential);
+    request[request_start] = (uint8_t)(pos - request_start - 1U);
+
+    _feed_single_channel(request, pos,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INVALID_ARGUMENT, response.error);
+    nv_storage_fake_reset();
+}
+
+static void test_prepare_refetch_same_transaction(void)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t first;
+    ble_link_codec_response_t second;
+
+    _reset();
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &first));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, first.error);
+
+    /* A second prepare with a fresh request id returns the same material:
+     * txn id, credential id, and application password. */
+    static const uint8_t prepare2[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x07, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
+    };
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(prepare2, sizeof(prepare2),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &second));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, second.error);
+    TEST_ASSERT_EQUAL(first.body_len, second.body_len);
+    TEST_ASSERT_EQUAL(0, memcmp(first.body_data, second.body_data,
+                                first.body_len));
+}
+
+static void test_authorize_expiry_clears_transaction(void)
+{
+    _reset();
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+
+    /* Force the deadline into the past; the tick clears the transaction. */
+    ble_link_service_test_set_auth_deadline_ticks(
+        (uint32_t)(xTaskGetTickCount() - 1U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_auth_expiry_tick());
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+}
+
 int main(void)
 {
     test_authorize_commit_wrong_credential();
     test_authorize_commit_truncated_rejected();
+    test_get_authorization_recovery();
+    test_get_authorization_requires_recovery_flag();
+    test_prepare_refetch_same_transaction();
+    test_authorize_expiry_clears_transaction();
     test_capabilities_request();
     test_capabilities_response_bytes();
     test_snapshot_request();
     test_authorize_flow();
-    test_subscribe_then_publish();
+    test_subscribe_events_unadvertised();
     test_no_subscriber_no_output();
     test_intermediate_fragment();
     test_admission_denied();
@@ -1271,14 +1623,16 @@ int main(void)
     test_timeout_closes_security2();
     test_stale_timeout_ignored();
     test_stale_feed_ignored();
-    test_channel_mismatch_rejected();
+    test_channel_routing();
     test_boot_mismatch_closes_session();
     test_one_transaction_at_a_time();
     test_authorize_prepare_produces_transaction();
     test_session_channel_reassembly();
     test_low_mtu_multi_fragment();
     test_idle_timeout_clears_state();
+    test_stale_ingress_epoch_timeout_is_ignored();
+    test_completed_work_is_copied_and_deferred();
+    test_clear_retires_queued_work();
 
-    return 0;
     return 0;
 }

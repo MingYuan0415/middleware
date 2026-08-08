@@ -14,10 +14,12 @@
 #include "esp_random.h"
 
 #include "ble_adv_manager.h"
+#include "ble_link_gatt.h"
 #include "ble_link_session.h"
 #include "ble_port_ops.h"
 #include "ble_link_service.h"
 
+#include "ble_nimble_port.h"
 #include "device_link_security.h"
 #include "ble_runtime.h"
 #include "device_link_service.h"
@@ -52,6 +54,8 @@ typedef enum
     DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING,
     DEVICE_LINK_SERVICE_COMMAND_SUSPEND,
     DEVICE_LINK_SERVICE_COMMAND_RESUME,
+    DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK,
+    DEVICE_LINK_SERVICE_COMMAND_REVOKE,
     DEVICE_LINK_SERVICE_COMMAND_DEINIT,
 } device_link_service_command_type_t;
 
@@ -60,6 +64,7 @@ typedef struct device_link_service_command
     device_link_service_command_type_t type;
     uint32_t sequence; /**< Suspend acknowledgement sequence. */
     bool accept_binding; /**< Confirm (true) or deny (false). */
+    ble_link_work_t *link_work; /**< Owned completed Link message. */
 } device_link_service_command_t;
 
 typedef struct device_link_service
@@ -228,6 +233,26 @@ static void _device_link_service_api_release(void)
 {
     atomic_fetch_sub_explicit(&s_api_users, 1U,
                               memory_order_release);
+}
+
+static esp_err_t _device_link_service_submit_link_work(
+    ble_link_work_t *work, void *arg)
+{
+    (void)arg;
+    if (work == NULL || !_device_link_service_api_acquire_early())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const device_link_service_command_t command =
+    {
+        .type = DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK,
+        .link_work = work,
+    };
+    const esp_err_t result = xQueueSend(s_service.queue, &command, 0U) ==
+                             pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+
+    _device_link_service_api_release();
+    return result;
 }
 
 static void _device_link_service_publish_now(
@@ -486,6 +511,30 @@ static void _device_link_service_ble_event(
 static void _device_link_service_handle_command(
     const device_link_service_command_t *command)
 {
+    if (command->type == DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK)
+    {
+        const bool pending_before = ble_link_service_pending_confirmation();
+        const esp_err_t result = ble_link_service_execute(command->link_work);
+        const bool pending_after = ble_link_service_pending_confirmation();
+
+        ble_link_service_release_work(command->link_work);
+        if (result == ESP_OK && pending_before == pending_after)
+        {
+            return;
+        }
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+        {
+            s_service.snapshot.last_error = result;
+        }
+        _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation++;
+        device_link_service_snapshot_t snapshot = s_service.snapshot;
+
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+        return;
+    }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     switch (command->type)
     {
@@ -525,6 +574,29 @@ static void _device_link_service_handle_command(
         s_service.suspended = false;
         s_service.snapshot.last_error = ESP_OK;
         break;
+    case DEVICE_LINK_SERVICE_COMMAND_REVOKE:
+        /* Local revoke: journal the intent, erase the authorization and
+         * its verifier, drop the session state, then let the port delete
+         * the bond/CCCD on the host core and clear the journal. A crash
+         * at any point resumes at startup before advertising. */
+        if (device_link_security_begin_revoke() == ESP_OK)
+        {
+            (void)device_link_security_erase_auth_record();
+            (void)device_link_security_load_long_term_verifier();
+            (void)ble_link_session_set_authorization(false, 0U);
+            ble_link_service_clear_session_state();
+            if (ble_nimble_port_revoke_binding() != ESP_OK)
+            {
+                /* The journal stays: the startup continuation completes
+                 * the revoke even if the queue is unavailable. */
+                s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
+            }
+        }
+        else
+        {
+            s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
+        }
+        break;
     case DEVICE_LINK_SERVICE_COMMAND_DEINIT:
         break;
     default:
@@ -547,6 +619,15 @@ static void _device_link_service_worker_tick(void)
     device_link_service_snapshot_t snapshot;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    /* An expired authorize transaction converges the snapshot state back
+     * to BOOTSTRAP_AUTHENTICATED even without further protocol traffic. */
+    const bool pending_before = ble_link_service_pending_confirmation();
+
+    (void)ble_link_service_auth_expiry_tick();
+    if (ble_link_service_pending_confirmation() != pending_before)
+    {
+        publish = true;
+    }
     if (s_service.window_open)
     {
         const TickType_t now = xTaskGetTickCount();
@@ -672,6 +753,15 @@ static void _device_link_service_release_resources(void)
     }
     if (s_service.queue != NULL)
     {
+        device_link_service_command_t command;
+
+        while (xQueueReceive(s_service.queue, &command, 0U) == pdTRUE)
+        {
+            if (command.type == DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK)
+            {
+                ble_link_service_release_work(command.link_work);
+            }
+        }
         vQueueDelete(s_service.queue);
     }
     if (s_service.stopped != NULL)
@@ -686,6 +776,7 @@ static void _device_link_service_release_resources(void)
     s_service.queue = NULL;
     s_service.stopped = NULL;
     s_service.mutex = NULL;
+    ble_link_gatt_set_work_submit(NULL, NULL);
     atomic_store_explicit(&s_worker_exited, false, memory_order_release);
 }
 
@@ -714,6 +805,27 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
         if (first_error == ESP_OK && step_result != ESP_OK)
         {
             first_error = step_result;
+        }
+    }
+    if (s_service.task != NULL)
+    {
+        const device_link_service_command_t command =
+        {
+            .type = DEVICE_LINK_SERVICE_COMMAND_DEINIT,
+        };
+
+        if (xQueueSend(s_service.queue, &command, portMAX_DELAY) != pdTRUE ||
+                xSemaphoreTake(s_service.stopped, portMAX_DELAY) != pdTRUE)
+        {
+            if (first_error == ESP_OK)
+            {
+                first_error = ESP_ERR_TIMEOUT;
+            }
+        }
+        else
+        {
+            vTaskDelete(s_service.task);
+            s_service.task = NULL;
         }
     }
     step_result = _device_link_service_runtime_teardown();
@@ -813,6 +925,18 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     if (result == ESP_OK)
     {
+        ble_link_gatt_set_work_submit(_device_link_service_submit_link_work,
+                                      NULL);
+        s_service.task = xTaskCreateStaticPinnedToCore(
+                             _device_link_service_worker,
+                             "device_link", CONFIG_DEVICE_LINK_SERVICE_TASK_STACK,
+                             NULL, config->task_priority,
+                             s_service.task_stack, &s_service.task_control,
+                             CONFIG_MAIN_PROJECT_TASK_CORE_ID);
+        result = s_service.task != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    if (result == ESP_OK)
+    {
         /* The router callback registers before the host task starts (the
          * router table is unsynchronized and the production port follows
          * the same register-before-run pattern), so registration never
@@ -845,16 +969,6 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
              * an installed lease. */
             (void)ble_adv_manager_release_lease(lease.lease_id);
         }
-    }
-    if (result == ESP_OK)
-    {
-        s_service.task = xTaskCreateStaticPinnedToCore(
-                             _device_link_service_worker,
-                             "device_link", CONFIG_DEVICE_LINK_SERVICE_TASK_STACK,
-                             NULL, config->task_priority,
-                             s_service.task_stack, &s_service.task_control,
-                             CONFIG_MAIN_PROJECT_TASK_CORE_ID);
-        result = s_service.task != NULL ? ESP_OK : ESP_ERR_NO_MEM;
     }
     if (result != ESP_OK)
     {
@@ -1060,15 +1174,37 @@ esp_err_t device_link_service_confirm_binding(bool accept)
     return result;
 }
 
+esp_err_t device_link_service_revoke_binding(void)
+{
+    if (!_device_link_service_api_acquire())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const device_link_service_command_t command =
+    {
+        .type = DEVICE_LINK_SERVICE_COMMAND_REVOKE,
+    };
+    const esp_err_t result = xQueueSend(s_service.queue, &command, 0U) ==
+                             pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+
+    _device_link_service_api_release();
+    return result;
+}
+
 bool device_link_service_pending_confirmation(void)
 {
     bool pending = false;
 
+    if (!_device_link_service_api_acquire())
+    {
+        return false;
+    }
     if (xSemaphoreTake(s_service.mutex, portMAX_DELAY) == pdTRUE)
     {
         pending = s_service.snapshot.pending_confirmation;
         xSemaphoreGive(s_service.mutex);
     }
+    _device_link_service_api_release();
     return pending;
 }
 

@@ -31,6 +31,7 @@ set(TEST_SOURCES
     "${COMPONENT}/src/ble_link_reassembler.c"
     "${COMPONENT}/src/ble_link_session.c"
     "${COMPONENT}/src/ble_link_events.c"
+    "${COMPONENT}/src/ble_link_sec_state.c"
     "${COMPONENT}/src/ble_link_service.c"
     "${COMPONENT}/src/ble_link_gatt.c"
     "${COMPONENT}/src/ble_event_router.c"
@@ -55,6 +56,7 @@ foreach(test_target IN ITEMS
         test_ble_link_reassembler
         test_ble_link_session
         test_ble_link_events
+        test_ble_link_sec_state
         test_ble_link_service
         test_ble_link_gatt)
     add_executable(${test_target} ${test_target}.c ${TEST_SOURCES})
@@ -96,8 +98,8 @@ set(BLE_RUNTIME_TESTS
     ble_runtime ble_gatt_registry ble_gap_manager ble_adv_manager
     ble_tx_scheduler ble_response_cache ble_link_codec
     ble_link_dispatcher ble_link_state ble_link_reassembler
-    ble_link_session ble_link_events ble_link_service
-    ble_link_gatt ble_event_router)
+    ble_link_session ble_link_events ble_link_sec_state
+    ble_link_service ble_link_gatt ble_event_router)
 
 if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND BLE_RUNTIME_SETARCH
         AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")

@@ -89,6 +89,25 @@ static void _reset(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_init(&s_config));
 }
 
+static void test_att_mtu_clamped(void)
+{
+    uint32_t facts_mtu = 0U;
+
+    _reset();
+    /* A peer requesting more than the 498 cap is answered with the cap. */
+    ble_link_gatt_set_att_mtu(517U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(498U, facts_mtu);
+    /* Values inside [23, 498] pass through. */
+    ble_link_gatt_set_att_mtu(185U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(185U, facts_mtu);
+    /* Values below the mandatory floor are clamped up to 23. */
+    ble_link_gatt_set_att_mtu(10U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(23U, facts_mtu);
+}
+
 static void test_registered_characteristics(void)
 {
     /* link_state first. */
@@ -310,7 +329,13 @@ static void test_idle_timeout_wired(void)
                           GEN, BLE_LINK_SESSION_CHANNEL_CONTROL,
                           &error));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, error);
-    ble_link_gatt_on_reassembly_idle_generation(GEN);
+    bool partial = false;
+    uint32_t ingress_epoch = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_get_reassembly_state(
+                          BLE_LINK_SERVICE_RX_CONTROL,
+                          &partial, &ingress_epoch));
+    ble_link_gatt_on_reassembly_idle_generation(GEN, ingress_epoch);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_query_admission(
                           GEN, BLE_LINK_SESSION_CHANNEL_CONTROL,
                           &error));
@@ -319,6 +344,7 @@ static void test_idle_timeout_wired(void)
 
 int main(void)
 {
+    test_att_mtu_clamped();
     test_registered_characteristics();
     test_write_feeds_service();
     test_link_state_read();

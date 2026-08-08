@@ -5,6 +5,9 @@
 #include <string.h>
 
 #include "esp_err.h"
+#ifndef UNIT_TEST_HOST
+    #include "esp_heap_caps.h"
+#endif
 
 #include "ble_tx_scheduler.h"
 
@@ -57,6 +60,15 @@ typedef struct ble_tx_scheduler
 } ble_tx_scheduler_t;
 
 static ble_tx_scheduler_t s_scheduler;
+
+static void *_ble_tx_scheduler_payload_alloc(size_t size)
+{
+#ifdef UNIT_TEST_HOST
+    return malloc(size);
+#else
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+}
 
 static void _ble_tx_scheduler_lock(void)
 {
@@ -422,7 +434,8 @@ esp_err_t ble_tx_scheduler_submit(
     }
     if (s_scheduler.in_flight_data == NULL)
     {
-        s_scheduler.in_flight_data = malloc(s_scheduler.config->max_frame_bytes);
+        s_scheduler.in_flight_data = _ble_tx_scheduler_payload_alloc(
+                                         s_scheduler.config->max_frame_bytes);
         if (s_scheduler.in_flight_data == NULL)
         {
             _ble_tx_scheduler_unlock();
@@ -434,8 +447,9 @@ esp_err_t ble_tx_scheduler_submit(
     frame = s_scheduler.frames[slot];
     if (frame == NULL)
     {
-        frame = malloc(sizeof(ble_tx_scheduler_frame_t) +
-                       s_scheduler.config->max_frame_bytes - 1U);
+        frame = _ble_tx_scheduler_payload_alloc(
+                    sizeof(ble_tx_scheduler_frame_t) +
+                    s_scheduler.config->max_frame_bytes - 1U);
         if (frame == NULL)
         {
             _ble_tx_scheduler_unlock();

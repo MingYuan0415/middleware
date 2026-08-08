@@ -18,6 +18,7 @@ PROTOBUF_C__BEGIN_DECLS
 typedef struct Microtech__Link__V1__PublicLinkState Microtech__Link__V1__PublicLinkState;
 typedef struct Microtech__Link__V1__LinkState Microtech__Link__V1__LinkState;
 typedef struct Microtech__Link__V1__GetLinkSnapshotRequest Microtech__Link__V1__GetLinkSnapshotRequest;
+typedef struct Microtech__Link__V1__GetAuthorizationRequest Microtech__Link__V1__GetAuthorizationRequest;
 typedef struct Microtech__Link__V1__AuthorizePrepareRequest Microtech__Link__V1__AuthorizePrepareRequest;
 typedef struct Microtech__Link__V1__AuthorizePrepareResponse Microtech__Link__V1__AuthorizePrepareResponse;
 typedef struct Microtech__Link__V1__AuthorizeCommitRequest Microtech__Link__V1__AuthorizeCommitRequest;
@@ -88,6 +89,23 @@ struct  Microtech__Link__V1__GetLinkSnapshotRequest
 #define MICROTECH__LINK__V1__GET_LINK_SNAPSHOT_REQUEST__INIT \
  { PROTOBUF_C_MESSAGE_INIT (&microtech__link__v1__get_link_snapshot_request__descriptor) \
      }
+
+
+struct  Microtech__Link__V1__GetAuthorizationRequest
+{
+  ProtobufCMessage base;
+  /*
+   * Credential id from the committed AuthorizationResult. The device
+   * returns the matching committed record (including the opaque
+   * device_authorization_id) only when the request arrives under a
+   * Security 2 session authenticated with the long-term credential of
+   * that same record and the peer identity matches the record.
+   */
+  ProtobufCBinaryData credential_id;
+};
+#define MICROTECH__LINK__V1__GET_AUTHORIZATION_REQUEST__INIT \
+ { PROTOBUF_C_MESSAGE_INIT (&microtech__link__v1__get_authorization_request__descriptor) \
+    , {0,NULL} }
 
 
 struct  Microtech__Link__V1__AuthorizePrepareRequest
@@ -192,6 +210,25 @@ Microtech__Link__V1__GetLinkSnapshotRequest *
 void   microtech__link__v1__get_link_snapshot_request__free_unpacked
                      (Microtech__Link__V1__GetLinkSnapshotRequest *message,
                       ProtobufCAllocator *allocator);
+/* Microtech__Link__V1__GetAuthorizationRequest methods */
+void   microtech__link__v1__get_authorization_request__init
+                     (Microtech__Link__V1__GetAuthorizationRequest         *message);
+size_t microtech__link__v1__get_authorization_request__get_packed_size
+                     (const Microtech__Link__V1__GetAuthorizationRequest   *message);
+size_t microtech__link__v1__get_authorization_request__pack
+                     (const Microtech__Link__V1__GetAuthorizationRequest   *message,
+                      uint8_t             *out);
+size_t microtech__link__v1__get_authorization_request__pack_to_buffer
+                     (const Microtech__Link__V1__GetAuthorizationRequest   *message,
+                      ProtobufCBuffer     *buffer);
+Microtech__Link__V1__GetAuthorizationRequest *
+       microtech__link__v1__get_authorization_request__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data);
+void   microtech__link__v1__get_authorization_request__free_unpacked
+                     (Microtech__Link__V1__GetAuthorizationRequest *message,
+                      ProtobufCAllocator *allocator);
 /* Microtech__Link__V1__AuthorizePrepareRequest methods */
 void   microtech__link__v1__authorize_prepare_request__init
                      (Microtech__Link__V1__AuthorizePrepareRequest         *message);
@@ -279,6 +316,9 @@ typedef void (*Microtech__Link__V1__LinkState_Closure)
 typedef void (*Microtech__Link__V1__GetLinkSnapshotRequest_Closure)
                  (const Microtech__Link__V1__GetLinkSnapshotRequest *message,
                   void *closure_data);
+typedef void (*Microtech__Link__V1__GetAuthorizationRequest_Closure)
+                 (const Microtech__Link__V1__GetAuthorizationRequest *message,
+                  void *closure_data);
 typedef void (*Microtech__Link__V1__AuthorizePrepareRequest_Closure)
                  (const Microtech__Link__V1__AuthorizePrepareRequest *message,
                   void *closure_data);
@@ -303,6 +343,7 @@ extern const ProtobufCEnumDescriptor    microtech__link__v1__public_link_flag__d
 extern const ProtobufCMessageDescriptor microtech__link__v1__public_link_state__descriptor;
 extern const ProtobufCMessageDescriptor microtech__link__v1__link_state__descriptor;
 extern const ProtobufCMessageDescriptor microtech__link__v1__get_link_snapshot_request__descriptor;
+extern const ProtobufCMessageDescriptor microtech__link__v1__get_authorization_request__descriptor;
 extern const ProtobufCMessageDescriptor microtech__link__v1__authorize_prepare_request__descriptor;
 extern const ProtobufCMessageDescriptor microtech__link__v1__authorize_prepare_response__descriptor;
 extern const ProtobufCMessageDescriptor microtech__link__v1__authorize_commit_request__descriptor;

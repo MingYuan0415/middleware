@@ -120,6 +120,17 @@ esp_err_t device_link_service_close_window(void);
 esp_err_t device_link_service_confirm_binding(bool accept);
 
 /**
+ * @brief Revoke the current binding (local operation, no wire command).
+ *
+ * Journals the revoke intent, erases the authorization record and its
+ * verifier, clears the session state, and deletes the bond/CCCD on the
+ * host core. A crash mid-revoke resumes at startup before advertising.
+ *
+ * @return ESP_OK when admitted; otherwise a lifecycle error.
+ */
+esp_err_t device_link_service_revoke_binding(void);
+
+/**
  * @brief Report whether a binding awaits local confirmation.
  *
  * Reads the service snapshot; the fact is refreshed by the worker.

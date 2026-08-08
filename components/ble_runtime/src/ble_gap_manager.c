@@ -146,6 +146,13 @@ esp_err_t ble_gap_manager_handle_event(
         return ESP_OK;
     case BLE_GAP_MANAGER_EVENT_ADV_COMPLETE:
         return ESP_OK;
+    case BLE_GAP_MANAGER_EVENT_RESET:
+        s_manager.snapshot.connected = false;
+        s_manager.snapshot.conn_handle = 0U;
+        s_manager.snapshot.encrypted = false;
+        _ble_gap_manager_reset_subscriptions();
+        s_manager.snapshot.mtu = 23U;
+        return ESP_OK;
     default:
         return ESP_ERR_INVALID_ARG;
     }

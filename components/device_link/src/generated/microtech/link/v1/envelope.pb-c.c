@@ -142,7 +142,7 @@ void   microtech__link__v1__envelope__free_unpacked
   assert(message->base.descriptor == &microtech__link__v1__envelope__descriptor);
   protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
 }
-static const ProtobufCFieldDescriptor microtech__link__v1__request__field_descriptors[6] =
+static const ProtobufCFieldDescriptor microtech__link__v1__request__field_descriptors[7] =
 {
   {
     "request_id",
@@ -216,10 +216,23 @@ static const ProtobufCFieldDescriptor microtech__link__v1__request__field_descri
     0 | PROTOBUF_C_FIELD_FLAG_ONEOF,             /* flags */
     0,NULL,NULL    /* reserved1,reserved2, etc */
   },
+  {
+    "get_authorization",
+    15,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_MESSAGE,
+    offsetof(Microtech__Link__V1__Request, body_case),
+    offsetof(Microtech__Link__V1__Request, get_authorization),
+    &microtech__link__v1__get_authorization_request__descriptor,
+    NULL,
+    0 | PROTOBUF_C_FIELD_FLAG_ONEOF,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
 };
 static const unsigned microtech__link__v1__request__field_indices_by_name[] = {
   4,   /* field[4] = authorize_commit */
   3,   /* field[3] = authorize_prepare */
+  6,   /* field[6] = get_authorization */
   1,   /* field[1] = get_capabilities */
   2,   /* field[2] = get_link_snapshot */
   0,   /* field[0] = request_id */
@@ -229,7 +242,7 @@ static const ProtobufCIntRange microtech__link__v1__request__number_ranges[2 + 1
 {
   { 1, 0 },
   { 10, 1 },
-  { 0, 6 }
+  { 0, 7 }
 };
 const ProtobufCMessageDescriptor microtech__link__v1__request__descriptor =
 {
@@ -239,7 +252,7 @@ const ProtobufCMessageDescriptor microtech__link__v1__request__descriptor =
   "Microtech__Link__V1__Request",
   "microtech.link.v1",
   sizeof(Microtech__Link__V1__Request),
-  6,
+  7,
   microtech__link__v1__request__field_descriptors,
   microtech__link__v1__request__field_indices_by_name,
   2,  microtech__link__v1__request__number_ranges,

@@ -149,7 +149,8 @@ static bool _ble_link_codec_valid_request_body(ble_link_codec_request_tag_t body
            body == BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT ||
            body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE ||
            body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT ||
-           body == BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS;
+           body == BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS ||
+           body == BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION;
 }
 
 static bool _ble_link_codec_valid_response_body(
@@ -235,7 +236,7 @@ esp_err_t ble_link_codec_decode_envelope(
         }
         field = (uint32_t)(tag >> 3U);
         if (!(field == 1U || field == 2U || field == 3U || field == 4U ||
-                (field >= 10U && field <= 14U)))
+                (field >= 10U && field <= 15U)))
         {
             /* Unknown field: skip the payload and retain the raw span. */
             if (out->unknown_fields_count >= BLE_LINK_CODEC_MAX_UNKNOWN_FIELDS)
@@ -496,6 +497,7 @@ esp_err_t ble_link_codec_decode_request(
         case 12U: /* authorize_prepare */
         case 13U: /* authorize_commit */
         case 14U: /* subscribe_events */
+        case 15U: /* get_authorization */
             if (wire != BLE_LINK_CODEC_WIRE_LEN)
             {
                 return ESP_ERR_INVALID_STATE;

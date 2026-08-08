@@ -5,6 +5,9 @@
 #include <string.h>
 
 #include "esp_err.h"
+#ifndef UNIT_TEST_HOST
+    #include "esp_heap_caps.h"
+#endif
 
 #include "ble_link_dispatcher.h"
 
@@ -12,8 +15,9 @@
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"
 
-#define BLE_LINK_DISPATCHER_REQUEST_TAGS 5U
+#define BLE_LINK_DISPATCHER_REQUEST_TAGS 6U
 #define BLE_LINK_DISPATCHER_SESSION_IDS_INITIAL 16U
+#define BLE_LINK_DISPATCHER_SESSION_IDS_MAX 16384U
 
 typedef struct ble_link_dispatcher_handler
 {
@@ -32,6 +36,17 @@ typedef struct ble_link_dispatcher
 } ble_link_dispatcher_t;
 
 static ble_link_dispatcher_t s_dispatcher;
+
+static uint64_t *_ble_link_dispatcher_resize_session_ids(
+    uint64_t *ids, size_t capacity)
+{
+#ifdef UNIT_TEST_HOST
+    return realloc(ids, capacity * sizeof(ids[0]));
+#else
+    return heap_caps_realloc(ids, capacity * sizeof(ids[0]),
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+}
 
 static ble_link_dispatcher_handler_t *_ble_link_dispatcher_find_handler(
     ble_link_codec_request_tag_t tag)
@@ -63,9 +78,9 @@ static bool _ble_link_dispatcher_add_session_id(uint64_t request_id)
 {
     if (s_dispatcher.session_ids == NULL)
     {
-        s_dispatcher.session_ids = malloc(
-                                       BLE_LINK_DISPATCHER_SESSION_IDS_INITIAL *
-                                       sizeof(s_dispatcher.session_ids[0]));
+        s_dispatcher.session_ids = _ble_link_dispatcher_resize_session_ids(
+                                       NULL,
+                                       BLE_LINK_DISPATCHER_SESSION_IDS_INITIAL);
         if (s_dispatcher.session_ids == NULL)
         {
             return false;
@@ -75,10 +90,14 @@ static bool _ble_link_dispatcher_add_session_id(uint64_t request_id)
     }
     if (s_dispatcher.session_id_count >= s_dispatcher.session_id_capacity)
     {
+        if (s_dispatcher.session_id_capacity >=
+                BLE_LINK_DISPATCHER_SESSION_IDS_MAX)
+        {
+            return false;
+        }
         const size_t new_capacity = s_dispatcher.session_id_capacity * 2U;
-        uint64_t *grown = realloc(
-                              s_dispatcher.session_ids,
-                              new_capacity * sizeof(s_dispatcher.session_ids[0]));
+        uint64_t *grown = _ble_link_dispatcher_resize_session_ids(
+                              s_dispatcher.session_ids, new_capacity);
 
         if (grown == NULL)
         {
@@ -146,7 +165,12 @@ esp_err_t ble_link_dispatcher_handle_request(
         *out_error = BLE_LINK_ERROR_UNSUPPORTED_OPERATION;
         return ESP_OK;
     }
-    *out_error = handler->handler(request, facts, handler->arg);
+    /* Handlers see the envelope flag through a facts copy: the caller's
+     * facts are connection facts and stay untouched. */
+    ble_link_dispatcher_facts_t effective_facts = *facts;
+
+    effective_facts.recovery_query = envelope->flags_count > 0U;
+    *out_error = handler->handler(request, &effective_facts, handler->arg);
     return ESP_OK;
 }
 
@@ -165,6 +189,7 @@ esp_err_t ble_link_dispatcher_register_request(
     case BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE:
     case BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT:
     case BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS:
+    case BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION:
         break;
     default:
         return ESP_ERR_INVALID_ARG;

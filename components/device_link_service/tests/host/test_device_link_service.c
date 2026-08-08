@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,6 +19,8 @@
 #include "ble_runtime.h"
 #include "device_link_service.h"
 #include "device_link_security.h"
+#include "device_link_security_auth.h"
+#include "nv_storage.h"
 #include "event_bus.h"
 
 #define TEST_WINDOW_MS 200U
@@ -42,6 +45,14 @@ static unsigned s_adv_start_count;
 static unsigned s_adv_stop_count;
 static bool s_fail_adv_start;
 static bool s_fail_port_init;
+static atomic_uint s_revoke_count = ATOMIC_VAR_INIT(0U);
+
+/* Host stub for the NimBLE host-core bond deletion: records the request. */
+esp_err_t ble_nimble_port_revoke_binding(void)
+{
+    atomic_fetch_add_explicit(&s_revoke_count, 1U, memory_order_acq_rel);
+    return ESP_OK;
+}
 static bool s_port_started;
 static bool s_port_stopped;
 static ble_adv_manager_state_t s_adv_state_before_deinit;
@@ -442,8 +453,8 @@ static void _deinit_service(void)
     assert(s_port_stopped);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    /* device_link_security keeps its boot-lifetime mutex alive. */
-    assert(host_freertos_live_semaphores() <= 1U);
+    /* Security and link-session keep boot-lifetime mutexes alive. */
+    assert(host_freertos_live_semaphores() <= 2U);
 }
 
 static const char *_qr_field(const char *qr, const char *name, char *output,
@@ -568,8 +579,8 @@ static void _test_rollback_port_init_failure(void)
     assert(device_link_service_init(&s_config) == ESP_FAIL);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    /* device_link_security keeps its boot-lifetime mutex alive. */
-    assert(host_freertos_live_semaphores() <= 1U);
+    /* Security and link-session keep boot-lifetime mutexes alive. */
+    assert(host_freertos_live_semaphores() <= 2U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_port_init = false;
@@ -592,8 +603,8 @@ static void _test_rollback_runtime_never_initialized(void)
     assert(device_link_service_init(&s_config) == ESP_ERR_NO_MEM);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    /* device_link_security keeps its boot-lifetime mutex alive. */
-    assert(host_freertos_live_semaphores() <= 1U);
+    /* Security and link-session keep boot-lifetime mutexes alive. */
+    assert(host_freertos_live_semaphores() <= 2U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     _init_service();
@@ -619,8 +630,8 @@ static void _test_rollback_lease_failure_retryable(void)
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    /* device_link_security keeps its boot-lifetime mutex alive. */
-    assert(host_freertos_live_semaphores() <= 1U);
+    /* Security and link-session keep boot-lifetime mutexes alive. */
+    assert(host_freertos_live_semaphores() <= 2U);
     assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
            ESP_OK);
     s_fail_adv_start = false;
@@ -639,6 +650,53 @@ static void _test_binding_confirmation(void)
     assert(!device_link_service_pending_confirmation());
     assert(device_link_service_confirm_binding(false) == ESP_OK);
     assert(!device_link_service_pending_confirmation());
+    _deinit_service();
+}
+
+static void _test_revoke_binding(void)
+{
+    /* A committed authorization record exists, then the local revoke
+     * journals the intent and erases the authorization in the worker;
+     * the port stub records the bond-deletion request. */
+    device_link_security_auth_record_t record;
+
+    nv_storage_fake_reset();
+    memset(&record, 0, sizeof(record));
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x40U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        record.salt[i] = (uint8_t)(0x30U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        record.verifier[i] = (uint8_t)(i & 0x7fU);
+    }
+    record.peer_addr_type = 1U;
+    record.peer_addr[0] = 0x11U;
+    record.peer_addr[5] = 0xaaU;
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+
+    _reset_host();
+    _init_service();
+    atomic_store_explicit(&s_revoke_count, 0U, memory_order_release);
+    assert(device_link_service_revoke_binding() == ESP_OK);
+    /* The worker applied the revoke: journal present (the port stub does
+     * not clear it), authorization erased, bond deletion requested. */
+    assert(_wait_for(device_link_security_revoke_pending, 500U));
+    assert(device_link_security_revoke_pending());
+    assert(device_link_security_load_auth_record(&record) ==
+           ESP_ERR_NOT_FOUND);
+    assert(atomic_load_explicit(&s_revoke_count, memory_order_acquire) == 1U);
+    /* The revocation is durable: the journal marker survives for the
+     * startup continuation. */
+    assert(device_link_security_end_revoke() == ESP_OK);
+    assert(!device_link_security_revoke_pending());
     _deinit_service();
 }
 
@@ -964,13 +1022,14 @@ static void _test_deinit_while_window_open(void)
     assert(!s_port_started);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
-    /* device_link_security keeps its boot-lifetime mutex alive. */
-    assert(host_freertos_live_semaphores() <= 1U);
+    /* Security and link-session keep boot-lifetime mutexes alive. */
+    assert(host_freertos_live_semaphores() <= 2U);
     assert((ble_link_session_get_state_flags() &
             BLE_LINK_STATE_FLAG_BINDABLE) == 0U);
     device_link_service_status_t status;
 
     assert(device_link_service_get_status(&status) == ESP_ERR_INVALID_STATE);
+    assert(!device_link_service_pending_confirmation());
 }
 
 static void _test_reinit_after_deinit(void)
@@ -992,6 +1051,7 @@ int main(void)
     _test_rollback_runtime_never_initialized();
     _test_rollback_lease_failure_retryable();
     _test_binding_confirmation();
+    _test_revoke_binding();
     _test_window_lifecycle();
     _test_close_window();
     _test_connect_events();

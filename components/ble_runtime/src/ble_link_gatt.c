@@ -106,6 +106,14 @@ typedef struct ble_link_gatt
 } ble_link_gatt_t;
 
 static ble_link_gatt_t s_gatt;
+static ble_link_work_submit_fn s_work_submit;
+static void *s_work_submit_arg;
+
+void ble_link_gatt_set_work_submit(ble_link_work_submit_fn submit, void *arg)
+{
+    s_work_submit = submit;
+    s_work_submit_arg = arg;
+}
 
 static int _ble_link_gatt_access(
     uint16_t conn_handle, uint16_t attr_handle,
@@ -389,16 +397,33 @@ static int _ble_link_gatt_access(
             return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
         }
     }
-    const esp_err_t result = ble_link_service_feed(
-                                 &facts, channel, context->write_data,
-                                 context->write_len);
+    ble_link_work_t *work = NULL;
+    esp_err_t result = ble_link_service_accept(
+                           &facts, channel, context->write_data,
+                           context->write_len, &work);
 
     if (result != ESP_OK && result != ESP_ERR_NOT_FINISHED)
     {
         /* Protocol or admission violation: reject the write. */
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
-    return 0;
+    if (result == ESP_ERR_NOT_FINISHED || work == NULL)
+    {
+        return 0;
+    }
+    if (s_work_submit != NULL)
+    {
+        result = s_work_submit(work, s_work_submit_arg);
+        if (result == ESP_OK)
+        {
+            return 0;
+        }
+        ble_link_service_release_work(work);
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    result = ble_link_service_execute(work);
+    ble_link_service_release_work(work);
+    return result == ESP_OK ? 0 : BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
 }
 
 esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
@@ -554,11 +579,12 @@ void ble_link_gatt_update_handles(void)
     }
 }
 
-void ble_link_gatt_on_reassembly_idle_generation(uint32_t generation)
+void ble_link_gatt_on_reassembly_idle_generation(
+    uint32_t generation, uint32_t epoch)
 {
     if (s_gatt.config != NULL)
     {
-        ble_link_service_idle_timeout(generation);
+        ble_link_service_idle_timeout_epoch(generation, epoch);
     }
 }
 
@@ -569,10 +595,28 @@ void ble_link_gatt_set_att_mtu(uint16_t mtu)
         ble_link_gatt_config_t *config = (ble_link_gatt_config_t *)
                                          s_gatt.config;
 
+        /* The Device Link profile caps the negotiated MTU at 498: a peer
+         * requesting more is answered with the cap, and every outbound
+         * value is bounded by the 498-derived limits. 23 is the mandatory
+         * floor. */
+        if (mtu > BLE_LINK_GATT_ATT_MTU_MAX)
+        {
+            mtu = BLE_LINK_GATT_ATT_MTU_MAX;
+        }
         config->att_mtu = (mtu >= 23U) ? mtu : 23U;
     }
 }
 
+
+esp_err_t ble_link_gatt_get_att_mtu(uint32_t *out_mtu)
+{
+    if (out_mtu == NULL || s_gatt.config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_mtu = s_gatt.config->att_mtu;
+    return ESP_OK;
+}
 
 uint16_t ble_link_gatt_link_state_handle(void)
 {

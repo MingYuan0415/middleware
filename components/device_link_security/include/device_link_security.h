@@ -14,6 +14,14 @@ extern "C" {
 /** @brief Default SRP username (also used when the config leaves it NULL). */
 #define DEVICE_LINK_SECURITY_USERNAME "microtech"
 
+/** @brief Verifier slot selected for a Security 2 handshake. */
+typedef enum
+{
+    DEVICE_LINK_SECURITY_VERIFIER_NONE = 0, /**< No verifier: handshake not admitted. */
+    DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP, /**< QR POP of the open pairing window. */
+    DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM, /**< Committed authorization record. */
+} device_link_security_verifier_kind_t;
+
 /**
  * @brief Authentication transition callback.
  *
@@ -79,9 +87,11 @@ void device_link_security_deinit(void);
 /**
  * @brief Open the bootstrap verifier for a binding window.
  *
- * Derives a fresh SRP salt and verifier from the window POP and rebuilds
- * the Protocomm instance, so any established session is replaced. The
- * salt and verifier are kept only until close_bootstrap.
+ * Derives a fresh SRP salt and verifier from the window POP into the
+ * bootstrap slot. The long-term verifier slot is preserved: a bound peer
+ * keeps reconnecting with its long-term credential while a replacement
+ * window is open. The salt and verifier are kept only until
+ * close_bootstrap.
  *
  * @param[in] pop QR proof of possession bytes.
  * @param[in] pop_len POP length.
@@ -91,10 +101,39 @@ esp_err_t device_link_security_open_bootstrap(
     const uint8_t *pop, size_t pop_len);
 
 /**
- * @brief Close the bootstrap verifier and replace it with the long-term
- * verifier if one is committed (P3.4b), otherwise none.
+ * @brief Close the bootstrap verifier and rebuild the instance with the
+ * long-term verifier if one is committed (P3.4b), otherwise none.
  */
 void device_link_security_close_bootstrap(void);
+
+/**
+ * @brief Select and pin the verifier for the next Security 2 handshake.
+ *
+ * Called before every first handshake command (command 0) with the
+ * resolved peer identity and the local pairing-window state. The adapter
+ * picks the long-term verifier when the committed record's identity
+ * matches the peer; otherwise the bootstrap verifier when a window is
+ * open; otherwise no verifier (the handshake is not admitted). The
+ * selection is pinned to the session so a later revoke or replacement
+ * cannot resurrect a stale handshake.
+ *
+ * @param[in] peer_addr_type Peer identity address type (0-2).
+ * @param[in] peer_addr Peer identity address bytes.
+ * @param[in] peer_addr_len Peer address length.
+ * @param[in] pairing_window_open Local pairing window state.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_INVALID_STATE when
+ *         uninitialized.
+ */
+esp_err_t device_link_security_select_verifier(
+    uint8_t peer_addr_type, const uint8_t *peer_addr, size_t peer_addr_len,
+    bool pairing_window_open);
+
+/**
+ * @brief Report the verifier kind pinned to the current session.
+ *
+ * @return DEVICE_LINK_SECURITY_VERIFIER_NONE, _BOOTSTRAP, or _LONG_TERM.
+ */
+device_link_security_verifier_kind_t device_link_security_selected_verifier(void);
 
 /**
  * @brief Process one Security 2 handshake frame.

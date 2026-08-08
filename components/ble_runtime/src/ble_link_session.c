@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "esp_err.h"
 
 #include "ble_link_session.h"
@@ -32,15 +35,42 @@ typedef struct ble_link_session
 } ble_link_session_t;
 
 static ble_link_session_t s_session;
+static StaticSemaphore_t s_session_mutex_control;
+static SemaphoreHandle_t s_session_mutex;
+static esp_err_t _ble_link_session_report_session_match_locked(
+    uint32_t generation, uint32_t revision, uint32_t security2_epoch);
+
+static void _ble_link_session_lock(void)
+{
+    if (s_session_mutex != NULL)
+    {
+        (void)xSemaphoreTakeRecursive(s_session_mutex, portMAX_DELAY);
+    }
+}
+
+static void _ble_link_session_unlock(void)
+{
+    if (s_session_mutex != NULL)
+    {
+        (void)xSemaphoreGiveRecursive(s_session_mutex);
+    }
+}
 
 void ble_link_session_init(uint64_t boot_id)
 {
+    if (s_session_mutex == NULL)
+    {
+        s_session_mutex = xSemaphoreCreateRecursiveMutexStatic(
+                              &s_session_mutex_control);
+    }
+    _ble_link_session_lock();
     memset(&s_session, 0, sizeof(s_session));
     atomic_init(&s_session.pairing_window_open, false);
     s_session.boot_id = boot_id;
+    _ble_link_session_unlock();
 }
 
-void ble_link_session_reset(void)
+static void _ble_link_session_reset_locked(void)
 {
     /* The boot id and epoch allocator are boot-scoped and survive a full
      * teardown (a runtime restart keeps them); only a fresh boot via
@@ -57,7 +87,9 @@ void ble_link_session_reset(void)
 #ifdef UNIT_TEST_HOST
 void ble_link_session_test_set_epoch(uint32_t value)
 {
+    _ble_link_session_lock();
     s_session.security2_epoch = value;
+    _ble_link_session_unlock();
 }
 #endif
 
@@ -67,7 +99,7 @@ void ble_link_session_set_pairing_window(bool open)
                           memory_order_release);
 }
 
-void ble_link_session_clear_link_security(uint32_t generation)
+static void _ble_link_session_clear_link_security_locked(uint32_t generation)
 {
     if (generation != s_session.generation || !s_session.active)
     {
@@ -89,7 +121,7 @@ static void _ble_link_session_clear_connection(void)
     s_session.authorized = false;
 }
 
-esp_err_t ble_link_session_handle_event(
+static esp_err_t _ble_link_session_handle_event_locked(
     uint32_t generation, ble_link_session_event_t event)
 {
     switch (event)
@@ -143,7 +175,7 @@ esp_err_t ble_link_session_handle_event(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_security2_open(
+static esp_err_t _ble_link_session_security2_open_locked(
     uint32_t generation, uint32_t *out_epoch)
 {
     if (out_epoch == NULL)
@@ -166,12 +198,12 @@ esp_err_t ble_link_session_security2_open(
     return ESP_OK;
 }
 
-bool ble_link_session_authorization_exhausted(void)
+static bool _ble_link_session_authorization_exhausted_locked(void)
 {
     return s_session.authorization_revision == UINT32_MAX;
 }
 
-esp_err_t ble_link_session_set_authorization(
+static esp_err_t _ble_link_session_set_authorization_locked(
     bool committed, uint32_t revision)
 {
     if (revision == 0U)
@@ -204,14 +236,15 @@ esp_err_t ble_link_session_set_authorization(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_report_session_match_current(
+static esp_err_t _ble_link_session_report_session_match_current_locked(
     uint32_t generation, uint32_t revision)
 {
-    return ble_link_session_report_session_match(
+    return _ble_link_session_report_session_match_locked(
                generation, revision, s_session.security2_epoch);
 }
 
-esp_err_t ble_link_session_security2_close_current(uint32_t generation)
+static esp_err_t _ble_link_session_security2_close_current_locked(
+    uint32_t generation)
 {
     if (generation != s_session.generation || !s_session.active)
     {
@@ -228,7 +261,7 @@ esp_err_t ble_link_session_security2_close_current(uint32_t generation)
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_report_session_match(
+static esp_err_t _ble_link_session_report_session_match_locked(
     uint32_t generation, uint32_t revision, uint32_t security2_epoch)
 {
     if (generation != s_session.generation || !s_session.active)
@@ -250,7 +283,7 @@ esp_err_t ble_link_session_report_session_match(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_query_admission(
+static esp_err_t _ble_link_session_query_admission_locked(
     uint32_t generation, ble_link_session_channel_t channel,
     uint32_t *out_error)
 {
@@ -311,7 +344,8 @@ esp_err_t ble_link_session_query_admission(
     return ESP_OK;
 }
 
-ble_link_session_state_t ble_link_session_get_state(uint32_t generation)
+static ble_link_session_state_t _ble_link_session_get_state_locked(
+    uint32_t generation)
 {
     if (generation != s_session.generation || !s_session.active)
     {
@@ -329,7 +363,7 @@ ble_link_session_state_t ble_link_session_get_state(uint32_t generation)
     return BLE_LINK_SESSION_CONNECTED;
 }
 
-esp_err_t ble_link_session_get_facts(
+static esp_err_t _ble_link_session_get_facts_locked(
     uint32_t generation, ble_link_dispatcher_facts_t *facts)
 {
     if (facts == NULL)
@@ -349,7 +383,7 @@ esp_err_t ble_link_session_get_facts(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_set_identity_known(
+static esp_err_t _ble_link_session_set_identity_known_locked(
     uint32_t generation, bool known)
 {
     if (generation != s_session.generation || !s_session.active)
@@ -365,7 +399,7 @@ esp_err_t ble_link_session_set_identity_known(
     return ESP_OK;
 }
 
-esp_err_t ble_link_session_get_security_facts(
+static esp_err_t _ble_link_session_get_security_facts_locked(
     uint32_t generation, bool *out_bond_verified,
     bool *out_identity_known)
 {
@@ -382,7 +416,7 @@ esp_err_t ble_link_session_get_security_facts(
     return ESP_OK;
 }
 
-uint32_t ble_link_session_get_state_flags(void)
+static uint32_t _ble_link_session_get_state_flags_locked(void)
 {
     uint32_t flags = 0U;
 
@@ -395,5 +429,158 @@ uint32_t ble_link_session_get_state_flags(void)
     {
         flags |= BLE_LINK_STATE_FLAG_BOUND;
     }
+    return flags;
+}
+
+void ble_link_session_reset(void)
+{
+    _ble_link_session_lock();
+    _ble_link_session_reset_locked();
+    _ble_link_session_unlock();
+}
+
+void ble_link_session_clear_link_security(uint32_t generation)
+{
+    _ble_link_session_lock();
+    _ble_link_session_clear_link_security_locked(generation);
+    _ble_link_session_unlock();
+}
+
+esp_err_t ble_link_session_handle_event(
+    uint32_t generation, ble_link_session_event_t event)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_handle_event_locked(
+                                 generation, event);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_security2_open(
+    uint32_t generation, uint32_t *out_epoch)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_security2_open_locked(
+                                 generation, out_epoch);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+bool ble_link_session_authorization_exhausted(void)
+{
+    _ble_link_session_lock();
+    const bool exhausted = _ble_link_session_authorization_exhausted_locked();
+
+    _ble_link_session_unlock();
+    return exhausted;
+}
+
+esp_err_t ble_link_session_set_authorization(bool committed, uint32_t revision)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_set_authorization_locked(
+                                 committed, revision);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_report_session_match_current(
+    uint32_t generation, uint32_t revision)
+{
+    _ble_link_session_lock();
+    const esp_err_t result =
+        _ble_link_session_report_session_match_current_locked(
+            generation, revision);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_security2_close_current(uint32_t generation)
+{
+    _ble_link_session_lock();
+    const esp_err_t result =
+        _ble_link_session_security2_close_current_locked(generation);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_report_session_match(
+    uint32_t generation, uint32_t revision, uint32_t security2_epoch)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_report_session_match_locked(
+                                 generation, revision, security2_epoch);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_query_admission(
+    uint32_t generation, ble_link_session_channel_t channel,
+    uint32_t *out_error)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_query_admission_locked(
+                                 generation, channel, out_error);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+ble_link_session_state_t ble_link_session_get_state(uint32_t generation)
+{
+    _ble_link_session_lock();
+    const ble_link_session_state_t state =
+        _ble_link_session_get_state_locked(generation);
+
+    _ble_link_session_unlock();
+    return state;
+}
+
+esp_err_t ble_link_session_get_facts(
+    uint32_t generation, ble_link_dispatcher_facts_t *facts)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_get_facts_locked(
+                                 generation, facts);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_set_identity_known(uint32_t generation, bool known)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_set_identity_known_locked(
+                                 generation, known);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_get_security_facts(
+    uint32_t generation, bool *out_bond_verified,
+    bool *out_identity_known)
+{
+    _ble_link_session_lock();
+    const esp_err_t result = _ble_link_session_get_security_facts_locked(
+                                 generation, out_bond_verified,
+                                 out_identity_known);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+uint32_t ble_link_session_get_state_flags(void)
+{
+    _ble_link_session_lock();
+    const uint32_t flags = _ble_link_session_get_state_flags_locked();
+
+    _ble_link_session_unlock();
     return flags;
 }

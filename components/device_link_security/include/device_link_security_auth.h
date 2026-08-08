@@ -117,6 +117,33 @@ esp_err_t device_link_security_derive_long_term_verifier(
  */
 esp_err_t device_link_security_load_long_term_verifier(void);
 
+/**
+ * @brief Journal the start of a local binding revoke.
+ *
+ * Writes a durable revoke-intent marker before any authorization or bond
+ * mutation, so a crash mid-revoke resumes at startup (the startup
+ * reconciliation completes the revoke before advertising). The marker is
+ * cleared by device_link_security_end_revoke() once the bond deletion
+ * succeeded.
+ *
+ * @return ESP_OK or a storage error.
+ */
+esp_err_t device_link_security_begin_revoke(void);
+
+/**
+ * @brief Clear the revoke-intent journal marker.
+ *
+ * @return ESP_OK (including when no marker existed) or a storage error.
+ */
+esp_err_t device_link_security_end_revoke(void);
+
+/**
+ * @brief Whether a revoke-intent marker is journaled.
+ *
+ * @return True while a revoke must still be completed.
+ */
+bool device_link_security_revoke_pending(void);
+
 #ifdef __cplusplus
 }
 #endif
