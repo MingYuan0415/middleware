@@ -17,6 +17,8 @@ set(BLE_RUNTIME "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(DEVICE_LINK_SECURITY "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
 set(EVENT_BUS "${PROJECT_ROOT}/layers/middleware/components/event_bus")
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
+set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
+set(PROTOBUF_C "$ENV{IDF_PATH}/components/protobuf-c/protobuf-c")
 
 add_executable(test_device_link_service
                test_device_link_service.c
@@ -39,6 +41,12 @@ add_executable(test_device_link_service
                "${CMAKE_CURRENT_LIST_DIR}/fakes/esp_srp.c"
                "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
                "${CMAKE_CURRENT_LIST_DIR}/fakes/protocomm_security2.c"
+               "${PROTOCOMM_PROTO}/constants.pb-c.c"
+               "${PROTOCOMM_PROTO}/sec0.pb-c.c"
+               "${PROTOCOMM_PROTO}/sec1.pb-c.c"
+               "${PROTOCOMM_PROTO}/sec2.pb-c.c"
+               "${PROTOCOMM_PROTO}/session.pb-c.c"
+               "${PROTOBUF_C}/protobuf-c/protobuf-c.c"
               )
 target_compile_features(test_device_link_service PRIVATE c_std_11)
 target_compile_definitions(test_device_link_service PRIVATE
@@ -50,7 +58,8 @@ target_compile_definitions(test_device_link_service PRIVATE
 target_include_directories(test_device_link_service PRIVATE
                            "${CMAKE_CURRENT_LIST_DIR}/fakes"
                            "${BLE_RUNTIME}/tests/host/fakes"
-                           "${DEVICE_LINK_SECURITY}/tests/host/fakes"
+                           "${PROTOCOMM_PROTO}"
+                           "${PROTOBUF_C}"
                            "${DEVICE_LINK_SECURITY}/include"
                            "${HOST_CONNECTIVITY}/include"
                            "${COMPONENT}/include"

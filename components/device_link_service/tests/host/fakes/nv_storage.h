@@ -17,6 +17,7 @@ esp_err_t nv_storage_get_blob(const char *key, void *out, size_t *size);
 esp_err_t nv_storage_erase_key(const char *key);
 void nv_storage_fake_reset(void);
 size_t nv_storage_fake_blob_len(void);
+void nv_storage_fake_fail_next_get(esp_err_t result);
 
 #ifdef __cplusplus
 }

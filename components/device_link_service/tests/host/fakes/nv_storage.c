@@ -21,6 +21,7 @@ typedef struct nv_storage_fake_entry
 
 static nv_storage_fake_entry_t s_entries[NV_STORAGE_FAKE_KEYS];
 static pthread_mutex_t s_mutex = PTHREAD_MUTEX_INITIALIZER;
+static esp_err_t s_fail_next_get;
 
 static void _lock(void)
 {
@@ -109,6 +110,13 @@ esp_err_t nv_storage_get_blob(const char *key, void *out, size_t *size)
         return ESP_ERR_INVALID_ARG;
     }
     _lock();
+    if (s_fail_next_get != ESP_OK)
+    {
+        result = s_fail_next_get;
+        s_fail_next_get = ESP_OK;
+        _unlock();
+        return result;
+    }
     nv_storage_fake_entry_t *entry = _find_entry_locked(key);
 
     if (entry == NULL)
@@ -156,6 +164,7 @@ void nv_storage_fake_reset(void)
 {
     _lock();
     memset(s_entries, 0, sizeof(s_entries));
+    s_fail_next_get = ESP_OK;
     _unlock();
 }
 
@@ -173,4 +182,11 @@ size_t nv_storage_fake_blob_len(void)
     }
     _unlock();
     return total;
+}
+
+void nv_storage_fake_fail_next_get(esp_err_t result)
+{
+    _lock();
+    s_fail_next_get = result;
+    _unlock();
 }

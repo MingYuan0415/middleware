@@ -19,12 +19,23 @@ extern "C" {
 
 EVENT_BUS_DECLARE_ID(DEVICE_LINK_SERVICE_MSG);
 
+/** @brief Nonzero, boot-scoped identity of a local binding decision. */
+typedef uint64_t device_link_confirmation_token_t;
+
+/** @brief Startup exposure policy. */
+typedef enum
+{
+    DEVICE_LINK_SERVICE_STARTUP_NORMAL = 0,
+    DEVICE_LINK_SERVICE_STARTUP_FACTORY_RESET_GATED,
+} device_link_service_startup_mode_t;
+
 /** @brief Device Link service lifecycle policy. */
 typedef struct device_link_service_config
 {
     const ble_runtime_host_port_t *runtime_port; /**< Required, e.g. ble_nimble_port_get(). */
     uint32_t task_priority; /**< Worker task priority. */
     uint32_t window_ms; /**< Binding window duration in milliseconds. */
+    device_link_service_startup_mode_t startup_mode; /**< Advertising gate. */
 } device_link_service_config_t;
 
 /** @brief Device Link service state visible to applications. */
@@ -60,6 +71,9 @@ typedef struct device_link_service_status
     bool client_connected; /**< One BLE transport client is connected. */
     bool qr_ready; /**< QR bootstrap data may be copied. */
     bool pending_confirmation; /**< A binding awaits local confirmation. */
+    device_link_confirmation_token_t confirmation_token; /**< Exact
+                                                          * transaction to
+                                                          * confirm. */
 } device_link_service_status_t;
 
 typedef device_link_service_status_t device_link_service_snapshot_t;
@@ -82,6 +96,17 @@ typedef device_link_service_status_t device_link_service_snapshot_t;
  * @return ESP_OK on success; otherwise an argument, lifecycle, or port error.
  */
 esp_err_t device_link_service_init(const device_link_service_config_t *config);
+
+/**
+ * @brief Release advertising after factory-reset recovery completed.
+ *
+ * Only valid for FACTORY_RESET_GATED startup. Init has already acquired the
+ * slow non-bindable lease while advertising is paused and the reset marker is
+ * still durable. This call commits visibility after the caller clears that
+ * marker. A physical advertising-start failure remains owned by the runtime's
+ * bounded retry state and does not fail this reset transaction.
+ */
+esp_err_t device_link_service_release_startup_gate(void);
 
 /**
  * @brief Stop the service and release all resources.
@@ -114,10 +139,12 @@ esp_err_t device_link_service_close_window(void);
  * race a window close or a disconnect. Accepting arms the active
  * authorize transaction; denying invalidates it.
  *
+ * @param[in] token Token from the status snapshot that exposed the prompt.
  * @param[in] accept True to confirm the binding, false to deny it.
  * @return ESP_OK when admitted; otherwise a lifecycle error.
  */
-esp_err_t device_link_service_confirm_binding(bool accept);
+esp_err_t device_link_service_confirm_binding(
+    device_link_confirmation_token_t token, bool accept);
 
 /**
  * @brief Revoke the current binding (local operation, no wire command).
@@ -197,15 +224,22 @@ bool device_link_service_is_active(void);
 /**
  * @brief Report whether the service blocks standby.
  *
- * Interim policy: any open binding window or any connected ACL blocks
- * light sleep, because the transport cannot yet distinguish an authorized
- * session from a public link_state reader and has no disconnect path.
- * Once P3.3/P3.4 provide session-aware state and a disconnect API, an idle
- * unauthenticated ACL should quiesce instead of blocking standby.
+ * The current conservative product policy treats an open or deferred binding
+ * window and every connected ACL as busy. This includes public-only
+ * link_state readers, so standby never suspends a live BLE transport.
  *
- * @return true while a window is open or a client is connected.
+ * @return true while a window is open/deferred or a client is connected.
  */
 bool device_link_service_is_busy(void);
+
+#ifdef UNIT_TEST_HOST
+/** @brief Test-only barrier invoked after API admission samples its state. */
+typedef void (*device_link_service_test_api_acquire_hook_t)(void *arg);
+
+/** @brief Install a test-only API admission barrier. */
+void device_link_service_test_set_api_acquire_hook(
+    device_link_service_test_api_acquire_hook_t hook, void *arg);
+#endif
 
 #ifdef __cplusplus
 }
