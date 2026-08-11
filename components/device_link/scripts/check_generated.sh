@@ -51,6 +51,18 @@ for generated in errors capabilities session events transfer envelope; do
         committed="$component_dir/src/generated/microtech/link/v1/$generated.$suffix"
         candidate="$temporary/microtech/link/v1/$generated.$suffix"
         if ! cmp -s "$committed" "$candidate"; then
+            # protobuf-c copies source comments into headers. Contract-only
+            # wording may change without changing the generated ABI or wire
+            # implementation, so keep checked-in artifacts byte-stable while
+            # still comparing every non-comment header line and every C byte.
+            if [ "$suffix" = "pb-c.h" ] &&
+                    diff -q \
+                        -I '^[[:space:]]*/\*' \
+                        -I '^[[:space:]]*\*' \
+                        -I '^[[:space:]]*\*/' \
+                        "$committed" "$candidate" >/dev/null; then
+                continue
+            fi
             echo "generated protobuf differs: $generated.$suffix" >&2
             diff -u "$committed" "$candidate" || true
             exit 1

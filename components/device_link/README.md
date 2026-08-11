@@ -22,6 +22,9 @@ from P0 is retained under `probe/` for evidence only and is not built.
 commit in `proto.lock`. `scripts/check_generated.sh` re-generates from the
 contract worktree and fails when the contract commit does not match the lock
 or the worktree is dirty, so generation is reproducible from clean commits.
+Generated C bytes and non-comment header declarations are compared exactly;
+contract wording copied only into protobuf-c header comments does not churn the
+checked-in generated files when the wire schema and generated ABI are unchanged.
 
 ## Host tests
 
