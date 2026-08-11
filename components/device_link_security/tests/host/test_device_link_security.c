@@ -10,13 +10,108 @@
 #include "nv_storage.h"
 #include "protocomm_security.h"
 #include "protocomm_security2.h"
+#include "session.pb-c.h"
 
 #define TEST_POP "window-pop-secret"
 #define TEST_USERNAME "microtech"
+#define TEST_AUTH_KEY "dls.auth"
+#define TEST_REVOKE_KEY "dls.revoke"
+#define TEST_SEC2_PUBLIC_KEY_BYTES 384U
+#define TEST_SEC2_PROOF_BYTES 64U
+#define TEST_SEC2_NONCE_BYTES 12U
 
 /* Peer identity used by the committed record in the selection tests. */
 static const uint8_t TEST_PEER_ADDR[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES] =
 {0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5};
+
+static uint8_t s_cmd0_wire[512];
+static size_t s_cmd0_wire_len;
+static uint8_t s_cmd1_wire[128];
+static size_t s_cmd1_wire_len;
+
+static size_t _pack_handshake_request(
+    device_link_security_handshake_stage_t stage,
+    uint8_t *out, size_t capacity)
+{
+    static uint8_t username[] = TEST_USERNAME;
+    static uint8_t public_key[TEST_SEC2_PUBLIC_KEY_BYTES] = {0x10, 0x20, 0x30, 0x40};
+    static uint8_t proof[TEST_SEC2_PROOF_BYTES] = {0x50, 0x60, 0x70};
+    S2SessionCmd0 cmd0 = S2_SESSION_CMD0__INIT;
+    S2SessionCmd1 cmd1 = S2_SESSION_CMD1__INIT;
+    Sec2Payload payload = SEC2_PAYLOAD__INIT;
+    SessionData session = SESSION_DATA__INIT;
+
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme2;
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    if (stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0)
+    {
+        cmd0.client_username.data = username;
+        cmd0.client_username.len = sizeof(username) - 1U;
+        cmd0.client_pubkey.data = public_key;
+        cmd0.client_pubkey.len = sizeof(public_key);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Command0;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SC0;
+        payload.sc0 = &cmd0;
+    }
+    else
+    {
+        cmd1.client_proof.data = proof;
+        cmd1.client_proof.len = sizeof(proof);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Command1;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SC1;
+        payload.sc1 = &cmd1;
+    }
+    const size_t packed_size = session_data__get_packed_size(&session);
+
+    assert(packed_size <= capacity);
+    assert(session_data__pack(&session, out) == packed_size);
+    return packed_size;
+}
+
+static void _prepare_handshake_wires(void)
+{
+    if (s_cmd0_wire_len == 0U)
+    {
+        s_cmd0_wire_len = _pack_handshake_request(
+                              DEVICE_LINK_SECURITY_HANDSHAKE_CMD0,
+                              s_cmd0_wire, sizeof(s_cmd0_wire));
+        s_cmd1_wire_len = _pack_handshake_request(
+                              DEVICE_LINK_SECURITY_HANDSHAKE_CMD1,
+                              s_cmd1_wire, sizeof(s_cmd1_wire));
+    }
+}
+
+static void _assert_handshake_response(
+    const uint8_t *wire, size_t wire_len,
+    device_link_security_handshake_stage_t stage)
+{
+    SessionData *session = session_data__unpack(NULL, wire_len, wire);
+
+    assert(session != NULL);
+    assert(session->sec_ver == SEC_SCHEME_VERSION__SecScheme2);
+    assert(session->proto_case == SESSION_DATA__PROTO_SEC2);
+    assert(session->sec2 != NULL);
+    if (stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0)
+    {
+        assert(session->sec2->msg ==
+               SEC2_MSG_TYPE__S2Session_Response0);
+        assert(session->sec2->payload_case ==
+               SEC2_PAYLOAD__PAYLOAD_SR0);
+        assert(session->sec2->sr0 != NULL);
+        assert(session->sec2->sr0->status == STATUS__Success);
+    }
+    else
+    {
+        assert(session->sec2->msg ==
+               SEC2_MSG_TYPE__S2Session_Response1);
+        assert(session->sec2->payload_case ==
+               SEC2_PAYLOAD__PAYLOAD_SR1);
+        assert(session->sec2->sr1 != NULL);
+        assert(session->sec2->sr1->status == STATUS__Success);
+    }
+    session_data__free_unpacked(session, NULL);
+}
 
 static void _select_bootstrap(void)
 {
@@ -24,6 +119,22 @@ static void _select_bootstrap(void)
                1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) == ESP_OK);
     assert(device_link_security_selected_verifier() ==
            DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP);
+}
+
+static void _complete_handshake(void)
+{
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+    device_link_security_handshake_result_t result;
+
+    assert(device_link_security_handshake_ex(
+               s_cmd1_wire, s_cmd1_wire_len, &out, &out_len,
+               &result) == ESP_OK);
+    assert(result.stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1);
+    assert(result.authenticated);
+    _assert_handshake_response(
+        out, out_len, DEVICE_LINK_SECURITY_HANDSHAKE_CMD1);
+    free(out);
 }
 
 #define FAKE_SESSION (protocomm_security_handle_t)(uintptr_t)0x2000U
@@ -39,10 +150,13 @@ static char s_captured_salt[64];
 static size_t s_captured_salt_len;
 static char s_captured_verifier[512];
 static size_t s_captured_verifier_len;
-static char s_last_sec2_request[256];
+static char s_last_sec2_request[512];
 static size_t s_last_sec2_request_len;
 static uint32_t s_last_session_id;
 static bool s_fail_next_sec2;
+static unsigned s_authenticated_count;
+static bool s_authenticated_observed_state;
+static esp_err_t s_authenticated_result;
 
 static esp_err_t _fake_sec2_init(protocomm_security_handle_t *handle)
 {
@@ -94,23 +208,80 @@ static esp_err_t _fake_sec2_req_handler(
     memcpy(s_captured_verifier, params->verifier, s_captured_verifier_len);
     s_sec2_handle_count++;
     s_last_sec2_request_len = (size_t)input_length;
+    assert(s_last_sec2_request_len <= sizeof(s_last_sec2_request));
     memcpy(s_last_sec2_request, input, s_last_sec2_request_len);
     if (s_fail_next_sec2)
     {
         s_fail_next_sec2 = false;
         return ESP_ERR_INVALID_ARG;
     }
-    uint8_t *response = malloc((size_t)input_length + 2U);
+    SessionData *request = session_data__unpack(
+                               NULL, (size_t)input_length, input);
+
+    if (request == NULL ||
+            request->sec_ver != SEC_SCHEME_VERSION__SecScheme2 ||
+            request->proto_case != SESSION_DATA__PROTO_SEC2 ||
+            request->sec2 == NULL)
+    {
+        session_data__free_unpacked(request, NULL);
+        return ESP_ERR_INVALID_ARG;
+    }
+    static uint8_t public_key[TEST_SEC2_PUBLIC_KEY_BYTES] =
+    {0x44, 0x50, 0x4b};
+    static uint8_t salt[DEVICE_LINK_SECURITY_AUTH_SALT_BYTES] =
+    {0x53, 0x41, 0x4c, 0x54};
+    static uint8_t proof[TEST_SEC2_PROOF_BYTES] =
+    {0x50, 0x52, 0x4f, 0x4f, 0x46};
+    static uint8_t nonce[TEST_SEC2_NONCE_BYTES] =
+    {0x4e, 0x4f, 0x4e, 0x43, 0x45};
+    S2SessionResp0 resp0 = S2_SESSION_RESP0__INIT;
+    S2SessionResp1 resp1 = S2_SESSION_RESP1__INIT;
+    Sec2Payload payload = SEC2_PAYLOAD__INIT;
+    SessionData session = SESSION_DATA__INIT;
+
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme2;
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    if (request->sec2->msg == SEC2_MSG_TYPE__S2Session_Command0 &&
+            request->sec2->payload_case == SEC2_PAYLOAD__PAYLOAD_SC0)
+    {
+        resp0.status = STATUS__Success;
+        resp0.device_pubkey.data = public_key;
+        resp0.device_pubkey.len = sizeof(public_key);
+        resp0.device_salt.data = salt;
+        resp0.device_salt.len = sizeof(salt);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Response0;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SR0;
+        payload.sr0 = &resp0;
+    }
+    else if (request->sec2->msg == SEC2_MSG_TYPE__S2Session_Command1 &&
+             request->sec2->payload_case == SEC2_PAYLOAD__PAYLOAD_SC1)
+    {
+        resp1.status = STATUS__Success;
+        resp1.device_proof.data = proof;
+        resp1.device_proof.len = sizeof(proof);
+        resp1.device_nonce.data = nonce;
+        resp1.device_nonce.len = sizeof(nonce);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Response1;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SR1;
+        payload.sr1 = &resp1;
+    }
+    else
+    {
+        session_data__free_unpacked(request, NULL);
+        return ESP_ERR_INVALID_ARG;
+    }
+    session_data__free_unpacked(request, NULL);
+    const size_t packed_size = session_data__get_packed_size(&session);
+    uint8_t *response = malloc(packed_size);
 
     if (response == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
-    memcpy(response, input, (size_t)input_length);
-    response[input_length] = 0xaa;
-    response[input_length + 1U] = 0xbb;
+    assert(session_data__pack(&session, response) == packed_size);
     *output = response;
-    *output_length = input_length + 2;
+    *output_length = (ssize_t)packed_size;
     return ESP_OK;
 }
 
@@ -210,6 +381,7 @@ esp_err_t esp_srp_gen_salt_verifier(
 
 static void _reset_fakes(void)
 {
+    _prepare_handshake_wires();
     nv_storage_fake_reset();
     s_new_count = 0U;
     s_delete_count = 0U;
@@ -225,6 +397,9 @@ static void _reset_fakes(void)
     s_last_sec2_request_len = 0U;
     s_last_session_id = 0U;
     s_fail_next_sec2 = false;
+    s_authenticated_count = 0U;
+    s_authenticated_observed_state = false;
+    s_authenticated_result = ESP_OK;
 }
 
 static esp_err_t _echo_request(
@@ -245,6 +420,15 @@ static esp_err_t _echo_request(
     *response = out;
     *response_len = request_len + 1U;
     return ESP_OK;
+}
+
+static esp_err_t _authenticated(void *arg)
+{
+    assert(arg == &s_authenticated_count);
+    s_authenticated_count++;
+    s_authenticated_observed_state =
+        device_link_security_is_authenticated();
+    return s_authenticated_result;
 }
 
 static const device_link_security_config_t s_lifecycle_config =
@@ -276,6 +460,54 @@ static void _test_init_validation(void)
     device_link_security_deinit();
 }
 
+static void _test_real_handshake_wire_validation(void)
+{
+    _prepare_handshake_wires();
+    device_link_security_handshake_stage_t stage;
+
+    assert(s_cmd0_wire_len > 4U);
+    assert(s_cmd1_wire_len > 4U);
+    assert(device_link_security_classify_handshake(
+               s_cmd0_wire, s_cmd0_wire_len, &stage) == ESP_OK);
+    assert(stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0);
+    assert(device_link_security_classify_handshake(
+               s_cmd1_wire, s_cmd1_wire_len, &stage) == ESP_OK);
+    assert(stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1);
+
+    S2SessionCmd0 cmd0 = S2_SESSION_CMD0__INIT;
+    Sec2Payload payload = SEC2_PAYLOAD__INIT;
+    SessionData session = SESSION_DATA__INIT;
+    uint8_t wire[64];
+
+    payload.msg = SEC2_MSG_TYPE__S2Session_Command0;
+    payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SC0;
+    payload.sc0 = &cmd0;
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme1;
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    size_t wire_len = session_data__pack(&session, wire);
+
+    assert(device_link_security_classify_handshake(
+               wire, wire_len, &stage) == ESP_ERR_INVALID_ARG);
+
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme2;
+    session.proto_case = SESSION_DATA__PROTO__NOT_SET;
+    session.sec2 = NULL;
+    wire_len = session_data__pack(&session, wire);
+    assert(device_link_security_classify_handshake(
+               wire, wire_len, &stage) == ESP_ERR_INVALID_ARG);
+
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    payload.msg = SEC2_MSG_TYPE__S2Session_Command1;
+    wire_len = session_data__pack(&session, wire);
+    assert(device_link_security_classify_handshake(
+               wire, wire_len, &stage) == ESP_ERR_INVALID_ARG);
+    assert(device_link_security_classify_handshake(
+               (const uint8_t *)"not-protobuf", 12U,
+               &stage) == ESP_ERR_INVALID_ARG);
+}
+
 static void _test_bootstrap_lifecycle(void)
 {
     _reset_fakes();
@@ -293,7 +525,7 @@ static void _test_bootstrap_lifecycle(void)
     size_t out_len = 0U;
 
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
 
     /* Open the window: the adapter keeps the POP-derived salt and
@@ -314,7 +546,7 @@ static void _test_bootstrap_lifecycle(void)
     /* Handshake opens the session, passes the POP-derived salt and
      * verifier to the SRP handler, and routes to the security endpoint. */
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     assert(s_open_session_count == 1U);
     assert(s_last_session_id == 7U);
     assert(s_sec2_handle_count == 1U);
@@ -322,16 +554,21 @@ static void _test_bootstrap_lifecycle(void)
     assert(s_captured_salt[0] == 0x40);
     assert(s_captured_verifier_len == 384U);
     assert(s_captured_verifier[0] == (char)(0x77U)); /* 'w' of the pop */
-    assert(memcmp(s_last_sec2_request, "cmd0", 4U) == 0);
-    assert(out_len == 6U);
-    assert(out[4] == 0xaa);
+    assert(s_last_sec2_request_len == s_cmd0_wire_len);
+    assert(memcmp(s_last_sec2_request, s_cmd0_wire,
+                  s_cmd0_wire_len) == 0);
+    _assert_handshake_response(
+        out, out_len, DEVICE_LINK_SECURITY_HANDSHAKE_CMD0);
     free(out);
 
-    /* Not authenticated until a protected frame decrypts. */
+    /* Cmd0 establishes only the handshaking session. */
     assert(!device_link_security_is_authenticated());
 
-    /* A protected frame routes through the app endpoint and the request
-     * callback; success marks the session authenticated. */
+    /* A valid Cmd1 proof and Resp1 authenticate immediately. */
+    _complete_handshake();
+    assert(device_link_security_is_authenticated());
+
+    /* A protected frame routes through the application callback. */
     assert(device_link_security_unprotect(
                (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) == ESP_OK);
     assert(s_app_handle_count == 1U);
@@ -339,7 +576,6 @@ static void _test_bootstrap_lifecycle(void)
     /* The plaintext echo ends at byte 6 and the 16-byte fake tag follows. */
     assert(out[6] == 0x7f);
     assert(out[22] == 0x5a);
-    assert(device_link_security_is_authenticated());
     free(out);
 
     /* Closing the window removes the verifier and tears the protocomm
@@ -348,7 +584,7 @@ static void _test_bootstrap_lifecycle(void)
     assert(s_delete_count == 1U);
     assert(device_link_security_is_authenticated() == false);
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
     assert(device_link_security_unprotect(
                (const uint8_t *)"cipher", 6U, &out, &out_len) ==
@@ -390,17 +626,86 @@ static void _test_failed_handshake_closes_session(void)
     size_t out_len = 0U;
 
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
     s_fail_next_sec2 = true;
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd1", 4U, &out, &out_len) ==
+               s_cmd1_wire, s_cmd1_wire_len, &out, &out_len) ==
            ESP_ERR_INVALID_ARG);
     assert(s_close_session_count == 1U);
     assert(!device_link_security_is_authenticated());
     assert(device_link_security_unprotect(
                (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
+    device_link_security_deinit();
+}
+
+static void _test_cmd1_authentication_transition(void)
+{
+    _reset_fakes();
+    const device_link_security_config_t config =
+    {
+        .username = TEST_USERNAME,
+        .session_id = 5U,
+        .request_cb = _echo_request,
+        .request_arg = NULL,
+        .authenticated_cb = _authenticated,
+        .authenticated_arg = &s_authenticated_count,
+    };
+
+    assert(device_link_security_init(&config) == ESP_OK);
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+    device_link_security_handshake_result_t result;
+
+    assert(device_link_security_handshake_ex(
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len,
+               &result) == ESP_OK);
+    assert(result.stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0);
+    assert(!result.authenticated);
+    assert(s_authenticated_count == 0U);
+    free(out);
+
+    assert(device_link_security_handshake_ex(
+               s_cmd1_wire, s_cmd1_wire_len, &out, &out_len,
+               &result) == ESP_OK);
+    assert(result.stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1);
+    assert(result.authenticated);
+    assert(s_authenticated_count == 1U);
+    assert(s_authenticated_observed_state);
+    free(out);
+
+    /* Protected traffic consumes the established session without causing
+     * another authentication transition. */
+    assert(device_link_security_unprotect(
+               (const uint8_t *)"ciphertext-payload-22b", 22U,
+               &out, &out_len) == ESP_OK);
+    assert(s_authenticated_count == 1U);
+    free(out);
+
+    /* A fresh Cmd0 replaces the authenticated epoch. If the Cmd1 transition
+     * callback then fails, the response is discarded and the new session is
+     * closed before protected traffic can be admitted. */
+    assert(device_link_security_handshake_ex(
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len,
+               &result) == ESP_OK);
+    assert(!result.authenticated);
+    free(out);
+    s_authenticated_result = ESP_FAIL;
+    out = (uint8_t *)(uintptr_t)1U;
+    out_len = 1U;
+    assert(device_link_security_handshake_ex(
+               s_cmd1_wire, s_cmd1_wire_len, &out, &out_len,
+               &result) == ESP_FAIL);
+    assert(out == NULL);
+    assert(out_len == 0U);
+    assert(!result.authenticated);
+    assert(s_authenticated_count == 2U);
+    assert(!device_link_security_session_open());
+    assert(!device_link_security_is_authenticated());
     device_link_security_deinit();
 }
 
@@ -422,8 +727,9 @@ static void _test_explicit_session_close(void)
     size_t out_len = 0U;
 
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
+    _complete_handshake();
     assert(device_link_security_unprotect(
                (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) == ESP_OK);
     free(out);
@@ -531,8 +837,12 @@ static void _test_long_term_verifier(void)
     size_t out_len = 0U;
 
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
+    assert(device_link_security_is_authenticated() == false);
+    assert(device_link_security_erase_auth_record() == ESP_OK);
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_NOT_FOUND);
     assert(device_link_security_is_authenticated() == false);
     device_link_security_deinit();
 }
@@ -550,7 +860,7 @@ static void _test_verifier_selection(void)
     assert(device_link_security_selected_verifier() ==
            DEVICE_LINK_SECURITY_VERIFIER_NONE);
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
 
     /* Open a window: an unknown peer inside the window selects the
@@ -559,7 +869,7 @@ static void _test_verifier_selection(void)
                (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
     _select_bootstrap();
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
     device_link_security_close_session();
 
@@ -598,7 +908,7 @@ static void _test_verifier_selection(void)
            DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM);
     /* The long-term record salt/verifier back the instance. */
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     assert(s_captured_salt_len == DEVICE_LINK_SECURITY_AUTH_SALT_BYTES);
     assert(memcmp(s_captured_salt, record.salt,
                   DEVICE_LINK_SECURITY_AUTH_SALT_BYTES) == 0);
@@ -614,7 +924,7 @@ static void _test_verifier_selection(void)
     assert(device_link_security_selected_verifier() ==
            DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP);
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
     device_link_security_close_session();
 
@@ -624,7 +934,7 @@ static void _test_verifier_selection(void)
     assert(device_link_security_selected_verifier() ==
            DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM);
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
     device_link_security_close_session();
 
@@ -634,13 +944,29 @@ static void _test_verifier_selection(void)
     assert(device_link_security_selected_verifier() ==
            DEVICE_LINK_SECURITY_VERIFIER_NONE);
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) ==
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) ==
            ESP_ERR_INVALID_STATE);
 
-    /* Invalid selection arguments fail closed. */
+    /* Invalid selection arguments fail closed: type 4 is out of range,
+     * type 3 (random identity) is a legal identity. */
     assert(device_link_security_select_verifier(
-               3U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) ==
+               4U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) ==
            ESP_ERR_INVALID_ARG);
+
+    /* A pending revoke journal rejects every selection, even with a
+     * matching record and an open window. */
+    assert(device_link_security_begin_revoke() == ESP_OK);
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) ==
+           ESP_ERR_INVALID_STATE);
+    assert(device_link_security_end_revoke() == ESP_OK);
+
+    /* A journal query failure (storage read error) also fails closed:
+     * with the revoke state unknown, no verifier may be selected. */
+    nv_storage_fake_fail_next_get(ESP_FAIL);
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) ==
+           ESP_ERR_INVALID_STATE);
     assert(device_link_security_select_verifier(
                1U, NULL, 0U, true) == ESP_ERR_INVALID_ARG);
     device_link_security_deinit();
@@ -664,15 +990,16 @@ static void _test_protect_requires_authentication(void)
     size_t out_len = 0U;
 
     assert(device_link_security_handshake(
-               (const uint8_t *)"cmd0", 4U, &out, &out_len) == ESP_OK);
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
     free(out);
-    /* Handshake alone is not enough: still pending. */
+    /* Cmd0 alone is not enough: still pending. */
     assert(device_link_security_protect(
                (const uint8_t *)"plain", 5U, &cipher, &cipher_len) ==
            ESP_ERR_INVALID_STATE);
     assert(device_link_security_unprotect(
-               (const uint8_t *)"ciphertext-payload-22b", 22U, &out, &out_len) == ESP_OK);
-    free(out);
+               (const uint8_t *)"ciphertext-payload-22b", 22U,
+               &out, &out_len) == ESP_ERR_INVALID_STATE);
+    _complete_handshake();
     /* Authenticated: protect produces ciphertext with a tag. */
     assert(device_link_security_protect(
                (const uint8_t *)"plain", 5U, &cipher, &cipher_len) == ESP_OK);
@@ -687,13 +1014,16 @@ static void _test_revoke_journal(void)
 {
     nv_storage_fake_reset();
     assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    bool pending = true;
 
     /* No marker initially. */
-    assert(!device_link_security_revoke_pending());
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(!pending);
     /* Begin journals the intent; the committed record coexists until the
      * revoke completes (multi-key storage). */
     assert(device_link_security_begin_revoke() == ESP_OK);
-    assert(device_link_security_revoke_pending());
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(pending);
     device_link_security_auth_record_t record;
 
     memset(&record, 0, sizeof(record));
@@ -718,12 +1048,14 @@ static void _test_revoke_journal(void)
         record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
-    assert(device_link_security_revoke_pending());
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(pending);
     assert(device_link_security_load_auth_record(&record) == ESP_OK);
 
     /* End clears the marker without touching the record. */
     assert(device_link_security_end_revoke() == ESP_OK);
-    assert(!device_link_security_revoke_pending());
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(!pending);
     assert(device_link_security_load_auth_record(&record) == ESP_OK);
     /* Erasing a missing marker is a no-op success. */
     assert(device_link_security_end_revoke() == ESP_OK);
@@ -732,16 +1064,138 @@ static void _test_revoke_journal(void)
     device_link_security_deinit();
 }
 
+static void _test_revoke_journal_fail_closed(void)
+{
+    nv_storage_fake_reset();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    bool pending = true;
+
+    /* A failed first commit never creates a durable revoke obligation. The
+     * caller must not mutate authorization state when begin_revoke fails. */
+    nv_storage_fake_fail_next_commit(ESP_FAIL);
+    assert(device_link_security_begin_revoke() == ESP_FAIL);
+    nv_storage_fake_power_cycle();
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(!pending);
+
+    nv_storage_fake_fail_next_get(ESP_FAIL);
+    assert(device_link_security_revoke_pending(&pending) == ESP_FAIL);
+    assert(!pending);
+
+    const uint8_t malformed_marker = 0x02U;
+
+    assert(nv_storage_set_blob(TEST_REVOKE_KEY, &malformed_marker,
+                               sizeof(malformed_marker)) == ESP_OK);
+    assert(device_link_security_revoke_pending(&pending) ==
+           ESP_ERR_INVALID_STATE);
+    assert(!pending);
+    assert(device_link_security_end_revoke() == ESP_OK);
+
+    assert(device_link_security_begin_revoke() == ESP_OK);
+    nv_storage_fake_fail_next_erase(ESP_FAIL);
+    assert(device_link_security_end_revoke() == ESP_FAIL);
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(pending);
+    /* A failed erase commit leaves the durable marker intact across a crash,
+     * even though the current NVS handle can observe its staged removal. */
+    nv_storage_fake_fail_next_commit(ESP_FAIL);
+    assert(device_link_security_end_revoke() == ESP_FAIL);
+    nv_storage_fake_power_cycle();
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(pending);
+    nv_storage_fake_fail_next_set(ESP_FAIL);
+    assert(device_link_security_begin_revoke() == ESP_FAIL);
+    assert(device_link_security_revoke_pending(&pending) == ESP_OK);
+    assert(pending);
+    assert(device_link_security_end_revoke() == ESP_OK);
+    device_link_security_deinit();
+}
+
+static void _test_nv_commit_boundary(void)
+{
+    /* The durable boundary: set_blob stages, the commit inside the same
+     * call publishes, a failed commit leaves the staged value readable
+     * (NVS handle semantics) but a power cycle restores the previous
+     * committed value. */
+    uint8_t value[32];
+    uint8_t out[32];
+    size_t size = sizeof(out);
+
+    nv_storage_fake_reset();
+    /* First write succeeds and is durable. */
+    memset(value, 0x11, sizeof(value));
+    assert(nv_storage_set_blob(TEST_AUTH_KEY, value, sizeof(value)) == ESP_OK);
+    size = sizeof(out);
+    memset(out, 0, sizeof(out));
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) == ESP_OK);
+    assert(size == sizeof(value) && out[0] == 0x11U);
+
+    /* Overwrite with a failed commit: the staged value is readable... */
+    memset(value, 0x22, sizeof(value));
+    nv_storage_fake_fail_next_commit(ESP_FAIL);
+    assert(nv_storage_set_blob(TEST_AUTH_KEY, value, sizeof(value)) ==
+           ESP_FAIL);
+    size = sizeof(out);
+    memset(out, 0, sizeof(out));
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) == ESP_OK);
+    assert(out[0] == 0x22U);
+    assert(nv_storage_fake_commit_pending());
+    /* ...but a power cycle restores the previous committed value. */
+    nv_storage_fake_power_cycle();
+    assert(!nv_storage_fake_commit_pending());
+    size = sizeof(out);
+    memset(out, 0, sizeof(out));
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) == ESP_OK);
+    assert(out[0] == 0x11U);
+
+    /* A failed commit of an erase stages the removal: reads see the erase
+     * (NVS handle semantics), and a power cycle restores the committed
+     * value. */
+    nv_storage_fake_fail_next_commit(ESP_FAIL);
+    assert(nv_storage_erase_key(TEST_AUTH_KEY) == ESP_FAIL);
+    size = sizeof(out);
+    memset(out, 0, sizeof(out));
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) ==
+           ESP_ERR_NVS_NOT_FOUND);
+    nv_storage_fake_power_cycle();
+    size = sizeof(out);
+    memset(out, 0, sizeof(out));
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) == ESP_OK);
+    assert(out[0] == 0x11U);
+
+    /* A committed erase is durable. */
+    assert(nv_storage_erase_key(TEST_AUTH_KEY) == ESP_OK);
+    size = sizeof(out);
+    assert(nv_storage_get_blob(TEST_AUTH_KEY, out, &size) ==
+           ESP_ERR_NVS_NOT_FOUND);
+
+    /* A staged write of a NEW key vanishes on power cycle. */
+    memset(value, 0x33, sizeof(value));
+    nv_storage_fake_fail_next_commit(ESP_FAIL);
+    assert(nv_storage_set_blob(TEST_REVOKE_KEY, value, sizeof(value)) ==
+           ESP_FAIL);
+    assert(nv_storage_fake_commit_pending());
+    nv_storage_fake_power_cycle();
+    assert(!nv_storage_fake_commit_pending());
+    size = sizeof(out);
+    assert(nv_storage_get_blob(TEST_REVOKE_KEY, out, &size) ==
+           ESP_ERR_NVS_NOT_FOUND);
+}
+
 int main(void)
 {
     _test_init_validation();
+    _test_real_handshake_wire_validation();
     _test_auth_record_persistence();
     _test_long_term_verifier();
     _test_verifier_selection();
     _test_revoke_journal();
+    _test_revoke_journal_fail_closed();
+    _test_nv_commit_boundary();
     _test_protect_requires_authentication();
     _test_bootstrap_lifecycle();
     _test_failed_handshake_closes_session();
+    _test_cmd1_authentication_transition();
     _test_explicit_session_close();
     puts("device_link_security host tests passed");
     return 0;

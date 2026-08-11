@@ -13,12 +13,20 @@ find_program(DEVICE_LINK_SECURITY_SETARCH setarch)
 get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
+set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
+set(PROTOBUF_C "$ENV{IDF_PATH}/components/protobuf-c/protobuf-c")
 
 add_executable(test_device_link_security
     test_device_link_security.c
     "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
     "${HOST_CONNECTIVITY}/freertos_host.c"
     "${COMPONENT}/src/device_link_security.c"
+    "${PROTOCOMM_PROTO}/constants.pb-c.c"
+    "${PROTOCOMM_PROTO}/sec0.pb-c.c"
+    "${PROTOCOMM_PROTO}/sec1.pb-c.c"
+    "${PROTOCOMM_PROTO}/sec2.pb-c.c"
+    "${PROTOCOMM_PROTO}/session.pb-c.c"
+    "${PROTOBUF_C}/protobuf-c/protobuf-c.c"
 )
 
 target_compile_features(test_device_link_security PRIVATE c_std_11)
@@ -26,6 +34,8 @@ target_compile_definitions(test_device_link_security PRIVATE
     _POSIX_C_SOURCE=200809L
 )
 target_include_directories(test_device_link_security PRIVATE
+    "${PROTOCOMM_PROTO}"
+    "${PROTOBUF_C}"
     "${CMAKE_CURRENT_LIST_DIR}/fakes"
     "${HOST_CONNECTIVITY}/include"
     "${COMPONENT}/include"

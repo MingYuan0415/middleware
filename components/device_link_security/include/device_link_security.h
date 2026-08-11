@@ -22,13 +22,38 @@ typedef enum
     DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM, /**< Committed authorization record. */
 } device_link_security_verifier_kind_t;
 
+/** @brief Security 2 handshake command accepted by the adapter. */
+typedef enum
+{
+    DEVICE_LINK_SECURITY_HANDSHAKE_CMD0 = 0,
+    DEVICE_LINK_SECURITY_HANDSHAKE_CMD1,
+} device_link_security_handshake_stage_t;
+
+/** @brief Result of one parsed Security 2 handshake exchange. */
+typedef struct device_link_security_handshake_result
+{
+    device_link_security_handshake_stage_t stage; /**< Accepted command. */
+    bool authenticated; /**< True only after a successful Cmd1/Resp1. */
+} device_link_security_handshake_result_t;
+
+/**
+ * @brief Parse and classify one Security 2 handshake request.
+ *
+ * This performs no session mutation. Transports use it to identify a Cmd0
+ * replacement before deciding whether the current indication slot must be
+ * retained.
+ */
+esp_err_t device_link_security_classify_handshake(
+    const uint8_t *input, size_t input_len,
+    device_link_security_handshake_stage_t *stage);
+
 /**
  * @brief Authentication transition callback.
  *
- * Invoked after the first successful decryption proves the SRP proof,
- * before the request callback dispatches the plaintext. Returns ESP_OK to
- * proceed, or an error to fail the session closed. Runs without the
- * adapter lock (the same unlocked context as the request callback).
+ * Invoked after a successful Cmd1 proof and Resp1, before the response is
+ * returned to the transport. Returns ESP_OK to accept the authenticated
+ * transition, or an error to fail the session closed. Runs without the
+ * adapter lock.
  *
  * @param[in] arg Callback argument from the configuration.
  * @return ESP_OK, or an error to fail the session closed.
@@ -73,6 +98,7 @@ typedef struct device_link_security_config
  * Creates the Protocomm instance with the Security 2 scheme and the
  * application endpoint. No verifier exists until a binding window opens
  * (or a long-term record is loaded), so handshakes fail closed meanwhile.
+ * A NULL username falls back to DEVICE_LINK_SECURITY_USERNAME.
  *
  * @param[in] config Configuration, copied.
  * @return ESP_OK or an allocation error.
@@ -102,9 +128,10 @@ esp_err_t device_link_security_open_bootstrap(
 
 /**
  * @brief Close the bootstrap verifier and rebuild the instance with the
- * long-term verifier if one is committed (P3.4b), otherwise none.
+ * long-term verifier if one is committed, otherwise none.
+ * @return ESP_OK or a verifier rebuild error.
  */
-void device_link_security_close_bootstrap(void);
+esp_err_t device_link_security_close_bootstrap(void);
 
 /**
  * @brief Select and pin the verifier for the next Security 2 handshake.
@@ -117,7 +144,8 @@ void device_link_security_close_bootstrap(void);
  * selection is pinned to the session so a later revoke or replacement
  * cannot resurrect a stale handshake.
  *
- * @param[in] peer_addr_type Peer identity address type (0-2).
+ * @param[in] peer_addr_type Peer identity address type (0-3; random
+ *                           identity type 3 is legal).
  * @param[in] peer_addr Peer identity address bytes.
  * @param[in] peer_addr_len Peer address length.
  * @param[in] pairing_window_open Local pairing window state.
@@ -142,12 +170,8 @@ device_link_security_verifier_kind_t device_link_security_selected_verifier(void
  * SessionData response, allocated by the adapter and freed by the caller
  * with free(). A success means the command was accepted; the handshake
  * sequence may still be mid-flight (command 0), so AUTHENTICATED is not
- * implied. The session becomes AUTHENTICATED only when the first
- * protected frame decrypts successfully, which the Security 2 scheme
- * only allows after the SRP proof verified. Poll
- * device_link_security_is_authenticated() after the first successful
- * protected exchange; unprotect() is permitted while pending because
- * the upstream decrypt is the proof-completion gate.
+ * implied. A successful command 1 proof and response 1 transition the
+ * session to AUTHENTICATED before this function returns.
  *
  * @param[in] input SessionData bytes.
  * @param[in] input_len Input length.
@@ -160,18 +184,41 @@ esp_err_t device_link_security_handshake(
     uint8_t **output, size_t *output_len);
 
 /**
+ * @brief Process and classify one Security 2 handshake frame.
+ *
+ * This is the structured form of device_link_security_handshake(). Both
+ * request and response are parsed as ESP-IDF SessionData/Sec2Payload; a
+ * mismatched response or unsuccessful status fails the session closed. A
+ * new Cmd0 retires any existing logical session before opening a fresh
+ * epoch.
+ *
+ * @param[in] input Serialized SessionData request.
+ * @param[in] input_len Request length.
+ * @param[out] output Allocated serialized SessionData response.
+ * @param[out] output_len Response length.
+ * @param[out] handshake_result Parsed stage and authentication result.
+ * @return ESP_OK, or an error with the current session closed.
+ */
+esp_err_t device_link_security_handshake_ex(
+    const uint8_t *input, size_t input_len,
+    uint8_t **output, size_t *output_len,
+    device_link_security_handshake_result_t *handshake_result);
+
+/**
  * @brief Decrypt and dispatch one protected application frame.
  *
  * The input is the AES-GCM ciphertext of an Envelope. The adapter
  * decrypts it, invokes the request callback with the plaintext, encrypts
  * the callback response, and returns it in @p output (freed by the
- * caller). Requires an AUTHENTICATED session; the first successful
- * decrypt is the AUTHENTICATED transition. Ciphertext of 16 bytes or
- * fewer is malformed and closes the session.
+ * caller). Requires a session authenticated by a successful Cmd1/Resp1.
+ * Ciphertext of 16 bytes or fewer is malformed and closes the session.
  *
- * All adapter entry points are serialized by an internal mutex; the
- * request callback runs while the lock is held and must not call back
- * into the adapter.
+ * All adapter entry points are serialized by an internal mutex, but the
+ * request callbacks run WITHOUT the lock and may call back into the
+ * adapter (protect, close_session, verifier transitions) without
+ * re-entering the mutex. The session identity is snapshotted under the
+ * lock and revalidated before the response is encrypted, so a session
+ * replaced during the callback fails closed.
  *
  * @param[in] input Ciphertext.
  * @param[in] input_len Ciphertext length (must exceed the 16-byte tag).
@@ -213,7 +260,7 @@ bool device_link_security_is_authenticated(void);
  * @brief Report whether a Security 2 session is established.
  *
  * True once a handshake opened the transport session; the session is
- * AUTHENTICATED only after a protected frame decrypts.
+ * AUTHENTICATED only after a successful Cmd1/Resp1.
  */
 bool device_link_security_session_open(void);
 

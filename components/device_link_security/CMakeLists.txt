@@ -8,4 +8,5 @@ idf_component_register(
         mbedtls
         mt_log
         nvs_flash
+        protobuf-c
 )

@@ -32,11 +32,19 @@ extern "C" {
 /** @brief Peer identity address length (bytes). */
 #define DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES 6U
 
+/** @brief Reserved tail bytes fixing the on-wire record size (no ABI
+ * padding is ever persisted). */
+#define DEVICE_LINK_SECURITY_AUTH_RESERVED_BYTES 1U
+
 /**
  * @brief Committed authorization record.
  *
  * The only state that grants authorization (device-link-security-v1).
  * The plaintext application password is never persisted.
+ *
+ * The record is persisted as a raw blob, so the layout is frozen: explicit
+ * reserved tail bytes replace compiler padding and the static asserts below
+ * pin every field offset. The reserved bytes are always written zeroed.
  */
 typedef struct device_link_security_auth_record
 {
@@ -48,7 +56,40 @@ typedef struct device_link_security_auth_record
     uint8_t verifier[DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES];
     uint8_t peer_addr_type; /**< BLE peer identity address type. */
     uint8_t peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES];
+    uint8_t reserved[DEVICE_LINK_SECURITY_AUTH_RESERVED_BYTES];
 } device_link_security_auth_record_t;
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#include <stddef.h>
+_Static_assert(offsetof(device_link_security_auth_record_t, magic) == 0U,
+               "auth record magic offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, schema_version) == 4U,
+    "auth record schema offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, credential_id) == 8U,
+    "auth record credential offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, device_auth_id) == 24U,
+    "auth record auth id offset");
+_Static_assert(offsetof(device_link_security_auth_record_t, salt) == 40U,
+               "auth record salt offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, verifier) == 56U,
+    "auth record verifier offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, peer_addr_type) == 440U,
+    "auth record peer type offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, peer_addr) == 441U,
+    "auth record peer addr offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, reserved) == 447U,
+    "auth record reserved offset");
+_Static_assert(
+    sizeof(device_link_security_auth_record_t) == 448U,
+    "auth record size is frozen at 448 bytes");
+#endif
 
 /**
  * @brief Check a record for a valid magic and schema version.
@@ -138,11 +179,15 @@ esp_err_t device_link_security_begin_revoke(void);
 esp_err_t device_link_security_end_revoke(void);
 
 /**
- * @brief Whether a revoke-intent marker is journaled.
+ * @brief Query whether a revoke-intent marker is journaled.
  *
- * @return True while a revoke must still be completed.
+ * A missing marker is reported as ESP_OK with @p pending set to false. Any
+ * other storage or validation error is returned so startup can fail closed.
+ *
+ * @param[out] pending True while a revoke must still be completed.
+ * @return ESP_OK, or a storage/validation error.
  */
-bool device_link_security_revoke_pending(void);
+esp_err_t device_link_security_revoke_pending(bool *pending);
 
 #ifdef __cplusplus
 }

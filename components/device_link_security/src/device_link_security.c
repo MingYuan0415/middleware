@@ -11,6 +11,7 @@
 
 #include "protocomm_security2.h"
 #include "esp_srp.h"
+#include "session.pb-c.h"
 
 #include "nvs.h"
 
@@ -75,8 +76,9 @@ static bool _device_link_security_record_valid(
         return false;
     }
     /* Persisted security material must be structurally sound: a legal
-     * peer identity and nonzero identifiers, salt, and verifier. */
-    if (record->peer_addr_type > 2U)
+     * peer identity (public, random, public identity, or random identity)
+     * and nonzero identifiers, salt, and verifier. */
+    if (record->peer_addr_type > 3U)
     {
         return false;
     }
@@ -116,6 +118,75 @@ static SemaphoreHandle_t s_mutex;
 static StaticSemaphore_t s_mutex_control;
 
 static void _device_link_security_close_session_locked(void);
+
+static esp_err_t _device_link_security_parse_handshake(
+    const uint8_t *data, size_t data_len, bool response,
+    device_link_security_handshake_stage_t *stage)
+{
+    if (data == NULL || data_len == 0U || stage == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    SessionData *session = session_data__unpack(NULL, data_len, data);
+
+    if (session == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    const Sec2Payload *payload = session->sec2;
+
+    if (session->sec_ver != SEC_SCHEME_VERSION__SecScheme2 ||
+            session->proto_case != SESSION_DATA__PROTO_SEC2 ||
+            payload == NULL)
+    {
+        goto cleanup;
+    }
+    if (!response &&
+            payload->msg == SEC2_MSG_TYPE__S2Session_Command0 &&
+            payload->payload_case == SEC2_PAYLOAD__PAYLOAD_SC0 &&
+            payload->sc0 != NULL)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD0;
+        result = ESP_OK;
+    }
+    else if (!response &&
+             payload->msg == SEC2_MSG_TYPE__S2Session_Command1 &&
+             payload->payload_case == SEC2_PAYLOAD__PAYLOAD_SC1 &&
+             payload->sc1 != NULL)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD1;
+        result = ESP_OK;
+    }
+    else if (response &&
+             payload->msg == SEC2_MSG_TYPE__S2Session_Response0 &&
+             payload->payload_case == SEC2_PAYLOAD__PAYLOAD_SR0 &&
+             payload->sr0 != NULL && payload->sr0->status == STATUS__Success)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD0;
+        result = ESP_OK;
+    }
+    else if (response &&
+             payload->msg == SEC2_MSG_TYPE__S2Session_Response1 &&
+             payload->payload_case == SEC2_PAYLOAD__PAYLOAD_SR1 &&
+             payload->sr1 != NULL && payload->sr1->status == STATUS__Success)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD1;
+        result = ESP_OK;
+    }
+
+cleanup:
+    session_data__free_unpacked(session, NULL);
+    return result;
+}
+
+esp_err_t device_link_security_classify_handshake(
+    const uint8_t *input, size_t input_len,
+    device_link_security_handshake_stage_t *stage)
+{
+    return _device_link_security_parse_handshake(
+               input, input_len, false, stage);
+}
 
 static void _device_link_security_lock(void)
 {
@@ -224,12 +295,20 @@ static void _device_link_security_teardown_sec(void)
 
 static esp_err_t _device_link_security_rebuild(void)
 {
-    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE ||
-            !_device_link_security_selection_loaded())
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
     {
         /* No verifier: no session can be established (fail closed). */
         _device_link_security_teardown_sec();
         return ESP_OK;
+    }
+    if (!_device_link_security_selection_loaded())
+    {
+        /* A non-NONE selection without slot material is an invariant
+         * violation (e.g. a load that failed after the selection was
+         * pinned): never report success for a session that cannot
+         * handshake. */
+        _device_link_security_teardown_sec();
+        return ESP_ERR_INVALID_STATE;
     }
     _device_link_security_teardown_sec();
     if (protocomm_security2.init == NULL)
@@ -264,8 +343,7 @@ static esp_err_t _device_link_security_rebuild(void)
 
 esp_err_t device_link_security_init(const device_link_security_config_t *config)
 {
-    if (config == NULL || config->username == NULL ||
-            config->request_cb == NULL)
+    if (config == NULL || config->request_cb == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -369,25 +447,29 @@ esp_err_t device_link_security_open_bootstrap(
     return result;
 }
 
-void device_link_security_close_bootstrap(void)
+esp_err_t device_link_security_close_bootstrap(void)
 {
+    esp_err_t result = ESP_OK;
+
     _device_link_security_lock();
-    if (s_security.initialized)
+    if (!s_security.initialized)
     {
-        if (s_security.selected_kind ==
-                DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
-        {
-            _device_link_security_teardown_sec();
-        }
-        _device_link_security_free_bootstrap();
-        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
-        if (s_security.lt_salt != NULL || s_security.lt_verifier != NULL)
-        {
-            s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
-        }
-        (void)_device_link_security_rebuild();
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP)
+    {
+        _device_link_security_teardown_sec();
+    }
+    _device_link_security_free_bootstrap();
+    s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+    if (s_security.lt_salt != NULL || s_security.lt_verifier != NULL)
+    {
+        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+    }
+    result = _device_link_security_rebuild();
     _device_link_security_unlock();
+    return result;
 }
 
 esp_err_t device_link_security_select_verifier(
@@ -396,12 +478,26 @@ esp_err_t device_link_security_select_verifier(
 {
     if (peer_addr == NULL ||
             peer_addr_len != DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES ||
-            peer_addr_type > 2U)
+            peer_addr_type > 3U)
     {
         return ESP_ERR_INVALID_ARG;
     }
     _device_link_security_lock();
     if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* A pending local revoke invalidates every verifier, persistent
+     * fail-closed defense: between the journal write and the port's
+     * deletion the record may already be erased, but a stale in-memory
+     * slot must not keep authenticating the revoked peer. ANY failure to
+     * determine the journal state is equally fail-closed: only a definite
+     * "no journal" allows a verifier selection. */
+    bool revoke_pending = false;
+
+    if (device_link_security_revoke_pending(&revoke_pending) != ESP_OK ||
+            revoke_pending)
     {
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
@@ -415,8 +511,16 @@ esp_err_t device_link_security_select_verifier(
     device_link_security_auth_record_t record;
 
     memset(&record, 0, sizeof(record));
-    if (device_link_security_load_auth_record(&record) == ESP_OK &&
-            _device_link_security_record_valid(&record) &&
+    const esp_err_t load_result =
+        device_link_security_load_auth_record(&record);
+
+    if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND)
+    {
+        _device_link_security_zeroize(&record, sizeof(record));
+        _device_link_security_unlock();
+        return load_result;
+    }
+    if (load_result == ESP_OK &&
             record.peer_addr_type == peer_addr_type &&
             memcmp(record.peer_addr, peer_addr,
                    DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES) == 0)
@@ -442,7 +546,15 @@ esp_err_t device_link_security_select_verifier(
     }
     else if (changed || s_security.sec_inst == NULL)
     {
-        (void)_device_link_security_rebuild();
+        const esp_err_t rebuild_result = _device_link_security_rebuild();
+
+        if (rebuild_result != ESP_OK)
+        {
+            s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+            _device_link_security_teardown_sec();
+            _device_link_security_unlock();
+            return rebuild_result;
+        }
     }
     _device_link_security_unlock();
     return ESP_OK;
@@ -463,9 +575,35 @@ esp_err_t device_link_security_handshake(
     const uint8_t *input, size_t input_len,
     uint8_t **output, size_t *output_len)
 {
-    if (input == NULL || output == NULL || output_len == NULL)
+    device_link_security_handshake_result_t handshake_result;
+
+    return device_link_security_handshake_ex(
+               input, input_len, output, output_len, &handshake_result);
+}
+
+esp_err_t device_link_security_handshake_ex(
+    const uint8_t *input, size_t input_len,
+    uint8_t **output, size_t *output_len,
+    device_link_security_handshake_result_t *handshake_result)
+{
+    if (input == NULL || output == NULL || output_len == NULL ||
+            handshake_result == NULL)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    *output = NULL;
+    *output_len = 0U;
+    memset(handshake_result, 0, sizeof(*handshake_result));
+    device_link_security_handshake_stage_t request_stage;
+    esp_err_t result = _device_link_security_parse_handshake(
+                           input, input_len, false, &request_stage);
+
+    if (result != ESP_OK)
+    {
+        _device_link_security_lock();
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return result;
     }
     _device_link_security_lock();
     if (!s_security.initialized || s_security.sec_inst == NULL ||
@@ -474,8 +612,24 @@ esp_err_t device_link_security_handshake(
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
+    if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0 &&
+            s_security.session_open)
+    {
+        _device_link_security_close_session_locked();
+    }
+    else if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1 &&
+             (!s_security.session_open || s_security.authenticated))
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_security.session_open)
     {
+        if (request_stage != DEVICE_LINK_SECURITY_HANDSHAKE_CMD0)
+        {
+            _device_link_security_unlock();
+            return ESP_ERR_INVALID_STATE;
+        }
         if (s_session_epoch >= UINT32_MAX - 1U)
         {
             /* The session generation space is exhausted: UINT32_MAX is
@@ -504,32 +658,74 @@ esp_err_t device_link_security_handshake(
     }
     uint8_t *response = NULL;
     ssize_t response_len = 0;
-    const esp_err_t result = protocomm_security2.security_req_handler(
-                                 s_security.sec_inst,
-                                 &s_security.sec_params,
-                                 s_security.config.session_id,
-                                 input, (ssize_t)input_len,
-                                 &response, &response_len, NULL);
+    result = protocomm_security2.security_req_handler(
+                 s_security.sec_inst,
+                 &s_security.sec_params,
+                 s_security.config.session_id,
+                 input, (ssize_t)input_len,
+                 &response, &response_len, NULL);
 
-    if (result != ESP_OK)
+    if (result != ESP_OK || response == NULL || response_len <= 0)
     {
-        if (response != NULL)
-        {
-            free(response);
-        }
+        free(response);
         /* A failed handshake (e.g. wrong POP or proof) closes the
          * session so no stale state accumulates. */
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
-        return result;
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
     }
-    /* The handshake sequence may still be mid-flight (cmd0 only); the
-     * session becomes AUTHENTICATED once a protected frame decrypts
-     * successfully, which the Security 2 scheme only allows after the
-     * SRP proof verified. */
+    device_link_security_handshake_stage_t response_stage;
+
+    result = _device_link_security_parse_handshake(
+                 response, (size_t)response_len, true, &response_stage);
+    if (result != ESP_OK || response_stage != request_stage)
+    {
+        free(response);
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+    }
+    const uint32_t session_epoch = s_session_epoch;
+    const protocomm_security_handle_t session_instance = s_security.sec_inst;
+    const device_link_security_authenticated_fn authenticated_cb =
+        s_security.config.authenticated_cb;
+    void *const authenticated_arg = s_security.config.authenticated_arg;
+
+    if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1)
+    {
+        s_security.authenticated = true;
+    }
+    handshake_result->stage = request_stage;
+    handshake_result->authenticated = s_security.authenticated;
     *output = response;
     *output_len = (size_t)response_len;
     _device_link_security_unlock();
+
+    if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1 &&
+            authenticated_cb != NULL)
+    {
+        result = authenticated_cb(authenticated_arg);
+        _device_link_security_lock();
+        const bool session_current =
+            s_session_epoch == session_epoch &&
+            s_security.sec_inst == session_instance &&
+            s_security.authenticated;
+
+        if (result != ESP_OK || !session_current)
+        {
+            if (session_current)
+            {
+                _device_link_security_close_session_locked();
+            }
+            free(*output);
+            *output = NULL;
+            *output_len = 0U;
+            handshake_result->authenticated = false;
+            _device_link_security_unlock();
+            return result != ESP_OK ? result : ESP_ERR_INVALID_STATE;
+        }
+        _device_link_security_unlock();
+    }
     return ESP_OK;
 }
 
@@ -552,6 +748,7 @@ esp_err_t device_link_security_unprotect(
     }
     _device_link_security_lock();
     if (!s_security.initialized || !s_security.session_open ||
+            !s_security.authenticated ||
             s_security.sec_inst == NULL ||
             protocomm_security2.decrypt == NULL ||
             protocomm_security2.encrypt == NULL)
@@ -584,49 +781,9 @@ esp_err_t device_link_security_unprotect(
      * epoch) is snapshotted under the lock and revalidated before the
      * response is encrypted, so a session replaced during the callback
      * fails closed instead of encrypting under the new session. */
-    const device_link_security_authenticated_fn authenticated_cb =
-        s_security.config.authenticated_cb;
-    void *const authenticated_arg = s_security.config.authenticated_arg;
     _device_link_security_unlock();
     uint8_t *plain_response = NULL;
     size_t plain_response_len = 0U;
-
-    if (authenticated_cb != NULL)
-    {
-        /* Validate the session again before the transition runs. */
-        _device_link_security_lock();
-        const bool session_current =
-            s_session_epoch == session_epoch &&
-            s_security.sec_inst == session_instance;
-
-        _device_link_security_unlock();
-        if (!session_current)
-        {
-            free(plain);
-            return ESP_ERR_INVALID_STATE;
-        }
-        result = authenticated_cb(authenticated_arg);
-        if (result != ESP_OK)
-        {
-            free(plain);
-            _device_link_security_lock();
-            _device_link_security_close_session_locked();
-            _device_link_security_unlock();
-            return result;
-        }
-    }
-    _device_link_security_lock();
-    const bool session_current =
-        s_session_epoch == session_epoch &&
-        s_security.sec_inst == session_instance;
-
-    _device_link_security_unlock();
-    if (!session_current)
-    {
-        /* The session was replaced while the transition ran. */
-        free(plain);
-        return ESP_ERR_INVALID_STATE;
-    }
     result = request_cb(
                  plain, (size_t)plain_len,
                  &plain_response, &plain_response_len,
@@ -659,7 +816,6 @@ esp_err_t device_link_security_unprotect(
             _device_link_security_unlock();
             return ESP_ERR_INVALID_STATE;
         }
-        s_security.authenticated = true;
         *output = NULL;
         *output_len = 0U;
         _device_link_security_unlock();
@@ -687,8 +843,6 @@ esp_err_t device_link_security_unprotect(
         _device_link_security_unlock();
         return result;
     }
-    /* A successful decrypt proves the SRP proof already verified. */
-    s_security.authenticated = true;
     *output = cipher;
     *output_len = (size_t)cipher_len;
     _device_link_security_unlock();
@@ -796,8 +950,13 @@ esp_err_t device_link_security_save_auth_record(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* The reserved tail bytes must never carry stale stack data into the
+     * persisted blob. */
+    device_link_security_auth_record_t zeroed = *record;
+
+    memset(zeroed.reserved, 0, sizeof(zeroed.reserved));
     return nv_storage_set_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
-                               record, sizeof(*record));
+                               &zeroed, sizeof(zeroed));
 }
 
 esp_err_t device_link_security_load_auth_record(
@@ -863,13 +1022,36 @@ esp_err_t device_link_security_end_revoke(void)
     return result;
 }
 
-bool device_link_security_revoke_pending(void)
+esp_err_t device_link_security_revoke_pending(bool *pending)
 {
-    uint8_t marker = 0U;
+    uint8_t marker[sizeof(s_revoke_marker)] = {0U};
     size_t size = sizeof(marker);
+    esp_err_t result;
 
-    return nv_storage_get_blob(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY,
-                               &marker, &size) == ESP_OK;
+    if (pending == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *pending = false;
+    result = nv_storage_get_blob(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY,
+                                 marker, &size);
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (size != sizeof(s_revoke_marker) ||
+            memcmp(marker, s_revoke_marker, sizeof(s_revoke_marker)) != 0)
+    {
+        _device_link_security_zeroize(marker, sizeof(marker));
+        return ESP_ERR_INVALID_STATE;
+    }
+    *pending = true;
+    _device_link_security_zeroize(marker, sizeof(marker));
+    return ESP_OK;
 }
 
 esp_err_t device_link_security_derive_long_term_verifier(
@@ -930,6 +1112,29 @@ esp_err_t device_link_security_load_long_term_verifier(void)
     const esp_err_t load_result =
         device_link_security_load_auth_record(&record);
 
+    if (load_result == ESP_ERR_NOT_FOUND)
+    {
+        const bool rebuild =
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM ||
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE;
+
+        if (s_security.selected_kind ==
+                DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM)
+        {
+            _device_link_security_teardown_sec();
+        }
+        _device_link_security_free_long_term();
+        if (rebuild)
+        {
+            s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+            const esp_err_t result = _device_link_security_rebuild();
+
+            _device_link_security_unlock();
+            return result == ESP_OK ? ESP_ERR_NOT_FOUND : result;
+        }
+        _device_link_security_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
     if (load_result != ESP_OK)
     {
         _device_link_security_unlock();
