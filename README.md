@@ -17,13 +17,17 @@
 | `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
+| `ble_runtime` | NimBLE host、静态 GATT、GAP/ADV、Device Link transport、不可变异步身份和 TX/deadline 调度的唯一底层 owner | `bt`；`device_link_security`、`freertos`、`mt_log`（私有） |
+| `device_link_security` | 使用 ESP-IDF protobuf-c 类型实现 Security 2、bootstrap/long-term verifier 和授权记录 journal | `nv_storage`、`protocomm`；`mbedtls`、`protobuf-c`（私有） |
+| `device_link_service` | 串行拥有绑定窗口、Security 2 会话、授权/清理事务、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link_security`、`event_bus` |
+| `factory_reset_service` | 持有版本化恢复出厂 journal；marker 持久化后才重启，并在全部 reset domain 与广告前置条件收敛后清除 marker | `nv_storage`；`mt_log`（私有） |
 | `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
 | `device_link` | Device Link v1 协议原语：framing 重组、冻结契约的 protobuf-c 消费代码与可复现生成校验；不拥有 NimBLE/Protocomm | `protobuf-c`（私有） |
 
 ## 目录结构
 
-每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试位于 `audio_service`、`device_link`、`nv_storage`、`power_service`、`sd_storage_service`、`time_service` 和 `weather_service` 的 `tests/host/`。
+每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试还覆盖 `ble_runtime`、`device_link_security`、`device_link_service`、`factory_reset_service` 和 `device_link`，入口均位于各组件的 `tests/host/`。
 
 ## 集成与初始化
 
@@ -51,6 +55,10 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
+- `device_link_service` worker 是 ACL、Security 2 epoch、授权事务、`link_state` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤；ACL 终态以 generation/handle 清理该 ACL 的全部 epoch，会话级失败仍核对 epoch/flow。Cmd0 只分配一次 epoch，Cmd1 在同一 epoch 认证。`link_state` 的当前值与投递 stamp 在 GATT 锁下分离，认证/CCCD 变化立即要求 fresh 值，提交或异步 completion 失败在 100 ms cooldown 后由 worker retained retry。
+- provisional/orphan/replacement cleanup 由 owner 按 100/200/400/800/1000 ms 退避保留，port 以固定 `4 + 1 overflow` 容量和物理目标合并避免队列满丢失。pending cleanup 拒绝新 ACL；live terminal cleanup 保留 session/control write fence 和 host-serialized terminate retry，公开 `link_state` 仍可读，广告仅在所有 cleanup 清空后恢复。peer-store 删除采用单次 explicit delete、逐类型 readback 和完整 host-run sticky error，持久化失败不能被同 run 的 RAM absence 冒充成功；deinit 通过双 host barrier 的 fixed-point drain 保留 revoke/cleanup 义务。
+- `ble_runtime` 的 TX scheduler 以固定 `queue_depth + 1` credit 覆盖 queued、in-flight 和待投递 completion，每个成功提交只产生一个终态。ADV START/STOP 失败保留 generation-scoped obligation，并按 100/200/400/800/1000 ms 退避；普通窗口取消使用不受 ADV 队列容量影响的通知唤醒。pairing gate 的 requested-open 与 cleanup/rejected/revoke/drain hold 独立，effective open 仅在 hold mask 为空时成立；被拒绝 ACL 在 CONNECT host callback 内先关 gate 再保留终止义务。
+- `device_link_security` 在 Cmd1 proof/Resp1 成功后立即标记认证；授权事务按 `PREPARED -> COMMIT_PROBED -> LOCALLY_CONFIRMED -> COMMITTED` 推进，本地确认同时核对 boot-scoped token 与 generation。durable Commit 的幂等结果在当前 ACL 内跨真实 long-term Security 2 重握手保留，并在 ACL 终态、replacement cutover、revoke/reset 时清除。Recovery Query 将确定不存在与 NVS/损坏记录的 ambiguous 失败分开映射。
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
 - `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。天气响应携带的 `location_key` 是服务端按 0.1° 网格派生的不透明作用域标识：同一网格恒定、不暴露坐标，key 变化即清空旧数据集并按“实时优先”全量刷新，避免跨网格的陈旧或混合快照；可选的 `district` 区县名为显示字段（本地化成功时出现、永不从设备头回显），不参与位置身份判定；缓存不落盘 key 与 district，重启后由会话定位重新建立。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
 
@@ -62,7 +70,10 @@ Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，N
 IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
 stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
 256 KiB。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
-`app_product_config_t` 在运行时传入。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，
+`app_product_config_t` 在运行时传入。恢复出厂启动先清 Wi-Fi profile，再以 gated 模式
+清 Device Link 授权、bond/CCCD 和易失状态，并在广告暂停时预取得 slow lease；全局 marker
+清除后仅解除广告 pause，再允许平台及网络继续启动。marker 清除前任一持久化、擦除或广告
+前置步骤失败均中止本次启动；清除后的物理 START 失败由 ADV owner 有界退避重试。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，
 定义于 `main/Kconfig.projbuild`。修改 Kconfig 后运行
 `idf.py reconfigure && idf.py save-defconfig && idf.py build`。
 
@@ -114,6 +125,41 @@ cmake --build /tmp/mt-device-link
 ctest --test-dir /tmp/mt-device-link --output-on-failure
 ```
 
+运行 NimBLE/Device Link runtime、Security 2 和 service owner 套件（需要先导出
+ESP-IDF v6.0.2 的 `IDF_PATH`）：
+
+```sh
+cmake -S components/ble_runtime/tests/host -B /tmp/mt-ble-runtime -G Ninja \
+    -DBLE_RUNTIME_SANITIZER=none
+cmake --build /tmp/mt-ble-runtime
+ctest --test-dir /tmp/mt-ble-runtime --output-on-failure
+
+cmake -S components/device_link_security/tests/host \
+    -B /tmp/mt-device-link-security -G Ninja \
+    -DDEVICE_LINK_SECURITY_SANITIZER=none
+cmake --build /tmp/mt-device-link-security
+ctest --test-dir /tmp/mt-device-link-security --output-on-failure
+
+cmake -S components/device_link_service/tests/host \
+    -B /tmp/mt-device-link-service -G Ninja \
+    -DDEVICE_LINK_SERVICE_SANITIZER=none
+cmake --build /tmp/mt-device-link-service
+ctest --test-dir /tmp/mt-device-link-service --output-on-failure
+```
+
+三套 sanitizer 选项均接受 `address` 或 `thread`。`ble_runtime` 套件还执行固定
+ESP-IDF v6.0.2 内部假设检查；失败时必须审查 NimBLE pairing/store/host-event 时序。
+
+运行恢复出厂 journal 的持久化、故障注入和断电恢复套件：
+
+```sh
+cmake -S components/factory_reset_service/tests/host \
+    -B /tmp/mt-factory-reset -G Ninja \
+    -DFACTORY_RESET_SERVICE_SANITIZER=none
+cmake --build /tmp/mt-factory-reset
+ctest --test-dir /tmp/mt-factory-reset --output-on-failure
+```
+
 运行 audio 和 SD 生命周期套件：
 
 ```sh
@@ -126,7 +172,7 @@ cmake --build /tmp/mt-sd
 ctest --test-dir /tmp/mt-sd --output-on-failure
 ```
 
-`NV_STORAGE_SANITIZER`、`TIME_SERVICE_SANITIZER` 和 `POWER_SERVICE_SANITIZER` 支持 `none`、`address` 和 `thread`；切换 sanitizer 时使用独立构建目录。x86_64 上若存在 `setarch`，CTest 会为 TSan 测试自动关闭 ASLR。QMI8658C、SDSPI partial rollback、ES8311 板级生命周期、PCF85063 alarm 和 AXP2101 profile 由 `layers/bsp/tests/host` 覆盖；`layers/app_manager/app_core/tests/host` 校验 BSP TE 参数到 adapter TE sync 的映射。所有硬件行为仍需随整机工程构建并按风险上板验证。
+所有列出的 `*_SANITIZER` 选项支持 `none`、`address` 和 `thread`；切换 sanitizer 时使用独立构建目录。x86_64 上若存在 `setarch`，CTest 会为 TSan 测试自动关闭 ASLR。QMI8658C、SDSPI partial rollback、ES8311 板级生命周期、PCF85063 alarm 和 AXP2101 profile 由 `layers/bsp/tests/host` 覆盖；`layers/app_manager/app_core/tests/host` 校验 BSP TE 参数到 adapter TE sync 的映射。所有硬件行为仍需随整机工程构建并按风险上板验证。
 
 ## 许可证
 
