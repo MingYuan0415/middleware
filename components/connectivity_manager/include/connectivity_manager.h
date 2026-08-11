@@ -136,6 +136,16 @@ esp_err_t connectivity_manager_init(
     const connectivity_manager_config_t *config);
 
 /**
+ * @brief Idempotently erase the persisted Wi-Fi profile before init.
+ *
+ * This reset-domain API owns the private profile key and excludes a racing
+ * manager initialization through the lifecycle state machine.
+ *
+ * @return ESP_OK when absent or erased; otherwise a lifecycle or NVS error.
+ */
+esp_err_t connectivity_manager_clear_persisted_profile(void);
+
+/**
  * @brief Stop the policy worker and release the low-level radio executor.
  *
  * @param timeout_ms is the total wait or CONNECTIVITY_MANAGER_WAIT_FOREVER.

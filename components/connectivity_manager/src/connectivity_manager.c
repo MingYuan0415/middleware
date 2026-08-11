@@ -77,6 +77,7 @@ typedef enum
 typedef enum
 {
     MANAGER_LIFECYCLE_OFFLINE = 0,
+    MANAGER_LIFECYCLE_STORAGE_RESETTING,
     MANAGER_LIFECYCLE_INITIALIZING,
     MANAGER_LIFECYCLE_RUNNING,
     MANAGER_LIFECYCLE_STOPPING,
@@ -2232,6 +2233,29 @@ static void _manager_release_resources(void)
                          sizeof(s_manager.command_pool));
     memset(s_manager.command_pool_used, 0,
            sizeof(s_manager.command_pool_used));
+}
+
+esp_err_t connectivity_manager_clear_persisted_profile(void)
+{
+    int expected = MANAGER_LIFECYCLE_OFFLINE;
+
+    if (!atomic_compare_exchange_strong_explicit(
+                &s_manager_lifecycle, &expected,
+                MANAGER_LIFECYCLE_STORAGE_RESETTING,
+                memory_order_acq_rel, memory_order_acquire))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = nv_storage_erase_key(
+                           CONNECTIVITY_MANAGER_PROFILE_KEY);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        result = ESP_OK;
+    }
+    atomic_store_explicit(&s_manager_lifecycle, MANAGER_LIFECYCLE_OFFLINE,
+                          memory_order_release);
+    return result;
 }
 
 esp_err_t connectivity_manager_init(
