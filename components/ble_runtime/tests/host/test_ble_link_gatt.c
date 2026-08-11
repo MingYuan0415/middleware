@@ -274,6 +274,28 @@ static void test_att_mtu_clamped(void)
     TEST_ASSERT_EQUAL(23U, facts_mtu);
 }
 
+static void test_identity_update_preserves_current_acl_mtu(void)
+{
+    static const uint8_t identity[6] = {1U, 2U, 3U, 4U, 5U, 6U};
+    uint32_t facts_mtu = 0U;
+
+    _reset();
+    ble_link_gatt_set_att_mtu(498U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_update_identity(
+                          GEN, 7U, 0U, identity));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(498U, facts_mtu);
+
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, ble_link_gatt_update_identity(
+                          GEN + 1U, 7U, 0U, identity));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, ble_link_gatt_update_identity(
+                          GEN, 8U, 0U, identity));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_gatt_update_identity(
+                          GEN, 7U, 0U, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(498U, facts_mtu);
+}
+
 static void test_registered_characteristics(void)
 {
     /* link_state first. */
@@ -631,6 +653,7 @@ static void test_idle_timeout_wired(void)
 int main(void)
 {
     test_att_mtu_clamped();
+    test_identity_update_preserves_current_acl_mtu();
     test_registered_characteristics();
     test_registered_profile_uuids();
     test_write_feeds_service();

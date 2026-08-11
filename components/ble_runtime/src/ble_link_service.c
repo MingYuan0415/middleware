@@ -187,7 +187,9 @@ typedef struct ble_link_ingress
     uint8_t session_buffer[BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
     uint8_t control_buffer[BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES];
     uint32_t generation;
+    uint16_t conn_handle;
     uint32_t epoch;
+    bool retired;
     bool exhausted;
 } ble_link_ingress_t;
 
@@ -928,8 +930,9 @@ bool ble_link_service_delayed_replacement_pending(uint32_t generation)
  * ingress generation before any work executes, so its idle timeout must be
  * able to abort the stale session state it carries. With no facts at all
  * (nothing ever fed or executed) every generation is treated as current
- * because there is nothing to protect. Only a generation older than both
- * recorded generations is stale and ignored.
+ * because there is nothing to protect. A terminally retired ingress is never
+ * current again. Only a generation older than both active recorded
+ * generations is stale and ignored.
  */
 static bool _ble_link_service_generation_current(uint32_t generation)
 {
@@ -942,7 +945,7 @@ static bool _ble_link_service_generation_current(uint32_t generation)
         return true;
     }
     return generation == facts_generation ||
-           generation == ingress_generation;
+           (!s_ingress.retired && generation == ingress_generation);
 }
 
 /**
@@ -2640,8 +2643,10 @@ static void _ble_link_service_clear_session_state_locked(bool retire_acl)
     const uint32_t generation =
         s_service.current_facts.connection_generation;
 
-    _ble_link_service_discard_provisional_bond(
-        generation, true);
+    if (generation != 0U)
+    {
+        _ble_link_service_discard_provisional_bond(generation, true);
+    }
     s_service.pending_transactions = 0U;
     s_service.completion.pending = false;
     s_service.completion.flow_id = 0U;
@@ -2725,10 +2730,15 @@ esp_err_t ble_link_service_clear_session_state_if_current(
         identity->kind == BLE_LINK_OPERATION_DISCONNECT ||
         identity->kind == BLE_LINK_OPERATION_RESET ||
         identity->kind == BLE_LINK_OPERATION_TERMINATE;
-    bool current =
+    const bool current_facts =
         s_service.current_facts.connection_generation ==
         identity->generation &&
         s_service.current_facts.conn_handle == identity->conn_handle;
+    const bool current_ingress =
+        !s_ingress.retired &&
+        s_ingress.generation == identity->generation &&
+        s_ingress.conn_handle == identity->conn_handle;
+    bool current = current_facts || (retire_acl && current_ingress);
 
     /* An ACL terminal event has generation+handle authority over every
      * Security 2 epoch on that ACL. This closes a Cmd0 that advanced the
@@ -2752,6 +2762,12 @@ esp_err_t ble_link_service_clear_session_state_if_current(
         return ESP_ERR_NOT_FOUND;
     }
     _ble_link_service_clear_session_state_locked(retire_acl);
+    if (retire_acl && current_ingress)
+    {
+        /* Preserve the generation floor while ensuring a repeated terminal
+         * callback and any same-generation ingress are permanent no-ops. */
+        s_ingress.retired = true;
+    }
     _ble_link_service_unlock();
     return ESP_OK;
 }
@@ -2943,6 +2959,8 @@ static esp_err_t _ble_link_service_accept_locked(
     ble_link_work_t **out_work)
 {
     if (facts == NULL || value == NULL || s_service.output == NULL ||
+            facts->connection_generation == 0U ||
+            facts->conn_handle == UINT16_MAX ||
             (channel != BLE_LINK_SERVICE_RX_SESSION &&
              channel != BLE_LINK_SERVICE_RX_CONTROL))
     {
@@ -2951,6 +2969,11 @@ static esp_err_t _ble_link_service_accept_locked(
     if (s_ingress.exhausted)
     {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (facts->connection_generation == s_ingress.generation &&
+            s_ingress.retired)
+    {
+        return ESP_OK;
     }
     if (facts->connection_generation != s_ingress.generation)
     {
@@ -2965,6 +2988,15 @@ static esp_err_t _ble_link_service_accept_locked(
             return ESP_ERR_INVALID_STATE;
         }
         s_ingress.generation = facts->connection_generation;
+        s_ingress.conn_handle = facts->conn_handle;
+        s_ingress.retired = false;
+    }
+    else if (facts->connection_generation != 0U &&
+             facts->conn_handle != s_ingress.conn_handle)
+    {
+        /* One generation names exactly one ACL. A reused handle receives a
+         * new generation before any ingress can be admitted. */
+        return ESP_ERR_INVALID_STATE;
     }
     ble_link_reassembler_t *slot = &s_ingress.reassembler[channel];
     const size_t slot_capacity =

@@ -54,9 +54,9 @@ void ble_link_sec_state_reset(ble_link_sec_state_t *state);
  * @brief Feed a CONNECT event.
  *
  * @param[in] window_open Pairing window state at connect time.
- * @param[in] identity_ready True when the connection address is already
- *                           the identity (non-RPA), false for an RPA peer
- *                           whose identity resolves later.
+ * @param[in] identity_ready True when the descriptor contains a normalized
+ *                           public or static-random identity, false while the
+ *                           identity is unresolved or otherwise invalid.
  * @param[in] had_bond Store held a bond for the (possibly unresolved)
  *                     identity; only meaningful when identity_ready.
  * @param[in] bonded Connection reports a stored bond.
@@ -95,6 +95,25 @@ uint32_t ble_link_sec_state_on_encrypted(
     ble_link_sec_state_t *state, bool encrypted, bool bonded,
     bool bond_verified);
 
+/**
+ * @brief Reconcile the latest NimBLE connection descriptor snapshot.
+ *
+ * Fresh pairing publishes the normalized identity before NimBLE persists the
+ * peer and local keys, so the identity callback cannot verify the bond yet.
+ * The final ENC_CHANGE descriptor is authoritative after key persistence;
+ * reconciling both facts admits that same ACL without a reconnect.
+ *
+ * @param[in,out] state Security admission accumulator.
+ * @param[in] identity_ready Descriptor contains a normalized identity.
+ * @param[in] encrypted Link encryption is active.
+ * @param[in] bonded Connection reports a stored bond.
+ * @param[in] bond_verified Store bond material is valid.
+ * @return Combined action mask.
+ */
+uint32_t ble_link_sec_state_reconcile_snapshot(
+    ble_link_sec_state_t *state, bool identity_ready, bool encrypted,
+    bool bonded, bool bond_verified);
+
 /** @brief Feed a disconnect or host reset; resets all facts. */
 uint32_t ble_link_sec_state_on_disconnect(ble_link_sec_state_t *state);
 
@@ -102,6 +121,16 @@ uint32_t ble_link_sec_state_on_disconnect(ble_link_sec_state_t *state);
  * @brief Whether the terminal decision admitted the peer as known.
  */
 bool ble_link_sec_state_peer_admitted(const ble_link_sec_state_t *state);
+
+/**
+ * @brief Whether this ACL created a newly verified provisional bond.
+ *
+ * The prior-bond fact is frozen at CONNECT. This predicate becomes true only
+ * after the current ACL has produced a verified bond, never merely because an
+ * unbonded connection candidate was accepted.
+ */
+bool ble_link_sec_state_provisional_bond_verified(
+    const ble_link_sec_state_t *state);
 
 #ifdef __cplusplus
 }

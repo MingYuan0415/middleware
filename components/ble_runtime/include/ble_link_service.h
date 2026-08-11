@@ -281,11 +281,12 @@ void ble_link_service_clear_session_state(void);
 /**
  * @brief Clear session state only when an immutable host identity is current.
  *
- * The generation and connection handle are always checked while holding the
- * service owner lock. Session-only failures also require an exact Security 2
- * epoch. ACL-terminal DISCONNECT, RESET, and TERMINATE operations deliberately
- * cover every epoch of that exact ACL, including a Cmd0 that advanced while
- * the terminal event waited for the owner lock.
+ * The generation and connection handle are checked against both executed
+ * facts and accepted ingress while holding the service owner lock. Session-
+ * only failures also require an exact Security 2 epoch. ACL-terminal
+ * DISCONNECT, RESET, and TERMINATE operations deliberately retire queued work
+ * and cover every epoch of that exact ACL, including a Cmd0 that advanced
+ * while the terminal event waited for the owner lock.
  *
  * @param[in] identity Host operation that requires the session teardown.
  * @return ESP_OK when cleared, ESP_ERR_NOT_FOUND for a stale identity, or

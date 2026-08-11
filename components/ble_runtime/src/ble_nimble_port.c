@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -29,11 +30,15 @@
 
 #include "ble_adv_manager.h"
 #include "ble_nimble_adv_start.h"
+#include "ble_nimble_peer_identity.h"
 #include "ble_nimble_pairing_gate.h"
 #include "ble_nimble_store_guard.h"
+#include "ble_nimble_store_restore_audit.h"
+#include "ble_nimble_store_reset.h"
 #include "ble_gap_manager.h"
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
+#include "ble_nimble_port_task_config.h"
 #include "ble_port_ops.h"
 
 #include "device_link_security.h"
@@ -53,8 +58,24 @@
 
 static const char *const TAG = "ble_nimble_port";
 
+_Static_assert(BLE_ADDR_PUBLIC == BLE_NIMBLE_PEER_ADDR_PUBLIC,
+               "NimBLE public address type changed");
+_Static_assert(BLE_ADDR_RANDOM == BLE_NIMBLE_PEER_ADDR_RANDOM,
+               "NimBLE random address type changed");
+_Static_assert(BLE_ADDR_PUBLIC_ID == BLE_NIMBLE_PEER_ADDR_PUBLIC_ID,
+               "NimBLE public identity address type changed");
+_Static_assert(BLE_ADDR_RANDOM_ID == BLE_NIMBLE_PEER_ADDR_RANDOM_ID,
+               "NimBLE random identity address type changed");
+
+/* ESP-IDF v6.0.2 exposes this controller-privacy operation only through an
+ * internal header. The fixed source and build mode are pinned by the runtime
+ * assumptions test. */
+int ble_hs_pvcy_remove_entry(uint8_t addr_type, const uint8_t *addr);
+
 static esp_err_t _ble_nimble_port_queue_provisional_unpair(
     const ble_link_operation_identity_t *identity, bool terminate_conn);
+static esp_err_t _ble_nimble_port_queue_terminal_provisional_unpair(
+    const ble_link_operation_identity_t *terminal_identity);
 static esp_err_t _ble_nimble_port_promote_provisional_bond(
     const ble_link_operation_identity_t *identity);
 static esp_err_t _ble_nimble_port_retain_remote_replacement(
@@ -193,7 +214,6 @@ static const ble_link_security_ops_t s_security_ops =
 #define BLE_NIMBLE_PORT_ADV_QUEUE_DEPTH 4U
 #define BLE_NIMBLE_PORT_ADV_TASK_STACK 2048U
 #define BLE_NIMBLE_PORT_ADV_TASK_PRIORITY 2U
-#define BLE_NIMBLE_PORT_LINK_TIMER_STACK 1024U
 #define BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY 1U
 #define BLE_NIMBLE_PORT_SECURITY_COMMAND_DELAY_MS 50U
 #define BLE_NIMBLE_PORT_OWNER_QUIT_SEND_MS 100U
@@ -215,14 +235,14 @@ static const ble_link_security_ops_t s_security_ops =
  *
  * @param[in] identity Exact connection and Security 2 operation identity.
  */
-static void _ble_nimble_port_link_abort(
+static esp_err_t _ble_nimble_port_link_abort(
     const ble_link_operation_identity_t *identity)
 {
     if (identity == NULL || identity->generation == 0U)
     {
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
-    (void)ble_link_service_clear_session_state_if_current(identity);
+    return ble_link_service_clear_session_state_if_current(identity);
 }
 
 static void _ble_nimble_port_zeroize(void *data, size_t size)
@@ -278,6 +298,7 @@ typedef struct ble_nimble_port
     bool deinit_failed;
     esp_err_t deinit_error;
     ble_nimble_store_guard_t storage_guard;
+    ble_nimble_store_callback_guard_t store_write_guard;
     int stop_result;
 } ble_nimble_port_t;
 
@@ -474,6 +495,8 @@ static bool _ble_nimble_port_bond_store_verified(
 static bool _ble_nimble_port_pairing_window_open(void);
 static void _ble_nimble_port_latch_storage_error(esp_err_t error);
 static esp_err_t _ble_nimble_port_storage_error_load(void);
+static esp_err_t _ble_nimble_port_audit_store_restore(void);
+static esp_err_t _ble_nimble_port_reconcile_sync_storage(void);
 static esp_err_t _ble_nimble_port_gap_handle_event(
     const ble_gap_manager_event_t *event);
 static esp_err_t _ble_nimble_port_gap_snapshot(
@@ -499,11 +522,15 @@ static esp_err_t _ble_nimble_port_promote_provisional_bond(
 static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr);
 static int _ble_nimble_port_store_status(
     struct ble_store_status_event *event, void *arg);
-static esp_err_t _ble_nimble_port_reconcile_storage(void);
 static esp_err_t _ble_nimble_port_reconcile_storage_locked(void);
 static esp_err_t _ble_nimble_port_execute_revoke_locked(void);
+static esp_err_t _ble_nimble_port_resume_revoke_locked(void);
 static esp_err_t _ble_nimble_port_invalidate_authorization(void);
 static esp_err_t _ble_nimble_port_delete_all_bonds(void);
+static esp_err_t _ble_nimble_port_clear_runtime_store(void *context);
+static esp_err_t _ble_nimble_port_erase_store_namespace(void);
+static esp_err_t _ble_nimble_port_reset_erase_namespace(void *context);
+static esp_err_t _ble_nimble_port_reset_audit_empty(void *context);
 static esp_err_t _ble_nimble_port_collect_residuals(
     int obj_type, ble_addr_t *peers, size_t *count, size_t capacity);
 static esp_err_t _ble_nimble_port_execute_revoke(void);
@@ -1093,6 +1120,150 @@ static void _ble_nimble_port_latch_storage_error(esp_err_t error)
 static esp_err_t _ble_nimble_port_storage_error_load(void)
 {
     return ble_nimble_store_guard_error(&s_port.storage_guard);
+}
+
+typedef struct ble_nimble_port_store_audit_context
+{
+    nvs_handle_t handle;
+    bool namespace_present;
+} ble_nimble_port_store_audit_context_t;
+
+static esp_err_t _ble_nimble_port_probe_store_blob(
+    void *context, const char *key, bool *out_present)
+{
+    ble_nimble_port_store_audit_context_t *audit = context;
+
+    if (audit == NULL || key == NULL || out_present == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_present = false;
+    if (!audit->namespace_present)
+    {
+        return ESP_OK;
+    }
+    size_t required_size = 0U;
+    const esp_err_t result = nvs_get_blob(
+                                 audit->handle, key, NULL, &required_size);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    *out_present = true;
+    return ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_count_restored_store(
+    void *context, int object_type, size_t *out_count)
+{
+    (void)context;
+    if (out_count == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int count = 0;
+    const int result = ble_store_util_count(object_type, &count);
+
+    if (result != 0 || count < 0)
+    {
+        return ESP_FAIL;
+    }
+    *out_count = (size_t)count;
+    return ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_audit_store_restore(void)
+{
+    static const ble_nimble_store_restore_family_t s_families[] =
+    {
+        {"our_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_OUR_SEC},
+        {"peer_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_PEER_SEC},
+        {"cccd_sec", CONFIG_BT_NIMBLE_MAX_CCCDS, BLE_STORE_OBJ_TYPE_CCCD},
+        {"csfc_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_CSFC},
+        {
+            "local_irk", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_LOCAL_IRK
+        },
+        {
+            "rpa_rec", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_PEER_ADDR
+        },
+    };
+    ble_nimble_port_store_audit_context_t context = {0};
+    esp_err_t result = nvs_open(
+                           "nimble_bond", NVS_READONLY, &context.handle);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        result = ESP_OK;
+    }
+    else if (result != ESP_OK)
+    {
+        return result;
+    }
+    else
+    {
+        context.namespace_present = true;
+    }
+    const ble_nimble_store_restore_audit_ops_t ops =
+    {
+        .probe = _ble_nimble_port_probe_store_blob,
+        .count = _ble_nimble_port_count_restored_store,
+        .context = &context,
+    };
+
+    result = ble_nimble_store_restore_audit(
+                 s_families, sizeof(s_families) / sizeof(s_families[0]),
+                 &ops);
+    if (context.namespace_present)
+    {
+        nvs_close(context.handle);
+    }
+    return result;
+}
+
+static int _ble_nimble_port_store_write(
+    int object_type, const union ble_store_value *value)
+{
+    if (s_port.store_write_guard.original == NULL)
+    {
+        return BLE_HS_ENOTSUP;
+    }
+    if (_ble_nimble_port_storage_error_load() != ESP_OK)
+    {
+        return BLE_HS_ESTORE_FAIL;
+    }
+    const int result =
+        s_port.store_write_guard.original(object_type, value);
+
+    return ble_nimble_store_guard_record_write_result(
+               &s_port.storage_guard, result, BLE_HS_ESTORE_CAP);
+}
+
+static esp_err_t _ble_nimble_port_install_store_write_guard(void)
+{
+    return ble_nimble_store_callback_guard_install(
+               &s_port.store_write_guard, &ble_hs_cfg.store_write_cb,
+               _ble_nimble_port_store_write);
+}
+
+static esp_err_t _ble_nimble_port_reconcile_store_write_guard(void)
+{
+    return ble_nimble_store_callback_guard_reconcile(
+               &s_port.store_write_guard, &ble_hs_cfg.store_write_cb,
+               _ble_nimble_port_store_write);
+}
+
+static void _ble_nimble_port_restore_store_write(void)
+{
+    ble_nimble_store_callback_guard_restore(
+        &s_port.store_write_guard, &ble_hs_cfg.store_write_cb,
+        _ble_nimble_port_store_write);
 }
 
 static esp_err_t _ble_nimble_port_gap_handle_event(
@@ -2128,7 +2299,32 @@ static void _ble_nimble_port_link_gatt_consumer(
      * identity under its own lock before closing the adapter session. */
     if (teardown)
     {
-        _ble_nimble_port_link_abort(&teardown_identity);
+        const esp_err_t teardown_result =
+            _ble_nimble_port_link_abort(&teardown_identity);
+
+        if (teardown_result != ESP_OK &&
+                teardown_result != ESP_ERR_NOT_FOUND)
+        {
+            LOG_E("session teardown failed result=%d", teardown_result);
+        }
+        if (teardown_identity.kind == BLE_LINK_OPERATION_DISCONNECT ||
+                teardown_identity.kind == BLE_LINK_OPERATION_RESET)
+        {
+            /* The service mutex has now linearized any durable Commit. Keep a
+             * port-owned, idempotent physical fallback for an ACL that never
+             * established current_facts or whose service callback has not yet
+             * transferred the provisional cleanup obligation. */
+            const esp_err_t cleanup_result =
+                _ble_nimble_port_queue_terminal_provisional_unpair(
+                    &teardown_identity);
+
+            if (cleanup_result != ESP_OK &&
+                    cleanup_result != ESP_ERR_NOT_FOUND)
+            {
+                LOG_E("terminal provisional cleanup failed result=%d",
+                      cleanup_result);
+            }
+        }
     }
     /* Host callbacks only retain the refresh fact and wake the Device Link
      * owner. Encoding, submission, and delivery-stamp mutation stay in the
@@ -2378,8 +2574,11 @@ static esp_err_t _ble_nimble_port_tx_manager_init(void)
 static bool _ble_nimble_port_bond_store_verified(
     const struct ble_gap_conn_desc *desc)
 {
-    if (desc == NULL || !desc->sec_state.encrypted ||
-            !desc->sec_state.bonded)
+    if (_ble_nimble_port_storage_error_load() != ESP_OK ||
+            desc == NULL || !desc->sec_state.encrypted ||
+            !desc->sec_state.bonded ||
+            !ble_nimble_peer_identity_valid(
+                desc->peer_id_addr.type, desc->peer_id_addr.val))
     {
         return false;
     }
@@ -2420,8 +2619,8 @@ static bool _ble_nimble_port_pairing_window_open(void)
 
 static bool _ble_nimble_port_peer_address_valid(const ble_addr_t *address)
 {
-    /* NimBLE address types: public, random, public identity, and random
-     * identity (BLE_ADDR_RANDOM_ID == 3) are all legal identities. */
+    /* Accept every NimBLE public/random address container here. Identity-
+     * specific static-random validation is applied by the helper below. */
     if (address == NULL || address->type > 3U)
     {
         return false;
@@ -2435,25 +2634,49 @@ static bool _ble_nimble_port_peer_address_valid(const ble_addr_t *address)
     return nonzero;
 }
 
-static void _ble_nimble_port_track_provisional_connection(
-    uint32_t generation, uint16_t conn_handle, bool had_bond,
+static void _ble_nimble_port_track_provisional_candidate(
+    uint32_t generation, uint16_t conn_handle,
     bool identity_ready, const ble_addr_t *peer_id_addr)
 {
     if (s_link_state_lock != NULL)
     {
         (void)xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY);
     }
-    s_provisional_bond = !had_bond;
+    /* A connection without a prior bond is only a candidate. Mark an actual
+     * provisional bond after the admission reducer observes durable key
+     * material; disconnecting before SMP must not manufacture cleanup work. */
+    s_provisional_bond = false;
     s_provisional_bond_promoted = false;
     s_provisional_cleanup_queued = false;
     s_provisional_generation = generation;
     s_provisional_conn_handle = conn_handle;
     s_provisional_peer_valid = identity_ready &&
-                               _ble_nimble_port_peer_address_valid(peer_id_addr);
+                               ble_nimble_peer_identity_valid(
+                                   peer_id_addr->type, peer_id_addr->val);
     memset(&s_provisional_peer, 0, sizeof(s_provisional_peer));
     if (s_provisional_peer_valid)
     {
         s_provisional_peer = *peer_id_addr;
+    }
+    if (s_link_state_lock != NULL)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+    }
+}
+
+static void _ble_nimble_port_mark_provisional_bond(
+    uint32_t generation, uint16_t conn_handle)
+{
+    if (s_link_state_lock != NULL)
+    {
+        (void)xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY);
+    }
+    if (generation != 0U && generation == s_provisional_generation &&
+            conn_handle == s_provisional_conn_handle &&
+            !s_provisional_bond_promoted &&
+            !s_provisional_cleanup_queued)
+    {
+        s_provisional_bond = true;
     }
     if (s_link_state_lock != NULL)
     {
@@ -2470,7 +2693,8 @@ static void _ble_nimble_port_update_provisional_identity(
     }
     if (s_provisional_generation == generation &&
             s_provisional_conn_handle == conn_handle &&
-            _ble_nimble_port_peer_address_valid(peer_id_addr))
+            ble_nimble_peer_identity_valid(
+                peer_id_addr->type, peer_id_addr->val))
     {
         s_provisional_peer = *peer_id_addr;
         s_provisional_peer_valid = true;
@@ -2517,6 +2741,12 @@ static void _ble_nimble_port_apply_sec_actions(
     {
         generation = snapshot.generation;
     }
+    if ((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U &&
+            ble_link_sec_state_provisional_bond_verified(
+                &s_link_sec_state))
+    {
+        _ble_nimble_port_mark_provisional_bond(generation, conn_handle);
+    }
     if ((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U)
     {
         (void)ble_link_session_handle_event(
@@ -2559,7 +2789,9 @@ static void _ble_nimble_port_apply_sec_actions(
 static bool _ble_nimble_port_peer_has_bond(
     const struct ble_gap_conn_desc *desc)
 {
-    if (desc == NULL)
+    if (desc == NULL ||
+            !ble_nimble_peer_identity_valid(
+                desc->peer_id_addr.type, desc->peer_id_addr.val))
     {
         return false;
     }
@@ -2584,11 +2816,22 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
     {
         return BLE_HS_ESTORE_FAIL;
     }
+    /* Remove the controller resolving-list entry while the normalized peer
+     * identity is still available. Calling ble_gap_unpair() after deleting
+     * the store cannot do this in controller-privacy mode because it first
+     * looks the IRK up in PEER_SEC. An absent entry is already converged. */
+    const int privacy_result = ble_hs_pvcy_remove_entry(
+                                   peer_id_addr->type, peer_id_addr->val);
+
+    if (privacy_result != 0 &&
+            privacy_result != BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID))
+    {
+        LOG_W("peer privacy cleanup failed result=%d", privacy_result);
+        return privacy_result;
+    }
     /* IDF v6.0.2 ble_gap_unpair() logs but discards a nonzero result from
-     * ble_store_util_delete_peer() on its normal PEER_SEC path. Perform the
-     * single explicit durable delete first and honor its result. The later
-     * gap_unpair call sees an empty store and is used only to remove the
-     * controller/privacy entry. */
+     * ble_store_util_delete_peer(). Perform the single explicit durable
+     * delete and honor its result instead. */
     int result = ble_store_util_delete_peer(peer_id_addr);
 
     if (result != 0)
@@ -2636,13 +2879,6 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
                 return BLE_HS_ESTORE_FAIL;
             }
         }
-    }
-    const int gap_result = ble_gap_unpair(peer_id_addr);
-
-    if (gap_result != 0 && gap_result != BLE_HS_ENOENT)
-    {
-        LOG_W("peer privacy cleanup failed result=%d", gap_result);
-        return gap_result;
     }
     return 0;
 }
@@ -2764,6 +3000,50 @@ static esp_err_t _ble_nimble_port_queue_provisional_unpair(
     }
     xSemaphoreGiveRecursive(s_link_state_lock);
     return result;
+}
+
+static esp_err_t _ble_nimble_port_queue_terminal_provisional_unpair(
+    const ble_link_operation_identity_t *terminal_identity)
+{
+    if (terminal_identity == NULL || terminal_identity->generation == 0U ||
+            (terminal_identity->kind != BLE_LINK_OPERATION_DISCONNECT &&
+             terminal_identity->kind != BLE_LINK_OPERATION_RESET) ||
+            s_link_state_lock == NULL ||
+            xSemaphoreTakeRecursive(s_link_state_lock,
+                                    portMAX_DELAY) != pdTRUE)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_provisional_bond || s_provisional_bond_promoted ||
+            s_provisional_cleanup_queued)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+        return ESP_OK;
+    }
+    if (terminal_identity->generation != s_provisional_generation ||
+            terminal_identity->conn_handle != s_provisional_conn_handle)
+    {
+        xSemaphoreGiveRecursive(s_link_state_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    const uint32_t token = _ble_nimble_port_next_operation_token_locked();
+
+    xSemaphoreGiveRecursive(s_link_state_lock);
+    if (token == 0U)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const ble_link_operation_identity_t cleanup_identity =
+    {
+        .generation = terminal_identity->generation,
+        .security_epoch = terminal_identity->security_epoch,
+        .token = token,
+        .kind = BLE_LINK_OPERATION_PROVISIONAL_DISCARD,
+        .conn_handle = terminal_identity->conn_handle,
+    };
+
+    return _ble_nimble_port_queue_provisional_unpair(
+               &cleanup_identity, false);
 }
 
 static esp_err_t _ble_nimble_port_promote_provisional_bond(
@@ -3068,7 +3348,8 @@ static esp_err_t _ble_nimble_port_bond_store_verified_identity(
         return ESP_ERR_INVALID_ARG;
     }
     *out_verified = false;
-    if (!_ble_nimble_port_peer_address_valid(peer_id_addr))
+    if (!ble_nimble_peer_identity_valid(
+                peer_id_addr->type, peer_id_addr->val))
     {
         return ESP_OK;
     }
@@ -3122,16 +3403,6 @@ static esp_err_t _ble_nimble_port_bond_store_verified_identity(
  * converges to unbound. A storage or reconciliation failure returns an
  * error so the runtime start fails closed instead of advertising.
  */
-static esp_err_t _ble_nimble_port_reconcile_storage(void)
-{
-    esp_err_t result;
-
-    _ble_nimble_port_storage_lock();
-    result = _ble_nimble_port_reconcile_storage_locked();
-    _ble_nimble_port_storage_unlock();
-    return result;
-}
-
 static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
 {
     device_link_security_auth_record_t record;
@@ -3316,12 +3587,35 @@ exit:
  * interrupted deletion (power cut between store records) can leave
  * PEER_SEC/CCCD/PEER_ADDR residuals behind. The sweep therefore also
  * collects every peer address visible in the residual record types and
- * deletes them, then verifies all four record types are empty before
- * reporting success. A non-empty store after the sweep is an error so the
- * caller keeps the revoke journal and fails closed.
+ * deletes them. The private NVS namespace is erased first so a malformed blob
+ * cannot make an IDF RAM-store persistence pass fail before durable deletion.
+ * The still-loaded RAM identities are then used to remove controller privacy
+ * entries and clear the public store. A final namespace erase removes anything
+ * re-persisted while clearing RAM, including keys left by older builds whose
+ * configured limits were larger. The caller may clear its revoke journal only
+ * after the empty store passes the startup durable-vs-RAM audit.
  */
 static esp_err_t _ble_nimble_port_delete_all_bonds(void)
 {
+    const ble_nimble_store_reset_ops_t ops =
+    {
+        .erase_namespace = _ble_nimble_port_reset_erase_namespace,
+        .clear_runtime = _ble_nimble_port_clear_runtime_store,
+        .audit_empty = _ble_nimble_port_reset_audit_empty,
+    };
+    const esp_err_t result = ble_nimble_store_reset_run(&ops);
+
+    if (result != ESP_OK)
+    {
+        _ble_nimble_port_latch_storage_error(result);
+        ESP_LOGW(TAG, "revoke peer-store reset failed (%d)", result);
+    }
+    return result;
+}
+
+static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
+{
+    (void)context;
     ble_addr_t peers[CONFIG_BT_NIMBLE_MAX_BONDS];
     int count = 0;
 
@@ -3407,7 +3701,45 @@ static esp_err_t _ble_nimble_port_delete_all_bonds(void)
             }
         }
     }
+    const int clear_result = ble_store_clear();
+
+    if (clear_result != 0)
+    {
+        _ble_nimble_port_latch_storage_error(ESP_FAIL);
+        ESP_LOGW(TAG, "revoke RAM store clear failed (%d)", clear_result);
+        return ESP_FAIL;
+    }
     return ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_erase_store_namespace(void)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("nimble_bond", NVS_READWRITE, &handle);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    result = nvs_erase_all(handle);
+    if (result == ESP_OK)
+    {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return result;
+}
+
+static esp_err_t _ble_nimble_port_reset_erase_namespace(void *context)
+{
+    (void)context;
+    return _ble_nimble_port_erase_store_namespace();
+}
+
+static esp_err_t _ble_nimble_port_reset_audit_empty(void *context)
+{
+    (void)context;
+    return _ble_nimble_port_audit_store_restore();
 }
 
 /**
@@ -3960,7 +4292,7 @@ static esp_err_t _ble_nimble_port_reset_peer_store(void)
  * journal is cleared. Idempotent; a failure keeps the journal so the
  * next boot retries (fail closed, no advertising).
  */
-static esp_err_t _ble_nimble_port_resume_revoke(void)
+static esp_err_t _ble_nimble_port_resume_revoke_locked(void)
 {
     bool pending = false;
     const esp_err_t pending_result =
@@ -3989,7 +4321,33 @@ static esp_err_t _ble_nimble_port_resume_revoke(void)
     {
         return verifier_result;
     }
-    return _ble_nimble_port_execute_revoke();
+    return _ble_nimble_port_execute_revoke_locked();
+}
+
+static esp_err_t _ble_nimble_port_reconcile_sync_storage(void)
+{
+    esp_err_t result;
+    bool revoke_pending = false;
+
+    _ble_nimble_port_storage_lock();
+    result = device_link_security_revoke_pending(&revoke_pending);
+    if (result == ESP_OK && revoke_pending)
+    {
+        /* A journaled revoke intentionally destroys the complete peer store.
+         * It does not depend on a successful RAM restore: the namespace erase
+         * is verified before the marker is cleared. */
+        result = _ble_nimble_port_resume_revoke_locked();
+    }
+    else if (result == ESP_OK)
+    {
+        result = _ble_nimble_port_audit_store_restore();
+        if (result == ESP_OK)
+        {
+            result = _ble_nimble_port_reconcile_storage_locked();
+        }
+    }
+    _ble_nimble_port_storage_unlock();
+    return result;
 }
 
 static esp_err_t _ble_nimble_port_register_remote_replacement(
@@ -4145,8 +4503,9 @@ static int _ble_nimble_port_gap_event(
             ble_link_sec_state_reset(&s_link_sec_state);
             s_link_sec_conn = event->connect.conn_handle;
             /* The controller supplies peer_id_addr when a stored IRK
-             * resolves the OTA address. Only an unresolved RPA defers the
-             * admission decision until Identity Information arrives. */
+             * resolves the OTA address. Any unresolved or non-identity
+             * address defers admission until normalized Identity Information
+             * arrives. */
             bool identity_ready = false;
             bool conn_bonded = false;
             bool bond_verified = false;
@@ -4160,7 +4519,9 @@ static int _ble_nimble_port_gap_event(
                 /* Controller privacy reports the normalized identity in
                  * peer_id_addr during a restored bond; peer_ota_addr may
                  * remain the current RPA for the lifetime of the ACL. */
-                identity_ready = !BLE_ADDR_IS_RPA(&desc.peer_id_addr);
+                identity_ready =
+                    ble_nimble_peer_identity_valid(
+                        desc.peer_id_addr.type, desc.peer_id_addr.val);
                 conn_bonded = desc.sec_state.bonded;
                 bond_verified = _ble_nimble_port_bond_store_verified(&desc);
                 had_bond = conn_bonded ||
@@ -4185,27 +4546,29 @@ static int _ble_nimble_port_gap_event(
                 /* ENC_CHANGE can precede this delayed CONNECT callback.
                  * Replay the descriptor's current encryption facts so the
                  * reducer cannot miss a restored-bond admission. */
-                replay_actions = ble_link_sec_state_on_encrypted(
-                                     &s_link_sec_state, true,
-                                     desc.sec_state.bonded,
-                                     bond_verified);
+                replay_actions = ble_link_sec_state_reconcile_snapshot(
+                                     &s_link_sec_state, identity_ready, true,
+                                     desc.sec_state.bonded, bond_verified);
             }
             /* Establish the accepted ACL generation before replaying security
              * facts from the descriptor. Applying them first makes the session
              * reducer correctly reject them as pre-CONNECT stale events. */
             _ble_nimble_port_dispatch(&port_event);
-            _ble_nimble_port_apply_sec_actions(
-                replay_actions, event->connect.conn_handle);
-            ble_link_gatt_request_link_state_refresh();
             ble_gap_manager_snapshot_t snapshot;
 
             if (_ble_nimble_port_gap_snapshot(&snapshot) == ESP_OK)
             {
-                _ble_nimble_port_track_provisional_connection(
+                /* Install the exact candidate before replay publishes verified
+                 * bond actions. ENC_CHANGE can precede a delayed CONNECT, and
+                 * the publication must be able to mark this ACL provisional. */
+                _ble_nimble_port_track_provisional_candidate(
                     snapshot.generation, event->connect.conn_handle,
-                    had_bond, identity_ready,
+                    identity_ready,
                     found ? &desc.peer_id_addr : NULL);
             }
+            _ble_nimble_port_apply_sec_actions(
+                replay_actions, event->connect.conn_handle);
+            ble_link_gatt_request_link_state_refresh();
             return 0;
         }
         break;
@@ -4222,6 +4585,10 @@ static int _ble_nimble_port_gap_event(
         const bool disconnect_current =
             _ble_nimble_port_capture_connection_identity(
                 &port_event, BLE_LINK_OPERATION_DISCONNECT);
+
+        LOG_I("disconnect handle=%u reason=%d current=%u",
+              event->disconnect.conn.conn_handle,
+              event->disconnect.reason, disconnect_current);
 
         if (disconnect_current &&
                 s_link_sec_conn == event->disconnect.conn.conn_handle)
@@ -4287,20 +4654,34 @@ static int _ble_nimble_port_gap_event(
 
             if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0)
             {
-                const uint32_t actions = ble_link_sec_state_on_encrypted(
-                                             &s_link_sec_state,
-                                             desc.sec_state.encrypted,
-                                             desc.sec_state.bonded,
-                                             _ble_nimble_port_bond_store_verified(
-                                                 &desc));
+                const bool identity_ready =
+                    ble_nimble_peer_identity_valid(
+                        desc.peer_id_addr.type, desc.peer_id_addr.val);
+                const bool bond_verified =
+                    _ble_nimble_port_bond_store_verified(&desc);
+
+                if (identity_ready)
+                {
+                    (void)ble_link_gatt_update_identity(
+                        s_timer_generation, event->enc_change.conn_handle,
+                        desc.peer_id_addr.type, desc.peer_id_addr.val);
+                    _ble_nimble_port_update_provisional_identity(
+                        s_timer_generation, event->enc_change.conn_handle,
+                        &desc.peer_id_addr);
+                }
+                const uint32_t actions =
+                    ble_link_sec_state_reconcile_snapshot(
+                        &s_link_sec_state, identity_ready,
+                        desc.sec_state.encrypted, desc.sec_state.bonded,
+                        bond_verified);
 
                 _ble_nimble_port_apply_sec_actions(
                     actions, event->enc_change.conn_handle);
                 LOG_I("encryption security handle=%u status=%d encrypted=%u "
-                      "bonded=%u verified=%u actions=0x%lx",
+                      "identity=%u bonded=%u verified=%u actions=0x%lx",
                       event->enc_change.conn_handle, event->enc_change.status,
-                      desc.sec_state.encrypted, desc.sec_state.bonded,
-                      _ble_nimble_port_bond_store_verified(&desc),
+                      desc.sec_state.encrypted, identity_ready,
+                      desc.sec_state.bonded, bond_verified,
                       (unsigned long)actions);
             }
         }
@@ -4331,7 +4712,13 @@ static int _ble_nimble_port_gap_event(
             {
                 return 0;
             }
-            ble_link_gatt_set_connection(
+            if (!ble_nimble_peer_identity_valid(
+                        desc.peer_id_addr.type, desc.peer_id_addr.val))
+            {
+                LOG_W("identity resolution produced non-identity address");
+                return 0;
+            }
+            (void)ble_link_gatt_update_identity(
                 s_timer_generation, event->identity_resolved.conn_handle,
                 desc.peer_id_addr.type, desc.peer_id_addr.val);
             _ble_nimble_port_update_provisional_identity(
@@ -4440,6 +4827,24 @@ static int _ble_nimble_port_gap_event(
     return 0;
 }
 
+static int _ble_nimble_port_gap_connection_event(
+    struct ble_gap_event *event, void *arg)
+{
+    if (event == NULL)
+    {
+        return 0;
+    }
+    /* Most GAP connection events are already delivered to the global listener.
+     * NimBLE v6.0.2 emits these two only through the callback captured by
+     * ble_gap_adv_start(); forward only them to avoid double reduction. */
+    if (event->type == BLE_GAP_EVENT_IDENTITY_RESOLVED ||
+            event->type == BLE_GAP_EVENT_REPEAT_PAIRING)
+    {
+        return _ble_nimble_port_gap_event(event, arg);
+    }
+    return 0;
+}
+
 static void _ble_nimble_port_on_sync(void)
 {
     if (ble_hs_synced())
@@ -4449,18 +4854,25 @@ static void _ble_nimble_port_on_sync(void)
         ble_nimble_pairing_gate_request(&s_pairing_gate_state, false);
         ble_hs_cfg.sm_sec_lvl = 1;
         LOG_I("host synchronized");
-        /* Reconcile the single bond against the authorization record
-         * before advertising opens; a failure latches the port so the
-         * runtime start fails closed. The latch keeps the FIRST error. */
-        if (_ble_nimble_port_storage_error_load() == ESP_OK)
+        /* ESP-IDF's NimBLE privacy startup reinitializes the store callbacks
+         * before every initial sync and host-reset resync. Reinstall the writer
+         * guard only when that exact original callback is observed; an unknown
+         * replacement is left untouched and fails this run closed. */
+        const esp_err_t guard_result =
+            _ble_nimble_port_reconcile_store_write_guard();
+
+        if (guard_result != ESP_OK)
         {
-            _ble_nimble_port_latch_storage_error(
-                _ble_nimble_port_resume_revoke());
+            _ble_nimble_port_latch_storage_error(guard_result);
+            LOG_E("store write guard unavailable result=%d", guard_result);
         }
+        /* IDF v6.0.2 logs and discards config-store restore failures. Under
+         * one storage transaction, either resume a journaled full-store erase
+         * or audit the durable counts before destructive reconciliation. */
         if (_ble_nimble_port_storage_error_load() == ESP_OK)
         {
             const esp_err_t reconcile =
-                _ble_nimble_port_reconcile_storage();
+                _ble_nimble_port_reconcile_sync_storage();
 
             _ble_nimble_port_latch_storage_error(reconcile);
             if (reconcile != ESP_OK)
@@ -4909,8 +5321,9 @@ static int _ble_nimble_port_adv_start_execute(
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     params.itvl_min = (uint16_t)(config->interval_ms * 16U / 10U);
     params.itvl_max = params.itvl_min;
-    result = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                               &params, NULL, NULL);
+    result = ble_gap_adv_start(
+                 BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &params,
+                 _ble_nimble_port_gap_connection_event, NULL);
     if (result != 0)
     {
         LOG_E("adv start failed result=%d", result);
@@ -5294,6 +5707,7 @@ static esp_err_t _ble_nimble_port_rollback_init(
         vSemaphoreDelete(s_timer_exit);
         s_timer_exit = NULL;
     }
+    _ble_nimble_port_restore_store_write();
     const esp_err_t cleanup = s_port.nimble_init_attempted
                               ? nimble_port_deinit()
                               : ESP_OK;
@@ -5422,7 +5836,8 @@ static esp_err_t _ble_nimble_port_init(void)
     {
         if (xTaskCreatePinnedToCore(
                     _ble_nimble_port_timer_owner,
-                    "ble_link_timer", BLE_NIMBLE_PORT_LINK_TIMER_STACK,
+                    "ble_link_timer",
+                    BLE_NIMBLE_PORT_LINK_TIMER_STACK_BYTES,
                     NULL, BLE_NIMBLE_PORT_LINK_TIMER_PRIORITY,
                     &s_timer_owner_task,
                     BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
@@ -5518,6 +5933,12 @@ static esp_err_t _ble_nimble_port_init(void)
         return _ble_nimble_port_rollback_init(result, false, false, false);
     }
     s_port.nimble_init_attempted = true;
+    result = _ble_nimble_port_install_store_write_guard();
+    if (result != ESP_OK)
+    {
+        return _ble_nimble_port_rollback_init(
+                   result, false, false, false);
+    }
     if (s_pairing_gate_ack == NULL)
     {
         s_pairing_gate_ack = xSemaphoreCreateBinaryStatic(
@@ -5822,6 +6243,7 @@ static esp_err_t _ble_nimble_port_deinit(void)
     _ble_nimble_port_timer_teardown();
     if (!s_port.deinitialized)
     {
+        _ble_nimble_port_restore_store_write();
         const esp_err_t result = s_port.nimble_init_attempted
                                  ? nimble_port_deinit()
                                  : ESP_OK;

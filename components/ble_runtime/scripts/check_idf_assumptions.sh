@@ -29,6 +29,17 @@ check_source()
     fi
 }
 
+check_contains()
+{
+    relative_path="$1"
+    expected_text="$2"
+    source_path="$IDF_PATH/$relative_path"
+    if ! grep -F "$expected_text" "$source_path" >/dev/null; then
+        echo "ESP-IDF assumption missing in $relative_path: $expected_text" >&2
+        exit 1
+    fi
+}
+
 NIMBLE="components/bt/host/nimble/nimble"
 NIMBLE_HOST="$NIMBLE/nimble/host"
 
@@ -57,8 +68,8 @@ check_source \
     "$NIMBLE_HOST/store/config/src/ble_store_config.c" \
     "88257faee279574ed4651bdb95e73c4d16ed6137477af21b4c3cab736c0f24d7"
 check_source \
-    "$NIMBLE_HOST/store/config/src/ble_store_config_conf.c" \
-    "1b0b79c4fc784dbed662f95e41d181b75d1716ded4ffab269e4f74403680c569"
+    "$NIMBLE_HOST/store/config/src/ble_store_nvs.c" \
+    "8ae9aac14729466943d0604d5c7602f4482ba5967b17b083dbd1666d04a1a538"
 check_source \
     "$NIMBLE_HOST/src/ble_gatts.c" \
     "6ecefb0b156c95b6d397dad2121da69f35883c0b42bb1a2435f524e4abf5fa6d"
@@ -78,6 +89,12 @@ check_source \
     "$NIMBLE_HOST/src/ble_hs.c" \
     "2b9626667d4601dff6e7c7bfdb37edf17567ac7da7d78a0d1d76983aac2bce35"
 check_source \
+    "$NIMBLE_HOST/src/ble_hs_cfg.c" \
+    "5d0dedb23d5e7c1ca7512d95fd81bc2804c52cc51e291f0ed9903376c4163f3b"
+check_source \
+    "$NIMBLE_HOST/src/ble_hs_startup.c" \
+    "e9e522760447054d4134137f4ae5e269a1a2b825616507ef994834869c9c1ad1"
+check_source \
     "$NIMBLE_HOST/src/ble_hs_mbuf.c" \
     "a4c4caec4990adb35c1fc3b3a16d13674988ec040b4b930e428d6ea87e2255a8"
 check_source \
@@ -86,5 +103,60 @@ check_source \
 check_source \
     "components/bt/host/nimble/port/include/esp_nimble_cfg.h" \
     "ec558db1eed63c71d5cd056d54943ab2cd20cae5188925486284d546469a5727"
+check_source \
+    "components/bt/host/nimble/Kconfig.in" \
+    "a1e0cf4df22d06697f359ed8752aab525d694a0eb0b6b25917e73196afa11876"
+
+# The cold-boot host config has no store writer. NimBLE privacy startup installs
+# one during every controller startup. ble_hs_sync() runs this path
+# both initially and after a host reset, before invoking the project sync
+# callback that captures or restores its guard.
+check_contains \
+    "$NIMBLE/porting/nimble/src/nimble_port.c" \
+    "ble_transport_hs_init();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs.c" \
+    "rc = ble_hs_startup_go();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs.c" \
+    "rc = ble_hs_sync();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs.c" \
+    "    ble_hs_sync();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs.c" \
+    "ble_hs_cfg.sync_cb();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs_startup.c" \
+    "ble_hs_pvcy_set_default_irk();"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs_pvcy.c" \
+    "ble_store_config_init();"
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_config.c" \
+    "ble_hs_cfg.store_write_cb = ble_store_config_write;"
+check_contains \
+    "$NIMBLE_HOST/src/ble_hs_pvcy.c" \
+    "ble_hs_pvcy_remove_entry(uint8_t addr_type, const uint8_t *addr)"
+
+# ESP32-S3 uses controller privacy, not ESP32-only host privacy. Therefore the
+# persisted schema contains the six public store families below and no private
+# p_dev_rec family. The compiled NVS implementation discards restore errors;
+# the runtime's pre-reconciliation audit is the fail-closed boundary.
+check_contains \
+    "components/bt/host/nimble/Kconfig.in" \
+    "depends on BT_NIMBLE_ENABLED && BT_NIMBLE_HS_PVCY && IDF_TARGET_ESP32"
+check_contains \
+    "components/bt/host/nimble/port/include/esp_nimble_cfg.h" \
+    "#define MYNEWT_VAL_BLE_HOST_BASED_PRIVACY (0)"
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_nvs.c" \
+    "#define NIMBLE_NVS_NAMESPACE                     \"nimble_bond\""
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_nvs.c" \
+    "err = ble_nvs_restore_sec_keys();"
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_nvs.c" \
+    "ESP_LOGE(TAG, \"NVS operation failed, can't retrieve the bonding info\");"
 
 echo "ESP-IDF BLE runtime assumptions verified"

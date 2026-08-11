@@ -64,19 +64,21 @@ static void test_unresolved_rpa_outside_window_fails_closed(void)
 
 static void test_identity_before_enc_change_converges(void)
 {
-    /* The same peer with the events in the opposite order converges to
-     * the same admission (identity resolves before encryption). */
+    /* IDF announces the normalized identity before persisting OUR/PEER keys.
+     * The callback therefore cannot verify the bond yet; final ENC_CHANGE
+     * must reconcile the now-durable descriptor without another callback. */
     ble_link_sec_state_t state;
 
     ble_link_sec_state_reset(&state);
     assert(ble_link_sec_state_on_connect(&state, true, false, false, false, false) ==
            BLE_LINK_SEC_ACTION_NONE);
     uint32_t actions =
-        ble_link_sec_state_on_identity(&state, true, true);
+        ble_link_sec_state_on_identity(&state, true, false);
 
     assert(actions == BLE_LINK_SEC_ACTION_NONE);
     assert(!state.finalized);
-    actions = ble_link_sec_state_on_encrypted(&state, true, true, true);
+    actions = ble_link_sec_state_reconcile_snapshot(
+                  &state, true, true, true, true);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
@@ -128,12 +130,27 @@ static void test_new_peer_in_window_is_admitted(void)
     assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
     assert(ble_link_sec_state_peer_admitted(&state));
+    assert(ble_link_sec_state_provisional_bond_verified(&state));
 
     /* A second ENC event (duplicate) must not re-report. */
     const uint32_t again =
         ble_link_sec_state_on_encrypted(&state, true, true, true);
 
     assert(again == BLE_LINK_SEC_ACTION_NONE);
+}
+
+static void test_unpaired_disconnect_does_not_create_provisional_bond(void)
+{
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(
+               &state, true, false, false, false, false) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    assert(!ble_link_sec_state_provisional_bond_verified(&state));
+    assert(ble_link_sec_state_on_disconnect(&state) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    assert(!ble_link_sec_state_provisional_bond_verified(&state));
 }
 
 static void test_malformed_bond_deleted_and_terminated(void)
@@ -213,6 +230,31 @@ static void test_static_identity_known_at_connect(void)
     assert(ble_link_sec_state_peer_admitted(&state));
 }
 
+static void test_final_encryption_snapshot_recovers_fresh_identity(void)
+{
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(
+               &state, true, false, false, false, false) ==
+           BLE_LINK_SEC_ACTION_NONE);
+
+    /* NimBLE can expose the normalized peer_id_addr only in the descriptor
+     * observed at final ENC_CHANGE. No separate identity callback is needed. */
+    const uint32_t actions = ble_link_sec_state_reconcile_snapshot(
+                                 &state, true, true, true, true);
+
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
+    assert(ble_link_sec_state_peer_admitted(&state));
+    assert(ble_link_sec_state_reconcile_snapshot(
+               &state, true, true, true, true) ==
+           BLE_LINK_SEC_ACTION_NONE);
+}
+
 int main(void)
 {
     test_reset_clears_state();
@@ -221,10 +263,12 @@ int main(void)
     test_identity_before_enc_change_converges();
     test_connect_bond_snapshot_is_not_overwritten();
     test_new_peer_in_window_is_admitted();
+    test_unpaired_disconnect_does_not_create_provisional_bond();
     test_malformed_bond_deleted_and_terminated();
     test_unknown_peer_outside_window_terminated();
     test_encryption_dropped_resets_decision();
     test_static_identity_known_at_connect();
+    test_final_encryption_snapshot_recovers_fresh_identity();
     puts("ble_link_sec_state: all tests passed");
     return 0;
 }

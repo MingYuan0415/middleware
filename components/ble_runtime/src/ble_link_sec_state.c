@@ -165,6 +165,27 @@ uint32_t ble_link_sec_state_on_encrypted(
     return actions;
 }
 
+uint32_t ble_link_sec_state_reconcile_snapshot(
+    ble_link_sec_state_t *state, bool identity_ready, bool encrypted,
+    bool bonded, bool bond_verified)
+{
+    uint32_t actions = BLE_LINK_SEC_ACTION_NONE;
+
+    if (!encrypted)
+    {
+        return ble_link_sec_state_on_encrypted(
+                   state, false, bonded, bond_verified);
+    }
+    if (identity_ready)
+    {
+        actions |= ble_link_sec_state_on_identity(
+                       state, bonded, bond_verified);
+    }
+    actions |= ble_link_sec_state_on_encrypted(
+                   state, encrypted, bonded, bond_verified);
+    return actions;
+}
+
 uint32_t ble_link_sec_state_on_disconnect(ble_link_sec_state_t *state)
 {
     if (state != NULL)
@@ -179,4 +200,10 @@ bool ble_link_sec_state_peer_admitted(const ble_link_sec_state_t *state)
     return state != NULL && state->active && state->finalized &&
            state->bond_verified && (state->connect_window_open ||
                                     state->had_bond);
+}
+
+bool ble_link_sec_state_provisional_bond_verified(
+    const ble_link_sec_state_t *state)
+{
+    return ble_link_sec_state_peer_admitted(state) && !state->had_bond;
 }

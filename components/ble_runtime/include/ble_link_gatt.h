@@ -134,6 +134,22 @@ extern "C" {
         uint8_t peer_addr_type, const uint8_t peer_addr[6]);
 
     /**
+     * @brief Update the resolved peer identity for the current connection.
+     *
+     * Unlike set_connection(), this preserves the negotiated ATT MTU and all
+     * other per-ACL delivery state.
+     *
+     * @param[in] generation Current connection generation.
+     * @param[in] conn_handle Current NimBLE connection handle.
+     * @param[in] peer_addr_type Normalized peer identity address type.
+     * @param[in] peer_addr Normalized six-byte peer identity address.
+     * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_NOT_FOUND for stale ACL.
+     */
+    esp_err_t ble_link_gatt_update_identity(
+        uint32_t generation, uint16_t conn_handle,
+        uint8_t peer_addr_type, const uint8_t peer_addr[6]);
+
+    /**
      * @brief Notify the 5000 ms reassembly idle timeout fired for a generation.
      *
      * @param[in] generation Generation the timer was armed for.

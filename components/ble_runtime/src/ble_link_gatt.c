@@ -872,6 +872,33 @@ void ble_link_gatt_set_connection(
     ble_link_service_wake_owner();
 }
 
+esp_err_t ble_link_gatt_update_identity(
+    uint32_t generation, uint16_t conn_handle,
+    uint8_t peer_addr_type, const uint8_t peer_addr[6])
+{
+    if (generation == 0U || peer_addr == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_gatt_lock();
+    if (!s_gatt.configured ||
+            s_gatt.config.connection_generation != generation ||
+            s_gatt.config.conn_handle != conn_handle)
+    {
+        _ble_link_gatt_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_gatt.config.peer_addr_type = peer_addr_type;
+    memcpy(s_gatt.config.peer_addr, peer_addr, 6U);
+    s_gatt.delivery_valid = false;
+    s_gatt.link_state_dirty = true;
+    s_gatt.link_state_retry_pending = false;
+    s_gatt.link_state_retry_not_before = 0U;
+    _ble_link_gatt_unlock();
+    ble_link_service_wake_owner();
+    return ESP_OK;
+}
+
 void ble_link_gatt_update_handles(void)
 {
     static const uint8_t *uuids[5] =

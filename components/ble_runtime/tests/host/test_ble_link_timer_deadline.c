@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "ble_nimble_port_task_config.h"
 #include "ble_link_timer_deadline.h"
 
 #define TEST_ASSERT_TRUE(value) assert(value)
@@ -60,6 +61,14 @@ static void test_reset_is_idle(void)
     ble_link_timer_deadline_reset(&state);
     TEST_ASSERT_EQUAL(UINT64_MAX,
                       ble_link_timer_deadline_remaining_us(&state, 10U));
+}
+
+static void test_owner_stack_budget_covers_security_cleanup(void)
+{
+    /* The production overflow occurred on the timeout -> session abort ->
+     * provisional cleanup path. Keep the audited floor tied to the value used
+     * by xTaskCreatePinnedToCore(). */
+    TEST_ASSERT_TRUE(BLE_NIMBLE_PORT_LINK_TIMER_STACK_BYTES >= 4096U);
 }
 
 static void test_absolute_deadline_expires_without_wake(void)
@@ -441,6 +450,7 @@ static void test_rejected_stale_result_does_not_retire_reused_handle(void)
 int main(void)
 {
     test_reset_is_idle();
+    test_owner_stack_budget_covers_security_cleanup();
     test_absolute_deadline_expires_without_wake();
     test_stale_wake_observes_latest_rearm();
     test_one_sweep_collects_each_due_slot_once();

@@ -70,8 +70,11 @@ foreach(test_target IN ITEMS
         test_ble_link_reassembler
         test_ble_link_cleanup_obligation
         test_ble_link_timer_deadline
+        test_ble_nimble_peer_identity
         test_ble_nimble_pairing_gate
         test_ble_nimble_store_guard
+        test_ble_nimble_store_restore_audit
+        test_ble_nimble_store_reset
         test_ble_nimble_tx_tracker
         test_ble_link_session
         test_ble_link_events
@@ -90,10 +93,22 @@ foreach(test_target IN ITEMS
         add_executable(${test_target}
             ${test_target}.c
             "${COMPONENT}/src/ble_nimble_pairing_gate.c")
+    elseif(test_target STREQUAL test_ble_nimble_peer_identity)
+        add_executable(${test_target}
+            ${test_target}.c
+            "${COMPONENT}/src/ble_nimble_peer_identity.c")
     elseif(test_target STREQUAL test_ble_nimble_store_guard)
         add_executable(${test_target}
             ${test_target}.c
             "${COMPONENT}/src/ble_nimble_store_guard.c")
+    elseif(test_target STREQUAL test_ble_nimble_store_restore_audit)
+        add_executable(${test_target}
+            ${test_target}.c
+            "${COMPONENT}/src/ble_nimble_store_restore_audit.c")
+    elseif(test_target STREQUAL test_ble_nimble_store_reset)
+        add_executable(${test_target}
+            ${test_target}.c
+            "${COMPONENT}/src/ble_nimble_store_reset.c")
     elseif(test_target STREQUAL test_ble_nimble_tx_tracker)
         add_executable(${test_target}
             ${test_target}.c
@@ -144,8 +159,11 @@ set(BLE_RUNTIME_TESTS
     ble_link_dispatcher ble_link_state ble_link_reassembler
     ble_link_cleanup_obligation
     ble_link_timer_deadline
+    ble_nimble_peer_identity
     ble_nimble_pairing_gate
     ble_nimble_store_guard
+    ble_nimble_store_restore_audit
+    ble_nimble_store_reset
     ble_nimble_tx_tracker
     ble_link_session ble_link_events ble_link_sec_state
     ble_link_service ble_link_gatt ble_event_router)

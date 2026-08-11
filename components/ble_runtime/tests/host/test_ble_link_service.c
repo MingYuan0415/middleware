@@ -2040,7 +2040,7 @@ static void test_completed_work_is_copied_and_deferred(void)
     TEST_ASSERT_EQUAL(1U, s_capture_count);
 }
 
-static void test_clear_retires_queued_work(void)
+static void test_terminal_clear_retires_queued_protected_work(void)
 {
     static const uint8_t request[] =
     {
@@ -2063,11 +2063,152 @@ static void test_clear_retires_queued_work(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
                           &s_facts, BLE_LINK_SERVICE_RX_CONTROL,
                           framed, 8U + total, &work));
-    ble_link_service_clear_session_state();
+    ble_link_operation_identity_t terminal =
+    {
+        .generation = GEN,
+        .security_epoch = s_facts.security_epoch,
+        .kind = BLE_LINK_OPERATION_DISCONNECT,
+        .conn_handle = s_facts.conn_handle,
+    };
+    ble_link_operation_identity_t stale = terminal;
+
+    stale.conn_handle++;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_clear_session_state_if_current(
+                          &terminal));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
                       ble_link_service_execute(work));
     ble_link_service_release_work(work);
     TEST_ASSERT_EQUAL(0U, s_capture_count);
+}
+
+static void test_terminal_clear_retires_queued_handshake(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+    ble_link_work_t *work = NULL;
+
+    _reset();
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    s_auto_confirm = false;
+    s_handshake_count = 0U;
+    s_security_close_count = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work != NULL);
+
+    const ble_link_operation_identity_t terminal =
+    {
+        .generation = GEN,
+        .security_epoch = s_facts.security_epoch,
+        .kind = BLE_LINK_OPERATION_RESET,
+        .conn_handle = s_facts.conn_handle,
+    };
+    ble_link_operation_identity_t stale = terminal;
+
+    stale.generation++;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    stale = terminal;
+    stale.conn_handle++;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_clear_session_state_if_current(
+                          &terminal));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_execute(work));
+    ble_link_service_release_work(work);
+    work = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work == NULL);
+    ble_link_service_idle_timeout(GEN);
+    TEST_ASSERT_EQUAL(0U, s_handshake_count);
+    TEST_ASSERT_EQUAL(0U, s_capture_count);
+    TEST_ASSERT_EQUAL(0U, s_security_close_count);
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+}
+
+static void test_ingress_requires_immutable_acl_identity(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+    ble_link_work_t *work = NULL;
+
+    _reset();
+    s_facts.connection_generation = 0U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work == NULL);
+
+    s_facts.connection_generation = GEN;
+    s_facts.conn_handle = UINT16_MAX;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work == NULL);
+}
+
+static void test_retired_generation_allows_handle_reuse(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+    ble_link_work_t *old_work = NULL;
+    ble_link_work_t *new_work = NULL;
+
+    _reset();
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    s_auto_confirm = false;
+    s_handshake_count = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &old_work));
+    TEST_ASSERT_TRUE(old_work != NULL);
+    const ble_link_operation_identity_t old_terminal =
+    {
+        .generation = GEN,
+        .security_epoch = s_facts.security_epoch,
+        .kind = BLE_LINK_OPERATION_DISCONNECT,
+        .conn_handle = s_facts.conn_handle,
+    };
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_clear_session_state_if_current(
+                          &old_terminal));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_execute(old_work));
+    ble_link_service_release_work(old_work);
+
+    ble_link_session_init(BOOT_ID);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN + 1U,
+                          BLE_LINK_SESSION_EVENT_ACL_CONNECTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN + 1U,
+                          BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN + 1U,
+                          BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          GEN + 1U, true));
+    _set_facts(true, false, false);
+    s_facts.connection_generation = GEN + 1U;
+    s_facts.security_epoch = ble_link_session_security2_epoch();
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &new_work));
+    TEST_ASSERT_TRUE(new_work != NULL);
+
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &old_terminal));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(new_work));
+    ble_link_service_release_work(new_work);
+    TEST_ASSERT_EQUAL(1U, s_handshake_count);
 }
 
 static void _commit_auth_record(void)
@@ -2584,6 +2725,22 @@ static void test_provisional_cleanup_is_retained_until_accepted(void)
                       ble_link_service_retained_retry_remaining_ms());
 }
 
+static void test_clear_without_connection_does_not_forge_cleanup_identity(void)
+{
+    _reset();
+    _enable_provisional_security_ops();
+
+    /* No frame was accepted, so the service has no immutable ACL identity.
+     * The port owns the physical provisional tracker and handles its exact
+     * DISCONNECT/RESET fallback; generation zero must never be dispatched. */
+    ble_link_service_clear_session_state();
+
+    TEST_ASSERT_EQUAL(0U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(!ble_link_service_retained_cleanup_pending());
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_retained_retry_remaining_ms());
+}
+
 static void test_provisional_cleanup_backoff_is_bounded(void)
 {
     static const uint32_t delays_ms[] = {100U, 200U, 400U, 800U, 1000U,
@@ -2961,9 +3118,13 @@ int main(void)
     test_idle_timeout_clears_state();
     test_stale_ingress_epoch_timeout_is_ignored();
     test_completed_work_is_copied_and_deferred();
-    test_clear_retires_queued_work();
+    test_terminal_clear_retires_queued_protected_work();
+    test_terminal_clear_retires_queued_handshake();
+    test_ingress_requires_immutable_acl_identity();
+    test_retired_generation_allows_handle_reuse();
     test_provisional_bond_lifecycle();
     test_provisional_cleanup_is_retained_until_accepted();
+    test_clear_without_connection_does_not_forge_cleanup_identity();
     test_provisional_cleanup_backoff_is_bounded();
     test_repeated_terminal_discard_coalesces_physical_target();
     test_failed_commit_retires_transaction();

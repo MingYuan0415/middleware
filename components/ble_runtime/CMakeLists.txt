@@ -4,8 +4,11 @@ idf_component_register(
         "src/ble_gatt_registry.c"
         "src/ble_nimble_port.c"
         "src/ble_nimble_adv_start.c"
+        "src/ble_nimble_peer_identity.c"
         "src/ble_nimble_pairing_gate.c"
         "src/ble_nimble_store_guard.c"
+        "src/ble_nimble_store_restore_audit.c"
+        "src/ble_nimble_store_reset.c"
         "src/ble_gap_manager.c"
         "src/ble_adv_manager.c"
         "src/ble_tx_scheduler.c"
@@ -29,4 +32,5 @@ idf_component_register(
         device_link_security
         freertos
         mt_log
+        nvs_flash
 )

@@ -19,6 +19,10 @@ adapter 自己创建 host task，因此 task 创建失败可见。`nimble_port_s
 fault，只能重启恢复。发生 terminal fault 时保留相关资源，避免失败 teardown 产生
 use-after-free；只有无 fault 的重试才释放资源。
 
+独立的 `ble_link_timer` owner 使用 4096B stack。它的 deadline sweep 可以同步退休
+Security 2 flow、推进 TX scheduler 并保留 provisional cleanup，因此不是只执行轻量 timer
+callback 的任务。
+
 clean deinit 先取得独立 shutdown pause，通过 NimBLE host barrier 关闭 pairing gate，随后
 持续推进 revoke、cleanup、terminal fence 和 accepted/rejected terminate。owner 仅在第一次
 empty observation 后再通过一次 host barrier，并得到第二次 empty observation 时退出，避免
@@ -38,10 +42,21 @@ no-op，conn_handle 复用不会把新连接误认为旧操作目标。CONNECT r
 connection descriptor，补放 encrypted、bond、identity 事实，覆盖 ENC_CHANGE 早于
 CONNECT 分发的时序。
 
+ESP-IDF v6.0.2 只通过 `ble_gap_adv_start()` 捕获的 per-connection GAP callback 投递
+`IDENTITY_RESOLVED` 和 `REPEAT_PAIRING`。每次 ADV START 都注册该 callback，并只转发这两个
+事件；其他连接事件继续由 global listener 处理，避免同一事件重复 reduction。identity event
+可以先更新当前 ACL 的 normalized identity；fresh public/static identity 不一定产生
+`IDENTITY_RESOLVED`，因此最终 ENC_CHANGE 路径会重新读取 connection descriptor 和 bond
+store，以当前 identity、bonded、verified facts 收敛同一 ACL 的准入。无旧 bond 的 CONNECT
+只登记 provisional candidate；只有 reducer 观察到当前 ACL 新生成且 verified 的 bond 后才
+形成 provisional cleanup 义务，SMP 完成前断连不会制造全量 bond 删除。
+
 DISCONNECT、RESET 和 TERMINATE 是 ACL 终态：匹配 generation/conn_handle 后统一清理该
 ACL 的全部 Security 2 epoch，即使 Cmd0 在事件等待 service mutex 时已推进 epoch 也不会
-遗留会话。同一终态重复执行为 no-op。ENC_CHANGE drop、TX failure 和 timeout 等会话级
-teardown 仍核对 security_epoch 及适用的 flow/token，不能退休更新的握手。
+遗留会话。accepted ingress 同时保存 generation/conn_handle；终态在 worker execute 前清除
+queued reservation、推进 ingress epoch 并标记该代 retired，因此已入队但未执行的 work 和
+同代后续 ingress 都是 no-op。同一终态重复执行为 no-op。ENC_CHANGE drop、TX failure 和
+timeout 等会话级 teardown 仍核对 security_epoch 及适用的 flow/token，不能退休更新的握手。
 
 provisional/orphan/replacement cleanup 在 Device Link owner 中保留；port callback 暂时失败时
 按 100/200/400/800/1000 ms 封顶退避，失败本身不产生新的 wake。port 使用 4 个固定 slot 和
@@ -54,7 +69,27 @@ DISCONNECT/RESET 释放；广告只在全部 cleanup slot 清空后恢复。
 定向 peer-store cleanup 只执行一次显式 `ble_store_util_delete_peer()`，并逐类 readback
 OUR_SEC、PEER_SEC、CCCD 和 PEER_ADDR。ESP-IDF store 在 NVS persist 前先删除 RAM entry，
 因此任一 store/枚举错误会在完整 host run 内粘滞；同一 host run 后续看到 RAM absence 不能
-退休义务。只有完整 host reload 从 durable NVS 重建状态后才允许 reconciliation 重试。
+退休义务。port 同时包装 NimBLE store write callback：容量溢出仍交给 replacement owner，
+其他写失败立即粘滞，bond verification 只有在 guard 保持成功时才接受 RAM mirror。当前
+ESP32-S3 构建使用 controller privacy；NimBLE privacy startup 的
+`ble_hs_pvcy_set_default_irk()` 路径会在 initial sync 和 reset resync 前恢复 IDF writer。cold
+boot callback 仍为 NULL 时只 arm guard；首次 sync 捕获 IDF writer，后续 resync 只对精确原
+writer 重装 wrapper。未知 callback 不会被覆盖，并使当前 host run fail closed。
+
+ESP-IDF v6.0.2 的 NVS loader 会记录却吞掉 store restore 错误。非 journaled revoke 的每次
+sync 都在同一 storage lock 下、destructive reconciliation 前，对当前 controller-privacy 构建
+可加载的 OUR_SEC、PEER_SEC、CCCD、CSFC、LOCAL_IRK 和 RPA_REC 六族执行有界审计：比较
+durable key presence count 与 public RAM-store count。NVS 访问、RAM count 或计数不一致都会
+粘滞 storage error，不发布 SYNC，也不开放 SMP/ADV；该审计不声称验证 blob 内容。完整 host
+reload 从 durable NVS 重建状态后才允许 reconciliation 重试。
+
+local revoke、factory reset 和 unresolved single-bond cleanup 使用完整 peer-store reset，而非
+定向 peer cleanup。reset 固定执行 `durable namespace erase -> controller/RAM cleanup ->
+durable namespace erase -> empty audit`；第一次 erase 先于任何 IDF RAM persistence helper，
+因此 malformed blob 不能阻塞删除，第二次 erase 覆盖 runtime cleanup 重新写入的数据，并清除
+旧配置超出当前上限的遗留 key。local revoke/factory reset journal 位于独立 namespace，只有
+整个 `nimble_bond` namespace 和 RAM mirror 都确认为空后才清除；journaled revoke 不依赖一次
+成功的 RAM restore。
 accepted/rejected terminate 在 NimBLE host event 中做最终身份核对和 handle-only HCI 副作用，
 成功提交仍保留到 exact DISCONNECT/RESET，而不是把 HCI command admission 当作物理终态。
 
