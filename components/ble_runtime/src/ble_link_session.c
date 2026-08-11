@@ -24,7 +24,9 @@ typedef struct ble_link_session
     bool encrypted;
     bool bond_verified;
     bool identity_known;
+    bool connection_pairing_window_open;
     uint32_t security2_epoch;    /**< Last accepted Security 2 epoch. */
+    bool security2_handshaking;
     bool security2_open;
     bool authorized;
     uint32_t authorization_revision;
@@ -116,6 +118,7 @@ static void _ble_link_session_clear_connection(void)
     s_session.encrypted = false;
     s_session.bond_verified = false;
     s_session.identity_known = false;
+    s_session.security2_handshaking = false;
     /* The epoch allocator is boot-scoped and never resets on disconnect. */
     s_session.security2_open = false;
     s_session.authorized = false;
@@ -175,7 +178,39 @@ static esp_err_t _ble_link_session_handle_event_locked(
     return ESP_OK;
 }
 
-static esp_err_t _ble_link_session_security2_open_locked(
+esp_err_t ble_link_session_set_connection_pairing_window(
+    uint32_t generation, bool open)
+{
+    _ble_link_session_lock();
+    if (generation != s_session.generation || !s_session.active)
+    {
+        _ble_link_session_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_session.connection_pairing_window_open = open;
+    _ble_link_session_unlock();
+    return ESP_OK;
+}
+
+esp_err_t ble_link_session_get_connection_pairing_window(
+    uint32_t generation, bool *out_open)
+{
+    if (out_open == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_session_lock();
+    if (generation != s_session.generation || !s_session.active)
+    {
+        _ble_link_session_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_open = s_session.connection_pairing_window_open;
+    _ble_link_session_unlock();
+    return ESP_OK;
+}
+
+static esp_err_t _ble_link_session_security2_begin_locked(
     uint32_t generation, uint32_t *out_epoch)
 {
     if (out_epoch == NULL)
@@ -188,13 +223,31 @@ static esp_err_t _ble_link_session_security2_open_locked(
     }
     if (s_session.security2_epoch >= UINT32_MAX)
     {
+        s_session.security2_handshaking = false;
+        s_session.security2_open = false;
+        s_session.authorized = false;
         return ESP_ERR_INVALID_STATE;
     }
     s_session.security2_epoch++;
-    s_session.security2_open = true;
+    s_session.security2_handshaking = true;
+    s_session.security2_open = false;
     /* Any epoch change invalidates the previous session match. */
     s_session.authorized = false;
     *out_epoch = s_session.security2_epoch;
+    return ESP_OK;
+}
+
+static esp_err_t _ble_link_session_security2_authenticate_current_locked(
+    uint32_t generation, uint32_t epoch)
+{
+    if (generation != s_session.generation || !s_session.active ||
+            !s_session.security2_handshaking ||
+            epoch != s_session.security2_epoch)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_session.security2_handshaking = false;
+    s_session.security2_open = true;
     return ESP_OK;
 }
 
@@ -256,6 +309,7 @@ static esp_err_t _ble_link_session_security2_close_current_locked(
     {
         s_session.security2_epoch++;
     }
+    s_session.security2_handshaking = false;
     s_session.security2_open = false;
     s_session.authorized = false;
     return ESP_OK;
@@ -352,11 +406,15 @@ static ble_link_session_state_t _ble_link_session_get_state_locked(
         return BLE_LINK_SESSION_INACTIVE;
     }
     if (s_session.encrypted && s_session.bond_verified &&
-            s_session.security2_open && s_session.authorized)
+            s_session.identity_known && s_session.security2_open &&
+            s_session.authorized)
     {
+        /* Exactly the control/session admission condition: a state name
+         * must never admit traffic the query would reject. */
         return BLE_LINK_SESSION_AUTHORIZED;
     }
-    if (s_session.encrypted && s_session.bond_verified)
+    if (s_session.encrypted && s_session.bond_verified &&
+            s_session.identity_known)
     {
         return BLE_LINK_SESSION_AUTHENTICATED;
     }
@@ -457,15 +515,52 @@ esp_err_t ble_link_session_handle_event(
     return result;
 }
 
-esp_err_t ble_link_session_security2_open(
+esp_err_t ble_link_session_security2_begin(
     uint32_t generation, uint32_t *out_epoch)
 {
     _ble_link_session_lock();
-    const esp_err_t result = _ble_link_session_security2_open_locked(
+    const esp_err_t result = _ble_link_session_security2_begin_locked(
                                  generation, out_epoch);
 
     _ble_link_session_unlock();
     return result;
+}
+
+esp_err_t ble_link_session_security2_authenticate_current(
+    uint32_t generation, uint32_t epoch)
+{
+    _ble_link_session_lock();
+    const esp_err_t result =
+        _ble_link_session_security2_authenticate_current_locked(
+            generation, epoch);
+
+    _ble_link_session_unlock();
+    return result;
+}
+
+esp_err_t ble_link_session_security2_open(
+    uint32_t generation, uint32_t *out_epoch)
+{
+    _ble_link_session_lock();
+    esp_err_t result = _ble_link_session_security2_begin_locked(
+                           generation, out_epoch);
+
+    if (result == ESP_OK)
+    {
+        result = _ble_link_session_security2_authenticate_current_locked(
+                     generation, *out_epoch);
+    }
+    _ble_link_session_unlock();
+    return result;
+}
+
+uint32_t ble_link_session_security2_epoch(void)
+{
+    _ble_link_session_lock();
+    const uint32_t epoch = s_session.security2_epoch;
+
+    _ble_link_session_unlock();
+    return epoch;
 }
 
 bool ble_link_session_authorization_exhausted(void)

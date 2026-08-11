@@ -75,6 +75,49 @@ const ble_runtime_host_port_t *ble_nimble_port_get(void);
  */
 esp_err_t ble_nimble_port_revoke_binding(void);
 
+/**
+ * @brief Request a local disconnect of the current ACL.
+ *
+ * Serializes the terminate through the host-core owner task, so the
+ * pairing window can be re-opened only after the existing ACL is gone.
+ *
+ * @return ESP_OK when the terminate was queued, otherwise a state error.
+ */
+esp_err_t ble_nimble_port_request_disconnect(void);
+
+/**
+ * @brief Close new-link admission and wait for a NimBLE host-event barrier.
+ *
+ * The barrier closes the SMP gate on the host core. Once it returns, every
+ * host callback queued before the call has either retained its cleanup work or
+ * completed. Repeated calls add a fresh barrier and are used by shutdown to
+ * establish a stable empty fixed point before stopping the host.
+ *
+ * @return ESP_OK, ESP_ERR_INVALID_STATE, or ESP_ERR_TIMEOUT.
+ */
+esp_err_t ble_nimble_port_begin_cleanup_drain(void);
+
+/**
+ * @brief Whether cleanup or terminal work remains owned by the NimBLE port.
+ *
+ * Device Link shutdown uses this retained-state query before stopping the
+ * host. A true result means the store/host owner must remain alive until the
+ * physical delete is confirmed or a bounded deinit caller times out.
+ *
+ * @return True while store cleanup, an ACL terminal fence, or an accepted or
+ *         rejected termination remains pending.
+ */
+bool ble_nimble_port_cleanup_pending(void);
+
+/**
+ * @brief Synchronously set the pairing-window SMP admission gate.
+ *
+ * The change executes on the persistent NimBLE host event queue and is
+ * acknowledged before return. Closed is fail-closed (`sm_sec_lvl=1`);
+ * open admits Pairing Request (`sm_sec_lvl=0`).
+ */
+esp_err_t ble_nimble_port_set_pairing_window(bool open);
+
 #ifdef __cplusplus
 }
 #endif

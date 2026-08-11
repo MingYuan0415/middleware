@@ -32,6 +32,14 @@ typedef struct ble_link_fragment
     size_t payload_len;
 } ble_link_fragment_t;
 
+/** @brief Outcome of one valid fragment accepted by the reassembler. */
+typedef enum
+{
+    BLE_LINK_REASSEMBLY_NEW_PARTIAL = 0, /**< New bytes appended; frame incomplete. */
+    BLE_LINK_REASSEMBLY_DUPLICATE,       /**< Exact latest-fragment duplicate. */
+    BLE_LINK_REASSEMBLY_COMPLETE,        /**< New bytes completed the frame. */
+} ble_link_reassembly_disposition_t;
+
 /**
  * @brief Reassembly slot for one RX characteristic and connection
  * generation.
@@ -52,6 +60,7 @@ typedef struct ble_link_reassembler
     uint8_t *buffer;
     size_t capacity;
     bool started;
+    bool completed_fragment_valid;
 } ble_link_reassembler_t;
 
 /**
@@ -98,7 +107,10 @@ esp_err_t ble_link_reassembler_parse(
  * offset + payload == total length, monotonically increasing offsets without
  * gaps or conflicting overlap, unchanged total length, and no unexpected
  * START. An exact duplicate of the most recently accepted fragment is
- * accepted without appending.
+ * accepted without appending, including the final fragment after delivery.
+ * Frame IDs identify only the active message: after completion, any nonzero
+ * ID may begin the next message. The retained final-fragment tombstone is
+ * cleared as soon as a different valid START fragment is accepted.
  *
  * @param[in,out] slot    Reassembly slot.
  * @param[in]     fragment Decoded fragment.
@@ -110,6 +122,24 @@ esp_err_t ble_link_reassembler_parse(
  */
 esp_err_t ble_link_reassembler_accept(
     ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment);
+
+/**
+ * @brief Accept one fragment and report whether it added new bytes.
+ *
+ * This applies the same validation as ble_link_reassembler_accept(), but
+ * returns ESP_OK for every valid fragment and reports the precise outcome in
+ * `out_disposition`. Callers use DUPLICATE to avoid refreshing the 5000 ms
+ * idle deadline and COMPLETE to deliver the assembled buffer exactly once.
+ *
+ * @param[in,out] slot            Reassembly slot.
+ * @param[in]     fragment        Decoded fragment.
+ * @param[out]    out_disposition Acceptance outcome.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG for a contract violation, or
+ *         ESP_ERR_NO_MEM when the frame exceeds the slot capacity.
+ */
+esp_err_t ble_link_reassembler_accept_ex(
+    ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment,
+    ble_link_reassembly_disposition_t *out_disposition);
 
 #ifdef __cplusplus
 }

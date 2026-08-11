@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 
+#include "ble_link_operation.h"
 #include "ble_port_ops.h"
 
 #ifdef UNIT_TEST_HOST
@@ -34,9 +35,12 @@ typedef enum
  */
 typedef struct ble_tx_scheduler_result
 {
+    ble_link_operation_identity_t identity;
     ble_tx_scheduler_kind_t kind;
     uint16_t conn_handle;
     uint16_t value_handle;
+    uint32_t flow_id; /**< Owning service flow, or zero when untracked. */
+    uint32_t token; /**< Unique nonzero identity of this submitted frame. */
     esp_err_t status;
     bool is_last; /**< True when this frame ends the transaction. */
 } ble_tx_scheduler_result_t;
@@ -58,9 +62,10 @@ typedef void (*ble_tx_scheduler_completion_cb_t)(
  * All entry points must be called serially from a single owner task or under
  * the caller's own synchronization, matching the port event feeding model.
  * The completion callback must not submit frames synchronously; the session
- * layer defers submissions to its worker. Under this contract the pending
- * completion buffer (queue_depth + 1, pre-allocated at init) is a strict
- * bound and no completion is dropped.
+ * layer defers submissions to its worker. Submitted frames, the in-flight
+ * frame, and undelivered completions share queue_depth + 1 fixed credits, so
+ * terminal completions never require allocation and are delivered exactly
+ * once.
  */
 typedef struct ble_tx_scheduler_config
 {
@@ -77,20 +82,20 @@ typedef struct ble_tx_scheduler_config
 /**
  * @brief Initialize the scheduler with an empty queue.
  *
- * The completion pending buffer is pre-allocated for one frame chain
- * (queue_depth + 1 entries); a failure leaves the scheduler uninitialized.
- *
  * @param[in] config Configuration, kept for the scheduler lifetime.
- * @return ESP_OK or ESP_ERR_NO_MEM.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_NO_MEM.
  */
 esp_err_t ble_tx_scheduler_init(const ble_tx_scheduler_config_t *config);
 
 /**
  * @brief Release the scheduler and its configuration.
  *
- * After this call every entry point returns ESP_ERR_INVALID_STATE (or the
- * idle fallback for queries) until the next init. The production port calls
- * this during teardown so no callback outlives the lock it uses.
+ * Every outstanding frame (in flight and queued) is completed with
+ * ESP_ERR_INVALID_STATE and all pending completions are delivered before
+ * the buffers are freed, so no submitted identity is silently lost. After
+ * this call every entry point returns ESP_ERR_INVALID_STATE until the next
+ * init. The production port calls this during teardown so no callback
+ * outlives the lock it uses.
  */
 void ble_tx_scheduler_deinit(void);
 
@@ -103,34 +108,37 @@ void ble_tx_scheduler_deinit(void);
  * sent when the in-flight frame completes through
  * ble_tx_scheduler_handle_notify_tx().
  *
+ * The caller freezes generation, Security 2 epoch, flow, kind, and connection
+ * in @p identity. Its token must be zero; the scheduler assigns the unique
+ * nonzero frame token before the operation becomes visible to the port.
+ *
  * @param[in] kind         Transmission kind.
- * @param[in] conn_handle  Connection handle.
+ * @param[in] identity     Complete caller-owned operation identity except for
+ *                        the scheduler-assigned token.
  * @param[in] value_handle Characteristic value handle.
  * @param[in] data         Payload; copied synchronously when sent.
  * @param[in] len          Payload length.
  * @param[in] is_last      True when this frame ends the transaction.
- * @return ESP_OK, or a synchronous port transmission error (latched and
- *         returned by later submissions, fail closed),
+ * @return ESP_OK, or the synchronous port transmission error for this frame,
  *         ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE after deinit, or
  *         ESP_ERR_NO_MEM when the queue is full or a buffer allocation
  *         failed.
  */
 esp_err_t ble_tx_scheduler_submit(
-    ble_tx_scheduler_kind_t kind, uint16_t conn_handle,
+    ble_tx_scheduler_kind_t kind,
+    const ble_link_operation_identity_t *identity,
     uint16_t value_handle, const uint8_t *data, size_t len,
     bool is_last);
 
 /**
  * @brief Feed one NOTIFY_TX port event into the scheduler.
  *
- * Completes the in-flight frame when the event matches its connection,
- * attribute handle, and indication kind; unrelated or stale events are
- * ignored. After completion the next queued frame is sent.
+ * Completes the in-flight frame only when the event's complete immutable
+ * identity, attribute handle, and indication kind match. Unrelated or stale
+ * events are ignored. After completion the next queued frame is sent.
  *
  * @param[in] event Port event.
  * @return ESP_OK when the event completed the in-flight frame,
- *         a synchronous port transmission error when the confirmation
- *         event advanced the queue into a failing frame (latched),
  *         ESP_ERR_NOT_FOUND when it belonged to no in-flight frame,
  *         ESP_ERR_INVALID_ARG, or ESP_ERR_INVALID_STATE after deinit.
  */
@@ -139,8 +147,9 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event);
 /**
  * @brief Drop the queue and the in-flight frame.
  *
- * Called on disconnect or teardown. The in-flight frame, if any, completes
- * with ESP_ERR_INVALID_STATE.
+ * Called on disconnect or teardown. Every outstanding frame (in flight and
+ * queued) completes with ESP_ERR_INVALID_STATE, so N submissions always
+ * produce N completions.
  */
 void ble_tx_scheduler_reset(void);
 
@@ -150,8 +159,8 @@ void ble_tx_scheduler_reset(void);
 bool ble_tx_scheduler_is_busy(void);
 
 /**
- * @brief Fail the in-flight indication with ESP_ERR_TIMEOUT and drop the
- * remaining queued frames of the transaction.
+ * @brief Fail the in-flight indication with ESP_ERR_TIMEOUT and retire its
+ * remaining queued flow frames.
  *
  * Called by the transport when the 2000 ms indication confirmation window
  * expires. The token must match the current in-flight indication, so a
@@ -172,6 +181,10 @@ esp_err_t ble_tx_scheduler_handle_indication_timeout(uint32_t token);
  * @return The token, or 0 when nothing is in flight.
  */
 uint32_t ble_tx_scheduler_get_in_flight_token(void);
+
+/** @brief Copy the immutable identity of the current in-flight frame. */
+esp_err_t ble_tx_scheduler_get_in_flight_identity(
+    ble_link_operation_identity_t *identity);
 
 #ifdef __cplusplus
 }

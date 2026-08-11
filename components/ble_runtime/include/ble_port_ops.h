@@ -7,6 +7,8 @@
 
 #include "esp_err.h"
 
+#include "ble_link_operation.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,16 +42,21 @@ typedef enum
 typedef struct ble_port_event
 {
     ble_port_event_type_t type;
+    ble_link_operation_identity_t identity; /**< Async operation identity. */
     uint16_t conn_handle;
     uint16_t attr_handle;
     int status;      /**< Connect/operation result or raw TX status. */
     uint16_t mtu;    /**< Negotiated ATT MTU on MTU events. */
     uint8_t reason;  /**< Disconnect reason on disconnect events. */
-    bool subscribed; /**< Subscribe state on subscribe events. */
+    bool subscribed; /**< Subscribe state on subscribe events (either kind). */
+    bool notify;     /**< Notification CCCD bit on subscribe events. */
+    bool indicate;   /**< Indication CCCD bit on subscribe events. */
     bool encrypted;  /**< Actual link encryption on encrypt events. */
     bool indication; /**< TX was an indication on NOTIFY_TX events. */
+    bool accepted;   /**< CONNECT passed connection admission. */
+    bool host_reset_pending; /**< ADV_COMPLETE preceded the host reset callback. */
     ble_port_tx_result_t tx_result; /**< TX outcome on NOTIFY_TX events. */
-    uint32_t generation; /**< Command generation on ADV_STARTED events. */
+    uint32_t generation; /**< Command generation on ADV_STARTED/STOPPED. */
 } ble_port_event_t;
 
 /**
@@ -86,7 +93,7 @@ typedef struct ble_port_adv_config
 typedef struct ble_port_ops
 {
     esp_err_t (*adv_start)(const ble_port_adv_config_t *config);
-    esp_err_t (*adv_stop)(void);
+    esp_err_t (*adv_stop)(uint32_t generation);
     esp_err_t (*notify)(uint16_t conn_handle, uint16_t value_handle,
                         const uint8_t *data, size_t len);
     esp_err_t (*indicate)(uint16_t conn_handle, uint16_t value_handle,

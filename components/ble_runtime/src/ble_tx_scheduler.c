@@ -18,7 +18,7 @@
 typedef struct ble_tx_scheduler_frame
 {
     ble_tx_scheduler_kind_t kind;
-    uint16_t conn_handle;
+    ble_link_operation_identity_t identity;
     uint16_t value_handle;
     size_t len;
     bool is_last;
@@ -28,7 +28,7 @@ typedef struct ble_tx_scheduler_frame
 typedef struct ble_tx_scheduler_pending
 {
     ble_tx_scheduler_kind_t kind;
-    uint16_t conn_handle;
+    ble_link_operation_identity_t identity;
     uint16_t value_handle;
     esp_err_t status;
     bool is_last;
@@ -41,16 +41,13 @@ typedef struct ble_tx_scheduler
     size_t head;
     size_t count;
     uint32_t token_counter;
-    uint32_t in_flight_token;
+    ble_link_operation_identity_t in_flight_identity;
     bool in_flight_is_last;
     bool in_flight;
-    bool sync_event_seen;
+    bool port_call_active;
     ble_tx_scheduler_kind_t in_flight_kind;
-    uint16_t in_flight_conn;
     uint16_t in_flight_attr;
-    esp_err_t fatal_error;
-    bool transaction_aborted;
-    size_t in_flight_len;
+    bool deinitializing;
     uint8_t *in_flight_data;
     unsigned int depth;
     bool draining;
@@ -60,6 +57,13 @@ typedef struct ble_tx_scheduler
 } ble_tx_scheduler_t;
 
 static ble_tx_scheduler_t s_scheduler;
+
+static ble_link_operation_kind_t _ble_tx_scheduler_operation_kind(
+    ble_tx_scheduler_kind_t kind)
+{
+    return kind == BLE_TX_SCHEDULER_KIND_INDICATE ?
+           BLE_LINK_OPERATION_TX_INDICATE : BLE_LINK_OPERATION_TX_NOTIFY;
+}
 
 static void *_ble_tx_scheduler_payload_alloc(size_t size)
 {
@@ -93,28 +97,15 @@ static void _ble_tx_scheduler_unlock(void)
  * NOTIFY_TX event or a completion callback submitting new frames) and drained
  * at the outermost entry, so the completion callback never runs inside the
  * port ops call and its stack usage is bounded by one frame chain. The
- * pending buffer is pre-allocated for the worst case (one chain of
- * queue_depth + 1 frames), so a full buffer is an internal invariant
- * violation, not an allocation failure.
+ * The fixed buffer is one entry larger than the frame queue. Admission treats
+ * queued, in-flight, and pending-completion entries as one shared credit pool,
+ * so this helper cannot overflow after a successful submission.
  */
 static void _ble_tx_scheduler_queue_completion(
-    ble_tx_scheduler_kind_t kind, uint16_t conn_handle,
-    uint16_t value_handle, esp_err_t status)
+    ble_tx_scheduler_kind_t kind,
+    const ble_link_operation_identity_t *identity, uint16_t value_handle,
+    esp_err_t status, bool is_last)
 {
-    if (s_scheduler.depth == 0U && !s_scheduler.draining &&
-            s_scheduler.pending_count == 0U &&
-            s_scheduler.config->completed != NULL)
-    {
-        ble_tx_scheduler_result_t result;
-
-        result.kind = kind;
-        result.conn_handle = conn_handle;
-        result.value_handle = value_handle;
-        result.status = status;
-        result.is_last = s_scheduler.in_flight_is_last;
-        s_scheduler.config->completed(&result, s_scheduler.config->completed_arg);
-        return;
-    }
     if (s_scheduler.pending == NULL)
     {
         LOG_E("pending completions not allocated");
@@ -122,18 +113,93 @@ static void _ble_tx_scheduler_queue_completion(
     }
     if (s_scheduler.pending_count >= s_scheduler.pending_capacity)
     {
-        LOG_E("pending completion overflow");
+        LOG_E("pending completion credit invariant violated");
         return;
     }
     ble_tx_scheduler_pending_t *entry =
         &s_scheduler.pending[s_scheduler.pending_count];
 
     entry->kind = kind;
-    entry->conn_handle = conn_handle;
+    entry->identity = *identity;
     entry->value_handle = value_handle;
     entry->status = status;
-    entry->is_last = s_scheduler.in_flight_is_last;
+    entry->is_last = is_last;
     s_scheduler.pending_count++;
+}
+
+/**
+ * @brief Complete and discard every frame still waiting in the ring.
+ *
+ * Caller holds the scheduler lock and has already entered a deferred
+ * completion scope. A terminal scheduler failure must not silently lose
+ * submitted frame identities.
+ */
+static void _ble_tx_scheduler_drop_queued_locked(esp_err_t status)
+{
+    while (s_scheduler.count > 0U)
+    {
+        ble_tx_scheduler_frame_t *frame = s_scheduler.frames[s_scheduler.head];
+
+        if (frame != NULL)
+        {
+            _ble_tx_scheduler_queue_completion(
+                frame->kind, &frame->identity, frame->value_handle,
+                status, frame->is_last);
+        }
+        s_scheduler.head = (s_scheduler.head + 1U) %
+                           s_scheduler.config->queue_depth;
+        s_scheduler.count--;
+    }
+    s_scheduler.head = 0U;
+}
+
+/**
+ * @brief Complete queued frames owned by one failed service flow.
+ *
+ * Frames from other flows and untracked best-effort notifications retain
+ * their order. A zero flow id has no transaction ownership and therefore
+ * retires only the in-flight frame.
+ */
+static void _ble_tx_scheduler_drop_flow_locked(
+    uint32_t flow_id, esp_err_t status)
+{
+    if (flow_id == 0U || s_scheduler.count == 0U)
+    {
+        return;
+    }
+    const size_t original_count = s_scheduler.count;
+    size_t kept = 0U;
+
+    for (size_t i = 0U; i < original_count; ++i)
+    {
+        const size_t source = (s_scheduler.head + i) %
+                              s_scheduler.config->queue_depth;
+        ble_tx_scheduler_frame_t *frame = s_scheduler.frames[source];
+
+        if (frame != NULL && frame->identity.flow_id == flow_id)
+        {
+            _ble_tx_scheduler_queue_completion(
+                frame->kind, &frame->identity, frame->value_handle,
+                status, frame->is_last);
+            continue;
+        }
+        const size_t destination = (s_scheduler.head + kept) %
+                                   s_scheduler.config->queue_depth;
+
+        if (destination != source)
+        {
+            ble_tx_scheduler_frame_t *swap = s_scheduler.frames[destination];
+
+            s_scheduler.frames[destination] = frame;
+            s_scheduler.frames[source] = swap;
+        }
+        kept++;
+    }
+    s_scheduler.count = kept;
+    if (kept == 0U)
+    {
+        s_scheduler.head = 0U;
+    }
 }
 
 /**
@@ -168,6 +234,8 @@ static void _ble_tx_scheduler_drain_completions(void)
     for (;;)
     {
         ble_tx_scheduler_pending_t entry;
+        ble_tx_scheduler_completion_cb_t completed = NULL;
+        void *completed_arg = NULL;
         bool have_entry = false;
 
         _ble_tx_scheduler_lock();
@@ -180,6 +248,8 @@ static void _ble_tx_scheduler_drain_completions(void)
         if (s_scheduler.pending_count > 0U)
         {
             entry = s_scheduler.pending[0];
+            completed = s_scheduler.config->completed;
+            completed_arg = s_scheduler.config->completed_arg;
             memmove(&s_scheduler.pending[0], &s_scheduler.pending[1],
                     (s_scheduler.pending_count - 1U) *
                     sizeof(s_scheduler.pending[0]));
@@ -193,16 +263,20 @@ static void _ble_tx_scheduler_drain_completions(void)
             return;
         }
         _ble_tx_scheduler_unlock();
-        if (s_scheduler.config->completed != NULL)
+        if (completed != NULL)
         {
             ble_tx_scheduler_result_t result;
 
+            memset(&result, 0, sizeof(result));
+            result.identity = entry.identity;
             result.kind = entry.kind;
-            result.conn_handle = entry.conn_handle;
+            result.conn_handle = entry.identity.conn_handle;
             result.value_handle = entry.value_handle;
+            result.flow_id = entry.identity.flow_id;
+            result.token = entry.identity.token;
             result.status = entry.status;
             result.is_last = entry.is_last;
-            s_scheduler.config->completed(&result, s_scheduler.config->completed_arg);
+            completed(&result, completed_arg);
         }
     }
 }
@@ -232,47 +306,63 @@ void ble_tx_scheduler_test_set_token(uint32_t value)
 }
 #endif
 
-static void _ble_tx_scheduler_send_head(void)
+static esp_err_t _ble_tx_scheduler_send_head(void)
 {
     ble_tx_scheduler_frame_t *frame;
     ble_tx_scheduler_kind_t kind;
+    ble_link_operation_identity_t identity;
     uint16_t conn;
     uint16_t attr;
+    uint32_t flow_id;
     size_t len;
-    uint32_t token;
-    esp_err_t result;
+    bool is_last;
+    esp_err_t first_error = ESP_OK;
 
     for (;;)
     {
-        if (s_scheduler.count == 0U || s_scheduler.in_flight)
+        if (s_scheduler.count == 0U || s_scheduler.in_flight ||
+                s_scheduler.port_call_active)
         {
-            return;
+            return first_error;
         }
         frame = s_scheduler.frames[s_scheduler.head];
         kind = frame->kind;
-        conn = frame->conn_handle;
+        identity = frame->identity;
+        conn = identity.conn_handle;
         attr = frame->value_handle;
+        flow_id = identity.flow_id;
         len = frame->len;
+        is_last = frame->is_last;
         memcpy(s_scheduler.in_flight_data, frame->data, len);
         s_scheduler.in_flight_kind = kind;
-        s_scheduler.in_flight_conn = conn;
+        s_scheduler.in_flight_identity = identity;
         s_scheduler.in_flight_attr = attr;
-        s_scheduler.in_flight_len = len;
-        s_scheduler.in_flight_is_last = frame->is_last;
-        if (s_scheduler.token_counter >= UINT32_MAX)
+        s_scheduler.in_flight_is_last = is_last;
+        if (identity.token == 0U)
         {
-            /* The token allocator never wraps: exhausted frames are
-             * rejected (fail closed). */
+            /* Submission rejects token exhaustion, so this is an internal
+             * identity invariant failure. Complete the affected frame and
+             * continue with independent work. */
             s_scheduler.head = (s_scheduler.head + 1U) %
                                s_scheduler.config->queue_depth;
             s_scheduler.count--;
-            return;
+            _ble_tx_scheduler_queue_completion(
+                kind, &identity, attr, ESP_ERR_INVALID_STATE, is_last);
+            if (kind == BLE_TX_SCHEDULER_KIND_INDICATE)
+            {
+                _ble_tx_scheduler_drop_flow_locked(
+                    flow_id, ESP_ERR_INVALID_STATE);
+            }
+            memset(&s_scheduler.in_flight_identity, 0,
+                   sizeof(s_scheduler.in_flight_identity));
+            if (first_error == ESP_OK)
+            {
+                first_error = ESP_ERR_INVALID_STATE;
+            }
+            continue;
         }
-        s_scheduler.token_counter++;
-        token = s_scheduler.token_counter;
-        s_scheduler.in_flight_token = token;
         s_scheduler.in_flight = true;
-        s_scheduler.sync_event_seen = false;
+        s_scheduler.port_call_active = true;
         s_scheduler.head = (s_scheduler.head + 1U) %
                            s_scheduler.config->queue_depth;
         s_scheduler.count--;
@@ -280,46 +370,73 @@ static void _ble_tx_scheduler_send_head(void)
         _ble_tx_scheduler_unlock();
         if (kind == BLE_TX_SCHEDULER_KIND_INDICATE)
         {
-            result = s_scheduler.config->ops->indicate(
-                         conn, attr, s_scheduler.in_flight_data, len);
-        }
-        else
-        {
-            result = s_scheduler.config->ops->notify(
-                         conn, attr, s_scheduler.in_flight_data, len);
-        }
-        _ble_tx_scheduler_lock();
+            const esp_err_t result = s_scheduler.config->ops->indicate(
+                                         conn, attr,
+                                         s_scheduler.in_flight_data, len);
 
-        /* A synchronous event completed this frame (or left an indication
-         * waiting for confirmation) and the re-entrant handler already
-         * advanced the queue, so re-check the loop conditions. Only when no
-         * event fired (host-test fakes) and the in-flight token still matches
-         * ours is the frame completed locally. */
-        if (s_scheduler.sync_event_seen)
-        {
-            continue;
-        }
-        if (s_scheduler.in_flight &&
-                s_scheduler.in_flight_token == token)
-        {
-            s_scheduler.in_flight = false;
-            s_scheduler.in_flight_token = 0U;
-            _ble_tx_scheduler_queue_completion(kind, conn, attr, result);
-            if (result != ESP_OK)
+            _ble_tx_scheduler_lock();
+            s_scheduler.port_call_active = false;
+            const bool ours = s_scheduler.in_flight &&
+                              ble_link_operation_identity_equal(
+                                  &s_scheduler.in_flight_identity,
+                                  &identity);
+
+            if (result != ESP_OK && ours)
             {
-                /* A failed transmission ends the transaction: nothing
-                 * further is sent and later submissions fail closed. */
-                s_scheduler.head = 0U;
-                s_scheduler.count = 0U;
-                s_scheduler.fatal_error = result;
+                s_scheduler.in_flight = false;
+                memset(&s_scheduler.in_flight_identity, 0,
+                       sizeof(s_scheduler.in_flight_identity));
+                _ble_tx_scheduler_queue_completion(
+                    kind, &identity, attr, result, is_last);
+                _ble_tx_scheduler_drop_flow_locked(flow_id, result);
+                if (first_error == ESP_OK)
+                {
+                    first_error = result;
+                }
                 continue;
             }
+            if (result != ESP_OK && first_error == ESP_OK)
+            {
+                /* A synchronous terminal event already completed this token;
+                 * preserve exactly-once completion and only surface the
+                 * contradictory port return to the initiating caller. */
+                first_error = result;
+            }
+            continue;
+        }
+        const esp_err_t result = s_scheduler.config->ops->notify(
+                                     conn, attr, s_scheduler.in_flight_data,
+                                     len);
+        _ble_tx_scheduler_lock();
+        s_scheduler.port_call_active = false;
+        const bool ours = s_scheduler.in_flight &&
+                          ble_link_operation_identity_equal(
+                              &s_scheduler.in_flight_identity, &identity);
+
+        if (ours)
+        {
+            s_scheduler.in_flight = false;
+            memset(&s_scheduler.in_flight_identity, 0,
+                   sizeof(s_scheduler.in_flight_identity));
+            _ble_tx_scheduler_queue_completion(
+                kind, &identity, attr, result, is_last);
+        }
+        if (result != ESP_OK && first_error == ESP_OK)
+        {
+            first_error = result;
         }
     }
 }
 
 esp_err_t ble_tx_scheduler_init(const ble_tx_scheduler_config_t *config)
 {
+    if (config == NULL || config->queue_depth == 0U ||
+            config->max_frame_bytes == 0U || config->ops == NULL ||
+            config->ops->notify == NULL || config->ops->indicate == NULL ||
+            config->queue_depth == SIZE_MAX)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     memset(&s_scheduler, 0, sizeof(s_scheduler));
     s_scheduler.config = config;
     s_scheduler.pending_capacity = config->queue_depth + 1U;
@@ -342,10 +459,35 @@ void ble_tx_scheduler_deinit(void)
                        ? s_scheduler.config->lock_arg
                        : NULL;
 
-    if (s_scheduler.config != NULL && s_scheduler.config->lock != NULL)
+    _ble_tx_scheduler_lock();
+    if (s_scheduler.config == NULL)
     {
-        s_scheduler.config->lock(s_scheduler.config->lock_arg);
+        _ble_tx_scheduler_unlock();
+        return;
     }
+    /* Refuse new submissions, then complete every outstanding frame and
+     * every already-generated pending completion before any buffer is
+     * freed: a submitted frame identity must never vanish silently. The
+     * completion callback runs in the drain below, outside the lock. */
+    s_scheduler.deinitializing = true;
+    if (s_scheduler.in_flight)
+    {
+        s_scheduler.depth++;
+        _ble_tx_scheduler_queue_completion(
+            s_scheduler.in_flight_kind, &s_scheduler.in_flight_identity,
+            s_scheduler.in_flight_attr, ESP_ERR_INVALID_STATE,
+            s_scheduler.in_flight_is_last);
+        s_scheduler.depth--;
+        s_scheduler.in_flight = false;
+        memset(&s_scheduler.in_flight_identity, 0,
+               sizeof(s_scheduler.in_flight_identity));
+    }
+    s_scheduler.depth++;
+    _ble_tx_scheduler_drop_queued_locked(ESP_ERR_INVALID_STATE);
+    s_scheduler.depth--;
+    _ble_tx_scheduler_unlock();
+    _ble_tx_scheduler_drain_completions();
+    _ble_tx_scheduler_lock();
     if (s_scheduler.config != NULL && s_scheduler.frames != NULL)
     {
         for (size_t i = 0U; i < s_scheduler.config->queue_depth; ++i)
@@ -364,8 +506,11 @@ void ble_tx_scheduler_deinit(void)
     s_scheduler.count = 0U;
     s_scheduler.head = 0U;
     s_scheduler.pending_count = 0U;
+    s_scheduler.pending_capacity = 0U;
     s_scheduler.in_flight = false;
     s_scheduler.depth = 0U;
+    s_scheduler.deinitializing = false;
+    _ble_tx_scheduler_unlock();
     if (unlock_cb != NULL)
     {
         unlock_cb(unlock_arg);
@@ -373,7 +518,8 @@ void ble_tx_scheduler_deinit(void)
 }
 
 esp_err_t ble_tx_scheduler_submit(
-    ble_tx_scheduler_kind_t kind, uint16_t conn_handle,
+    ble_tx_scheduler_kind_t kind,
+    const ble_link_operation_identity_t *identity,
     uint16_t value_handle, const uint8_t *data, size_t len,
     bool is_last)
 {
@@ -381,8 +527,10 @@ esp_err_t ble_tx_scheduler_submit(
     size_t slot;
     esp_err_t result = ESP_OK;
 
-    if (kind != BLE_TX_SCHEDULER_KIND_NOTIFY &&
-            kind != BLE_TX_SCHEDULER_KIND_INDICATE)
+    if ((kind != BLE_TX_SCHEDULER_KIND_NOTIFY &&
+            kind != BLE_TX_SCHEDULER_KIND_INDICATE) || identity == NULL ||
+            identity->generation == 0U || identity->token != 0U ||
+            identity->kind != _ble_tx_scheduler_operation_kind(kind))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -396,19 +544,10 @@ esp_err_t ble_tx_scheduler_submit(
         _ble_tx_scheduler_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_scheduler.fatal_error != ESP_OK)
+    if (s_scheduler.deinitializing)
     {
-        /* A previous transmission failed: the transaction is over and the
-         * session must be closed by the caller. */
-        const esp_err_t fatal = s_scheduler.fatal_error;
-
-        _ble_tx_scheduler_unlock();
-        return fatal;
-    }
-    if (s_scheduler.transaction_aborted)
-    {
-        /* The transaction was terminated by a timeout or error: further
-         * submissions fail closed. */
+        /* Teardown accepted the outstanding queue already; new work is
+         * refused until the next init. */
         _ble_tx_scheduler_unlock();
         return ESP_ERR_INVALID_STATE;
     }
@@ -417,10 +556,24 @@ esp_err_t ble_tx_scheduler_submit(
         _ble_tx_scheduler_unlock();
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_scheduler.count >= s_scheduler.config->queue_depth)
+    const size_t credits_in_use = s_scheduler.pending_count +
+                                  s_scheduler.count +
+                                  (s_scheduler.in_flight ? 1U : 0U);
+
+    if (credits_in_use >= s_scheduler.pending_capacity ||
+            s_scheduler.count >= s_scheduler.config->queue_depth)
     {
         _ble_tx_scheduler_unlock();
         return ESP_ERR_NO_MEM;
+    }
+    if (s_scheduler.token_counter >= UINT32_MAX - 1U ||
+            s_scheduler.count >=
+            (size_t)(UINT32_MAX - 1U - s_scheduler.token_counter))
+    {
+        /* The token allocator never wraps: submissions that cannot be
+         * assigned a fresh token are rejected (fail closed). */
+        _ble_tx_scheduler_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
     if (s_scheduler.frames == NULL)
     {
@@ -457,32 +610,18 @@ esp_err_t ble_tx_scheduler_submit(
         }
         s_scheduler.frames[slot] = frame;
     }
-    if (s_scheduler.token_counter >= UINT32_MAX ||
-            s_scheduler.token_counter + s_scheduler.count + 1U >=
-            UINT32_MAX)
-    {
-        /* The token allocator never wraps: submissions that cannot be
-         * assigned a fresh token are rejected (fail closed). */
-        _ble_tx_scheduler_unlock();
-        return ESP_ERR_INVALID_STATE;
-    }
+    s_scheduler.token_counter++;
     frame->kind = kind;
-    frame->conn_handle = conn_handle;
+    frame->identity = *identity;
+    frame->identity.token = s_scheduler.token_counter;
     frame->value_handle = value_handle;
     frame->len = len;
     frame->is_last = is_last;
     memcpy(frame->data, data, len);
     s_scheduler.count++;
     s_scheduler.depth++;
-    _ble_tx_scheduler_send_head();
+    result = _ble_tx_scheduler_send_head();
     s_scheduler.depth--;
-    /* A synchronous transmission failure is returned to the caller of the
-     * submit that caused it, so a single-fragment transaction fails
-     * immediately and the session is closed. */
-    if (s_scheduler.fatal_error != ESP_OK)
-    {
-        result = s_scheduler.fatal_error;
-    }
     _ble_tx_scheduler_unlock();
     _ble_tx_scheduler_drain_completions();
     return result;
@@ -492,8 +631,9 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event)
 {
     esp_err_t status;
     ble_tx_scheduler_kind_t done_kind;
-    uint16_t done_conn;
+    ble_link_operation_identity_t done_identity;
     uint16_t done_attr;
+    bool done_is_last;
 
     if (event == NULL)
     {
@@ -510,7 +650,9 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event)
         return ESP_ERR_INVALID_STATE;
     }
     if (!s_scheduler.in_flight ||
-            s_scheduler.in_flight_conn != event->conn_handle ||
+            !ble_link_operation_identity_equal(
+                &s_scheduler.in_flight_identity, &event->identity) ||
+            event->conn_handle != event->identity.conn_handle ||
             s_scheduler.in_flight_attr != event->attr_handle ||
             (s_scheduler.in_flight_kind == BLE_TX_SCHEDULER_KIND_INDICATE) !=
             event->indication)
@@ -519,7 +661,6 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event)
         _ble_tx_scheduler_unlock();
         return ESP_ERR_NOT_FOUND;
     }
-    s_scheduler.sync_event_seen = true;
     if (s_scheduler.in_flight_kind == BLE_TX_SCHEDULER_KIND_INDICATE &&
             event->tx_result == BLE_PORT_TX_SENT)
     {
@@ -541,35 +682,25 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event)
         status = ESP_FAIL;
     }
     done_kind = s_scheduler.in_flight_kind;
-    done_conn = s_scheduler.in_flight_conn;
+    done_identity = s_scheduler.in_flight_identity;
     done_attr = s_scheduler.in_flight_attr;
+    done_is_last = s_scheduler.in_flight_is_last;
     s_scheduler.in_flight = false;
-    s_scheduler.in_flight_token = 0U;
+    memset(&s_scheduler.in_flight_identity, 0,
+           sizeof(s_scheduler.in_flight_identity));
     s_scheduler.depth++;
-    _ble_tx_scheduler_queue_completion(done_kind, done_conn, done_attr, status);
-    if (status == ESP_ERR_TIMEOUT || status == ESP_FAIL)
+    _ble_tx_scheduler_queue_completion(
+        done_kind, &done_identity, done_attr, status,
+        done_is_last);
+    if (status != ESP_OK && done_kind == BLE_TX_SCHEDULER_KIND_INDICATE)
     {
-        /* A timeout or a failed transmission ends the transaction: the
-         * queued fragments are dropped and nothing further is sent. */
-        s_scheduler.head = 0U;
-        s_scheduler.count = 0U;
-        s_scheduler.transaction_aborted = true;
+        /* An indication failure retires only its response flow. Independent
+         * notifications remain best effort and other epochs may re-handshake
+         * on the same ACL. */
+        _ble_tx_scheduler_drop_flow_locked(done_identity.flow_id, status);
     }
-    else
-    {
-        _ble_tx_scheduler_send_head();
-    }
+    (void)_ble_tx_scheduler_send_head();
     s_scheduler.depth--;
-    /* A synchronous failure of a queued fragment (sent from this event)
-     * is surfaced to the caller so the session is closed. */
-    if (status == ESP_OK && s_scheduler.fatal_error != ESP_OK)
-    {
-        const esp_err_t fatal = s_scheduler.fatal_error;
-
-        _ble_tx_scheduler_unlock();
-        _ble_tx_scheduler_drain_completions();
-        return fatal;
-    }
     _ble_tx_scheduler_unlock();
     _ble_tx_scheduler_drain_completions();
     return ESP_OK;
@@ -577,67 +708,68 @@ esp_err_t ble_tx_scheduler_handle_notify_tx(const ble_port_event_t *event)
 
 void ble_tx_scheduler_reset(void)
 {
-    ble_tx_scheduler_kind_t kind = BLE_TX_SCHEDULER_KIND_NOTIFY;
-    uint16_t conn = 0U;
-    uint16_t attr = 0U;
-    bool complete_pending = false;
-
     _ble_tx_scheduler_lock();
     if (s_scheduler.config == NULL)
     {
         _ble_tx_scheduler_unlock();
         return;
     }
+    /* Complete the in-flight frame AND every queued frame with the
+     * teardown status, so N submitted frames always produce N
+     * completions. */
     if (s_scheduler.in_flight)
     {
-        kind = s_scheduler.in_flight_kind;
-        conn = s_scheduler.in_flight_conn;
-        attr = s_scheduler.in_flight_attr;
-        s_scheduler.in_flight = false;
-        s_scheduler.in_flight_token = 0U;
-        complete_pending = true;
-    }
-    s_scheduler.head = 0U;
-    s_scheduler.count = 0U;
-    s_scheduler.fatal_error = ESP_OK;
-    s_scheduler.transaction_aborted = false;
-    if (complete_pending)
-    {
         s_scheduler.depth++;
-        _ble_tx_scheduler_queue_completion(kind, conn, attr,
-                                           ESP_ERR_INVALID_STATE);
+        _ble_tx_scheduler_queue_completion(
+            s_scheduler.in_flight_kind, &s_scheduler.in_flight_identity,
+            s_scheduler.in_flight_attr, ESP_ERR_INVALID_STATE,
+            s_scheduler.in_flight_is_last);
         s_scheduler.depth--;
+        s_scheduler.in_flight = false;
+        memset(&s_scheduler.in_flight_identity, 0,
+               sizeof(s_scheduler.in_flight_identity));
     }
+    s_scheduler.depth++;
+    _ble_tx_scheduler_drop_queued_locked(ESP_ERR_INVALID_STATE);
+    s_scheduler.depth--;
     _ble_tx_scheduler_unlock();
     _ble_tx_scheduler_drain_completions();
 }
 
-static esp_err_t _ble_tx_scheduler_fail_in_flight(
-    esp_err_t status, bool drop_queue)
+static esp_err_t _ble_tx_scheduler_fail_in_flight(esp_err_t status)
 {
     ble_tx_scheduler_kind_t kind = BLE_TX_SCHEDULER_KIND_NOTIFY;
-    uint16_t conn = 0U;
+    ble_link_operation_identity_t identity;
     uint16_t attr = 0U;
+    bool is_last = false;
+
+    memset(&identity, 0, sizeof(identity));
 
     if (s_scheduler.in_flight)
     {
         kind = s_scheduler.in_flight_kind;
-        conn = s_scheduler.in_flight_conn;
+        identity = s_scheduler.in_flight_identity;
         attr = s_scheduler.in_flight_attr;
+        is_last = s_scheduler.in_flight_is_last;
         s_scheduler.in_flight = false;
-        s_scheduler.in_flight_token = 0U;
+        memset(&s_scheduler.in_flight_identity, 0,
+               sizeof(s_scheduler.in_flight_identity));
         s_scheduler.depth++;
-        _ble_tx_scheduler_queue_completion(kind, conn, attr, status);
+        _ble_tx_scheduler_queue_completion(
+            kind, &identity, attr, status, is_last);
         s_scheduler.depth--;
     }
-    if (drop_queue)
+    if (kind == BLE_TX_SCHEDULER_KIND_INDICATE)
     {
-        /* The framing contract ends the whole transaction: the queued
-         * fragments are dropped and further submissions fail closed. */
-        s_scheduler.head = 0U;
-        s_scheduler.count = 0U;
-        s_scheduler.transaction_aborted = true;
+        /* The framing contract ends this response flow, not the scheduler or
+         * unrelated best-effort notifications. */
+        s_scheduler.depth++;
+        _ble_tx_scheduler_drop_flow_locked(identity.flow_id, status);
+        s_scheduler.depth--;
     }
+    s_scheduler.depth++;
+    (void)_ble_tx_scheduler_send_head();
+    s_scheduler.depth--;
     return ESP_OK;
 }
 
@@ -658,13 +790,13 @@ esp_err_t ble_tx_scheduler_handle_indication_timeout(uint32_t token)
         _ble_tx_scheduler_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    if (token != 0U && s_scheduler.in_flight_token != token)
+    if (token != 0U && s_scheduler.in_flight_identity.token != token)
     {
         /* A late timer from a previous indication is ignored. */
         _ble_tx_scheduler_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    result = _ble_tx_scheduler_fail_in_flight(ESP_ERR_TIMEOUT, true);
+    result = _ble_tx_scheduler_fail_in_flight(ESP_ERR_TIMEOUT);
     _ble_tx_scheduler_unlock();
     _ble_tx_scheduler_drain_completions();
     return result;
@@ -675,9 +807,28 @@ uint32_t ble_tx_scheduler_get_in_flight_token(void)
     uint32_t token;
 
     _ble_tx_scheduler_lock();
-    token = s_scheduler.in_flight ? s_scheduler.in_flight_token : 0U;
+    token = s_scheduler.in_flight ? s_scheduler.in_flight_identity.token : 0U;
     _ble_tx_scheduler_unlock();
     return token;
+}
+
+esp_err_t ble_tx_scheduler_get_in_flight_identity(
+    ble_link_operation_identity_t *identity)
+{
+    if (identity == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_tx_scheduler_lock();
+    if (!s_scheduler.in_flight)
+    {
+        memset(identity, 0, sizeof(*identity));
+        _ble_tx_scheduler_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    *identity = s_scheduler.in_flight_identity;
+    _ble_tx_scheduler_unlock();
+    return ESP_OK;
 }
 
 bool ble_tx_scheduler_is_busy(void)

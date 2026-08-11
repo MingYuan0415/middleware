@@ -19,47 +19,60 @@ static void test_reset_clears_state(void)
 
 static void test_enc_change_before_identity_holds(void)
 {
-    /* Bound peer reconnect with RPA: ENC_CHANGE arrives while the
-     * identity is still the unresolved RPA. Nothing may be deleted or
-     * terminated. */
+    /* Bound peer reconnect: the controller resolves the identity at
+     * CONNECT (stored IRK), so the had_bond snapshot is captured there;
+     * ENC_CHANGE alone completes the admission. */
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(&state, false, true, true, true, true) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    const uint32_t actions =
+        ble_link_sec_state_on_encrypted(&state, true, true, true);
+
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
+    assert(ble_link_sec_state_peer_admitted(&state));
+}
+
+static void test_unresolved_rpa_outside_window_fails_closed(void)
+{
+    /* A peer whose identity did NOT resolve at CONNECT and that is not
+     * inside a pairing window can never prove a prior bond: the had_bond
+     * fact is frozen (no re-query at identity time, or a fresh pairing
+     * would bypass a closed window). Fail closed: delete and terminate. */
     ble_link_sec_state_t state;
 
     ble_link_sec_state_reset(&state);
     assert(ble_link_sec_state_on_connect(&state, false, false, false, false, false) ==
            BLE_LINK_SEC_ACTION_NONE);
-    /* ENC with unresolved identity: store lookups fail, but the reducer
-     * must hold, not classify as orphan. */
+    assert(ble_link_sec_state_on_encrypted(
+               &state, true, true, true) == BLE_LINK_SEC_ACTION_NONE);
+    /* Identity resolves with a stored bond, but the snapshot held no prior
+     * bond and no window is open: this can only be this connection's own
+     * fresh pairing, which must not be admitted. */
     const uint32_t actions =
-        ble_link_sec_state_on_encrypted(&state, true, true, false);
+        ble_link_sec_state_on_identity(&state, true, true);
 
-    assert(actions == BLE_LINK_SEC_ACTION_NONE);
-    assert(!state.finalized);
-    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
-    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
-
-    /* Identity resolves to the stored bond: the peer is admitted. */
-    const uint32_t resolved =
-        ble_link_sec_state_on_identity(&state, true, true, true);
-
-    assert((resolved & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
-    assert((resolved & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
-    assert((resolved & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
-    assert((resolved & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
-    assert((resolved & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
-    assert(ble_link_sec_state_peer_admitted(&state));
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) != 0U);
+    assert(!ble_link_sec_state_peer_admitted(&state));
 }
 
 static void test_identity_before_enc_change_converges(void)
 {
     /* The same peer with the events in the opposite order converges to
-     * the same admission. */
+     * the same admission (identity resolves before encryption). */
     ble_link_sec_state_t state;
 
     ble_link_sec_state_reset(&state);
-    assert(ble_link_sec_state_on_connect(&state, false, false, false, false, false) ==
+    assert(ble_link_sec_state_on_connect(&state, true, false, false, false, false) ==
            BLE_LINK_SEC_ACTION_NONE);
     uint32_t actions =
-        ble_link_sec_state_on_identity(&state, true, false, false);
+        ble_link_sec_state_on_identity(&state, true, true);
 
     assert(actions == BLE_LINK_SEC_ACTION_NONE);
     assert(!state.finalized);
@@ -67,6 +80,28 @@ static void test_identity_before_enc_change_converges(void)
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
+    assert(ble_link_sec_state_peer_admitted(&state));
+}
+
+static void test_connect_bond_snapshot_is_not_overwritten(void)
+{
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(
+               &state, false, false, true, true, true) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    assert(ble_link_sec_state_on_encrypted(
+               &state, true, true, true) == BLE_LINK_SEC_ACTION_NONE);
+    /* A late identity callback reports a fresh store entry created by the
+     * current pairing; the had_bond fact is not re-derived and the CONNECT
+     * snapshot still admits the original bonded peer. */
+    const uint32_t actions = ble_link_sec_state_on_identity(
+                                 &state, false, false);
+
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
     assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
     assert(ble_link_sec_state_peer_admitted(&state));
@@ -87,7 +122,7 @@ static void test_new_peer_in_window_is_admitted(void)
 
     assert(actions == BLE_LINK_SEC_ACTION_NONE);
     assert(!state.finalized);
-    actions = ble_link_sec_state_on_identity(&state, true, true, true);
+    actions = ble_link_sec_state_on_identity(&state, true, true);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
@@ -182,7 +217,9 @@ int main(void)
 {
     test_reset_clears_state();
     test_enc_change_before_identity_holds();
+    test_unresolved_rpa_outside_window_fails_closed();
     test_identity_before_enc_change_converges();
+    test_connect_bond_snapshot_is_not_overwritten();
     test_new_peer_in_window_is_admitted();
     test_malformed_bond_deleted_and_terminated();
     test_unknown_peer_outside_window_terminated();

@@ -67,19 +67,43 @@ esp_err_t ble_link_session_set_authorization(
 bool ble_link_session_authorization_exhausted(void);
 
 /**
- * @brief Open a Security 2 session.
+ * @brief Begin a Security 2 handshake and allocate its logical epoch.
  *
- * The session is the single epoch allocator: the fresh epoch is returned
- * and must be used for the subsequent session-match report. Any later
- * accepted open or close invalidates the previous match.
+ * A Cmd0 calls this exactly once. It immediately retires any previous
+ * Security 2 session, allocates the new epoch, and leaves control admission
+ * closed until ble_link_session_security2_authenticate_current() accepts
+ * Cmd1 for that same epoch.
  *
  * @param[in]  generation Current connection generation.
  * @param[out] out_epoch  Fresh epoch for this handshake.
  * @return ESP_OK, or ESP_ERR_INVALID_STATE when the generation is not
  *         current or the epoch allocator is exhausted.
  */
+esp_err_t ble_link_session_security2_begin(
+    uint32_t generation, uint32_t *out_epoch);
+
+/**
+ * @brief Mark the current handshaking Security 2 epoch authenticated.
+ *
+ * @param[in] generation Current connection generation.
+ * @param[in] epoch Epoch allocated by the corresponding Cmd0.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale epoch/generation or
+ *         when no handshake is active.
+ */
+esp_err_t ble_link_session_security2_authenticate_current(
+    uint32_t generation, uint32_t epoch);
+
+/**
+ * @brief Allocate and authenticate one Security 2 epoch atomically.
+ *
+ * Compatibility helper for callers that do not model Cmd0/Cmd1 separately.
+ * New handshake owners should use begin/authenticate_current explicitly.
+ */
 esp_err_t ble_link_session_security2_open(
     uint32_t generation, uint32_t *out_epoch);
+
+/** @brief Return the current boot-scoped Security 2 epoch. */
+uint32_t ble_link_session_security2_epoch(void);
 
 /**
  * @brief Report that the current session matched the committed record at
@@ -170,6 +194,30 @@ void ble_link_session_reset(void);
  */
 esp_err_t ble_link_session_handle_event(
     uint32_t generation, ble_link_session_event_t event);
+
+/**
+ * @brief Pin the pairing-window admission state to the current ACL.
+ *
+ * The global window may close while an ACL is still being finalized. The
+ * connection keeps the decision captured at CONNECT; a later connection uses
+ * the new global state.
+ *
+ * @param[in] generation Current connection generation.
+ * @param[in] open      Window state captured at connection admission.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale generation.
+ */
+esp_err_t ble_link_session_set_connection_pairing_window(
+    uint32_t generation, bool open);
+
+/**
+ * @brief Read the pairing-window state pinned to the current ACL.
+ *
+ * @param[in] generation Current connection generation.
+ * @param[out] out_open  Pinned window state.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale generation.
+ */
+esp_err_t ble_link_session_get_connection_pairing_window(
+    uint32_t generation, bool *out_open);
 
 /**
  * @brief Clear the link security facts (encryption dropped).

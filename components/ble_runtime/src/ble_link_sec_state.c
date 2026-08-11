@@ -22,7 +22,7 @@ static bool _ble_link_sec_state_finalize_locked(ble_link_sec_state_t *state)
         return false;
     }
     if (state->bond_verified && (state->connect_window_open ||
-            state->had_bond))
+                                 state->had_bond))
     {
         /* The bond matches the contract and the peer is either pairing
          * inside a window or reconnecting with a stored bond: a known
@@ -69,8 +69,7 @@ uint32_t ble_link_sec_state_on_connect(
 }
 
 uint32_t ble_link_sec_state_on_identity(
-    ble_link_sec_state_t *state, bool had_bond, bool bonded,
-    bool bond_verified)
+    ble_link_sec_state_t *state, bool bonded, bool bond_verified)
 {
     uint32_t actions = BLE_LINK_SEC_ACTION_NONE;
 
@@ -79,15 +78,19 @@ uint32_t ble_link_sec_state_on_identity(
         return actions;
     }
     state->identity_ready = true;
-    state->had_bond = had_bond;
-    state->bonded = bonded;
-    state->bond_verified = bond_verified;
+    /* The prior-bond fact is frozen at CONNECT (a snapshot of the store
+     * before this ACL's SMP procedure). Identity resolution may run after a
+     * new provisional key was written, so it must never be re-derived from
+     * the store here: a pairing created by THIS connection would otherwise
+     * look like a pre-existing bond and bypass a closed pairing window. */
+    state->bonded = state->bonded || bonded;
+    state->bond_verified = state->bond_verified || bond_verified;
     if (!_ble_link_sec_state_finalize_locked(state))
     {
         return actions;
     }
     if (state->bond_verified && (state->connect_window_open ||
-            state->had_bond))
+                                 state->had_bond))
     {
         if (!state->link_encrypted_reported)
         {
@@ -140,7 +143,7 @@ uint32_t ble_link_sec_state_on_encrypted(
         return actions;
     }
     if (state->bond_verified && (state->connect_window_open ||
-            state->had_bond))
+                                 state->had_bond))
     {
         if (!state->link_encrypted_reported)
         {

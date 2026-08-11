@@ -41,11 +41,25 @@ static bool _ble_link_reassembler_duplicate(
     const ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment)
 {
     return slot->frame_id == fragment->frame_id &&
+           slot->total_length == fragment->total_length &&
            slot->last_offset == fragment->offset &&
            slot->last_len == fragment->payload_len &&
            slot->last_flags == fragment->flags &&
            memcmp(&slot->buffer[fragment->offset], fragment->payload,
                   fragment->payload_len) == 0;
+}
+
+static void _ble_link_reassembler_begin(
+    ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment)
+{
+    slot->frame_id = fragment->frame_id;
+    slot->total_length = fragment->total_length;
+    slot->received = 0U;
+    slot->last_offset = 0U;
+    slot->last_flags = 0U;
+    slot->last_len = 0U;
+    slot->started = true;
+    slot->completed_fragment_valid = false;
 }
 
 esp_err_t ble_link_reassembler_parse(
@@ -70,14 +84,30 @@ esp_err_t ble_link_reassembler_parse(
 esp_err_t ble_link_reassembler_accept(
     ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment)
 {
+    ble_link_reassembly_disposition_t disposition;
+    const esp_err_t result = ble_link_reassembler_accept_ex(
+                                 slot, fragment, &disposition);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    return disposition == BLE_LINK_REASSEMBLY_COMPLETE
+           ? ESP_OK
+           : ESP_ERR_NOT_FINISHED;
+}
+
+esp_err_t ble_link_reassembler_accept_ex(
+    ble_link_reassembler_t *slot, const ble_link_fragment_t *fragment,
+    ble_link_reassembly_disposition_t *out_disposition)
+{
     if (slot == NULL || slot->buffer == NULL || fragment == NULL ||
-            fragment->payload == NULL)
+            fragment->payload == NULL || out_disposition == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
     const bool start = (fragment->flags & BLE_LINK_FRAMING_FLAG_START) != 0U;
     const bool end = (fragment->flags & BLE_LINK_FRAMING_FLAG_END) != 0U;
-    const bool was_started = slot->started;
 
     if (fragment->version != BLE_LINK_FRAMING_VERSION)
     {
@@ -96,6 +126,18 @@ esp_err_t ble_link_reassembler_accept(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    if (fragment->offset > fragment->total_length ||
+            fragment->payload_len >
+            (size_t)fragment->total_length - fragment->offset)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!slot->started && slot->completed_fragment_valid &&
+            _ble_link_reassembler_duplicate(slot, fragment))
+    {
+        *out_disposition = BLE_LINK_REASSEMBLY_DUPLICATE;
+        return ESP_OK;
+    }
     if (!slot->started)
     {
         if (!start || fragment->offset != 0U)
@@ -106,10 +148,7 @@ esp_err_t ble_link_reassembler_accept(
         {
             return ESP_ERR_NO_MEM;
         }
-        slot->frame_id = fragment->frame_id;
-        slot->total_length = fragment->total_length;
-        slot->received = 0U;
-        slot->started = true;
+        _ble_link_reassembler_begin(slot, fragment);
     }
     else
     {
@@ -122,38 +161,25 @@ esp_err_t ble_link_reassembler_accept(
             return ESP_ERR_INVALID_ARG;
         }
     }
-    if (fragment->offset > fragment->total_length ||
-            fragment->payload_len >
-            (size_t)fragment->total_length - fragment->offset)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (was_started)
+    if (fragment->offset < slot->received)
     {
         const bool duplicate =
             _ble_link_reassembler_duplicate(slot, fragment);
 
-        if (fragment->offset < slot->received && !duplicate)
+        if (!duplicate)
         {
             return ESP_ERR_INVALID_ARG;
         }
-        if (fragment->offset > slot->received)
-        {
-            return ESP_ERR_INVALID_ARG;
-        }
-        if (start && !duplicate)
-        {
-            return ESP_ERR_INVALID_ARG;
-        }
-        if (duplicate)
-        {
-            /* Exact duplicate of the most recent fragment: accepted. */
-            if (end)
-            {
-                return ESP_ERR_INVALID_ARG;
-            }
-            return ESP_ERR_NOT_FINISHED;
-        }
+        *out_disposition = BLE_LINK_REASSEMBLY_DUPLICATE;
+        return ESP_OK;
+    }
+    if (fragment->offset > slot->received)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (slot->received > 0U && start)
+    {
+        return ESP_ERR_INVALID_ARG;
     }
     if (fragment->offset == slot->received)
     {
@@ -174,12 +200,15 @@ esp_err_t ble_link_reassembler_accept(
         {
             return ESP_ERR_INVALID_ARG;
         }
-        ble_link_reassembler_reset(slot);
+        slot->started = false;
+        slot->completed_fragment_valid = true;
+        *out_disposition = BLE_LINK_REASSEMBLY_COMPLETE;
         return ESP_OK;
     }
     if (slot->received == slot->total_length)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    return ESP_ERR_NOT_FINISHED;
+    *out_disposition = BLE_LINK_REASSEMBLY_NEW_PARTIAL;
+    return ESP_OK;
 }

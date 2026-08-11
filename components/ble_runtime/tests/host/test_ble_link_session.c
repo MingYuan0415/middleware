@@ -150,6 +150,36 @@ static void test_admission_progression(void)
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_SESSION));
 }
 
+static void test_encrypted_descriptor_replay_follows_acl_connect(void)
+{
+    ble_link_session_init(BOOT1);
+    /* An ENC_CHANGE may already be reflected in the connection descriptor
+     * before NimBLE delivers CONNECT. Security facts applied before the ACL
+     * generation exists are intentionally ignored. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_set_identity_known(GEN1, true));
+    TEST_ASSERT_EQUAL(BLE_LINK_SESSION_INACTIVE,
+                      ble_link_session_get_state(GEN1));
+
+    /* The CONNECT callback must establish the generation first, then replay
+     * the descriptor's encrypted/bond/identity facts. */
+    _connect(GEN1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_identity_known(GEN1, true));
+    TEST_ASSERT_EQUAL(BLE_LINK_SESSION_AUTHENTICATED,
+                      ble_link_session_get_state(GEN1));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK,
+                      _query(GEN1, BLE_LINK_SESSION_CHANNEL_SESSION));
+}
+
 static void test_security2_closed_keeps_acl(void)
 {
     ble_link_session_init(BOOT1);
@@ -475,6 +505,41 @@ static void test_security2_epoch_invalidation(void)
                       _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
 }
 
+static void test_security2_handshake_uses_one_epoch(void)
+{
+    uint32_t epoch = 0U;
+
+    ble_link_session_init(BOOT1);
+    _connect(GEN1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          GEN1, true));
+
+    /* Cmd0 owns epoch allocation but does not authenticate control. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_begin(
+                          GEN1, &epoch));
+    TEST_ASSERT_TRUE(epoch != 0U);
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED,
+                      _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_authenticate_current(
+                          GEN1, epoch + 1U));
+
+    /* Cmd1 authenticates the epoch allocated by Cmd0 without advancing it. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_security2_authenticate_current(
+                          GEN1, epoch));
+    TEST_ASSERT_EQUAL(epoch, ble_link_session_security2_epoch());
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_PERMISSION_DENIED,
+                      _query(GEN1, BLE_LINK_SESSION_CHANNEL_CONTROL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_security2_authenticate_current(
+                          GEN1, epoch));
+}
+
 static void test_late_close_does_not_preserve_old_match(void)
 {
     ble_link_session_init(BOOT1);
@@ -589,6 +654,7 @@ int main(void)
     test_authorization_exhausted();
     test_boot_init_and_reset();
     test_admission_progression();
+    test_encrypted_descriptor_replay_follows_acl_connect();
     test_security2_closed_keeps_acl();
     test_stale_authorization_revision_ignored();
     test_stale_generation_ignored();
@@ -605,6 +671,7 @@ int main(void)
     test_late_match_after_revoke_rejected();
     test_stale_revision_match_after_replace_rejected();
     test_security2_epoch_invalidation();
+    test_security2_handshake_uses_one_epoch();
     test_late_close_does_not_preserve_old_match();
     test_epoch_exhaustion_survives_reconnect();
     test_new_boot_resets_session();

@@ -53,6 +53,23 @@ typedef struct ble_runtime_host_port
     /** @brief Start the host task and wait until the stack is synchronized. */
     esp_err_t (*start)(void);
 
+    /**
+     * @brief Stop advertising and synchronously apply the SMP pairing gate.
+     *
+     * The implementation must not return success until advertising is
+     * stopped and the host-core gate reflects @p open. The caller resumes
+     * advertising only after the surrounding security transition commits.
+     */
+    esp_err_t (*set_pairing_gate)(bool open);
+
+    /**
+     * @brief Verify the journaled factory-reset peer-store sweep completed.
+     *
+     * Called after host synchronization in factory-reset-gated mode. It
+     * returns success only after every bond and persisted CCCD is absent.
+     */
+    esp_err_t (*reset_peer_store)(void);
+
     /** @brief Stop the host stack; must not return before teardown completes. */
     esp_err_t (*stop)(void);
 

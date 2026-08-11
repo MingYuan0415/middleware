@@ -7,6 +7,8 @@
 
 #include "esp_err.h"
 
+#include "ble_link_operation.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,12 +29,15 @@ typedef enum
 typedef struct ble_gap_manager_event
 {
     ble_gap_manager_event_type_t type;
+    ble_link_operation_identity_t identity; /**< Connection event identity. */
     uint16_t conn_handle;
     int status;      /**< Connect status or other operation result. */
     uint16_t mtu;    /**< Negotiated ATT MTU on MTU events. */
     uint8_t reason;  /**< Disconnect reason on disconnect events. */
     uint16_t attr_handle; /**< Characteristic handle on subscribe events. */
     bool subscribed;      /**< Subscribe state on subscribe events. */
+    bool notify;          /**< Notification CCCD bit on subscribe events. */
+    bool indicate;        /**< Indication CCCD bit on subscribe events. */
     bool encrypted;       /**< Actual link encryption on encrypt events. */
 } ble_gap_manager_event_t;
 
@@ -73,17 +78,21 @@ void ble_gap_manager_set_admission_cb(
  * @brief Feed one translated GAP event into the manager.
  *
  * The port translates NimBLE events and calls this from its host task.
- * Events for a connection that is not the current one are ignored; the
- * manager relies on the NimBLE host task processing events serially and in
- * order, so no event from a retired connection arrives after its disconnect.
+ * Connection-scoped events carry the immutable generation and operation kind.
+ * Events whose identity does not match the current connection are no-ops,
+ * including callbacks for a retired generation whose numeric handle was
+ * reused. A DISCONNECT with generation zero can only cancel an admission
+ * reservation for which no connection generation has been allocated yet.
  *
  * When a new connection is rejected (ESP_ERR_NO_MEM), the port must actively
  * terminate that ACL with ble_gap_terminate(); the manager does not record
  * the connection.
  *
  * @param[in] event Translated event.
- * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_NO_MEM when a new
- *         connection is rejected.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM when a new
+ *         connection is rejected, or ESP_ERR_INVALID_STATE when the
+ *         connection-generation or admission-reservation space is
+ *         exhausted (the port must terminate that ACL).
  */
 esp_err_t ble_gap_manager_handle_event(
     const ble_gap_manager_event_t *event);
@@ -99,6 +108,23 @@ bool ble_gap_manager_is_subscribed(
     uint16_t conn_handle, uint16_t attr_handle);
 
 /**
+ * @brief Query whether a characteristic CCCD bit is currently enabled.
+ *
+ * The GATT profile distinguishes notifications from indications; a TX path
+ * must verify the exact kind it is about to send because NimBLE never
+ * checks the CCCD itself.
+ *
+ * @param[in] conn_handle Connection handle.
+ * @param[in] attr_handle Characteristic value handle.
+ * @param[in] notify      True to query the notification bit, false for the
+ *                        indication bit.
+ * @return True when the requested CCCD bit is enabled for the current
+ *         connection.
+ */
+bool ble_gap_manager_is_subscribed_kind(
+    uint16_t conn_handle, uint16_t attr_handle, bool notify);
+
+/**
  * @brief Copy the current connection snapshot.
  *
  * Must be called from the same task that feeds events (the host task), or
@@ -108,6 +134,14 @@ bool ble_gap_manager_is_subscribed(
  * @return ESP_OK or ESP_ERR_INVALID_ARG.
  */
 esp_err_t ble_gap_manager_get_snapshot(ble_gap_manager_snapshot_t *out);
+
+#ifdef UNIT_TEST_HOST
+/** @brief Test-only setter for exercising generation exhaustion. */
+void ble_gap_manager_test_set_generation(uint32_t generation);
+
+/** @brief Test-only setter for exercising admission-token exhaustion. */
+void ble_gap_manager_test_set_admission_token(uint32_t token);
+#endif
 
 #ifdef __cplusplus
 }

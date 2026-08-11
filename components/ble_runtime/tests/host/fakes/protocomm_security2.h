@@ -8,10 +8,9 @@ extern "C" {
 #endif
 
 /* Security 2 vtable fake: mirrors the production driver (init, transport
- * sessions, SRP handshake handler, AES-GCM encrypt/decrypt). The fake
- * handshake echoes the request prefixed with "resp:", decrypt strips a
- * 16-byte tag and encrypts a 16-byte tag, so the adapter logic and the
- * request callback path are exercised end to end. */
+ * sessions, structured Cmd0/Cmd1 responses, AES-GCM encrypt/decrypt).
+ * Decrypt strips a 16-byte tag and encrypt appends one, so the adapter and
+ * request callback paths are exercised end to end. */
 extern const protocomm_security_t protocomm_security2;
 
 #ifdef __cplusplus

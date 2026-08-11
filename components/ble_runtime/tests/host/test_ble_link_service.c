@@ -5,6 +5,7 @@
 
 #include "freertos/task.h"
 #include "esp_err.h"
+#include "host_freertos.h"
 
 #include "ble_link_codec.h"
 #include "ble_link_events.h"
@@ -16,6 +17,7 @@
 
 #include "device_link_security.h"
 #include "nv_storage.h"
+#include "session.pb-c.h"
 
 static esp_err_t _sec_stub_request(
     const uint8_t *request, size_t request_len,
@@ -64,12 +66,238 @@ static const device_link_security_config_t s_sec_config =
 
 #define BOOT_ID 72623859790382856ULL
 #define GEN 1U
+#define TEST_SEC2_PUBLIC_KEY_BYTES 384U
+#define TEST_SEC2_PROOF_BYTES 64U
+#define TEST_SEC2_TAG_BYTES 16U
+
+static size_t _pack_real_handshake_request(
+    device_link_security_handshake_stage_t stage,
+    uint8_t *out, size_t capacity)
+{
+    static uint8_t username[] = "microtech";
+    static uint8_t public_key[TEST_SEC2_PUBLIC_KEY_BYTES] =
+    {0x10U, 0x20U, 0x30U, 0x40U};
+    static uint8_t proof[TEST_SEC2_PROOF_BYTES] =
+    {0x50U, 0x60U, 0x70U};
+    S2SessionCmd0 cmd0 = S2_SESSION_CMD0__INIT;
+    S2SessionCmd1 cmd1 = S2_SESSION_CMD1__INIT;
+    Sec2Payload payload = SEC2_PAYLOAD__INIT;
+    SessionData session = SESSION_DATA__INIT;
+
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme2;
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    if (stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0)
+    {
+        cmd0.client_username.data = username;
+        cmd0.client_username.len = sizeof(username) - 1U;
+        cmd0.client_pubkey.data = public_key;
+        cmd0.client_pubkey.len = sizeof(public_key);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Command0;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SC0;
+        payload.sc0 = &cmd0;
+    }
+    else
+    {
+        cmd1.client_proof.data = proof;
+        cmd1.client_proof.len = sizeof(proof);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Command1;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SC1;
+        payload.sc1 = &cmd1;
+    }
+    const size_t packed_size = session_data__get_packed_size(&session);
+
+    TEST_ASSERT_TRUE(packed_size <= capacity);
+    TEST_ASSERT_EQUAL(packed_size, session_data__pack(&session, out));
+    return packed_size;
+}
 
 /* Capture sink state. */
 static uint8_t s_capture[16][512];
 static size_t s_capture_lens[16];
 static size_t s_capture_count;
 static ble_link_service_tx_channel_t s_capture_channels[16];
+static uint32_t s_capture_flow_ids[16];
+static bool s_capture_last[16];
+static bool s_auto_confirm;
+static uint16_t s_next_frame_id;
+static unsigned int s_provisional_discard_count;
+static unsigned int s_provisional_promote_count;
+static unsigned int s_security_close_count;
+static uint32_t s_provisional_generation;
+static bool s_provisional_terminate;
+static ble_link_operation_identity_t s_provisional_identity;
+static esp_err_t s_provisional_result;
+static unsigned int s_replacement_count;
+static esp_err_t s_replacement_result;
+static ble_link_operation_identity_t s_replacement_identity;
+static unsigned int s_handshake_count;
+static unsigned int s_owner_wake_count;
+
+static void _owner_wake(void *arg)
+{
+    (void)arg;
+    s_owner_wake_count++;
+}
+
+static void _security_close(void)
+{
+    s_security_close_count++;
+}
+
+static esp_err_t _discard_provisional_bond(
+    const ble_link_operation_identity_t *identity,
+    bool terminate_conn)
+{
+    s_provisional_discard_count++;
+    s_provisional_identity = *identity;
+    s_provisional_generation = identity->generation;
+    s_provisional_terminate = terminate_conn;
+    return s_provisional_result;
+}
+
+static esp_err_t _promote_provisional_bond(
+    const ble_link_operation_identity_t *identity)
+{
+    s_provisional_promote_count++;
+    s_provisional_identity = *identity;
+    s_provisional_generation = identity->generation;
+    return s_provisional_result;
+}
+
+static esp_err_t _replace_authorization(
+    const ble_link_operation_identity_t *identity)
+{
+    s_replacement_count++;
+    s_replacement_identity = *identity;
+    return s_replacement_result;
+}
+
+static esp_err_t _real_security_request(
+    const uint8_t *request, size_t request_len,
+    uint8_t **response, size_t *response_len, void *arg)
+{
+    (void)arg;
+    return ble_link_service_process_plaintext(
+               request, request_len, response, response_len);
+}
+
+static esp_err_t _real_security_authenticated(void *arg)
+{
+    (void)arg;
+    return ble_link_service_on_authenticated(NULL);
+}
+
+static void _real_security_close(void)
+{
+    s_security_close_count++;
+    device_link_security_close_session();
+}
+
+static const device_link_security_config_t s_real_sec_config =
+{
+    .username = "microtech",
+    .session_id = 1U,
+    .request_cb = _real_security_request,
+    .request_arg = NULL,
+    .authenticated_cb = _real_security_authenticated,
+    .authenticated_arg = NULL,
+};
+
+static const ble_link_security_ops_t s_real_security_ops =
+{
+    .select_verifier = device_link_security_select_verifier,
+    .selected_verifier = device_link_security_selected_verifier,
+    .classify_handshake = device_link_security_classify_handshake,
+    .handshake = device_link_security_handshake_ex,
+    .unprotect = device_link_security_unprotect,
+    .protect = device_link_security_protect,
+    .is_authenticated = device_link_security_is_authenticated,
+    .session_open = device_link_security_session_open,
+    .close_session = _real_security_close,
+    .discard_provisional_bond = _discard_provisional_bond,
+    .promote_provisional_bond = _promote_provisional_bond,
+    .replace_authorization = _replace_authorization,
+};
+
+static const ble_link_security_ops_t s_provisional_security_ops =
+{
+    .close_session = _security_close,
+    .discard_provisional_bond = _discard_provisional_bond,
+    .promote_provisional_bond = _promote_provisional_bond,
+    .replace_authorization = _replace_authorization,
+};
+
+static esp_err_t _classify_handshake(
+    const uint8_t *input, size_t input_len,
+    device_link_security_handshake_stage_t *stage)
+{
+    if (input == NULL || stage == NULL || input_len != 4U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (memcmp(input, "cmd0", 4U) == 0)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD0;
+        return ESP_OK;
+    }
+    if (memcmp(input, "cmd1", 4U) == 0)
+    {
+        *stage = DEVICE_LINK_SECURITY_HANDSHAKE_CMD1;
+        return ESP_OK;
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
+static esp_err_t _process_handshake(
+    const uint8_t *input, size_t input_len,
+    uint8_t **output, size_t *output_len,
+    device_link_security_handshake_result_t *handshake_result)
+{
+    device_link_security_handshake_stage_t stage;
+    const esp_err_t result = _classify_handshake(
+                                 input, input_len, &stage);
+
+    if (result != ESP_OK || output == NULL || output_len == NULL ||
+            handshake_result == NULL)
+    {
+        return result != ESP_OK ? result : ESP_ERR_INVALID_ARG;
+    }
+    uint8_t *response = malloc(5U);
+
+    if (response == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(response, stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0 ?
+           "resp0" : "resp1", 5U);
+    *output = response;
+    *output_len = 5U;
+    handshake_result->stage = stage;
+    handshake_result->authenticated =
+        stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1;
+    s_handshake_count++;
+    return ESP_OK;
+}
+
+static esp_err_t _select_handshake_verifier(
+    uint8_t peer_addr_type, const uint8_t *peer_addr,
+    size_t peer_addr_len, bool pairing_window_open)
+{
+    (void)peer_addr_type;
+    (void)peer_addr;
+    (void)peer_addr_len;
+    (void)pairing_window_open;
+    return ESP_OK;
+}
+
+static const ble_link_security_ops_t s_handshake_security_ops =
+{
+    .select_verifier = _select_handshake_verifier,
+    .classify_handshake = _classify_handshake,
+    .handshake = _process_handshake,
+    .close_session = _security_close,
+};
 
 /* Reassembly of the captured outbound fragments. */
 static uint8_t s_outbound[1024];
@@ -79,20 +307,27 @@ static ble_link_service_facts_t s_facts;
 
 static esp_err_t _capture(const uint8_t *value, size_t len,
                           ble_link_service_tx_channel_t channel,
-                          bool is_last, void *arg)
+                          bool is_last, uint32_t flow_id, void *arg)
 {
-    (void)is_last;
     (void)arg;
     TEST_ASSERT_TRUE(s_capture_count < 16U);
     TEST_ASSERT_TRUE(len <= sizeof(s_capture[0]));
     memcpy(s_capture[s_capture_count], value, len);
     s_capture_lens[s_capture_count] = len;
     s_capture_channels[s_capture_count] = channel;
+    s_capture_flow_ids[s_capture_count] = flow_id;
+    s_capture_last[s_capture_count] = is_last;
     s_capture_count++;
     /* Model the transport: every frame confirmation advances the
      * outbound stream (the service emits the next fragment); the final
      * confirmation releases the transaction gate. */
-    ble_link_service_response_completed();
+    if (s_auto_confirm && flow_id != 0U)
+    {
+        TEST_ASSERT_EQUAL(ESP_OK,
+                          ble_link_service_response_completed(
+                              flow_id, is_last));
+        TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    }
     return ESP_OK;
 }
 
@@ -104,18 +339,24 @@ static void _feed_single_channel(
     ble_link_service_rx_channel_t channel)
 {
     uint8_t framed[512];
+    memset(framed, 0, sizeof(framed));
     const size_t total = payload_len + 1U;
 
     framed[0] = 1U;
     framed[1] = 3U; /* START|END */
-    framed[2] = 0x01U;
-    framed[3] = 0x00U;
+    framed[2] = (uint8_t)(s_next_frame_id & 0xffU);
+    framed[3] = (uint8_t)(s_next_frame_id >> 8U);
     framed[4] = (uint8_t)(total & 0xffU);
     framed[5] = (uint8_t)((total >> 8U) & 0xffU);
     framed[6] = 0x00U;
     framed[7] = 0x00U;
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
     memcpy(&framed[9], payload, payload_len);
+    s_next_frame_id++;
+    if (s_next_frame_id == 0U)
+    {
+        s_next_frame_id = 1U;
+    }
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_feed(
                           &s_facts, channel, framed, 8U + total));
 }
@@ -126,10 +367,52 @@ static void _feed_single(const uint8_t *payload, size_t payload_len)
                          BLE_LINK_SERVICE_RX_CONTROL);
 }
 
+static esp_err_t _accept_handshake_single(
+    const uint8_t *payload, size_t payload_len,
+    ble_link_work_t **out_work)
+{
+    uint8_t framed[512];
+    const size_t total = payload_len + 1U;
+
+    TEST_ASSERT_TRUE(8U + total <= sizeof(framed));
+    memset(framed, 0, sizeof(framed));
+    framed[0] = 1U;
+    framed[1] = 3U;
+    framed[2] = (uint8_t)(s_next_frame_id & 0xffU);
+    framed[3] = (uint8_t)(s_next_frame_id >> 8U);
+    framed[4] = (uint8_t)(total & 0xffU);
+    framed[5] = (uint8_t)((total >> 8U) & 0xffU);
+    framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE;
+    memcpy(&framed[9], payload, payload_len);
+    s_next_frame_id++;
+    if (s_next_frame_id == 0U)
+    {
+        s_next_frame_id = 1U;
+    }
+    return ble_link_service_accept(
+               &s_facts, BLE_LINK_SERVICE_RX_SESSION,
+               framed, 8U + total, out_work);
+}
+
+static esp_err_t _feed_handshake_single(
+    const uint8_t *payload, size_t payload_len)
+{
+    ble_link_work_t *work = NULL;
+    esp_err_t result = _accept_handshake_single(
+                           payload, payload_len, &work);
+
+    if (result == ESP_OK && work != NULL)
+    {
+        result = ble_link_service_execute(work);
+    }
+    ble_link_service_release_work(work);
+    return result;
+}
+
 /**
  * @brief Reassemble captured fragments into one message.
  */
-static void _reassemble_captured(void)
+static void _reassemble_captured_type(uint8_t expected_transport_type)
 {
     s_outbound_len = 0U;
     for (size_t i = 0U; i < s_capture_count; ++i)
@@ -143,10 +426,26 @@ static void _reassemble_captured(void)
     }
     /* The reassembled message begins with the transport type byte. */
     TEST_ASSERT_TRUE(s_outbound_len >= 1U);
-    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED,
-                      s_outbound[0]);
+    TEST_ASSERT_EQUAL(expected_transport_type, s_outbound[0]);
     memmove(s_outbound, &s_outbound[1], s_outbound_len - 1U);
     s_outbound_len -= 1U;
+}
+
+static void _reassemble_captured(void)
+{
+    _reassemble_captured_type(BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED);
+}
+
+static void _reassemble_real_protected(void)
+{
+    _reassemble_captured();
+    TEST_ASSERT_TRUE(s_outbound_len >= TEST_SEC2_TAG_BYTES);
+    for (size_t i = s_outbound_len - TEST_SEC2_TAG_BYTES;
+            i < s_outbound_len; ++i)
+    {
+        TEST_ASSERT_EQUAL(0x5aU, s_outbound[i]);
+    }
+    s_outbound_len -= TEST_SEC2_TAG_BYTES;
 }
 
 static void _set_facts(bool encrypted, bool authenticated, bool authorized)
@@ -154,7 +453,9 @@ static void _set_facts(bool encrypted, bool authenticated, bool authorized)
     memset(&s_facts, 0, sizeof(s_facts));
     s_facts.active_boot_id = BOOT_ID;
     s_facts.connection_generation = GEN;
+    s_facts.security_epoch = ble_link_session_security2_epoch();
     s_facts.preferred_att_mtu = 495U;
+    s_facts.conn_handle = 7U;
     s_facts.encrypted = encrypted;
     s_facts.session_authenticated = authenticated;
     s_facts.authorized = authorized;
@@ -195,13 +496,402 @@ static void _reset(void)
     memset(s_capture, 0, sizeof(s_capture));
     memset(s_capture_lens, 0, sizeof(s_capture_lens));
     memset(s_capture_channels, 0, sizeof(s_capture_channels));
+    memset(s_capture_flow_ids, 0, sizeof(s_capture_flow_ids));
+    memset(s_capture_last, 0, sizeof(s_capture_last));
     s_capture_count = 0U;
+    s_auto_confirm = true;
+    s_next_frame_id = 1U;
     ble_link_service_reset();
     ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
     ble_link_events_init();
     _establish_session();
     _set_facts(true, true, true);
     (void)device_link_security_init(&s_sec_config);
+}
+
+static void _enable_provisional_security_ops(void)
+{
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_provisional_security_ops, 32U);
+    s_provisional_discard_count = 0U;
+    s_provisional_promote_count = 0U;
+    s_security_close_count = 0U;
+    s_provisional_generation = 0U;
+    s_provisional_terminate = false;
+    memset(&s_provisional_identity, 0, sizeof(s_provisional_identity));
+    s_provisional_result = ESP_OK;
+    s_replacement_count = 0U;
+    s_replacement_result = ESP_OK;
+    memset(&s_replacement_identity, 0, sizeof(s_replacement_identity));
+    s_owner_wake_count = 0U;
+}
+
+static void _confirm_last_captured_flow(void);
+
+static void _clear_capture(void)
+{
+    memset(s_capture, 0, sizeof(s_capture));
+    memset(s_capture_lens, 0, sizeof(s_capture_lens));
+    memset(s_capture_channels, 0, sizeof(s_capture_channels));
+    memset(s_capture_flow_ids, 0, sizeof(s_capture_flow_ids));
+    memset(s_capture_last, 0, sizeof(s_capture_last));
+    s_capture_count = 0U;
+}
+
+static void _setup_real_bootstrap_session(void)
+{
+    static const uint8_t pop[] = "window-pop-secret";
+
+    nv_storage_fake_reset();
+    device_link_security_deinit();
+    ble_link_service_reset();
+    ble_link_session_init(BOOT_ID);
+    ble_link_session_set_pairing_window(true);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN, BLE_LINK_SESSION_EVENT_ACL_CONNECTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(GEN, true));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_connection_pairing_window(
+                          GEN, true));
+    ble_link_events_init();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_real_security_ops, 32U);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_init(&s_real_sec_config));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_open_bootstrap(
+                          pop, sizeof(pop) - 1U));
+    _set_facts(true, false, false);
+    s_facts.pairing_window_open = true;
+    s_provisional_discard_count = 0U;
+    s_provisional_promote_count = 0U;
+    s_security_close_count = 0U;
+    s_provisional_result = ESP_OK;
+    s_replacement_count = 0U;
+    s_replacement_result = ESP_OK;
+    s_next_frame_id = 1U;
+    s_auto_confirm = false;
+    _clear_capture();
+}
+
+static void _assert_real_handshake_response(
+    device_link_security_handshake_stage_t stage)
+{
+    _reassemble_captured_type(BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE);
+    SessionData *session = session_data__unpack(
+                               NULL, s_outbound_len, s_outbound);
+
+    TEST_ASSERT_TRUE(session != NULL);
+    TEST_ASSERT_EQUAL(SEC_SCHEME_VERSION__SecScheme2, session->sec_ver);
+    TEST_ASSERT_EQUAL(SESSION_DATA__PROTO_SEC2, session->proto_case);
+    TEST_ASSERT_TRUE(session->sec2 != NULL);
+    if (stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0)
+    {
+        TEST_ASSERT_EQUAL(SEC2_MSG_TYPE__S2Session_Response0,
+                          session->sec2->msg);
+        TEST_ASSERT_EQUAL(SEC2_PAYLOAD__PAYLOAD_SR0,
+                          session->sec2->payload_case);
+        TEST_ASSERT_TRUE(session->sec2->sr0 != NULL);
+        TEST_ASSERT_EQUAL(STATUS__Success, session->sec2->sr0->status);
+    }
+    else
+    {
+        TEST_ASSERT_EQUAL(SEC2_MSG_TYPE__S2Session_Response1,
+                          session->sec2->msg);
+        TEST_ASSERT_EQUAL(SEC2_PAYLOAD__PAYLOAD_SR1,
+                          session->sec2->payload_case);
+        TEST_ASSERT_TRUE(session->sec2->sr1 != NULL);
+        TEST_ASSERT_EQUAL(STATUS__Success, session->sec2->sr1->status);
+    }
+    session_data__free_unpacked(session, NULL);
+}
+
+static uint32_t _complete_real_handshake(void)
+{
+    uint8_t handshake[512];
+    const uint32_t epoch_before = ble_link_session_security2_epoch();
+    size_t handshake_len = _pack_real_handshake_request(
+                               DEVICE_LINK_SECURITY_HANDSHAKE_CMD0,
+                               handshake, sizeof(handshake));
+
+    _clear_capture();
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(handshake, handshake_len));
+    const uint32_t epoch = ble_link_session_security2_epoch();
+
+    TEST_ASSERT_EQUAL(epoch_before + 1U, epoch);
+    s_facts.security_epoch = epoch;
+    _assert_real_handshake_response(DEVICE_LINK_SECURITY_HANDSHAKE_CMD0);
+    TEST_ASSERT_TRUE(s_capture_last[s_capture_count - 1U]);
+    _confirm_last_captured_flow();
+
+    handshake_len = _pack_real_handshake_request(
+                        DEVICE_LINK_SECURITY_HANDSHAKE_CMD1,
+                        handshake, sizeof(handshake));
+    _clear_capture();
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(handshake, handshake_len));
+    TEST_ASSERT_EQUAL(epoch, ble_link_session_security2_epoch());
+    TEST_ASSERT_TRUE(device_link_security_is_authenticated());
+    _assert_real_handshake_response(DEVICE_LINK_SECURITY_HANDSHAKE_CMD1);
+    TEST_ASSERT_TRUE(s_capture_last[s_capture_count - 1U]);
+    _confirm_last_captured_flow();
+    s_facts.security_epoch = epoch;
+    s_facts.session_authenticated = true;
+    ble_link_dispatcher_facts_t live_facts;
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_get_facts(GEN, &live_facts));
+    s_facts.authorized = live_facts.authorized;
+    return epoch;
+}
+
+static void _feed_real_protected(
+    const uint8_t *plain, size_t plain_len)
+{
+    uint8_t cipher[512];
+
+    TEST_ASSERT_TRUE(plain_len + TEST_SEC2_TAG_BYTES <= sizeof(cipher));
+    memcpy(cipher, plain, plain_len);
+    memset(&cipher[plain_len], 0xa5, TEST_SEC2_TAG_BYTES);
+    _feed_single_channel(cipher, plain_len + TEST_SEC2_TAG_BYTES,
+                         BLE_LINK_SERVICE_RX_SESSION);
+}
+
+static void _confirm_last_captured_flow(void)
+{
+    TEST_ASSERT_TRUE(s_capture_count > 0U);
+    const size_t index = s_capture_count - 1U;
+    const uint32_t flow_id = s_capture_flow_ids[index];
+
+    TEST_ASSERT_TRUE(flow_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_response_completed(
+                          flow_id, s_capture_last[index]));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+}
+
+static void test_response_flow_identity_and_deferred_busy(void)
+{
+    static const uint8_t request_one[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+    uint8_t request_two[sizeof(request_one)];
+
+    memcpy(request_two, request_one, sizeof(request_two));
+    request_two[1] = 0x02U;
+    _reset();
+    s_facts.preferred_att_mtu = 23U;
+    s_auto_confirm = false;
+    _feed_single(request_one, sizeof(request_one));
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    TEST_ASSERT_TRUE(s_capture_flow_ids[0] != 0U);
+    const uint32_t first_flow = s_capture_flow_ids[0];
+
+    _feed_single(request_two, sizeof(request_two));
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    TEST_ASSERT_TRUE(ble_link_service_response_in_flight());
+
+    const size_t first_start = 0U;
+    while (!s_capture_last[s_capture_count - 1U])
+    {
+        _confirm_last_captured_flow();
+        TEST_ASSERT_TRUE(s_capture_count < 16U);
+        TEST_ASSERT_EQUAL(first_flow,
+                          s_capture_flow_ids[s_capture_count - 1U]);
+    }
+    const size_t first_count = s_capture_count;
+    TEST_ASSERT_TRUE(first_count > first_start + 1U);
+    TEST_ASSERT_TRUE(s_capture_flow_ids[first_count - 1U] == first_flow);
+
+    /* Final confirmation starts the deferred BUSY response as a new flow. */
+    _confirm_last_captured_flow();
+    TEST_ASSERT_TRUE(s_capture_count > first_count);
+    const uint32_t busy_flow = s_capture_flow_ids[first_count];
+
+    TEST_ASSERT_TRUE(busy_flow != 0U);
+    TEST_ASSERT_TRUE(busy_flow != first_flow);
+    TEST_ASSERT_EQUAL(BLE_LINK_SERVICE_TX_CONTROL_RESPONSE,
+                      s_capture_channels[first_count]);
+    TEST_ASSERT_TRUE(ble_link_service_response_in_flight());
+    while (!s_capture_last[s_capture_count - 1U])
+    {
+        _confirm_last_captured_flow();
+        TEST_ASSERT_TRUE(s_capture_count < 16U);
+        TEST_ASSERT_EQUAL(busy_flow,
+                          s_capture_flow_ids[s_capture_count - 1U]);
+    }
+    _confirm_last_captured_flow();
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+}
+
+static void test_stale_response_flow_is_ignored(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
+    };
+
+    _reset();
+    s_auto_confirm = false;
+    _feed_single(request, sizeof(request));
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    const uint32_t old_flow = s_capture_flow_ids[0];
+
+    ble_link_service_abort_transactions();
+    _reset();
+    s_auto_confirm = false;
+    _feed_single(request, sizeof(request));
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    const uint32_t new_flow = s_capture_flow_ids[0];
+
+    TEST_ASSERT_TRUE(old_flow != 0U);
+    TEST_ASSERT_TRUE(new_flow != 0U);
+    TEST_ASSERT_TRUE(old_flow != new_flow);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_response_completed(old_flow, false));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    ble_link_service_abort_transactions();
+}
+
+static void test_handshake_queued_admission(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+    static const uint8_t competing[] = "cmdX";
+    ble_link_work_t *work = NULL;
+    ble_link_work_t *duplicate = NULL;
+
+    _reset();
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    s_auto_confirm = false;
+    s_handshake_count = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work != NULL);
+    TEST_ASSERT_EQUAL(0U, s_handshake_count);
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &duplicate));
+    TEST_ASSERT_TRUE(duplicate == NULL);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED, _accept_handshake_single(
+                          competing, sizeof(competing) - 1U,
+                          &duplicate));
+    TEST_ASSERT_TRUE(duplicate == NULL);
+
+    /* A failed queue submission releases the reservation with the work. */
+    ble_link_service_release_work(work);
+    work = NULL;
+    s_next_frame_id = 1U;
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &work));
+    TEST_ASSERT_TRUE(work != NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(work));
+    ble_link_service_release_work(work);
+    TEST_ASSERT_EQUAL(1U, s_handshake_count);
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    ble_link_service_abort_transactions();
+}
+
+static void test_cmd0_delayed_replacement(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+    static const uint8_t competing[] = "cmdX";
+
+    _reset();
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    s_auto_confirm = false;
+    s_handshake_count = 0U;
+    s_security_close_count = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    TEST_ASSERT_EQUAL(1U, s_handshake_count);
+    TEST_ASSERT_EQUAL(1U, s_capture_count);
+    const uint32_t old_flow = s_capture_flow_ids[0];
+
+    TEST_ASSERT_TRUE(old_flow != 0U);
+    /* A new Cmd0 retires the old logical session immediately but cannot
+     * create its response while the old indication occupies the slot. */
+    ble_link_work_t *replacement = NULL;
+    ble_link_work_t *duplicate = NULL;
+
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &replacement));
+    TEST_ASSERT_TRUE(replacement != NULL);
+    TEST_ASSERT_TRUE(!ble_link_service_delayed_replacement_pending(GEN));
+    TEST_ASSERT_EQUAL(ESP_OK, _accept_handshake_single(
+                          cmd0, sizeof(cmd0) - 1U, &duplicate));
+    TEST_ASSERT_TRUE(duplicate == NULL);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED, _accept_handshake_single(
+                          competing, sizeof(competing) - 1U,
+                          &duplicate));
+    TEST_ASSERT_TRUE(duplicate == NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(replacement));
+    ble_link_service_release_work(replacement);
+    TEST_ASSERT_TRUE(ble_link_service_delayed_replacement_pending(GEN));
+    TEST_ASSERT_EQUAL(1U, s_handshake_count);
+    ble_link_dispatcher_facts_t facts;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_get_facts(GEN, &facts));
+    TEST_ASSERT_TRUE(!facts.session_authenticated);
+    /* Exact repeats are absorbed and do not process or replace the one
+     * retained body; competing ingress reports BUSY/invalid state. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    TEST_ASSERT_EQUAL(1U, s_handshake_count);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED,
+                      _feed_handshake_single(
+                          competing, sizeof(competing) - 1U));
+    TEST_ASSERT_TRUE(ble_link_service_delayed_replacement_pending(GEN));
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_response_completed(old_flow, true));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(2U, s_handshake_count);
+    TEST_ASSERT_EQUAL(2U, s_capture_count);
+    TEST_ASSERT_TRUE(!ble_link_service_delayed_replacement_pending(GEN));
+    const uint32_t new_flow = s_capture_flow_ids[1];
+
+    TEST_ASSERT_TRUE(new_flow != 0U && new_flow != old_flow);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_response_completed(old_flow, true));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_response_completed(new_flow, true));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+
+    /* Timeout/session-abort discards a retained replacement without ever
+     * invoking Protocomm for it. The timer owner applies ACL termination. */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    TEST_ASSERT_EQUAL(3U, s_handshake_count);
+    const uint32_t timeout_flow =
+        s_capture_flow_ids[s_capture_count - 1U];
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    TEST_ASSERT_TRUE(ble_link_service_delayed_replacement_pending(GEN));
+    ble_link_service_abort_transactions();
+    TEST_ASSERT_TRUE(!ble_link_service_delayed_replacement_pending(GEN));
+    TEST_ASSERT_EQUAL(3U, s_handshake_count);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_response_completed(
+                          timeout_flow, true));
 }
 
 static void test_capabilities_request(void)
@@ -407,10 +1097,11 @@ static void test_authorize_flow(void)
     _reassemble_captured();
     const size_t commit_len = _build_commit_body(commit, sizeof(commit), 5U);
 
-    /* A commit before local confirmation is refused. */
+    /* Prepare alone does not expose a local confirmation. The first
+     * valid Commit is the mandatory probe and is refused. */
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
-    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
     _feed_single_channel(commit, commit_len,
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
@@ -421,17 +1112,23 @@ static void test_authorize_flow(void)
                           &response));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_CONFIRMATION_REQUIRED, response.error);
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
+    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    const uint64_t confirmation_token =
+        ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(confirmation_token != 0U);
 
     /* Confirm locally, then commit succeeds with a fresh request id
      * (the dispatcher replay guard rejects reused ids). */
-    ble_link_service_confirm_binding(true);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
+                          confirmation_token, true));
     TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
     const size_t commit2_len = _build_commit_body(commit, sizeof(commit), 6U);
 
     TEST_ASSERT_EQUAL(commit_len, commit2_len);
-    _feed_single_channel(commit, commit_len,
+    _feed_single_channel(commit, commit2_len,
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
@@ -542,7 +1239,7 @@ static void test_no_subscriber_no_output(void)
 static void test_intermediate_fragment(void)
 {
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     _reset();
     memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
@@ -570,6 +1267,7 @@ static void test_admission_denied(void)
                           false, 2U));
     _set_facts(true, true, false);
     uint8_t framed[512];
+    memset(framed, 0, sizeof(framed));
     const size_t total = sizeof(request) + 1U;
 
     framed[0] = 1U;
@@ -620,7 +1318,7 @@ static void test_authorize_commit_truncated_rejected(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
     };
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     _feed_single_channel(prepare, sizeof(prepare),
                          BLE_LINK_SERVICE_RX_SESSION);
     memset(s_capture, 0, sizeof(s_capture));
@@ -628,6 +1326,7 @@ static void test_authorize_commit_truncated_rejected(void)
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
+    framed[3] = 0x00U;
     framed[4] = (uint8_t)((sizeof(commit) + 1U) & 0xffU);
     framed[5] = (uint8_t)(((sizeof(commit) + 1U) >> 8U) & 0xffU);
     framed[8] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
@@ -662,7 +1361,7 @@ static void test_dispatch_error_encoded(void)
     s_capture_count = 0U;
     /* Same request_id again. */
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
     framed[1] = 3U;
     framed[2] = 0x02U;
@@ -720,7 +1419,7 @@ static void test_bootstrap_admission_for_authorize(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
     };
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
     framed[0] = 1U;
@@ -750,7 +1449,7 @@ static void test_generation_change_resets_state(void)
     _reset();
     /* Start a partial frame in generation 1. */
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
     framed[1] = 1U;
@@ -867,9 +1566,19 @@ static void test_committed_replay_idempotent(void)
     _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
-    ble_link_service_confirm_binding(true);
     const size_t commit_len = _build_commit_body(commit, sizeof(commit), 5U);
 
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    const uint64_t confirmation_token =
+        ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(confirmation_token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
+                          confirmation_token, true));
+    (void)_build_commit_body(commit, sizeof(commit), 6U);
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
     _feed_single_channel(commit, commit_len,
@@ -878,7 +1587,7 @@ static void test_committed_replay_idempotent(void)
      * with the full result. */
     memset(s_capture, 0, sizeof(s_capture));
     s_capture_count = 0U;
-    (void)_build_commit_body(commit, sizeof(commit), 6U);
+    (void)_build_commit_body(commit, sizeof(commit), 7U);
     _feed_single_channel(commit, commit_len,
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
@@ -897,12 +1606,15 @@ static void test_timeout_closes_security2(void)
     uint32_t error = 0U;
 
     _reset();
+    _enable_provisional_security_ops();
     ble_link_service_idle_timeout(GEN);
     /* The Security 2 session is closed: control admission fails. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_query_admission(
                           GEN, BLE_LINK_SESSION_CHANNEL_CONTROL,
                           &error));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNAUTHENTICATED, error);
+    /* The adapter session is closed through the security ops as well. */
+    TEST_ASSERT_EQUAL(1U, s_security_close_count);
 }
 
 static void test_stale_timeout_ignored(void)
@@ -927,7 +1639,7 @@ static void test_stale_feed_ignored(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
     };
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     _reset();
     /* Advance to generation 2 with a fresh session. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
@@ -981,7 +1693,7 @@ static void test_channel_routing(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
     };
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     _reset();
     _establish_session();
     _set_facts(true, true, true);
@@ -1068,7 +1780,7 @@ static void test_boot_mismatch_closes_session(void)
      * closed, no response is emitted. */
     s_facts.active_boot_id = BOOT_ID ^ 1U;
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
     framed[1] = 3U;
@@ -1161,7 +1873,7 @@ static void test_session_channel_reassembly(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00,
     };
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     _reset();
     /* A partial frame on the session channel does not disturb control. */
     memset(framed, 0, sizeof(framed));
@@ -1201,7 +1913,7 @@ static void test_low_mtu_multi_fragment(void)
     _reset();
     s_facts.preferred_att_mtu = 23U;
     uint8_t framed[512];
-
+    memset(framed, 0, sizeof(framed));
     memset(framed, 0, sizeof(framed));
     framed[0] = 1U;
     framed[1] = 3U;
@@ -1480,6 +2192,176 @@ static void test_get_authorization_recovery(void)
                           envelope.body_data, envelope.body_len,
                           &response));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_NOT_FOUND, response.error);
+
+    /* An I/O failure is ambiguous and must not collapse to NOT_FOUND. */
+    nv_storage_fake_fail_next_get(ESP_FAIL);
+    device_link_security_auth_record_t probe_record;
+
+    memset(&probe_record, 0, sizeof(probe_record));
+    TEST_ASSERT_EQUAL(ESP_FAIL,
+                      device_link_security_load_auth_record(&probe_record));
+    nv_storage_fake_fail_next_get(ESP_FAIL);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    const size_t storage_len = _build_recovery_query(
+                                   request, sizeof(request), 6U,
+                                   credential, sizeof(credential));
+
+    _feed_single_channel(request, storage_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_STORAGE, response.error);
+
+    /* A present but malformed durable record is an internal consistency
+     * failure, also ambiguous to the client. */
+    device_link_security_auth_record_t corrupt_record;
+
+    memset(&corrupt_record, 0, sizeof(corrupt_record));
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "dls.auth", &corrupt_record,
+                          sizeof(corrupt_record)));
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    const size_t corrupt_len = _build_recovery_query(
+                                   request, sizeof(request), 7U,
+                                   credential, sizeof(credential));
+
+    _feed_single_channel(request, corrupt_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INTERNAL, response.error);
+    nv_storage_fake_reset();
+}
+
+static void _decode_real_captured_response(
+    uint64_t request_id, uint32_t error,
+    ble_link_codec_response_tag_t body)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+
+    _reassemble_real_protected();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(request_id, response.request_id);
+    TEST_ASSERT_EQUAL(error, response.error);
+    TEST_ASSERT_EQUAL(body, response.body);
+}
+
+static void test_real_security2_rehandshake_commit_replay_and_recovery(void)
+{
+    uint8_t commit[64];
+    uint8_t recovery[64];
+    device_link_security_auth_record_t record;
+
+    _setup_real_bootstrap_session();
+    const uint32_t bootstrap_epoch = _complete_real_handshake();
+
+    TEST_ASSERT_EQUAL(DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP,
+                      device_link_security_selected_verifier());
+    TEST_ASSERT_TRUE(!s_facts.authorized);
+
+    /* Prepare, Commit probe, local confirmation, and durable Commit all run
+     * through the real adapter's decrypt/request/encrypt callbacks. */
+    s_pending_captured = false;
+    esp_random_fake_reset(0x5eed5eedU);
+    _clear_capture();
+    _feed_real_protected(s_prepare_request, sizeof(s_prepare_request));
+    _reassemble_real_protected();
+    _capture_pending_credential();
+    _confirm_last_captured_flow();
+    const size_t commit_len = _build_commit_body(
+                                  commit, sizeof(commit), 5U);
+
+    _clear_capture();
+    _feed_real_protected(commit, commit_len);
+    _decode_real_captured_response(
+        5U, BLE_LINK_ERROR_CONFIRMATION_REQUIRED,
+        BLE_LINK_CODEC_RESPONSE_NONE);
+    const uint64_t confirmation_token =
+        ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(confirmation_token != 0U);
+    _confirm_last_captured_flow();
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_confirm_binding(
+                          confirmation_token, true));
+
+    TEST_ASSERT_EQUAL(commit_len,
+                      _build_commit_body(commit, sizeof(commit), 6U));
+    _clear_capture();
+    _feed_real_protected(commit, commit_len);
+    _decode_real_captured_response(
+        6U, BLE_LINK_ERROR_OK,
+        BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT);
+    TEST_ASSERT_TRUE(ble_link_service_response_in_flight());
+    _confirm_last_captured_flow();
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+    TEST_ASSERT_EQUAL(1U, s_provisional_promote_count);
+    memset(&record, 0, sizeof(record));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_load_auth_record(&record));
+    TEST_ASSERT_EQUAL(0, memcmp(record.credential_id,
+                                s_pending_credential,
+                                sizeof(s_pending_credential)));
+    TEST_ASSERT_TRUE(!device_link_security_session_open());
+
+    /* The terminal Commit response retired the bootstrap session, but its
+     * cache remains ACL-scoped. A true long-term Cmd0/Cmd1 re-handshake must
+     * use one new link epoch (Cmd1 cannot allocate another) and restore the
+     * authorized state from the committed peer record. */
+    TEST_ASSERT_TRUE(ble_link_session_security2_epoch() > bootstrap_epoch);
+    s_facts.security_epoch = ble_link_session_security2_epoch();
+    s_facts.session_authenticated = false;
+    s_facts.authorized = false;
+    const uint32_t long_term_epoch = _complete_real_handshake();
+
+    TEST_ASSERT_TRUE(long_term_epoch > bootstrap_epoch);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM,
+                      device_link_security_selected_verifier());
+    TEST_ASSERT_TRUE(s_facts.authorized);
+
+    /* A fresh request id with the exact committed txn+credential replays the
+     * terminal success after re-handshake. It is not tied to the retired
+     * bootstrap adapter session. */
+    TEST_ASSERT_EQUAL(commit_len,
+                      _build_commit_body(commit, sizeof(commit), 7U));
+    _clear_capture();
+    _feed_real_protected(commit, commit_len);
+    _decode_real_captured_response(
+        7U, BLE_LINK_ERROR_OK,
+        BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT);
+    _confirm_last_captured_flow();
+
+    /* The same real long-term session can perform the contract's ambiguous
+     * Commit recovery query using the durable credential. */
+    const size_t recovery_len = _build_recovery_query(
+                                    recovery, sizeof(recovery), 8U,
+                                    s_pending_credential,
+                                    sizeof(s_pending_credential));
+
+    _clear_capture();
+    _feed_real_protected(recovery, recovery_len);
+    _decode_real_captured_response(
+        8U, BLE_LINK_ERROR_OK,
+        BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT);
+    _confirm_last_captured_flow();
+
+    device_link_security_deinit();
+    ble_link_session_set_pairing_window(false);
     nv_storage_fake_reset();
 }
 
@@ -1585,16 +2467,458 @@ static void test_prepare_refetch_same_transaction(void)
 static void test_authorize_expiry_clears_transaction(void)
 {
     _reset();
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_auth_expiry_remaining_ms());
     esp_random_fake_reset(0x5eed5eedU);
     _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
                          BLE_LINK_SERVICE_RX_SESSION);
-    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+    TEST_ASSERT_TRUE(ble_link_service_auth_expiry_remaining_ms() > 0U);
+    TEST_ASSERT_TRUE(ble_link_service_auth_expiry_remaining_ms() <
+                     UINT32_MAX);
 
     /* Force the deadline into the past; the tick clears the transaction. */
-    ble_link_service_test_set_auth_deadline_ticks(
-        (uint32_t)(xTaskGetTickCount() - 1U));
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t past_deadline = now == 1U ? UINT32_MAX : now - 1U;
+
+    ble_link_service_test_set_auth_deadline_ticks(past_deadline);
+    TEST_ASSERT_EQUAL(0U, ble_link_service_auth_expiry_remaining_ms());
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_auth_expiry_tick());
     TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_auth_expiry_remaining_ms());
+}
+
+static void test_provisional_bond_lifecycle(void)
+{
+    uint8_t commit[64];
+
+    device_link_security_deinit();
+    nv_storage_fake_reset();
+
+    _reset();
+    _enable_provisional_security_ops();
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t probe_len = _build_commit_body(
+                                 commit, sizeof(commit), 5U);
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, probe_len, BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
+                          ble_link_service_confirmation_token(), false));
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_EQUAL(GEN, s_provisional_generation);
+    TEST_ASSERT_TRUE(s_provisional_terminate);
+    TEST_ASSERT_EQUAL(1U, s_security_close_count);
+
+    _reset();
+    _enable_provisional_security_ops();
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+    ble_link_service_test_set_auth_deadline_ticks(UINT32_MAX);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_auth_expiry_tick());
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_EQUAL(GEN, s_provisional_generation);
+    TEST_ASSERT_TRUE(s_provisional_terminate);
+
+    _reset();
+    _enable_provisional_security_ops();
+    esp_random_fake_reset(0x5eed5eedU);
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t commit_len = _build_commit_body(commit, sizeof(commit), 6U);
+
+    _feed_single_channel(commit, commit_len, BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
+                          ble_link_service_confirmation_token(), true));
+    (void)_build_commit_body(commit, sizeof(commit), 7U);
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len, BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_EQUAL(1U, s_provisional_promote_count);
+    TEST_ASSERT_EQUAL(0U, s_provisional_discard_count);
+    TEST_ASSERT_EQUAL(GEN, s_provisional_generation);
+}
+
+static void test_provisional_cleanup_is_retained_until_accepted(void)
+{
+    _reset();
+    _enable_provisional_security_ops();
+    s_provisional_result = ESP_ERR_NO_MEM;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    const ble_link_operation_identity_t retained = s_provisional_identity;
+
+    TEST_ASSERT_TRUE(retained.token != 0U);
+    TEST_ASSERT_EQUAL(BLE_LINK_OPERATION_PROVISIONAL_DISCARD,
+                      retained.kind);
+    TEST_ASSERT_TRUE(ble_link_service_retained_cleanup_pending());
+    TEST_ASSERT_TRUE(
+        ble_link_service_retained_retry_remaining_ms() > 0U);
+    TEST_ASSERT_TRUE(
+        ble_link_service_retained_retry_remaining_ms() <= 100U);
+    s_provisional_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    host_freertos_advance_ticks(pdMS_TO_TICKS(100U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(2U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(ble_link_operation_identity_equal(
+                         &retained, &s_provisional_identity));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(2U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(!ble_link_service_retained_cleanup_pending());
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_retained_retry_remaining_ms());
+}
+
+static void test_provisional_cleanup_backoff_is_bounded(void)
+{
+    static const uint32_t delays_ms[] = {100U, 200U, 400U, 800U, 1000U,
+                                         1000U
+                                        };
+
+    _reset();
+    _enable_provisional_security_ops();
+    s_provisional_result = ESP_ERR_NO_MEM;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    ble_link_service_set_worker_wake(_owner_wake, NULL);
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_EQUAL(1U, s_owner_wake_count);
+
+    for (size_t attempt = 0U;
+            attempt < sizeof(delays_ms) / sizeof(delays_ms[0]); ++attempt)
+    {
+        const uint32_t remaining_ms =
+            ble_link_service_retained_retry_remaining_ms();
+
+        TEST_ASSERT_TRUE(remaining_ms > 0U);
+        TEST_ASSERT_TRUE(remaining_ms <= delays_ms[attempt]);
+        for (unsigned int notification = 0U; notification < 16U;
+                ++notification)
+        {
+            ble_link_service_wake_owner();
+            TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED,
+                              ble_link_service_pump_tx());
+        }
+        TEST_ASSERT_EQUAL(attempt + 1U, s_provisional_discard_count);
+        /* External notifications only wake the owner; failed retry dispatch
+         * itself must never add another self-wake. */
+        TEST_ASSERT_EQUAL(1U + 16U * (attempt + 1U), s_owner_wake_count);
+        host_freertos_advance_ticks(pdMS_TO_TICKS(delays_ms[attempt]));
+        TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_link_service_pump_tx());
+        TEST_ASSERT_EQUAL(attempt + 2U, s_provisional_discard_count);
+    }
+    TEST_ASSERT_TRUE(
+        ble_link_service_retained_retry_remaining_ms() <= 1000U);
+    s_provisional_result = ESP_OK;
+    host_freertos_advance_ticks(pdMS_TO_TICKS(1000U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_TRUE(!ble_link_service_retained_cleanup_pending());
+}
+
+static void test_repeated_terminal_discard_coalesces_physical_target(void)
+{
+    _reset();
+    _enable_provisional_security_ops();
+    s_provisional_result = ESP_ERR_NO_MEM;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+
+    /* The timeout retains the first discard and then clears auth_txn. */
+    ble_link_service_idle_timeout(GEN);
+    const ble_link_operation_identity_t first = s_provisional_identity;
+
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(first.token != 0U);
+    /* auth_txn is now empty, so this separate terminal path generates another
+     * token. The retained slot must still keep the first identity and
+     * cooldown. */
+    ble_link_service_abort_transactions();
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(ble_link_service_retained_cleanup_pending());
+
+    s_provisional_result = ESP_OK;
+    host_freertos_advance_ticks(pdMS_TO_TICKS(100U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(2U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(ble_link_operation_identity_equal(
+                         &first, &s_provisional_identity));
+    TEST_ASSERT_TRUE(!ble_link_service_retained_cleanup_pending());
+}
+
+static void test_failed_commit_retires_transaction(void)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+    uint8_t commit[64];
+    const uint8_t filler = 1U;
+
+    device_link_security_deinit();
+    nv_storage_fake_reset();
+    _reset();
+    _enable_provisional_security_ops();
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t commit_len = _build_commit_body(
+                                  commit, sizeof(commit), 5U);
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    const uint64_t token = ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_confirm_binding(token, true));
+
+    /* Exhaust the fake NVS slots so the real authorization save fails
+     * before its durable boundary. */
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "fill.1", &filler, sizeof(filler)));
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "fill.2", &filler, sizeof(filler)));
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "fill.3", &filler, sizeof(filler)));
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "fill.4", &filler, sizeof(filler)));
+
+    (void)_build_commit_body(commit, sizeof(commit), 6U);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_STORAGE, response.error);
+    TEST_ASSERT_EQUAL(1U, s_provisional_discard_count);
+    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+    TEST_ASSERT_EQUAL(0U, ble_link_service_confirmation_token());
+
+    /* The explicit pre-durable failure is terminal. A fresh request id
+     * cannot retry the retired transaction while bond cleanup is live. */
+    (void)_build_commit_body(commit, sizeof(commit), 7U);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INVALID_ARGUMENT, response.error);
+    nv_storage_fake_reset();
+}
+
+static void test_remote_replacement_is_owner_serialized(void)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+    uint8_t commit[64];
+    const ble_link_operation_identity_t replacement =
+    {
+        .generation = GEN,
+        .security_epoch = 1U,
+        .token = 900U,
+        .kind = BLE_LINK_OPERATION_REMOTE_REPLACEMENT,
+        .conn_handle = 7U,
+    };
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_register_remote_replacement(
+                          &replacement));
+    TEST_ASSERT_TRUE(!ble_link_service_retained_cleanup_pending());
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_retained_retry_remaining_ms());
+
+    _reset();
+    _enable_provisional_security_ops();
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    s_replacement_result = ESP_ERR_NO_MEM;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_register_remote_replacement(
+                          &replacement));
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(1U, s_replacement_count);
+    s_replacement_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(1U, s_replacement_count);
+    host_freertos_advance_ticks(pdMS_TO_TICKS(100U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(2U, s_replacement_count);
+    TEST_ASSERT_TRUE(ble_link_operation_identity_equal(
+                         &replacement, &s_replacement_identity));
+
+    /* Once the first Commit probe entered, Commit wins the linearization
+     * race and the host callback may not register replacement mutation. */
+    _reset();
+    _enable_provisional_security_ops();
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t commit_len = _build_commit_body(
+                                  commit, sizeof(commit), 5U);
+
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_register_remote_replacement(
+                          &replacement));
+    TEST_ASSERT_EQUAL(0U, s_replacement_count);
+
+    /* A durable Commit is terminal and no longer outranks a later pairing
+     * retry. Replacement admission clears the retained terminal result so it
+     * cannot be replayed while replacement cleanup is in progress. */
+    nv_storage_fake_reset();
+    _reset();
+    _enable_provisional_security_ops();
+    s_pending_captured = false;
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    (void)_build_commit_body(commit, sizeof(commit), 5U);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    const uint64_t token = ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(token, true));
+    (void)_build_commit_body(commit, sizeof(commit), 6U);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len, &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_register_remote_replacement(
+                          &replacement));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_pump_tx());
+    TEST_ASSERT_EQUAL(1U, s_replacement_count);
+
+    /* Re-open the same fake ACL after the cutover. The exact terminal Commit
+     * is no longer cached and therefore cannot return the old success. */
+    _establish_session();
+    (void)_build_commit_body(commit, sizeof(commit), 7U);
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len, &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INVALID_ARGUMENT, response.error);
+    nv_storage_fake_reset();
+}
+
+static void test_handshaking_teardown_requires_current_identity(void)
+{
+    static const uint8_t cmd0[] = "cmd0";
+
+    _reset();
+    ble_link_service_reset();
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    s_auto_confirm = false;
+    s_security_close_count = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    const uint32_t epoch = ble_link_session_security2_epoch();
+    const ble_link_operation_identity_t current =
+    {
+        .generation = GEN,
+        .security_epoch = epoch,
+        .kind = BLE_LINK_OPERATION_DISCONNECT,
+        .conn_handle = s_facts.conn_handle,
+    };
+    ble_link_operation_identity_t stale = current;
+
+    TEST_ASSERT_TRUE(epoch != 0U);
+    /* The first Cmd0 retired the adapter's previous logical session. */
+    TEST_ASSERT_EQUAL(1U, s_security_close_count);
+
+    stale.generation++;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    stale = current;
+    stale.security_epoch--;
+    stale.kind = BLE_LINK_OPERATION_ENCRYPT_CHANGE;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    stale = current;
+    stale.conn_handle++;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &stale));
+    TEST_ASSERT_TRUE(ble_link_service_response_in_flight());
+    TEST_ASSERT_EQUAL(1U, s_security_close_count);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_clear_session_state_if_current(
+                          &current));
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+    TEST_ASSERT_EQUAL(2U, s_security_close_count);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_clear_session_state_if_current(
+                          &current));
+    TEST_ASSERT_EQUAL(2U, s_security_close_count);
+
+    /* ACL-terminal teardown deliberately ignores an older Security 2 epoch:
+     * a Cmd0 may advance it while DISCONNECT waits for the service mutex. */
+    ble_link_service_init(BOOT_ID, _capture, NULL,
+                          &s_handshake_security_ops, 32U);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      _feed_handshake_single(cmd0, sizeof(cmd0) - 1U));
+    ble_link_operation_identity_t terminal =
+    {
+        .generation = GEN,
+        .security_epoch = ble_link_session_security2_epoch() - 1U,
+        .kind = BLE_LINK_OPERATION_DISCONNECT,
+        .conn_handle = s_facts.conn_handle,
+    };
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_clear_session_state_if_current(
+                          &terminal));
+    TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
 }
 
 int main(void)
@@ -1602,9 +2926,14 @@ int main(void)
     test_authorize_commit_wrong_credential();
     test_authorize_commit_truncated_rejected();
     test_get_authorization_recovery();
+    test_real_security2_rehandshake_commit_replay_and_recovery();
     test_get_authorization_requires_recovery_flag();
     test_prepare_refetch_same_transaction();
     test_authorize_expiry_clears_transaction();
+    test_response_flow_identity_and_deferred_busy();
+    test_stale_response_flow_is_ignored();
+    test_handshake_queued_admission();
+    test_cmd0_delayed_replacement();
     test_capabilities_request();
     test_capabilities_response_bytes();
     test_snapshot_request();
@@ -1633,6 +2962,13 @@ int main(void)
     test_stale_ingress_epoch_timeout_is_ignored();
     test_completed_work_is_copied_and_deferred();
     test_clear_retires_queued_work();
+    test_provisional_bond_lifecycle();
+    test_provisional_cleanup_is_retained_until_accepted();
+    test_provisional_cleanup_backoff_is_bounded();
+    test_repeated_terminal_discard_coalesces_physical_target();
+    test_failed_commit_retires_transaction();
+    test_remote_replacement_is_owner_serialized();
+    test_handshaking_teardown_requires_current_identity();
 
     return 0;
 }

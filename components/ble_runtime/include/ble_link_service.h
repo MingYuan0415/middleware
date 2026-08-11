@@ -8,6 +8,7 @@
 #include "esp_err.h"
 
 #include "ble_link_events.h"
+#include "ble_link_reassembler.h"
 #include "ble_link_security_ops.h"
 #include "device_link_security_auth.h"
 
@@ -61,12 +62,15 @@ typedef enum
  * @param[in] value   Framed value bytes.
  * @param[in] len     Value length.
  * @param[in] channel TX characteristic channel.
+ * @param[in] flow_id Nonzero response flow identity, or zero for an
+ *                    independent event notification.
  * @param[in] arg     Argument from service init.
  * @return ESP_OK, or an error to abort the transaction.
  */
 typedef esp_err_t (*ble_link_service_output_t)(
     const uint8_t *value, size_t len,
-    ble_link_service_tx_channel_t channel, bool is_last, void *arg);
+    ble_link_service_tx_channel_t channel, bool is_last, uint32_t flow_id,
+    void *arg);
 
 /**
  * @brief Runtime facts the service needs per request.
@@ -75,12 +79,15 @@ typedef struct ble_link_service_facts
 {
     uint64_t active_boot_id;
     uint32_t connection_generation;
+    uint32_t security_epoch;
     uint32_t preferred_att_mtu;
+    uint16_t conn_handle;
     bool encrypted;
     bool session_authenticated;
     bool authorized;
     bool identity_known;
     bool secure_connections_bond_verified;
+    bool pairing_window_open; /**< Window state captured at ACL connect. */
     uint8_t peer_addr_type; /**< SMP peer identity address type. */
     uint8_t peer_addr[6]; /**< SMP peer identity address. */
 } ble_link_service_facts_t;
@@ -152,7 +159,10 @@ esp_err_t ble_link_service_feed(
  *
  * A completed message is copied into worker-owned memory. The caller owns
  * `out_work` on success and must execute or release it. Incomplete frames
- * return ESP_ERR_NOT_FINISHED with a NULL work item.
+ * return ESP_ERR_NOT_FINISHED with a NULL work item. While a completed
+ * handshake is queued or a replacement Cmd0 is delayed, exact duplicate
+ * fragments are absorbed and any different ingress returns
+ * ESP_ERR_NOT_ALLOWED synchronously with a NULL work item.
  */
 esp_err_t ble_link_service_accept(
     const ble_link_service_facts_t *facts,
@@ -165,6 +175,29 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work);
 
 /** @brief Zeroize and release a completed ingress message. */
 void ble_link_service_release_work(ble_link_work_t *work);
+
+/** @brief Worker wake callback: prompt the owner to call pump_tx(). */
+typedef void (*ble_link_service_wake_fn_t)(void *arg);
+
+/**
+ * @brief Register the worker wake callback.
+ *
+ * The TX completion callback only records a fact. The completion path wakes
+ * the owner through this callback (e.g. a task notification), and the owner
+ * calls pump_tx() from its task context. The callback must be non-blocking
+ * and callable from the transport completion context. The service invokes it
+ * while holding its recursive state lock; it may signal the owner but must not
+ * wait for owner work to complete. Disabling the callback is a barrier against
+ * an in-progress invocation.
+ *
+ * @param[in] wake Wake callback, or NULL to disable.
+ * @param[in] arg  Callback argument.
+ */
+void ble_link_service_set_worker_wake(
+    ble_link_service_wake_fn_t wake, void *arg);
+
+/** @brief Signal the registered service owner without performing owner work. */
+void ble_link_service_wake_owner(void);
 
 /**
  * @brief Whether a response transaction is in flight (waiting for the
@@ -184,11 +217,56 @@ bool ble_link_service_response_in_flight(void);
 void ble_link_service_abort_transactions(void);
 
 /**
- * @brief Complete the response transaction.
+ * @brief Whether an old indication currently blocks a retained Cmd0.
  *
- * Called by the transport when the final fragment's indication confirms.
+ * Used by the indication-timeout owner to apply the contract's stronger
+ * outcome: discard the retained Cmd0 and terminate that exact ACL.
  */
-void ble_link_service_response_completed(void);
+bool ble_link_service_delayed_replacement_pending(uint32_t generation);
+
+/**
+ * @brief Record one confirmed response fragment.
+ *
+ * The transport calls this from its completion callback. It only records an
+ * immutable completion fact; the caller must invoke
+ * ble_link_service_pump_tx() from the service worker to emit the next
+ * fragment. A stale or unrelated flow ID is ignored and returns
+ * ESP_ERR_NOT_FOUND.
+ */
+esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
+
+/**
+ * @brief Advance a response stream from the service owner task.
+ *
+ * This is the only API that may submit the next response fragment after a
+ * confirmation. It also emits one deferred BUSY response, when present,
+ * after the active response has fully completed.
+ *
+ * @return ESP_OK, or an error that caused the current session to fail closed.
+ */
+esp_err_t ble_link_service_pump_tx(void);
+
+/**
+ * @brief Return the nearest retained cleanup/replacement retry deadline.
+ *
+ * @return Remaining milliseconds, zero when work is due, or UINT32_MAX
+ *         when no retained storage obligation exists.
+ */
+uint32_t ble_link_service_retained_retry_remaining_ms(void);
+
+/** @brief Whether any retained cleanup or replacement obligation exists. */
+bool ble_link_service_retained_cleanup_pending(void);
+
+/**
+ * @brief Register remote replacement work from a NimBLE host callback.
+ *
+ * Registration only stores immutable identity and wakes the Device Link
+ * owner. If Commit already reached COMMIT_PROBED, Commit wins and the
+ * replacement is rejected. Otherwise subsequent request execution is blocked
+ * until the owner transfers the retained replacement to the security port.
+ */
+esp_err_t ble_link_service_register_remote_replacement(
+    const ble_link_operation_identity_t *identity);
 
 /**
  * @brief Clear all per-connection session state after a disconnect.
@@ -201,6 +279,22 @@ void ble_link_service_response_completed(void);
 void ble_link_service_clear_session_state(void);
 
 /**
+ * @brief Clear session state only when an immutable host identity is current.
+ *
+ * The generation and connection handle are always checked while holding the
+ * service owner lock. Session-only failures also require an exact Security 2
+ * epoch. ACL-terminal DISCONNECT, RESET, and TERMINATE operations deliberately
+ * cover every epoch of that exact ACL, including a Cmd0 that advanced while
+ * the terminal event waited for the owner lock.
+ *
+ * @param[in] identity Host operation that requires the session teardown.
+ * @return ESP_OK when cleared, ESP_ERR_NOT_FOUND for a stale identity, or
+ *         ESP_ERR_INVALID_ARG for an invalid teardown identity.
+ */
+esp_err_t ble_link_service_clear_session_state_if_current(
+    const ble_link_operation_identity_t *identity);
+
+/**
  * @brief Expire the active authorize transaction when its deadline passed.
  *
  * Called periodically by the device-link worker tick so the UI snapshot
@@ -209,6 +303,18 @@ void ble_link_service_clear_session_state(void);
  * @return ESP_OK.
  */
 esp_err_t ble_link_service_auth_expiry_tick(void);
+
+/**
+ * @brief Return the remaining authorize transaction lifetime.
+ *
+ * The result is derived from the same absolute deadline consumed by
+ * ble_link_service_auth_expiry_tick(). It lets the owner sleep until the
+ * exact deadline instead of relying on a periodic timer event.
+ *
+ * @return Remaining milliseconds, zero when due, or UINT32_MAX when no
+ *         authorize transaction has an expiry obligation.
+ */
+uint32_t ble_link_service_auth_expiry_remaining_ms(void);
 
 /**
  * @brief Query whether a partial frame is being reassembled on a channel.
@@ -240,6 +346,12 @@ esp_err_t ble_link_service_get_reassembly_state(
     ble_link_service_rx_channel_t channel,
     bool *out_partial, uint32_t *out_epoch);
 
+/** @brief Snapshot reassembly state and the latest accepted disposition. */
+esp_err_t ble_link_service_get_reassembly_state_ex(
+    ble_link_service_rx_channel_t channel,
+    bool *out_partial, uint32_t *out_epoch,
+    ble_link_reassembly_disposition_t *out_disposition);
+
 /**
  * @brief Publish a link_state_changed event to the current subscriber.
  *
@@ -270,22 +382,32 @@ esp_err_t ble_link_service_on_authenticated(void *arg);
 /**
  * @brief Accept or deny the pending binding confirmation.
  *
- * Accepting arms the active authorize transaction so a subsequent
+ * Accepting arms the exact Commit-probed authorize transaction so a fresh
  * AuthorizeCommit persists the authorization record. Denying invalidates
- * the transaction: any later commit of it is rejected. Without an active
- * transaction the call has no effect.
+ * that transaction. A stale token or generation is rejected.
  *
+ * @param[in] token Nonzero token returned by
+ *                  ble_link_service_confirmation_token().
  * @param[in] accept True to confirm, false to deny.
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale decision.
  */
-void ble_link_service_confirm_binding(bool accept);
+esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept);
 
 /**
  * @brief Report whether a binding awaits local confirmation.
  *
- * @return True while an authorize transaction is active and not yet
- *         confirmed (or denied).
+ * @return True only after a valid Commit probe and before the local
+ *         decision.
  */
 bool ble_link_service_pending_confirmation(void);
+
+/**
+ * @brief Return the token of the transaction awaiting local confirmation.
+ *
+ * @return Nonzero boot-scoped token, or zero when no Commit probe is
+ *         awaiting a local decision.
+ */
+uint64_t ble_link_service_confirmation_token(void);
 
 /**
  * @brief Process one plaintext Envelope and produce the plaintext response

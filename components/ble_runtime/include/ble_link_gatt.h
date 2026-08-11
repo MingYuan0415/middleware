@@ -33,8 +33,9 @@ extern "C" {
         uint8_t peer_addr[6];         /**< SMP peer identity address. */
         uint16_t att_mtu;             /**< Negotiated ATT MTU, 23 default. */
         size_t tx_queue_depth;        /**< TX scheduler queue depth. */
-        void (*publish_link_state)(const uint8_t *value, size_t len,
-                                   void *arg); /**< link_state notify sink. */
+        esp_err_t (*publish_link_state)(const uint8_t *value, size_t len,
+                                        void *arg); /**< link_state notify
+                                                     *  submit sink. */
         void *publish_arg;
         const ble_link_security_ops_t *security_ops; /**< Security 2 ops, or
                                                   *  NULL for the plaintext
@@ -100,6 +101,27 @@ extern "C" {
      * @return ESP_OK, or ESP_ERR_INVALID_ARG.
      */
     esp_err_t ble_link_gatt_refresh_link_state(void);
+
+    /** @brief Force a fresh snapshot after Security 2 authentication. */
+    void ble_link_gatt_authentication_epoch_advance(void);
+
+    /** @brief Force a fresh snapshot after link_state CCCD changes. */
+    void ble_link_gatt_cccd_epoch_advance(void);
+
+    /** @brief Retain a best-effort snapshot retry obligation. */
+    void ble_link_gatt_mark_link_state_dirty(void);
+
+    /** @brief Mark current link state for an event-driven owner refresh. */
+    void ble_link_gatt_request_link_state_refresh(void);
+
+    /** @brief Whether the owner still has an undelivered link-state value. */
+    bool ble_link_gatt_link_state_dirty(void);
+
+    /** @brief Whether a failed submit/completion requires a timed retry. */
+    bool ble_link_gatt_link_state_retry_pending(void);
+
+    /** @brief Milliseconds until the retained link-state retry is eligible. */
+    uint32_t ble_link_gatt_link_state_retry_remaining_ms(void);
 
     /**
      * @brief Advance the connection identity (new connection or generation).

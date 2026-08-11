@@ -7,9 +7,13 @@
 #include "esp_err.h"
 #include "protocomm_security.h"
 #include "protocomm_security2.h"
+#include "session.pb-c.h"
 
 #define FAKE_SESSION (protocomm_security_handle_t)(uintptr_t)0x2000U
 #define FAKE_TAG_BYTES 16U
+#define FAKE_PUBLIC_KEY_BYTES 384U
+#define FAKE_PROOF_BYTES 64U
+#define FAKE_NONCE_BYTES 12U
 
 /* In-memory copy of the SRP params for the last handshake. */
 static char s_last_salt[64];
@@ -117,17 +121,72 @@ static esp_err_t _sec2_req_handler(
         s_fail_next_handshake = false;
         return ESP_ERR_INVALID_ARG;
     }
-    uint8_t *response = malloc((size_t)input_length + 2U);
+    SessionData *request = session_data__unpack(
+                               NULL, (size_t)input_length, input);
+
+    if (request == NULL ||
+            request->sec_ver != SEC_SCHEME_VERSION__SecScheme2 ||
+            request->proto_case != SESSION_DATA__PROTO_SEC2 ||
+            request->sec2 == NULL)
+    {
+        session_data__free_unpacked(request, NULL);
+        return ESP_ERR_INVALID_ARG;
+    }
+    static uint8_t public_key[FAKE_PUBLIC_KEY_BYTES] =
+    {0x44U, 0x50U, 0x4bU};
+    static uint8_t salt[16U] = {0x53U, 0x41U, 0x4cU, 0x54U};
+    static uint8_t proof[FAKE_PROOF_BYTES] =
+    {0x50U, 0x52U, 0x4fU, 0x4fU, 0x46U};
+    static uint8_t nonce[FAKE_NONCE_BYTES] =
+    {0x4eU, 0x4fU, 0x4eU, 0x43U, 0x45U};
+    S2SessionResp0 resp0 = S2_SESSION_RESP0__INIT;
+    S2SessionResp1 resp1 = S2_SESSION_RESP1__INIT;
+    Sec2Payload payload = SEC2_PAYLOAD__INIT;
+    SessionData session = SESSION_DATA__INIT;
+
+    session.sec_ver = SEC_SCHEME_VERSION__SecScheme2;
+    session.proto_case = SESSION_DATA__PROTO_SEC2;
+    session.sec2 = &payload;
+    if (request->sec2->msg == SEC2_MSG_TYPE__S2Session_Command0 &&
+            request->sec2->payload_case == SEC2_PAYLOAD__PAYLOAD_SC0)
+    {
+        resp0.status = STATUS__Success;
+        resp0.device_pubkey.data = public_key;
+        resp0.device_pubkey.len = sizeof(public_key);
+        resp0.device_salt.data = salt;
+        resp0.device_salt.len = sizeof(salt);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Response0;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SR0;
+        payload.sr0 = &resp0;
+    }
+    else if (request->sec2->msg == SEC2_MSG_TYPE__S2Session_Command1 &&
+             request->sec2->payload_case == SEC2_PAYLOAD__PAYLOAD_SC1)
+    {
+        resp1.status = STATUS__Success;
+        resp1.device_proof.data = proof;
+        resp1.device_proof.len = sizeof(proof);
+        resp1.device_nonce.data = nonce;
+        resp1.device_nonce.len = sizeof(nonce);
+        payload.msg = SEC2_MSG_TYPE__S2Session_Response1;
+        payload.payload_case = SEC2_PAYLOAD__PAYLOAD_SR1;
+        payload.sr1 = &resp1;
+    }
+    else
+    {
+        session_data__free_unpacked(request, NULL);
+        return ESP_ERR_INVALID_ARG;
+    }
+    session_data__free_unpacked(request, NULL);
+    const size_t packed_size = session_data__get_packed_size(&session);
+    uint8_t *response = malloc(packed_size);
 
     if (response == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
-    memcpy(response, input, (size_t)input_length);
-    response[input_length] = 0xaa;
-    response[input_length + 1U] = 0xbb;
+    assert(session_data__pack(&session, response) == packed_size);
     *output = response;
-    *output_length = input_length + 2;
+    *output_length = (ssize_t)packed_size;
     return ESP_OK;
 }
 

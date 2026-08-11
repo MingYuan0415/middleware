@@ -154,8 +154,11 @@ static void test_exact_duplicate_accepted(void)
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_reassembler_accept(
                           &s_slot, &fragment));
     _feed("010104000b00000048656c6c6f2177", storage, &storage_len, &fragment);
-    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED, ble_link_reassembler_accept(
-                          &s_slot, &fragment));
+    ble_link_reassembly_disposition_t disposition;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept_ex(
+                          &s_slot, &fragment, &disposition));
+    TEST_ASSERT_EQUAL(BLE_LINK_REASSEMBLY_DUPLICATE, disposition);
     _feed("010204000b0007006f726c64", storage, &storage_len, &fragment);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
                           &s_slot, &fragment));
@@ -251,7 +254,7 @@ static void test_capacity_exceeded(void)
     ble_link_reassembler_init(&s_slot, small, sizeof(small));
     ble_link_fragment_t fragment;
 
-    _feed("01030100100000004141414141414141414141414141414141", storage, &storage_len, &fragment);
+    _feed("010301001000000041414141414141414141414141414141", storage, &storage_len, &fragment);
 
     TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_link_reassembler_accept(
                           &s_slot, &fragment));
@@ -308,9 +311,83 @@ static void test_frame_reuse_after_completion(void)
 
     _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
 
+    ble_link_reassembly_disposition_t disposition;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept_ex(
+                          &s_slot, &fragment, &disposition));
+    TEST_ASSERT_EQUAL(BLE_LINK_REASSEMBLY_COMPLETE, disposition);
+    /* The exact final fragment is accepted but cannot deliver twice. */
+    _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept_ex(
+                          &s_slot, &fragment, &disposition));
+    TEST_ASSERT_EQUAL(BLE_LINK_REASSEMBLY_DUPLICATE, disposition);
+    /* A different message may immediately reuse the same nonzero ID. */
+    _feed("0103010008000000476f6f6462796521", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept_ex(
+                          &s_slot, &fragment, &disposition));
+    TEST_ASSERT_EQUAL(BLE_LINK_REASSEMBLY_COMPLETE, disposition);
+    TEST_ASSERT_EQUAL(0, memcmp(s_buffer, "Goodbye!", 8U));
+}
+
+static void test_late_duplicate_after_second_completion(void)
+{
+    uint8_t storage[512];
+    size_t storage_len = 0U;
+
+    _init_slot();
+    ble_link_fragment_t fragment;
+
+    _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
                           &s_slot, &fragment));
-    /* The slot must stay usable after completion. */
+    _feed("010302000800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+    /* Only the latest final fragment is a tombstone. Frame IDs do not impose
+     * ordering across completed messages, so frame 1 is reusable here. */
+    _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+}
+
+static void test_frame_id_wrap_accepted(void)
+{
+    uint8_t storage[512];
+    size_t storage_len = 0U;
+
+    _init_slot();
+    ble_link_fragment_t fragment;
+
+    _feed("0103ffff0800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+    /* Any nonzero ID may identify the next message. */
+    _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+    /* Reusing 65535 is valid; frame IDs are not a cross-message sequence. */
+    _feed("0103ffff0800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+}
+
+static void test_arbitrary_frame_ids_reusable(void)
+{
+    uint8_t storage[512];
+    size_t storage_len = 0U;
+
+    _init_slot();
+    ble_link_fragment_t fragment;
+
+    _feed("010302000800000048656c6c6f216d65", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+    /* A lower ID is valid for the next different message. */
+    _feed("0103010008000000476f6f6462796521", storage, &storage_len, &fragment);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
+                          &s_slot, &fragment));
+    /* Reset still clears both active and final-fragment state. */
+    ble_link_reassembler_reset(&s_slot);
     _feed("010301000800000048656c6c6f216d65", storage, &storage_len, &fragment);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_reassembler_accept(
                           &s_slot, &fragment));
@@ -409,6 +486,11 @@ static void test_invalid_arguments(void)
     }));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_reassembler_accept(
                           &s_slot, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_reassembler_accept_ex(
+                          &s_slot, &(ble_link_fragment_t)
+    {
+        0
+    }, NULL));
 }
 
 int main(void)
@@ -422,6 +504,9 @@ int main(void)
     test_capacity_exceeded();
     test_max_payload_487();
     test_frame_reuse_after_completion();
+    test_late_duplicate_after_second_completion();
+    test_frame_id_wrap_accepted();
+    test_arbitrary_frame_ids_reusable();
     test_wrap_attack_rejected();
     test_flags_only_duplicate_rejected();
     test_explicit_reset_keeps_slot_usable();

@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,10 +6,12 @@
 
 #include "esp_err.h"
 
+#include "ble_gap_manager.h"
 #include "ble_gatt_registry.h"
 #include "ble_link_gatt.h"
 #include "ble_link_session.h"
 #include "ble_tx_scheduler.h"
+#include "host_freertos.h"
 
 #define TEST_ASSERT_TRUE(condition) \
     do \
@@ -41,15 +44,89 @@
 static uint8_t s_published[BLE_LINK_STATE_MAX_ENCODED_BYTES];
 static size_t s_published_len;
 static unsigned int s_publish_calls;
+static pthread_barrier_t *s_publish_enter_barrier;
+static pthread_barrier_t *s_publish_exit_barrier;
 
 static ble_link_gatt_config_t s_config;
 
-static void _publish(const uint8_t *value, size_t len, void *arg)
+static esp_err_t _fake_notify(uint16_t conn_handle, uint16_t value_handle,
+                              const uint8_t *data, size_t len)
+{
+    (void)conn_handle;
+    (void)value_handle;
+    (void)data;
+    (void)len;
+    return ESP_OK;
+}
+
+static esp_err_t _fake_indicate(uint16_t conn_handle, uint16_t value_handle,
+                                const uint8_t *data, size_t len)
+{
+    (void)conn_handle;
+    (void)value_handle;
+    (void)data;
+    (void)len;
+    return ESP_OK;
+}
+
+static const ble_port_ops_t s_fake_port_ops =
+{
+    .adv_start = NULL,
+    .adv_stop = NULL,
+    .notify = _fake_notify,
+    .indicate = _fake_indicate,
+};
+
+static const ble_tx_scheduler_config_t s_scheduler_config =
+{
+    .queue_depth = 32U,
+    .max_frame_bytes = 512U,
+    .ops = &s_fake_port_ops,
+};
+
+static esp_err_t _publish(const uint8_t *value, size_t len, void *arg)
 {
     (void)arg;
     memcpy(s_published, value, len);
     s_published_len = len;
     s_publish_calls++;
+    if (s_publish_enter_barrier != NULL)
+    {
+        (void)pthread_barrier_wait(s_publish_enter_barrier);
+        (void)pthread_barrier_wait(s_publish_exit_barrier);
+    }
+    return ESP_OK;
+}
+
+
+static void _subscribe_tx_kind(uint16_t attr_handle, bool notify,
+                               bool indicate)
+{
+    static bool connected = false;
+    ble_gap_manager_event_t event;
+    ble_gap_manager_snapshot_t snapshot;
+
+    if (!connected)
+    {
+        ble_gap_manager_init();
+        memset(&event, 0, sizeof(event));
+        event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
+        event.conn_handle = 7U;
+        event.status = 0;
+        TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_handle_event(&event));
+        connected = true;
+    }
+    memset(&event, 0, sizeof(event));
+    event.type = BLE_GAP_MANAGER_EVENT_SUBSCRIBE;
+    event.conn_handle = 7U;
+    event.attr_handle = attr_handle;
+    event.notify = notify;
+    event.indicate = indicate;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    event.identity.generation = snapshot.generation;
+    event.identity.kind = BLE_LINK_OPERATION_SUBSCRIBE;
+    event.identity.conn_handle = event.conn_handle;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_handle_event(&event));
 }
 
 static void _establish_session(void)
@@ -78,6 +155,10 @@ static void _reset(void)
     memset(&s_published, 0, sizeof(s_published));
     s_published_len = 0U;
     s_publish_calls = 0U;
+    s_publish_enter_barrier = NULL;
+    s_publish_exit_barrier = NULL;
+    ble_link_gatt_reset();
+    ble_tx_scheduler_deinit();
     memset(&s_config, 0, sizeof(s_config));
     s_config.boot_id = BOOT_ID;
     s_config.connection_generation = GEN;
@@ -85,8 +166,83 @@ static void _reset(void)
     s_config.att_mtu = 23U;
     s_config.tx_queue_depth = 32U;
     s_config.publish_link_state = _publish;
-    ble_link_gatt_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_init(&s_scheduler_config));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_init(&s_config));
+}
+
+static void *_refresh_link_state_thread(void *arg)
+{
+    esp_err_t *result = arg;
+
+    *result = ble_link_gatt_refresh_link_state();
+    return NULL;
+}
+
+static void test_refresh_retains_concurrent_epoch_dirty(void)
+{
+    pthread_barrier_t entered;
+    pthread_barrier_t release;
+    pthread_t refresh_thread;
+    esp_err_t refresh_result = ESP_FAIL;
+
+    _reset();
+    _establish_session();
+    TEST_ASSERT_EQUAL(0, pthread_barrier_init(&entered, NULL, 2U));
+    TEST_ASSERT_EQUAL(0, pthread_barrier_init(&release, NULL, 2U));
+    s_publish_enter_barrier = &entered;
+    s_publish_exit_barrier = &release;
+    TEST_ASSERT_EQUAL(0, pthread_create(
+                          &refresh_thread, NULL,
+                          _refresh_link_state_thread, &refresh_result));
+    (void)pthread_barrier_wait(&entered);
+
+    /* Host callbacks may advance both epochs or mark a failed notification
+     * while the owner is inside the transport submit. None of those facts may
+     * be overwritten when the older submit returns. */
+    ble_link_gatt_authentication_epoch_advance();
+    ble_link_gatt_cccd_epoch_advance();
+    ble_link_gatt_mark_link_state_dirty();
+    (void)pthread_barrier_wait(&release);
+    TEST_ASSERT_EQUAL(0, pthread_join(refresh_thread, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, refresh_result);
+    TEST_ASSERT_EQUAL(1U, s_publish_calls);
+
+    s_publish_enter_barrier = NULL;
+    s_publish_exit_barrier = NULL;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED,
+                      ble_link_gatt_refresh_link_state());
+    host_freertos_advance_ticks(pdMS_TO_TICKS(100U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_refresh_link_state());
+    TEST_ASSERT_EQUAL(2U, s_publish_calls);
+    TEST_ASSERT_EQUAL(0, pthread_barrier_destroy(&entered));
+    TEST_ASSERT_EQUAL(0, pthread_barrier_destroy(&release));
+}
+
+static void test_async_failure_retry_is_cooled_down(void)
+{
+    _reset();
+    _establish_session();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_refresh_link_state());
+    const unsigned int initial_calls = s_publish_calls;
+
+    for (unsigned int attempt = 0U; attempt < 3U; ++attempt)
+    {
+        /* Model an asynchronous terminal notification failure. Its wake may
+         * run the owner immediately, but the retained submit is ineligible
+         * until the absolute 100 ms retry boundary. */
+        ble_link_gatt_mark_link_state_dirty();
+        TEST_ASSERT_TRUE(ble_link_gatt_link_state_retry_pending());
+        TEST_ASSERT_TRUE(
+            ble_link_gatt_link_state_retry_remaining_ms() > 0U);
+        TEST_ASSERT_EQUAL(ESP_ERR_NOT_FINISHED,
+                          ble_link_gatt_refresh_link_state());
+        TEST_ASSERT_EQUAL(initial_calls + attempt, s_publish_calls);
+        host_freertos_advance_ticks(pdMS_TO_TICKS(100U));
+        TEST_ASSERT_EQUAL(0U,
+                          ble_link_gatt_link_state_retry_remaining_ms());
+        TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_refresh_link_state());
+        TEST_ASSERT_EQUAL(initial_calls + attempt + 1U, s_publish_calls);
+    }
 }
 
 static void test_att_mtu_clamped(void)
@@ -106,6 +262,16 @@ static void test_att_mtu_clamped(void)
     ble_link_gatt_set_att_mtu(10U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
     TEST_ASSERT_EQUAL(23U, facts_mtu);
+    const uint8_t peer_addr[6] = {1U, 2U, 3U, 4U, 5U, 6U};
+
+    ble_link_gatt_set_att_mtu(185U);
+    ble_link_gatt_set_connection(GEN + 1U, 8U, 1U, peer_addr);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(23U, facts_mtu);
+    ble_link_gatt_set_att_mtu(185U);
+    ble_link_gatt_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&facts_mtu));
+    TEST_ASSERT_EQUAL(23U, facts_mtu);
 }
 
 static void test_registered_characteristics(void)
@@ -117,7 +283,7 @@ static void test_registered_characteristics(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_uuid(
                           (const uint8_t[16])
     {
-        0xb5, 0x82, 0xef, 0xa4, 0x8a, 0x23, 0x4f, 0x86,
+        0xb5, 0x82, 0xef, 0xa4, 0xa8, 0x23, 0x4f, 0x86,
               0xeb, 0x44, 0x6b, 0xdc, 0x24, 0x1f, 0x78, 0xa4,
     }, &characteristic));
     TEST_ASSERT_TRUE(characteristic != NULL);
@@ -128,6 +294,79 @@ static void test_registered_characteristics(void)
     TEST_ASSERT_EQUAL(BLE_GATT_REGISTRY_ADMISSION_PUBLIC_MINIMUM,
                       characteristic->read_admission);
     TEST_ASSERT_TRUE(characteristic->access_cb != NULL);
+}
+
+static void test_registered_profile_uuids(void)
+{
+    static const uint8_t expected_services[2][16] =
+    {
+        {
+            0xa3, 0x4e, 0x85, 0x57, 0x11, 0x3d, 0x8a, 0xa2,
+            0x59, 0x4e, 0xbb, 0xb4, 0x92, 0x31, 0x20, 0x3e,
+        },
+        {
+            0x1c, 0xc3, 0x0a, 0x88, 0x32, 0x4e, 0xa0, 0x9f,
+            0x6e, 0x42, 0xef, 0xc4, 0x78, 0x72, 0x83, 0x2b,
+        },
+    };
+    static const size_t expected_characteristic_counts[2] = {5U, 3U};
+    static const uint8_t expected_characteristics[8][16] =
+    {
+        {
+            0xb5, 0x82, 0xef, 0xa4, 0xa8, 0x23, 0x4f, 0x86,
+            0xeb, 0x44, 0x6b, 0xdc, 0x24, 0x1f, 0x78, 0xa4,
+        },
+        {
+            0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
+            0xd8, 0x4d, 0x4c, 0xcb, 0x43, 0xe6, 0x01, 0x48,
+        },
+        {
+            0x2a, 0x05, 0xaf, 0xd2, 0x5f, 0xec, 0xa1, 0x83,
+            0x2c, 0x40, 0xac, 0xbe, 0x10, 0x57, 0xe8, 0x2b,
+        },
+        {
+            0xc8, 0x13, 0x3d, 0x40, 0x3d, 0xfb, 0x0c, 0x8e,
+            0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
+        },
+        {
+            0x3a, 0x88, 0x03, 0x4c, 0xf6, 0xb8, 0x62, 0xb5,
+            0x9c, 0x4a, 0x40, 0x1e, 0xc7, 0x5a, 0x73, 0x11,
+        },
+        {
+            0xa1, 0xf0, 0x28, 0x86, 0x72, 0x76, 0xac, 0x97,
+            0x1e, 0x47, 0xff, 0xe9, 0x4d, 0x8d, 0x59, 0xf3,
+        },
+        {
+            0x95, 0xc5, 0xb2, 0xef, 0x19, 0xa6, 0x7d, 0xa1,
+            0xde, 0x46, 0xd0, 0x7d, 0xf1, 0xa0, 0x9a, 0xa9,
+        },
+        {
+            0x9b, 0xd4, 0x94, 0xb8, 0xef, 0xb7, 0xba, 0x96,
+            0x02, 0x4a, 0xd5, 0x16, 0xf1, 0x25, 0x41, 0xec,
+        },
+    };
+
+    _reset();
+    for (size_t i = 0U; i < 2U; ++i)
+    {
+        const ble_gatt_registry_service_t *service = NULL;
+
+        TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_get_service(i, &service));
+        TEST_ASSERT_TRUE(service != NULL);
+        TEST_ASSERT_TRUE(memcmp(service->uuid, expected_services[i], 16U) == 0);
+        TEST_ASSERT_EQUAL(expected_characteristic_counts[i],
+                          service->characteristic_count);
+    }
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        const ble_gatt_registry_characteristic_t *characteristic = NULL;
+
+        TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_uuid(
+                              expected_characteristics[i], &characteristic));
+        TEST_ASSERT_TRUE(characteristic != NULL);
+        TEST_ASSERT_TRUE(memcmp(characteristic->uuid,
+                                expected_characteristics[i], 16U) == 0);
+    }
 }
 
 static void test_write_feeds_service(void)
@@ -162,13 +401,23 @@ static void test_write_feeds_service(void)
     context.write_len = (uint16_t)(9U + sizeof(request));
     /* Assign the control_rx handle. */
     const uint16_t control_rx_handle = 0x20U;
+    const uint16_t control_tx_handle = 0x21U;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
                           (const uint8_t[16])
     {
-        0xc8, 0x13, 0x3d, 0x40, 0xfb, 0x3d, 0x0c, 0x8e,
+        0xc8, 0x13, 0x3d, 0x40, 0x3d, 0xfb, 0x0c, 0x8e,
               0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
     }, control_rx_handle));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
+                          (const uint8_t[16])
+    {
+        0x3a, 0x88, 0x03, 0x4c, 0xf6, 0xb8, 0x62, 0xb5,
+              0x9c, 0x4a, 0x40, 0x1e, 0xc7, 0x5a, 0x73, 0x11,
+    }, control_tx_handle));
+    ble_link_gatt_update_handles();
+    /* The control response is an indication: its CCCD must be enabled. */
+    _subscribe_tx_kind(control_tx_handle, false, true);
     const ble_gatt_registry_characteristic_t *characteristic = NULL;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_handle(
@@ -176,7 +425,6 @@ static void test_write_feeds_service(void)
     const int cb_result = characteristic->access_cb(
                               7U, control_rx_handle, &context, NULL);
 
-    fprintf(stderr, "write cb result=%d\n", cb_result);
     TEST_ASSERT_EQUAL(0, cb_result);
 }
 
@@ -198,7 +446,7 @@ static void test_link_state_read(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
                           (const uint8_t[16])
     {
-        0xb5, 0x82, 0xef, 0xa4, 0x8a, 0x23, 0x4f, 0x86,
+        0xb5, 0x82, 0xef, 0xa4, 0xa8, 0x23, 0x4f, 0x86,
               0xeb, 0x44, 0x6b, 0xdc, 0x24, 0x1f, 0x78, 0xa4,
     }, link_state_handle));
     const ble_gatt_registry_characteristic_t *characteristic = NULL;
@@ -271,8 +519,36 @@ static void test_transfer_service_rejects(void)
     context.op = BLE_GATT_REGISTRY_OP_WRITE_CHR;
     context.write_data = data;
     context.write_len = sizeof(data);
-    TEST_ASSERT_TRUE(characteristic->access_cb(
-                         7U, 0x50U, &context, NULL) != 0);
+    TEST_ASSERT_EQUAL(0x05, characteristic->access_cb(
+                          7U, 0x50U, &context, NULL));
+}
+
+static void test_link_state_read_reports_att_resource(void)
+{
+    uint8_t value[1] = {0};
+    uint16_t len = 0U;
+    ble_gatt_registry_access_context_t context;
+    const uint16_t link_state_handle = 0x70U;
+
+    _reset();
+    _establish_session();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
+                          (const uint8_t[16])
+    {
+        0xb5, 0x82, 0xef, 0xa4, 0xa8, 0x23, 0x4f, 0x86,
+              0xeb, 0x44, 0x6b, 0xdc, 0x24, 0x1f, 0x78, 0xa4,
+    }, link_state_handle));
+    const ble_gatt_registry_characteristic_t *characteristic = NULL;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_handle(
+                          link_state_handle, &characteristic));
+    memset(&context, 0, sizeof(context));
+    context.op = BLE_GATT_REGISTRY_OP_READ_CHR;
+    context.read_out = value;
+    context.read_capacity = 0U;
+    context.read_len = &len;
+    TEST_ASSERT_EQUAL(0x11, characteristic->access_cb(
+                          7U, link_state_handle, &context, NULL));
 }
 
 static void test_authorize_prepare_on_session_channel(void)
@@ -303,13 +579,23 @@ static void test_authorize_prepare_on_session_channel(void)
     context.write_data = framed;
     context.write_len = (uint16_t)(9U + sizeof(prepare));
     const uint16_t session_rx_handle = 0x60U;
+    const uint16_t session_tx_handle = 0x61U;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
                           (const uint8_t[16])
     {
         0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
-              0xd8, 0x4d, 0xcb, 0x4c, 0x43, 0xe6, 0x01, 0x48,
+              0xd8, 0x4d, 0x4c, 0xcb, 0x43, 0xe6, 0x01, 0x48,
     }, session_rx_handle));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_assign_handle(
+                          (const uint8_t[16])
+    {
+        0x2a, 0x05, 0xaf, 0xd2, 0x5f, 0xec, 0xa1, 0x83,
+              0x2c, 0x40, 0xac, 0xbe, 0x10, 0x57, 0xe8, 0x2b,
+    }, session_tx_handle));
+    ble_link_gatt_update_handles();
+    /* The session response is an indication: its CCCD must be enabled. */
+    _subscribe_tx_kind(session_tx_handle, false, true);
     const ble_gatt_registry_characteristic_t *characteristic = NULL;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_lookup_by_handle(
@@ -346,12 +632,16 @@ int main(void)
 {
     test_att_mtu_clamped();
     test_registered_characteristics();
+    test_registered_profile_uuids();
     test_write_feeds_service();
     test_link_state_read();
     test_refresh_publishes_once();
+    test_refresh_retains_concurrent_epoch_dirty();
+    test_async_failure_retry_is_cooled_down();
     test_update_handles();
     test_idle_timeout_wired();
     test_transfer_service_rejects();
+    test_link_state_read_reports_att_resource();
     test_authorize_prepare_on_session_channel();
     printf("ble_link_gatt: all tests passed\n");
     return 0;
