@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -57,6 +58,10 @@
 #include "ble_tx_scheduler.h"
 
 static const char *const TAG = "ble_nimble_port";
+
+#define BLE_NIMBLE_PORT_STORE_NAMESPACE "nimble_bond"
+#define BLE_NIMBLE_PORT_STORE_KEY_BYTES 16U
+#define BLE_NIMBLE_PORT_RPA_KEY_PREFIX "rpa_rec"
 
 _Static_assert(BLE_ADDR_PUBLIC == BLE_NIMBLE_PEER_ADDR_PUBLIC,
                "NimBLE public address type changed");
@@ -527,12 +532,15 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void);
 static esp_err_t _ble_nimble_port_resume_revoke_locked(void);
 static esp_err_t _ble_nimble_port_invalidate_authorization(void);
 static esp_err_t _ble_nimble_port_delete_all_bonds(void);
+static esp_err_t _ble_nimble_port_prepare_runtime_store_reset(void *context);
 static esp_err_t _ble_nimble_port_clear_runtime_store(void *context);
 static esp_err_t _ble_nimble_port_erase_store_namespace(void);
 static esp_err_t _ble_nimble_port_reset_erase_namespace(void *context);
 static esp_err_t _ble_nimble_port_reset_audit_empty(void *context);
 static esp_err_t _ble_nimble_port_collect_residuals(
     int obj_type, ble_addr_t *peers, size_t *count, size_t capacity);
+static esp_err_t _ble_nimble_port_collect_durable_rpa_residuals(
+    ble_addr_t *peers, size_t *count, size_t capacity);
 static esp_err_t _ble_nimble_port_execute_revoke(void);
 static bool _ble_nimble_port_store_object_is_bond(int object_type);
 static esp_err_t _ble_nimble_port_production_adv_start(
@@ -1126,7 +1134,83 @@ typedef struct ble_nimble_port_store_audit_context
 {
     nvs_handle_t handle;
     bool namespace_present;
+    struct ble_store_value_rpa_rec matched_rpa[CONFIG_BT_NIMBLE_MAX_BONDS];
+    size_t matched_rpa_count;
 } ble_nimble_port_store_audit_context_t;
+
+static esp_err_t _ble_nimble_port_format_rpa_key(
+    size_t entry, char key[BLE_NIMBLE_PORT_STORE_KEY_BYTES])
+{
+    const int written = snprintf(
+                            key, BLE_NIMBLE_PORT_STORE_KEY_BYTES,
+                            "%s_%u", BLE_NIMBLE_PORT_RPA_KEY_PREFIX,
+                            (unsigned int)entry);
+
+    return written < 0 ||
+           (size_t)written >= BLE_NIMBLE_PORT_STORE_KEY_BYTES ?
+           ESP_ERR_INVALID_SIZE : ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_read_durable_rpa_blob(
+    nvs_handle_t handle, bool namespace_present, const char *key,
+    struct ble_store_value_rpa_rec *out_value, bool *out_present,
+    bool *out_valid_size)
+{
+    if (key == NULL || out_value == NULL || out_present == NULL ||
+            out_valid_size == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+    *out_present = false;
+    *out_valid_size = false;
+    if (!namespace_present)
+    {
+        return ESP_OK;
+    }
+    size_t required_size = 0U;
+    esp_err_t result = nvs_get_blob(handle, key, NULL, &required_size);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    *out_present = true;
+    if (required_size != sizeof(*out_value))
+    {
+        return ESP_OK;
+    }
+    result = nvs_get_blob(handle, key, out_value, &required_size);
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        memset(out_value, 0, sizeof(*out_value));
+        *out_present = false;
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    *out_valid_size = true;
+    return ESP_OK;
+}
+
+static bool _ble_nimble_port_durable_rpa_valid(
+    const struct ble_store_value_rpa_rec *value)
+{
+    if (value == NULL ||
+            !ble_nimble_peer_identity_valid(
+                value->peer_addr.type, value->peer_addr.val))
+    {
+        return false;
+    }
+    return ble_nimble_peer_rpa_reference_valid(
+               value->peer_rpa_addr.type, value->peer_rpa_addr.val);
+}
 
 static esp_err_t _ble_nimble_port_probe_store_blob(
     void *context, const char *key, bool *out_present)
@@ -1177,26 +1261,127 @@ static esp_err_t _ble_nimble_port_count_restored_store(
     return ESP_OK;
 }
 
+static esp_err_t _ble_nimble_port_match_restored_store(
+    void *context, int object_type, const char *key, bool *out_match)
+{
+    ble_nimble_port_store_audit_context_t *audit = context;
+
+    if (audit == NULL || object_type != BLE_STORE_OBJ_TYPE_PEER_ADDR ||
+            key == NULL || out_match == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_match = false;
+    struct ble_store_value_rpa_rec durable;
+    bool present = false;
+    bool valid_size = false;
+    const esp_err_t read_result = _ble_nimble_port_read_durable_rpa_blob(
+                                      audit->handle,
+                                      audit->namespace_present, key,
+                                      &durable, &present, &valid_size);
+
+    if (read_result != ESP_OK)
+    {
+        return read_result;
+    }
+    if (!present || !valid_size ||
+            !_ble_nimble_port_durable_rpa_valid(&durable))
+    {
+        return ESP_OK;
+    }
+    struct ble_store_key_rpa_rec exact_key =
+    {
+        .peer_rpa_addr = durable.peer_rpa_addr,
+        .idx = 0U,
+    };
+    struct ble_store_value_rpa_rec restored;
+
+    memset(&restored, 0, sizeof(restored));
+    const int store_result = ble_store_read_rpa_rec(&exact_key, &restored);
+
+    if (store_result == BLE_HS_ENOENT)
+    {
+        return ESP_OK;
+    }
+    if (store_result != 0)
+    {
+        return ESP_FAIL;
+    }
+    const bool exact = ble_addr_cmp(&durable.peer_rpa_addr,
+                                    &restored.peer_rpa_addr) == 0 &&
+                       ble_addr_cmp(&durable.peer_addr,
+                                    &restored.peer_addr) == 0;
+
+    if (!exact)
+    {
+        return ESP_OK;
+    }
+    for (size_t i = 0U; i < audit->matched_rpa_count; ++i)
+    {
+        if (ble_addr_cmp(&audit->matched_rpa[i].peer_rpa_addr,
+                         &restored.peer_rpa_addr) == 0 &&
+                ble_addr_cmp(&audit->matched_rpa[i].peer_addr,
+                             &restored.peer_addr) == 0)
+        {
+            return ESP_OK;
+        }
+    }
+    if (audit->matched_rpa_count >= CONFIG_BT_NIMBLE_MAX_BONDS)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    audit->matched_rpa[audit->matched_rpa_count] = restored;
+    audit->matched_rpa_count++;
+    *out_match = true;
+    return ESP_OK;
+}
+
+static void _ble_nimble_port_report_store_mismatch(
+    void *context, const ble_nimble_store_restore_mismatch_t *mismatch)
+{
+    (void)context;
+    if (mismatch != NULL)
+    {
+        ESP_LOGE(TAG, "store restore mismatch family=%s durable=%u RAM=%u",
+                 mismatch->key_prefix,
+                 (unsigned int)mismatch->durable_count,
+                 (unsigned int)mismatch->restored_count);
+    }
+}
+
 static esp_err_t _ble_nimble_port_audit_store_restore(void)
 {
     static const ble_nimble_store_restore_family_t s_families[] =
     {
-        {"our_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_OUR_SEC},
-        {"peer_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_PEER_SEC},
-        {"cccd_sec", CONFIG_BT_NIMBLE_MAX_CCCDS, BLE_STORE_OBJ_TYPE_CCCD},
-        {"csfc_sec", CONFIG_BT_NIMBLE_MAX_BONDS, BLE_STORE_OBJ_TYPE_CSFC},
         {
-            "local_irk", CONFIG_BT_NIMBLE_MAX_BONDS,
-            BLE_STORE_OBJ_TYPE_LOCAL_IRK
+            "our_sec", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_OUR_SEC, false
         },
         {
-            "rpa_rec", CONFIG_BT_NIMBLE_MAX_BONDS,
-            BLE_STORE_OBJ_TYPE_PEER_ADDR
+            "peer_sec", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_PEER_SEC, false
+        },
+        {
+            "cccd_sec", CONFIG_BT_NIMBLE_MAX_CCCDS,
+            BLE_STORE_OBJ_TYPE_CCCD, false
+        },
+        {
+            "csfc_sec", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_CSFC, false
+        },
+        {
+            "local_irk", CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_LOCAL_IRK, false
+        },
+        {
+            BLE_NIMBLE_PORT_RPA_KEY_PREFIX, CONFIG_BT_NIMBLE_MAX_BONDS,
+            BLE_STORE_OBJ_TYPE_PEER_ADDR, true
         },
     };
     ble_nimble_port_store_audit_context_t context = {0};
     esp_err_t result = nvs_open(
-                           "nimble_bond", NVS_READONLY, &context.handle);
+                           BLE_NIMBLE_PORT_STORE_NAMESPACE, NVS_READONLY,
+                           &context.handle);
 
     if (result == ESP_ERR_NVS_NOT_FOUND)
     {
@@ -1214,6 +1399,8 @@ static esp_err_t _ble_nimble_port_audit_store_restore(void)
     {
         .probe = _ble_nimble_port_probe_store_blob,
         .count = _ble_nimble_port_count_restored_store,
+        .match = _ble_nimble_port_match_restored_store,
+        .mismatch = _ble_nimble_port_report_store_mismatch,
         .context = &context,
     };
 
@@ -2849,7 +3036,6 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
         BLE_STORE_OBJ_TYPE_OUR_SEC,
         BLE_STORE_OBJ_TYPE_PEER_SEC,
         BLE_STORE_OBJ_TYPE_CCCD,
-        BLE_STORE_OBJ_TYPE_PEER_ADDR,
     };
 
     for (size_t type_index = 0U;
@@ -2879,6 +3065,25 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
                 return BLE_HS_ESTORE_FAIL;
             }
         }
+    }
+    /* IDF v6.0.2 does not treat BLE_ADDR_ANY as a wildcard for RPA records,
+     * so its PEER_ADDR iterator cannot verify deletion. The config store does
+     * support an exact identity key; use it for the targeted readback. */
+    struct ble_store_key_rpa_rec rpa_key =
+    {
+        .peer_rpa_addr = *peer_id_addr,
+        .idx = 0U,
+    };
+    struct ble_store_value_rpa_rec rpa_value;
+
+    memset(&rpa_value, 0, sizeof(rpa_value));
+    const int rpa_result = ble_store_read_rpa_rec(&rpa_key, &rpa_value);
+
+    if (rpa_result != BLE_HS_ENOENT)
+    {
+        _ble_nimble_port_latch_storage_error(ESP_FAIL);
+        LOG_W("peer RPA store residual result=%d", rpa_result);
+        return rpa_result == 0 ? BLE_HS_ESTORE_FAIL : rpa_result;
     }
     return 0;
 }
@@ -3536,9 +3741,8 @@ static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
         {
             goto exit;
         }
-        result = _ble_nimble_port_collect_residuals(
-                     BLE_STORE_OBJ_TYPE_PEER_ADDR, residual,
-                     &residual_count,
+        result = _ble_nimble_port_collect_durable_rpa_residuals(
+                     residual, &residual_count,
                      sizeof(residual) / sizeof(residual[0]));
 
         if (result != ESP_OK)
@@ -3580,6 +3784,128 @@ exit:
     return result;
 }
 
+typedef struct ble_nimble_port_store_reset_context
+{
+    struct ble_store_value_rpa_rec rpa[CONFIG_BT_NIMBLE_MAX_BONDS];
+    size_t rpa_count;
+} ble_nimble_port_store_reset_context_t;
+
+static esp_err_t _ble_nimble_port_exact_rpa_key_absent(
+    const ble_addr_t *address)
+{
+    if (address == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const struct ble_store_key_rpa_rec key =
+    {
+        .peer_rpa_addr = *address,
+        .idx = 0U,
+    };
+    struct ble_store_value_rpa_rec value;
+
+    memset(&value, 0, sizeof(value));
+    const int result = ble_store_read_rpa_rec(&key, &value);
+
+    if (result == BLE_HS_ENOENT)
+    {
+        return ESP_OK;
+    }
+    return result == 0 ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+}
+
+static esp_err_t _ble_nimble_port_delete_exact_rpa_key(
+    const ble_addr_t *address)
+{
+    if (address == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const struct ble_store_key_rpa_rec key =
+    {
+        .peer_rpa_addr = *address,
+        .idx = 0U,
+    };
+
+    for (size_t attempt = 0U; attempt < CONFIG_BT_NIMBLE_MAX_BONDS;
+            ++attempt)
+    {
+        struct ble_store_value_rpa_rec value;
+
+        memset(&value, 0, sizeof(value));
+        const int read_result = ble_store_read_rpa_rec(&key, &value);
+
+        if (read_result == BLE_HS_ENOENT)
+        {
+            return ESP_OK;
+        }
+        if (read_result != 0 || ble_store_delete_rpa_rec(&key) != 0)
+        {
+            return ESP_FAIL;
+        }
+    }
+    return _ble_nimble_port_exact_rpa_key_absent(address);
+}
+
+static esp_err_t _ble_nimble_port_prepare_runtime_store_reset(void *context)
+{
+    ble_nimble_port_store_reset_context_t *reset = context;
+
+    if (reset == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(reset, 0, sizeof(*reset));
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(
+                           BLE_NIMBLE_PORT_STORE_NAMESPACE, NVS_READONLY,
+                           &handle);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    for (size_t entry = 1U; entry <= CONFIG_BT_NIMBLE_MAX_BONDS; ++entry)
+    {
+        char key[BLE_NIMBLE_PORT_STORE_KEY_BYTES];
+        bool present = false;
+        bool valid_size = false;
+
+        result = _ble_nimble_port_format_rpa_key(entry, key);
+        if (result != ESP_OK)
+        {
+            break;
+        }
+        struct ble_store_value_rpa_rec value;
+
+        result = _ble_nimble_port_read_durable_rpa_blob(
+                     handle, true, key, &value, &present, &valid_size);
+        if (result != ESP_OK)
+        {
+            break;
+        }
+        /* Invalid-length blobs are not restored by IDF and need no RAM key.
+         * Preserve every exact-size value, including semantically malformed
+         * ones, so factory reset can still remove a value that IDF accepted. */
+        if (present && valid_size)
+        {
+            if (reset->rpa_count >= CONFIG_BT_NIMBLE_MAX_BONDS)
+            {
+                result = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+            reset->rpa[reset->rpa_count] = value;
+            reset->rpa_count++;
+        }
+    }
+    nvs_close(handle);
+    return result;
+}
+
 /**
  * @brief Delete every stored bond (and its CCCDs) on the host core.
  *
@@ -3597,11 +3923,15 @@ exit:
  */
 static esp_err_t _ble_nimble_port_delete_all_bonds(void)
 {
+    ble_nimble_port_store_reset_context_t context = {0};
     const ble_nimble_store_reset_ops_t ops =
     {
+        .prepare_runtime_cleanup =
+        _ble_nimble_port_prepare_runtime_store_reset,
         .erase_namespace = _ble_nimble_port_reset_erase_namespace,
         .clear_runtime = _ble_nimble_port_clear_runtime_store,
         .audit_empty = _ble_nimble_port_reset_audit_empty,
+        .context = &context,
     };
     const esp_err_t result = ble_nimble_store_reset_run(&ops);
 
@@ -3610,12 +3940,18 @@ static esp_err_t _ble_nimble_port_delete_all_bonds(void)
         _ble_nimble_port_latch_storage_error(result);
         ESP_LOGW(TAG, "revoke peer-store reset failed (%d)", result);
     }
+    _ble_nimble_port_zeroize(&context, sizeof(context));
     return result;
 }
 
 static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
 {
-    (void)context;
+    ble_nimble_port_store_reset_context_t *reset = context;
+
+    if (reset == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     ble_addr_t peers[CONFIG_BT_NIMBLE_MAX_BONDS];
     int count = 0;
 
@@ -3645,7 +3981,6 @@ static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
         {
             BLE_STORE_OBJ_TYPE_PEER_SEC,
             BLE_STORE_OBJ_TYPE_CCCD,
-            BLE_STORE_OBJ_TYPE_PEER_ADDR,
         };
         ble_addr_t residual[CONFIG_BT_NIMBLE_MAX_BONDS];
         size_t residual_count = 0U;
@@ -3672,6 +4007,44 @@ static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
             }
         }
     }
+    /* The IDF PEER_ADDR wildcard iterator and ble_store_clear() cannot see
+     * RPA records. Delete both exact lookup forms captured before the first
+     * namespace erase, including an RPA-only orphan with no OUR_SEC index. */
+    for (size_t i = 0U; i < reset->rpa_count; ++i)
+    {
+        const struct ble_store_value_rpa_rec *rpa = &reset->rpa[i];
+
+        if (ble_nimble_peer_identity_valid(
+                    rpa->peer_addr.type, rpa->peer_addr.val))
+        {
+            const int privacy_result = ble_hs_pvcy_remove_entry(
+                                           rpa->peer_addr.type,
+                                           rpa->peer_addr.val);
+
+            if (privacy_result != 0 &&
+                    privacy_result !=
+                    BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID))
+            {
+                ESP_LOGW(TAG, "revoke RPA privacy cleanup failed (%d)",
+                         privacy_result);
+                return ESP_FAIL;
+            }
+        }
+        esp_err_t rpa_result = _ble_nimble_port_delete_exact_rpa_key(
+                                   &rpa->peer_rpa_addr);
+
+        if (rpa_result == ESP_OK)
+        {
+            rpa_result = _ble_nimble_port_delete_exact_rpa_key(
+                             &rpa->peer_addr);
+        }
+        if (rpa_result != ESP_OK)
+        {
+            ESP_LOGW(TAG, "revoke exact RPA deletion failed (%d)",
+                     rpa_result);
+            return rpa_result;
+        }
+    }
     /* Verify the store is fully empty before the journal is cleared: a
      * residual record would otherwise resurrect after the revoke. */
     {
@@ -3680,7 +4053,6 @@ static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
             BLE_STORE_OBJ_TYPE_OUR_SEC,
             BLE_STORE_OBJ_TYPE_PEER_SEC,
             BLE_STORE_OBJ_TYPE_CCCD,
-            BLE_STORE_OBJ_TYPE_PEER_ADDR,
         };
 
         for (size_t t = 0U; t < sizeof(s_check_types) / sizeof(s_check_types[0]);
@@ -3715,7 +4087,9 @@ static esp_err_t _ble_nimble_port_clear_runtime_store(void *context)
 static esp_err_t _ble_nimble_port_erase_store_namespace(void)
 {
     nvs_handle_t handle;
-    esp_err_t result = nvs_open("nimble_bond", NVS_READWRITE, &handle);
+    esp_err_t result = nvs_open(
+                           BLE_NIMBLE_PORT_STORE_NAMESPACE, NVS_READWRITE,
+                           &handle);
 
     if (result != ESP_OK)
     {
@@ -3738,16 +4112,38 @@ static esp_err_t _ble_nimble_port_reset_erase_namespace(void *context)
 
 static esp_err_t _ble_nimble_port_reset_audit_empty(void *context)
 {
-    (void)context;
+    ble_nimble_port_store_reset_context_t *reset = context;
+
+    if (reset == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0U; i < reset->rpa_count; ++i)
+    {
+        esp_err_t result = _ble_nimble_port_exact_rpa_key_absent(
+                               &reset->rpa[i].peer_rpa_addr);
+
+        if (result == ESP_OK)
+        {
+            result = _ble_nimble_port_exact_rpa_key_absent(
+                         &reset->rpa[i].peer_addr);
+        }
+        if (result != ESP_OK)
+        {
+            ESP_LOGW(TAG, "revoke exact RPA audit failed (%d)", result);
+            return result;
+        }
+    }
     return _ble_nimble_port_audit_store_restore();
 }
 
 /**
  * @brief Collect unique peer identities from one residual store type.
  *
- * Used by the revoke sweep: PEER_SEC/CCCD/PEER_ADDR records carry the peer
- * identity even when the OUR_SEC record (the bonded_peers() index) was
- * already deleted by an interrupted unpair.
+ * Used by the revoke sweep: PEER_SEC and CCCD records carry the peer identity
+ * even when the OUR_SEC record (the bonded_peers() index) was already deleted
+ * by an interrupted unpair. RPA records use the durable exact-key collector
+ * below because IDF v6.0.2 cannot iterate that family.
  */
 typedef struct ble_nimble_port_residual_sweep
 {
@@ -3756,6 +4152,35 @@ typedef struct ble_nimble_port_residual_sweep
     size_t capacity;
     bool failed;
 } ble_nimble_port_residual_sweep_t;
+
+static int _ble_nimble_port_residual_add(
+    ble_nimble_port_residual_sweep_t *sweep, const ble_addr_t *addr)
+{
+    if (sweep == NULL ||
+            !_ble_nimble_port_peer_address_valid(addr))
+    {
+        if (sweep != NULL)
+        {
+            sweep->failed = true;
+        }
+        return 1;
+    }
+    for (size_t i = 0U; i < sweep->count; ++i)
+    {
+        if (ble_addr_cmp(&sweep->peers[i], addr) == 0)
+        {
+            return 0;
+        }
+    }
+    if (sweep->count >= sweep->capacity)
+    {
+        sweep->failed = true;
+        return 1;
+    }
+    sweep->peers[sweep->count] = *addr;
+    sweep->count++;
+    return 0;
+}
 
 static int _ble_nimble_port_residual_collect(
     int obj_type, union ble_store_value *value, void *cookie)
@@ -3782,38 +4207,20 @@ static int _ble_nimble_port_residual_collect(
     case BLE_STORE_OBJ_TYPE_CCCD:
         addr = value->cccd.peer_addr;
         break;
-    case BLE_STORE_OBJ_TYPE_PEER_ADDR:
-        addr = value->rpa_rec.peer_addr;
-        break;
     default:
         sweep->failed = true;
         return 1;
     }
-    if (!_ble_nimble_port_peer_address_valid(&addr))
-    {
-        sweep->failed = true;
-        return 1;
-    }
-    for (size_t i = 0U; i < sweep->count; ++i)
-    {
-        if (ble_addr_cmp(&sweep->peers[i], &addr) == 0)
-        {
-            return 0;
-        }
-    }
-    if (sweep->count >= sweep->capacity)
-    {
-        sweep->failed = true;
-        return 1;
-    }
-    sweep->peers[sweep->count] = addr;
-    sweep->count++;
-    return 0;
+    return _ble_nimble_port_residual_add(sweep, &addr);
 }
 
 static esp_err_t _ble_nimble_port_collect_residuals(
     int obj_type, ble_addr_t *peers, size_t *count, size_t capacity)
 {
+    if (obj_type == BLE_STORE_OBJ_TYPE_PEER_ADDR)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     ble_nimble_port_residual_sweep_t sweep =
     {
         .count = *count,
@@ -3833,6 +4240,86 @@ static esp_err_t _ble_nimble_port_collect_residuals(
         _ble_nimble_port_latch_storage_error(ESP_FAIL);
         ESP_LOGW(TAG, "residual store iteration failed (%d)", rc);
         return ESP_FAIL;
+    }
+    *count = sweep.count;
+    if (peers != NULL)
+    {
+        memcpy(peers, sweep.peers, sweep.count * sizeof(sweep.peers[0]));
+    }
+    return ESP_OK;
+}
+
+static esp_err_t _ble_nimble_port_collect_durable_rpa_residuals(
+    ble_addr_t *peers, size_t *count, size_t capacity)
+{
+    if (count == NULL || *count > capacity ||
+            (*count > 0U && peers == NULL))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ble_nimble_port_residual_sweep_t sweep =
+    {
+        .count = *count,
+        .capacity = capacity,
+    };
+
+    if (*count > 0U)
+    {
+        memcpy(sweep.peers, peers, *count * sizeof(sweep.peers[0]));
+    }
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(
+                           BLE_NIMBLE_PORT_STORE_NAMESPACE, NVS_READONLY,
+                           &handle);
+
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (result != ESP_OK)
+    {
+        _ble_nimble_port_latch_storage_error(result);
+        return result;
+    }
+    for (size_t entry = 1U; entry <= CONFIG_BT_NIMBLE_MAX_BONDS; ++entry)
+    {
+        char key[BLE_NIMBLE_PORT_STORE_KEY_BYTES];
+        struct ble_store_value_rpa_rec rpa;
+        bool present = false;
+        bool valid_size = false;
+
+        result = _ble_nimble_port_format_rpa_key(entry, key);
+        if (result == ESP_OK)
+        {
+            result = _ble_nimble_port_read_durable_rpa_blob(
+                         handle, true, key, &rpa, &present, &valid_size);
+        }
+        if (result != ESP_OK)
+        {
+            break;
+        }
+        if (!present)
+        {
+            continue;
+        }
+        if (!valid_size || !_ble_nimble_port_durable_rpa_valid(&rpa))
+        {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (_ble_nimble_port_residual_add(&sweep, &rpa.peer_addr) != 0)
+        {
+            result = ESP_FAIL;
+            break;
+        }
+    }
+    nvs_close(handle);
+    if (result != ESP_OK || sweep.failed)
+    {
+        _ble_nimble_port_latch_storage_error(
+            result == ESP_OK ? ESP_FAIL : result);
+        ESP_LOGW(TAG, "durable RPA residual collection failed (%d)", result);
+        return result == ESP_OK ? ESP_FAIL : result;
     }
     *count = sweep.count;
     if (peers != NULL)

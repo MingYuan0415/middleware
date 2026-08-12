@@ -5,12 +5,19 @@
 esp_err_t ble_nimble_store_reset_run(
     const ble_nimble_store_reset_ops_t *ops)
 {
-    if (ops == NULL || ops->erase_namespace == NULL ||
+    if (ops == NULL || ops->prepare_runtime_cleanup == NULL ||
+            ops->erase_namespace == NULL ||
             ops->clear_runtime == NULL || ops->audit_empty == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t result = ops->erase_namespace(ops->context);
+    esp_err_t result = ops->prepare_runtime_cleanup(ops->context);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    result = ops->erase_namespace(ops->context);
 
     if (result != ESP_OK)
     {

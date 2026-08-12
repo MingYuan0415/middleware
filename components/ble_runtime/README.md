@@ -67,7 +67,8 @@ fence 未清空时 GAP 拒绝新 ACL；live ACL 的 terminal cleanup 立即拒�
 DISCONNECT/RESET 释放；广告只在全部 cleanup slot 清空后恢复。
 
 定向 peer-store cleanup 只执行一次显式 `ble_store_util_delete_peer()`，并逐类 readback
-OUR_SEC、PEER_SEC、CCCD 和 PEER_ADDR。ESP-IDF store 在 NVS persist 前先删除 RAM entry，
+OUR_SEC、PEER_SEC、CCCD；RPA_REC 使用 identity/RPA 精确 key readback。ESP-IDF store 在
+NVS persist 前先删除 RAM entry，
 因此任一 store/枚举错误会在完整 host run 内粘滞；同一 host run 后续看到 RAM absence 不能
 退休义务。port 同时包装 NimBLE store write callback：容量溢出仍交给 replacement owner，
 其他写失败立即粘滞，bond verification 只有在 guard 保持成功时才接受 RAM mirror。当前
@@ -78,14 +79,17 @@ writer 重装 wrapper。未知 callback 不会被覆盖，并使当前 host run 
 
 ESP-IDF v6.0.2 的 NVS loader 会记录却吞掉 store restore 错误。非 journaled revoke 的每次
 sync 都在同一 storage lock 下、destructive reconciliation 前，对当前 controller-privacy 构建
-可加载的 OUR_SEC、PEER_SEC、CCCD、CSFC、LOCAL_IRK 和 RPA_REC 六族执行有界审计：比较
-durable key presence count 与 public RAM-store count。NVS 访问、RAM count 或计数不一致都会
-粘滞 storage error，不发布 SYNC，也不开放 SMP/ADV；该审计不声称验证 blob 内容。完整 host
-reload 从 durable NVS 重建状态后才允许 reconciliation 重试。
+可加载的六个 store family 执行有界审计：OUR_SEC、PEER_SEC、CCCD、CSFC 和 LOCAL_IRK
+比较 durable key presence count 与 public RAM-store count；RPA_REC 因固定 IDF 的
+PEER_ADDR iterator 不支持 wildcard，改为逐个读取 `rpa_rec_N` 并与 RAM 中完整
+`{peer_rpa_addr, peer_addr}` 精确匹配。NVS 访问、RAM count、blob 尺寸/identity 或匹配不一致
+都会粘滞 storage error，不发布 SYNC，也不开放 SMP/ADV。完整 host reload 从 durable NVS
+重建状态后才允许 reconciliation 重试。
 
 local revoke、factory reset 和 unresolved single-bond cleanup 使用完整 peer-store reset，而非
-定向 peer cleanup。reset 固定执行 `durable namespace erase -> controller/RAM cleanup ->
-durable namespace erase -> empty audit`；第一次 erase 先于任何 IDF RAM persistence helper，
+定向 peer cleanup。reset 先捕获当前可加载 RPA_REC 的精确 key，再固定执行
+`durable namespace erase -> controller/RAM cleanup -> durable namespace erase -> empty audit`；
+第一次 erase 先于任何 IDF RAM persistence helper，
 因此 malformed blob 不能阻塞删除，第二次 erase 覆盖 runtime cleanup 重新写入的数据，并清除
 旧配置超出当前上限的遗留 key。local revoke/factory reset journal 位于独立 namespace，只有
 整个 `nimble_bond` namespace 和 RAM mirror 都确认为空后才清除；journaled revoke 不依赖一次

@@ -27,6 +27,20 @@ extern "C" {
 bool ble_nimble_peer_identity_valid(
     uint8_t address_type, const uint8_t address[6]);
 
+/**
+ * @brief Check a persisted peer-RPA reference.
+ *
+ * NimBLE writes an RPA record for every bond. A direct public/static peer can
+ * therefore use BLE_ADDR_ANY, while a privacy peer uses a random resolvable
+ * address.
+ *
+ * @param[in] address_type BLE address type stored with the RPA reference.
+ * @param[in] address Six-byte Bluetooth address in little-endian order.
+ * @return True for BLE_ADDR_ANY or a random resolvable private address.
+ */
+bool ble_nimble_peer_rpa_reference_valid(
+    uint8_t address_type, const uint8_t address[6]);
+
 #ifdef __cplusplus
 }
 #endif

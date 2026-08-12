@@ -13,6 +13,7 @@ typedef esp_err_t (*ble_nimble_store_reset_step_fn)(void *context);
 /** @brief Durable and runtime operations required by the reset sequence. */
 typedef struct ble_nimble_store_reset_ops
 {
+    ble_nimble_store_reset_step_fn prepare_runtime_cleanup;
     ble_nimble_store_reset_step_fn erase_namespace;
     ble_nimble_store_reset_step_fn clear_runtime;
     ble_nimble_store_reset_step_fn audit_empty;
@@ -22,10 +23,11 @@ typedef struct ble_nimble_store_reset_ops
 /**
  * @brief Reset the complete NimBLE peer store in a crash-recoverable order.
  *
- * The durable namespace is erased before any runtime cleanup so a malformed
- * blob cannot block deletion through an IDF persistence callback. Runtime
- * cleanup may re-persist intermediate state, so the namespace is erased again
- * before the empty-store audit.
+ * Exact runtime cleanup keys are captured before the durable namespace is
+ * erased. The erase then prevents a malformed blob from blocking deletion
+ * through an IDF persistence callback. Runtime cleanup may re-persist
+ * intermediate state, so the namespace is erased again before the empty-store
+ * audit.
  *
  * @param[in] ops Reset operations and their shared context.
  * @return ESP_OK or the first failed operation result.

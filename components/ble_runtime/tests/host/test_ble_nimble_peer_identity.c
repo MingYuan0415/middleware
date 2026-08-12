@@ -95,12 +95,50 @@ static void test_unknown_type_and_null_address_are_rejected(void)
                BLE_NIMBLE_PEER_ADDR_PUBLIC, NULL));
 }
 
+static void test_rpa_reference_accepts_any_and_resolvable_random(void)
+{
+    static const uint8_t any[6] = {0U};
+    static const uint8_t rpa[6] =
+    {
+        1U, 2U, 3U, 4U, 5U, 0x40U,
+    };
+
+    assert(ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_PUBLIC, any));
+    assert(ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_RANDOM, rpa));
+}
+
+static void test_rpa_reference_rejects_other_address_classes(void)
+{
+    static const uint8_t zero[6] = {0U};
+    static const uint8_t public_address[6] =
+    {
+        1U, 2U, 3U, 4U, 5U, 6U,
+    };
+    static const uint8_t static_random[6] =
+    {
+        1U, 2U, 3U, 4U, 5U, 0xc0U,
+    };
+
+    assert(!ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_RANDOM, zero));
+    assert(!ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_PUBLIC, public_address));
+    assert(!ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_RANDOM, static_random));
+    assert(!ble_nimble_peer_rpa_reference_valid(
+               BLE_NIMBLE_PEER_ADDR_PUBLIC, NULL));
+}
+
 int main(void)
 {
     test_public_identity_requires_nonzero_address();
     test_random_identity_requires_static_address_class();
     test_static_random_part_rejects_uniform_limits();
     test_unknown_type_and_null_address_are_rejected();
+    test_rpa_reference_accepts_any_and_resolvable_random();
+    test_rpa_reference_rejects_other_address_classes();
     puts("ble_nimble_peer_identity: all tests passed");
     return 0;
 }

@@ -4,11 +4,12 @@
 
 #include "ble_nimble_store_reset.h"
 
-#define TEST_TRACE_CAPACITY 4U
+#define TEST_TRACE_CAPACITY 5U
 
 typedef enum fake_step
 {
-    FAKE_STEP_ERASE = 1,
+    FAKE_STEP_PREPARE = 1,
+    FAKE_STEP_ERASE,
     FAKE_STEP_CLEAR,
     FAKE_STEP_AUDIT,
 } fake_step_t;
@@ -36,6 +37,11 @@ static esp_err_t _erase(void *context)
     return _record(context, FAKE_STEP_ERASE);
 }
 
+static esp_err_t _prepare(void *context)
+{
+    return _record(context, FAKE_STEP_PREPARE);
+}
+
 static esp_err_t _clear(void *context)
 {
     return _record(context, FAKE_STEP_CLEAR);
@@ -50,6 +56,7 @@ static ble_nimble_store_reset_ops_t _ops(fake_reset_t *fake)
 {
     const ble_nimble_store_reset_ops_t ops =
     {
+        .prepare_runtime_cleanup = _prepare,
         .erase_namespace = _erase,
         .clear_runtime = _clear,
         .audit_empty = _audit,
@@ -65,11 +72,12 @@ static void test_reset_order(void)
     const ble_nimble_store_reset_ops_t ops = _ops(&fake);
 
     assert(ble_nimble_store_reset_run(&ops) == ESP_OK);
-    assert(fake.trace_count == 4U);
-    assert(fake.trace[0] == FAKE_STEP_ERASE);
-    assert(fake.trace[1] == FAKE_STEP_CLEAR);
-    assert(fake.trace[2] == FAKE_STEP_ERASE);
-    assert(fake.trace[3] == FAKE_STEP_AUDIT);
+    assert(fake.trace_count == 5U);
+    assert(fake.trace[0] == FAKE_STEP_PREPARE);
+    assert(fake.trace[1] == FAKE_STEP_ERASE);
+    assert(fake.trace[2] == FAKE_STEP_CLEAR);
+    assert(fake.trace[3] == FAKE_STEP_ERASE);
+    assert(fake.trace[4] == FAKE_STEP_AUDIT);
 }
 
 static void test_each_failure_stops_the_reset(void)
@@ -94,6 +102,9 @@ static void test_invalid_configuration_is_rejected(void)
     ble_nimble_store_reset_ops_t ops = _ops(&fake);
 
     assert(ble_nimble_store_reset_run(NULL) == ESP_ERR_INVALID_ARG);
+    ops.prepare_runtime_cleanup = NULL;
+    assert(ble_nimble_store_reset_run(&ops) == ESP_ERR_INVALID_ARG);
+    ops = _ops(&fake);
     ops.erase_namespace = NULL;
     assert(ble_nimble_store_reset_run(&ops) == ESP_ERR_INVALID_ARG);
     ops = _ops(&fake);

@@ -159,4 +159,18 @@ check_contains \
     "$NIMBLE_HOST/store/config/src/ble_store_nvs.c" \
     "ESP_LOGE(TAG, \"NVS operation failed, can't retrieve the bonding info\");"
 
+# Generic PEER_ADDR iteration seeds BLE_ADDR_ANY, but the fixed config-store
+# finder compares that address exactly against both fields. It therefore
+# cannot enumerate RPA_REC and the runtime must use durable blobs plus exact
+# ble_store_read_rpa_rec() keys for restore, cleanup and reset verification.
+check_contains \
+    "$NIMBLE_HOST/src/ble_store.c" \
+    "key.rpa_rec.peer_rpa_addr = *BLE_ADDR_ANY;"
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_config.c" \
+    "ble_addr_cmp(&rpa_rec->peer_rpa_addr, &key->peer_rpa_addr) &&"
+check_contains \
+    "$NIMBLE_HOST/store/config/src/ble_store_config.c" \
+    "ble_addr_cmp(&rpa_rec->peer_addr, &key->peer_rpa_addr)"
+
 echo "ESP-IDF BLE runtime assumptions verified"
