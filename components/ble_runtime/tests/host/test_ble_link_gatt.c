@@ -8,6 +8,7 @@
 
 #include "ble_gap_manager.h"
 #include "ble_gatt_registry.h"
+#include "ble_link_events.h"
 #include "ble_link_gatt.h"
 #include "ble_link_session.h"
 #include "ble_tx_scheduler.h"
@@ -158,6 +159,7 @@ static void _reset(void)
     s_publish_enter_barrier = NULL;
     s_publish_exit_barrier = NULL;
     ble_link_gatt_reset();
+    ble_link_events_reset();
     ble_tx_scheduler_deinit();
     memset(&s_config, 0, sizeof(s_config));
     s_config.boot_id = BOOT_ID;
@@ -483,6 +485,24 @@ static void test_link_state_read(void)
     TEST_ASSERT_EQUAL(0x01U, value[1]);
 }
 
+static void test_event_sequence_boot_lifecycle(void)
+{
+    _reset();
+    TEST_ASSERT_EQUAL(1U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(2U, ble_link_events_next());
+    ble_link_gatt_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_restart());
+    TEST_ASSERT_EQUAL(2U, ble_link_events_baseline());
+
+    ble_link_gatt_config_t next_boot = s_config;
+
+    next_boot.boot_id = BOOT_ID + 1U;
+    ble_link_gatt_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_init(&next_boot));
+    TEST_ASSERT_EQUAL(1U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(2U, ble_link_events_next());
+}
+
 static void test_refresh_publishes_once(void)
 {
     _reset();
@@ -658,6 +678,7 @@ int main(void)
     test_registered_profile_uuids();
     test_write_feeds_service();
     test_link_state_read();
+    test_event_sequence_boot_lifecycle();
     test_refresh_publishes_once();
     test_refresh_retains_concurrent_epoch_dirty();
     test_async_failure_retry_is_cooled_down();

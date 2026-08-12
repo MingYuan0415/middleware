@@ -137,16 +137,16 @@ static void test_snapshot_size_query_and_small_buffer(void)
 static void test_sequence_monotonic_and_baseline(void)
 {
     ble_link_events_init();
-    TEST_ASSERT_EQUAL(0U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(1U, ble_link_events_baseline());
     TEST_ASSERT_TRUE(!ble_link_events_exhausted());
-    TEST_ASSERT_EQUAL(1U, ble_link_events_next());
     TEST_ASSERT_EQUAL(2U, ble_link_events_next());
-    TEST_ASSERT_EQUAL(2U, ble_link_events_baseline());
     TEST_ASSERT_EQUAL(3U, ble_link_events_next());
+    TEST_ASSERT_EQUAL(3U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(4U, ble_link_events_next());
     /* A new boot resets the sequence. */
     ble_link_events_reset();
-    TEST_ASSERT_EQUAL(0U, ble_link_events_baseline());
-    TEST_ASSERT_EQUAL(1U, ble_link_events_next());
+    TEST_ASSERT_EQUAL(1U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(2U, ble_link_events_next());
 }
 
 static void test_sequence_exhaustion_boundary(void)
@@ -163,7 +163,7 @@ static void test_sequence_exhaustion_boundary(void)
     TEST_ASSERT_EQUAL(UINT64_MAX, ble_link_events_baseline());
 }
 
-static void test_snapshot_zero_sequence_omitted(void)
+static void test_snapshot_zero_sequence_rejected(void)
 {
     ble_link_snapshot_t snapshot;
     uint8_t out[BLE_LINK_EVENTS_SNAPSHOT_MAX_BYTES];
@@ -172,16 +172,11 @@ static void test_snapshot_zero_sequence_omitted(void)
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.event_sequence = 0U;
     snapshot.link_state.boot_id = 42U;
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_snapshot_encode(
+    ble_link_events_test_set_sequence(0U);
+    TEST_ASSERT_EQUAL(0U, ble_link_events_next());
+    TEST_ASSERT_EQUAL(0U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_snapshot_encode(
                           &snapshot, out, sizeof(out), &out_len));
-    /* Only the link_state field, sequence omitted. */
-    static const uint8_t expected[] =
-    {
-        0x12, 0x09, 0x09, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-
-    TEST_ASSERT_EQUAL(sizeof(expected), out_len);
-    TEST_ASSERT_EQUAL(0, memcmp(out, expected, sizeof(expected)));
 }
 
 static void test_snapshot_negative_enum_rejected(void)
@@ -210,14 +205,14 @@ static void test_snapshot_negative_enum_rejected(void)
 static void test_sequence_large_loop(void)
 {
     ble_link_events_init();
-    uint64_t expected = 1U;
+    uint64_t expected = 2U;
 
     for (uint64_t i = 0U; i < 1000000U; ++i)
     {
         TEST_ASSERT_EQUAL(expected, ble_link_events_next());
         expected++;
     }
-    TEST_ASSERT_EQUAL(1000000U, ble_link_events_baseline());
+    TEST_ASSERT_EQUAL(1000001U, ble_link_events_baseline());
     TEST_ASSERT_TRUE(!ble_link_events_exhausted());
 }
 
@@ -230,7 +225,7 @@ int main(void)
     test_sequence_monotonic_and_baseline();
     test_sequence_large_loop();
     test_sequence_exhaustion_boundary();
-    test_snapshot_zero_sequence_omitted();
+    test_snapshot_zero_sequence_rejected();
     test_snapshot_negative_enum_rejected();
     printf("ble_link_events: all tests passed\n");
     return 0;

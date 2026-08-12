@@ -1212,18 +1212,6 @@ static void _ble_link_service_write_bytes(uint8_t *out, size_t *pos,
     *pos += len;
 }
 
-static size_t _ble_link_service_varint_size(uint64_t value)
-{
-    size_t size = 1U;
-
-    while (value >= 0x80U)
-    {
-        value >>= 7U;
-        size++;
-    }
-    return size;
-}
-
 /**
  * @brief Build the current LinkState from session and connection facts.
  */
@@ -1327,36 +1315,6 @@ static void _ble_link_service_encode_link_state(
         _ble_link_service_write_tag(out, pos, 6U, 0U);
         _ble_link_service_write_varint(out, pos, 1U);
     }
-}
-
-/**
- * @brief Encode a Snapshot message (event_sequence + LinkState).
- */
-static size_t _ble_link_service_encode_snapshot(
-    uint8_t *out, size_t capacity, uint64_t event_sequence,
-    const ble_link_state_snapshot_t *link_state)
-{
-    uint8_t link_state_bytes[64];
-    size_t link_state_len = 0U;
-
-    _ble_link_service_encode_link_state(link_state_bytes, &link_state_len,
-                                        link_state);
-    const size_t size = 1U + 8U + 1U +
-                        _ble_link_service_varint_size(link_state_len) +
-                        link_state_len;
-
-    if (capacity < size)
-    {
-        return 0U;
-    }
-    size_t pos = 0U;
-
-    _ble_link_service_write_tag(out, &pos, 1U, 1U);
-    _ble_link_service_write_fixed64(out, &pos, event_sequence);
-    _ble_link_service_write_tag(out, &pos, 2U, 2U);
-    _ble_link_service_write_bytes(out, &pos, link_state_bytes,
-                                  link_state_len);
-    return size;
 }
 
 static void _ble_link_service_encode_capabilities(uint8_t *out, size_t *pos)
@@ -1761,14 +1719,19 @@ static uint32_t _ble_link_service_handle_snapshot(
 {
     (void)facts;
     (void)arg;
-    ble_link_state_snapshot_t link_state;
+    ble_link_snapshot_t snapshot;
     uint8_t body[64];
+    size_t body_len = 0U;
 
+    memset(&snapshot, 0, sizeof(snapshot));
     _ble_link_service_build_link_state(&s_service.current_facts,
-                                       &link_state);
-    const size_t body_len = _ble_link_service_encode_snapshot(
-                                body, sizeof(body), ble_link_events_baseline(),
-                                &link_state);
+                                       &snapshot.link_state);
+    snapshot.event_sequence = ble_link_events_baseline();
+    if (ble_link_snapshot_encode(&snapshot, body, sizeof(body),
+                                 &body_len) != ESP_OK)
+    {
+        return BLE_LINK_ERROR_INTERNAL;
+    }
 
     _ble_link_service_emit_response(
         request->request_id, BLE_LINK_ERROR_OK,

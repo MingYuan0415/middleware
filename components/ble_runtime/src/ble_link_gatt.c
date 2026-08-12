@@ -108,6 +108,7 @@ static const uint8_t s_transfer_state_uuid[16] =
 typedef struct ble_link_gatt
 {
     ble_link_gatt_config_t config; /**< Writable copy of the init config. */
+    uint64_t event_boot_id;        /**< Boot owning the event baseline. */
     bool configured;
     bool registered;
     uint16_t handles[5];
@@ -521,7 +522,14 @@ esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
      * handle, peer identity, MTU) are written by set/reset paths and must
      * never mutate a caller-owned (possibly flash-resident) object. */
     _ble_link_gatt_lock();
+    const bool new_event_boot = s_gatt.event_boot_id != config->boot_id;
+
+    if (new_event_boot)
+    {
+        ble_link_events_init();
+    }
     s_gatt.config = *config;
+    s_gatt.event_boot_id = config->boot_id;
     s_gatt.configured = true;
     const bool registered = s_gatt.registered;
 
@@ -566,6 +574,7 @@ void ble_link_gatt_reset(void)
 {
     _ble_link_gatt_lock();
     const ble_link_gatt_config_t config = s_gatt.config;
+    const uint64_t event_boot_id = s_gatt.event_boot_id;
     const bool registered = s_gatt.registered;
 
     _ble_link_gatt_unlock();
@@ -576,6 +585,7 @@ void ble_link_gatt_reset(void)
     _ble_link_gatt_lock();
     memset(&s_gatt, 0, sizeof(s_gatt));
     s_gatt.config = config;
+    s_gatt.event_boot_id = event_boot_id;
     s_gatt.configured = true;
     s_gatt.registered = registered;
     s_gatt.config.connection_generation = 0U;

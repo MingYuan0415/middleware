@@ -57,15 +57,15 @@ typedef struct ble_link_snapshot
 /**
  * @brief Initialize the event sequence for a boot.
  *
- * The sequence starts at 0 and produces nonzero monotonic values from the
- * first allocation. A new boot resets its interpretation. All sequence
- * functions must be called from a single owner task; no internal
+ * The first full snapshot uses baseline 1, so the first incremental event
+ * allocation returns 2. A same-boot transport restart must not call this API.
+ * All sequence functions must be called from a single owner task; no internal
  * synchronization is provided.
  */
 void ble_link_events_init(void);
 
 /**
- * @brief Reset the event sequence to 0 (new boot).
+ * @brief Reset the event sequence to baseline 1 for a new boot.
  */
 void ble_link_events_reset(void);
 
@@ -78,7 +78,7 @@ void ble_link_events_reset(void);
 uint64_t ble_link_events_next(void);
 
 /**
- * @brief Current baseline: the last allocated sequence, or 0.
+ * @brief Current nonzero baseline, or 0 before boot initialization.
  */
 uint64_t ble_link_events_baseline(void);
 
@@ -90,8 +90,8 @@ bool ble_link_events_exhausted(void);
 /**
  * @brief Encode a Snapshot for the subscribe response or get_link_snapshot.
  *
- * Value domain is enforced: binding_state and authorization_state must be
- * defined enum values, and boot_id must be nonzero.
+ * Value domain is enforced: event_sequence and boot_id must be nonzero, and
+ * binding_state and authorization_state must be defined enum values.
  *
  * @param[in]  snapshot Snapshot to encode.
  * @param[out] out      Buffer, or NULL to query the size.

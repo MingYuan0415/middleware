@@ -983,8 +983,37 @@ static void test_snapshot_request(void)
                           &response));
     TEST_ASSERT_EQUAL(2U, response.request_id);
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_SNAPSHOT, response.body);
-    /* Snapshot: event_sequence=0 (no events yet), link_state present. */
+    TEST_ASSERT_TRUE(response.body_len >= 9U);
     TEST_ASSERT_EQUAL(0x09U, response.body_data[0]);
+    TEST_ASSERT_EQUAL(0x01U, response.body_data[1]);
+    for (size_t i = 2U; i < 9U; ++i)
+    {
+        TEST_ASSERT_EQUAL(0U, response.body_data[i]);
+    }
+}
+
+static void test_snapshot_zero_baseline_returns_internal(void)
+{
+    static const uint8_t request[] =
+    {
+        0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+        0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x00,
+    };
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+
+    _reset();
+    ble_link_events_test_set_sequence(0U);
+    _feed_single(request, sizeof(request));
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INTERNAL, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
 }
 
 /* authorize_prepare request, request_id=3. */
@@ -3139,6 +3168,7 @@ int main(void)
     test_capabilities_request();
     test_capabilities_response_bytes();
     test_snapshot_request();
+    test_snapshot_zero_baseline_returns_internal();
     test_authorize_flow();
     test_authorize_commit_rejects_private_peer_address();
     test_subscribe_events_unadvertised();

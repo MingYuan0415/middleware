@@ -21,17 +21,17 @@ void ble_link_events_test_set_sequence(uint64_t value)
 
 void ble_link_events_init(void)
 {
-    s_sequence = 0U;
+    s_sequence = 1U;
 }
 
 void ble_link_events_reset(void)
 {
-    s_sequence = 0U;
+    s_sequence = 1U;
 }
 
 uint64_t ble_link_events_next(void)
 {
-    if (s_sequence >= BLE_LINK_EVENTS_MAX_SEQUENCE)
+    if (s_sequence == 0U || s_sequence >= BLE_LINK_EVENTS_MAX_SEQUENCE)
     {
         return 0U;
     }
@@ -140,7 +140,8 @@ static void _ble_link_snapshot_write_link_state(
 
 static bool _ble_link_snapshot_valid(const ble_link_snapshot_t *snapshot)
 {
-    if (snapshot == NULL || snapshot->link_state.boot_id == 0U)
+    if (snapshot == NULL || snapshot->event_sequence == 0U ||
+            snapshot->link_state.boot_id == 0U)
     {
         return false;
     }
@@ -174,9 +175,7 @@ esp_err_t ble_link_snapshot_encode(
     }
     const size_t link_state_size =
         _ble_link_snapshot_link_state_size(&snapshot->link_state);
-    const size_t seq_size =
-        (snapshot->event_sequence != 0U) ? 9U : 0U;
-    const size_t size = seq_size + 2U + link_state_size;
+    const size_t size = 9U + 2U + link_state_size;
 
     if (size > BLE_LINK_EVENTS_SNAPSHOT_MAX_BYTES)
     {
@@ -193,12 +192,8 @@ esp_err_t ble_link_snapshot_encode(
     }
     size_t pos = 0U;
 
-    if (snapshot->event_sequence != 0U)
-    {
-        _ble_link_snapshot_write_tag(out, &pos, 1U, 1U);
-        _ble_link_snapshot_write_fixed64(out, &pos,
-                                         snapshot->event_sequence);
-    }
+    _ble_link_snapshot_write_tag(out, &pos, 1U, 1U);
+    _ble_link_snapshot_write_fixed64(out, &pos, snapshot->event_sequence);
     _ble_link_snapshot_write_tag(out, &pos, 2U, 2U);
     _ble_link_snapshot_write_varint(out, &pos, link_state_size);
     _ble_link_snapshot_write_link_state(out, &pos, &snapshot->link_state);

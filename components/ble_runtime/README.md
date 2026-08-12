@@ -104,6 +104,11 @@ transport submit。只有授权后提交成功才更新 stamp；并发 epoch/事
 `PublicLinkState`。同步/异步 notification 失败保留 dirty obligation，owner 在 100 ms
 `retry_not_before` 后重试，因而不会丢失 fresh 值或形成失败忙循环。
 
+`GetLinkSnapshot` 的 `event_sequence` 是当前 boot 的原子 baseline。新 `boot_id` 建立时固定
+初始化为 `1`，首个增量事件分配 `2`；同一 boot 内的 NimBLE/GATT runtime restart、连接终态
+和 Security 2 teardown 都保留当前值。`0` 只作为未初始化或耗尽后的内部哨兵，snapshot
+encoder 会拒绝将其写入 wire，service 遇到该不变量错误时返回 `LINK_ERROR_INTERNAL`。
+
 每个完整 Cmd0 只分配一次 security epoch，Cmd1 仅把该 epoch 从 `HANDSHAKING` 推进到
 `AUTHENTICATED`。durable Commit 的终态 replay 以 generation/handle、peer identity、
 transaction/credential 为键，在当前 ACL 内跨真实 long-term Cmd0/Cmd1 重握手保留；ACL
