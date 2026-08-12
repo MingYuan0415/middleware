@@ -1039,7 +1039,7 @@ static void _protocol_establish_bootstrap_session(uint32_t generation)
 {
     static const uint8_t peer_addr[6] =
     {
-        0x11U, 0U, 0U, 0U, 0U, 0xaaU,
+        0x11U, 0U, 0U, 0U, 0U, 0xeaU,
     };
     uint32_t security_epoch = 0U;
 
@@ -1067,7 +1067,7 @@ static void _protocol_establish_session(uint32_t generation)
 {
     static const uint8_t peer_addr[6] =
     {
-        0x11U, 0U, 0U, 0U, 0U, 0xaaU,
+        0x11U, 0U, 0U, 0U, 0U, 0xeaU,
     };
     uint32_t security_epoch = 0U;
 
@@ -1325,7 +1325,7 @@ static void _protocol_save_auth_record(uint8_t credential[16])
     }
     record.peer_addr_type = 1U;
     record.peer_addr[0] = 0x11U;
-    record.peer_addr[5] = 0xaaU;
+    record.peer_addr[5] = 0xeaU;
     memcpy(credential, record.credential_id, sizeof(record.credential_id));
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
 }
@@ -1711,7 +1711,7 @@ static void _test_revoke_async_retry(void)
     }
     record.peer_addr_type = 1U;
     record.peer_addr[0] = 0x11U;
-    record.peer_addr[5] = 0xaaU;
+    record.peer_addr[5] = 0xeaU;
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
 
     _reset_host();
@@ -1772,7 +1772,7 @@ static void _test_revoke_fail_retries(void)
     }
     record.peer_addr_type = 1U;
     record.peer_addr[0] = 0x11U;
-    record.peer_addr[5] = 0xaaU;
+    record.peer_addr[5] = 0xeaU;
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
 
     _reset_host();
@@ -2208,7 +2208,7 @@ static void _test_revoke_binding(void)
     }
     record.peer_addr_type = 1U;
     record.peer_addr[0] = 0x11U;
-    record.peer_addr[5] = 0xaaU;
+    record.peer_addr[5] = 0xeaU;
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
 
     _reset_host();

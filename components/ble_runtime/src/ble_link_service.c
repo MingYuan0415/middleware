@@ -2164,18 +2164,10 @@ static uint32_t _ble_link_service_handle_authorize_commit(
     /* The committed record must carry the normalized SMP identity of the
      * authenticated connection; an unknown or invalid identity is
      * refused. */
-    bool peer_valid = s_service.current_facts.peer_addr_type <= 3U;
-
-    if (peer_valid)
-    {
-        peer_valid = false;
-        for (size_t i = 0U; i < 6U; ++i)
-        {
-            peer_valid = peer_valid ||
-                         s_service.current_facts.peer_addr[i] != 0U;
-        }
-    }
-    if (!s_service.current_facts.identity_known || !peer_valid)
+    if (!s_service.current_facts.identity_known ||
+            !device_link_security_normalized_identity_valid(
+                s_service.current_facts.peer_addr_type,
+                s_service.current_facts.peer_addr))
     {
         s_service.close_after_encrypt.active = true;
         s_service.close_after_encrypt.generation =

@@ -463,7 +463,7 @@ static void _set_facts(bool encrypted, bool authenticated, bool authorized)
     s_facts.peer_addr_type = 1U;
     memset(s_facts.peer_addr, 0, sizeof(s_facts.peer_addr));
     s_facts.peer_addr[0] = 0x11U;
-    s_facts.peer_addr[5] = 0xaaU;
+    s_facts.peer_addr[5] = 0xeaU;
     s_facts.secure_connections_bond_verified = true;
 }
 
@@ -1139,6 +1139,51 @@ static void test_authorize_flow(void)
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT,
                       response.body);
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, response.error);
+}
+
+static void test_authorize_commit_rejects_private_peer_address(void)
+{
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+    device_link_security_auth_record_t record;
+    uint8_t commit[64];
+
+    device_link_security_deinit();
+    nv_storage_fake_reset();
+    _reset();
+    s_pending_captured = false;
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t commit_len = _build_commit_body(
+                                  commit, sizeof(commit), 5U);
+
+    _clear_capture();
+    _feed_single_channel(commit, commit_len, BLE_LINK_SERVICE_RX_SESSION);
+    const uint64_t token = ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(token, true));
+
+    /* Identity facts are revalidated at the durable boundary. An RPA must
+     * never become the primary key even if an upstream regression labels it
+     * identity_known. */
+    s_facts.peer_addr[5] = 0x4aU;
+    TEST_ASSERT_EQUAL(commit_len,
+                      _build_commit_body(commit, sizeof(commit), 6U));
+    _clear_capture();
+    _feed_single_channel(commit, commit_len, BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len, &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INVALID_ARGUMENT, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
+    memset(&record, 0, sizeof(record));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      device_link_security_load_auth_record(&record));
 }
 
 static void test_authorize_commit_wrong_credential(void)
@@ -2233,7 +2278,7 @@ static void _commit_auth_record(void)
     }
     record.peer_addr_type = 1U;
     record.peer_addr[0] = 0x11U;
-    record.peer_addr[5] = 0xaaU;
+    record.peer_addr[5] = 0xeaU;
     TEST_ASSERT_EQUAL(ESP_OK,
                       device_link_security_save_auth_record(&record));
 }
@@ -3095,6 +3140,7 @@ int main(void)
     test_capabilities_response_bytes();
     test_snapshot_request();
     test_authorize_flow();
+    test_authorize_commit_rejects_private_peer_address();
     test_subscribe_events_unadvertised();
     test_no_subscriber_no_output();
     test_intermediate_fragment();

@@ -27,6 +27,8 @@
 #define DEVICE_LINK_SECURITY_ENDPOINT_SECURITY "sec2"
 #define DEVICE_LINK_SECURITY_ENDPOINT_APP "dl"
 #define DEVICE_LINK_SECURITY_SALT_BYTES 16U
+#define DEVICE_LINK_SECURITY_STATIC_RANDOM_MASK 0xc0U
+#define DEVICE_LINK_SECURITY_RANDOM_PART_MASK 0x3fU
 
 typedef struct device_link_security
 {
@@ -63,6 +65,54 @@ static uint32_t s_session_epoch;
 /** @brief Storage key of the local-revoke journal marker. */
 #define DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY "dls.revoke"
 
+bool device_link_security_normalized_identity_valid(
+    uint8_t peer_addr_type,
+    const uint8_t peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES])
+{
+    if (peer_addr == NULL)
+    {
+        return false;
+    }
+    bool nonzero = false;
+
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        nonzero = nonzero || peer_addr[i] != 0U;
+    }
+    if (peer_addr_type == DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC ||
+            peer_addr_type == DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC_ID)
+    {
+        return nonzero;
+    }
+    if (peer_addr_type != DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM &&
+            peer_addr_type != DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM_ID)
+    {
+        return false;
+    }
+    if ((peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] &
+            DEVICE_LINK_SECURITY_STATIC_RANDOM_MASK) !=
+            DEVICE_LINK_SECURITY_STATIC_RANDOM_MASK)
+    {
+        return false;
+    }
+    bool random_part_nonzero =
+        (peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] &
+         DEVICE_LINK_SECURITY_RANDOM_PART_MASK) != 0U;
+    bool random_part_not_all_one =
+        (peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] &
+         DEVICE_LINK_SECURITY_RANDOM_PART_MASK) !=
+        DEVICE_LINK_SECURITY_RANDOM_PART_MASK;
+
+    for (size_t i = 0U;
+            i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U; ++i)
+    {
+        random_part_nonzero = random_part_nonzero || peer_addr[i] != 0U;
+        random_part_not_all_one = random_part_not_all_one ||
+                                  peer_addr[i] != UINT8_MAX;
+    }
+    return random_part_nonzero && random_part_not_all_one;
+}
+
 static bool _device_link_security_record_valid(
     const device_link_security_auth_record_t *record)
 {
@@ -75,23 +125,18 @@ static bool _device_link_security_record_valid(
     {
         return false;
     }
-    /* Persisted security material must be structurally sound: a legal
-     * peer identity (public, random, public identity, or random identity)
-     * and nonzero identifiers, salt, and verifier. */
-    if (record->peer_addr_type > 3U)
+    /* Persisted security material must carry a normalized identity, never an
+     * OTA private address, plus nonzero identifiers, salt, and verifier. */
+    if (!device_link_security_normalized_identity_valid(
+                record->peer_addr_type, record->peer_addr))
     {
         return false;
     }
-    bool peer_nonzero = false;
     bool credential_nonzero = false;
     bool auth_id_nonzero = false;
     bool salt_nonzero = false;
     bool verifier_nonzero = false;
 
-    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
-    {
-        peer_nonzero = peer_nonzero || record->peer_addr[i] != 0U;
-    }
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         credential_nonzero = credential_nonzero ||
@@ -109,8 +154,8 @@ static bool _device_link_security_record_valid(
     {
         verifier_nonzero = verifier_nonzero || record->verifier[i] != 0U;
     }
-    return peer_nonzero && credential_nonzero && auth_id_nonzero &&
-           salt_nonzero && verifier_nonzero;
+    return credential_nonzero && auth_id_nonzero && salt_nonzero &&
+           verifier_nonzero;
 }
 
 static device_link_security_t s_security;
@@ -476,9 +521,9 @@ esp_err_t device_link_security_select_verifier(
     uint8_t peer_addr_type, const uint8_t *peer_addr, size_t peer_addr_len,
     bool pairing_window_open)
 {
-    if (peer_addr == NULL ||
-            peer_addr_len != DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES ||
-            peer_addr_type > 3U)
+    if (peer_addr_len != DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES ||
+            !device_link_security_normalized_identity_valid(
+                peer_addr_type, peer_addr))
     {
         return ESP_ERR_INVALID_ARG;
     }

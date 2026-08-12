@@ -32,6 +32,18 @@ extern "C" {
 /** @brief Peer identity address length (bytes). */
 #define DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES 6U
 
+/** @brief Public device address. */
+#define DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC 0U
+
+/** @brief Random device address. */
+#define DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM 1U
+
+/** @brief Resolved public identity address. */
+#define DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC_ID 2U
+
+/** @brief Resolved random identity address. */
+#define DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM_ID 3U
+
 /** @brief Reserved tail bytes fixing the on-wire record size (no ABI
  * padding is ever persisted). */
 #define DEVICE_LINK_SECURITY_AUTH_RESERVED_BYTES 1U
@@ -92,10 +104,27 @@ _Static_assert(
 #endif
 
 /**
- * @brief Check a record for a valid magic and schema version.
+ * @brief Validate a normalized SMP peer identity address.
+ *
+ * Public identities must be nonzero. Random identities must use the static
+ * random class; over-the-air resolvable/private addresses, non-resolvable
+ * private addresses, the reserved random class, and static-random values with
+ * an all-zero or all-one random part are rejected.
+ *
+ * @param[in] peer_addr_type BLE peer identity address type (0-3).
+ * @param[in] peer_addr Six-byte identity address.
+ * @return True only for a normalized public or static-random identity.
+ */
+bool device_link_security_normalized_identity_valid(
+    uint8_t peer_addr_type,
+    const uint8_t peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES]);
+
+/**
+ * @brief Check a committed record for structural validity.
  *
  * @param[in] record Record to validate.
- * @return True when committed and structurally valid.
+ * @return True when committed, normalized to a peer identity, and
+ *         structurally valid.
  */
 bool device_link_security_auth_record_valid(
     const device_link_security_auth_record_t *record);

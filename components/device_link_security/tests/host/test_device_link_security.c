@@ -22,7 +22,7 @@
 
 /* Peer identity used by the committed record in the selection tests. */
 static const uint8_t TEST_PEER_ADDR[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES] =
-{0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5};
+{0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xe5};
 
 static uint8_t s_cmd0_wire[512];
 static size_t s_cmd0_wire_len;
@@ -746,6 +746,58 @@ static void _test_explicit_session_close(void)
     device_link_security_deinit();
 }
 
+static void _test_normalized_identity_validation(void)
+{
+    static const uint8_t zero[6] = {0};
+    static const uint8_t public_identity[6] = {1U, 2U, 3U, 4U, 5U, 6U};
+    static const uint8_t static_random[6] =
+    {1U, 2U, 3U, 4U, 5U, 0xc1U};
+    static const uint8_t rpa[6] = {1U, 2U, 3U, 4U, 5U, 0x41U};
+    static const uint8_t nrpa[6] = {1U, 2U, 3U, 4U, 5U, 0x01U};
+    static const uint8_t reserved[6] = {1U, 2U, 3U, 4U, 5U, 0x81U};
+    static const uint8_t static_random_part_zero[6] =
+    {0U, 0U, 0U, 0U, 0U, 0xc0U};
+    static const uint8_t static_random_part_one[6] =
+    {0xffU, 0xffU, 0xffU, 0xffU, 0xffU, 0xffU};
+    static const uint8_t static_low_boundary[6] =
+    {1U, 0U, 0U, 0U, 0U, 0xc0U};
+    static const uint8_t static_high_boundary[6] =
+    {0xfeU, 0xffU, 0xffU, 0xffU, 0xffU, 0xffU};
+
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC, NULL));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC, zero));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC, public_identity));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_PUBLIC_ID, public_identity));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM, static_random));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM_ID, static_random));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM, rpa));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM, nrpa));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM, reserved));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM,
+               static_random_part_zero));
+    assert(!device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM,
+               static_random_part_one));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM,
+               static_low_boundary));
+    assert(device_link_security_normalized_identity_valid(
+               DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM_ID,
+               static_high_boundary));
+    assert(!device_link_security_normalized_identity_valid(4U,
+            public_identity));
+}
+
 static void _test_auth_record_persistence(void)
 {
     nv_storage_fake_reset();
@@ -779,6 +831,7 @@ static void _test_auth_record_persistence(void)
     {
         record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
+    record.peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] = 0xe5U;
     assert(device_link_security_auth_record_valid(&record) == true);
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
     device_link_security_auth_record_t loaded;
@@ -786,6 +839,22 @@ static void _test_auth_record_persistence(void)
     memset(&loaded, 0, sizeof(loaded));
     assert(device_link_security_load_auth_record(&loaded) == ESP_OK);
     assert(memcmp(&loaded, &record, sizeof(record)) == 0);
+    /* A present record containing an OTA RPA is corrupt, not a valid primary
+     * identity. Raw injection bypasses save validation to model damaged or
+     * legacy NVS. */
+    record.peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] = 0x45U;
+    assert(device_link_security_auth_record_valid(&record) == false);
+    assert(device_link_security_save_auth_record(&record) ==
+           ESP_ERR_INVALID_ARG);
+    assert(nv_storage_set_blob(TEST_AUTH_KEY, &record, sizeof(record)) ==
+           ESP_OK);
+    memset(&loaded, 0xa5, sizeof(loaded));
+    assert(device_link_security_load_auth_record(&loaded) ==
+           ESP_ERR_INVALID_STATE);
+    for (size_t i = 0U; i < sizeof(loaded); ++i)
+    {
+        assert(((const uint8_t *)&loaded)[i] == 0U);
+    }
     /* Erase clears the record. */
     assert(device_link_security_erase_auth_record() == ESP_OK);
     assert(device_link_security_load_auth_record(&loaded) ==
@@ -829,6 +898,7 @@ static void _test_long_term_verifier(void)
     {
         record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
+    record.peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] = 0xe5U;
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
     /* Loading the long-term verifier makes the session handshakable and
      * no bootstrap verifier is required. */
@@ -917,7 +987,7 @@ static void _test_verifier_selection(void)
 
     /* A different peer inside the open window selects the bootstrap
      * verifier (replacement flow for the new peer). */
-    static const uint8_t other_peer[6] = {0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5};
+    static const uint8_t other_peer[6] = {0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xf5};
 
     assert(device_link_security_select_verifier(
                1U, other_peer, sizeof(other_peer), true) == ESP_OK);
@@ -1047,6 +1117,7 @@ static void _test_revoke_journal(void)
     {
         record.peer_addr[i] = (uint8_t)(0xa0U + i);
     }
+    record.peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] = 0xe5U;
     assert(device_link_security_save_auth_record(&record) == ESP_OK);
     assert(device_link_security_revoke_pending(&pending) == ESP_OK);
     assert(pending);
@@ -1186,6 +1257,7 @@ int main(void)
 {
     _test_init_validation();
     _test_real_handshake_wire_validation();
+    _test_normalized_identity_validation();
     _test_auth_record_persistence();
     _test_long_term_verifier();
     _test_verifier_selection();
