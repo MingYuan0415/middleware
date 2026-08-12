@@ -1,0 +1,4 @@
+version: "0.1.0"
+description: "Generic bounded background chore worker for MicroTech"
+dependencies:
+  idf: ">=5.0"

@@ -23,11 +23,12 @@
 | `factory_reset_service` | 持有版本化恢复出厂 journal；marker 持久化后才重启，并在全部 reset domain 与广告前置条件收敛后清除 marker | `nv_storage`；`mt_log`（私有） |
 | `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
+| `chore_service` | 单一后台杂活 worker：任意任务可提交一次性或周期 job（固定槽位池、协作式取消、挂起后不追补），用于不便在 GUI worker 或调用上下文执行的短时有界工作；禁止 LVGL 调用与长阻塞 | `mt_log`、`esp_timer`、`freertos`、`heap`（私有） |
 | `device_link` | Device Link v1 协议原语：framing 重组、冻结契约的 protobuf-c 消费代码与可复现生成校验；不拥有 NimBLE/Protocomm | `protobuf-c`（私有） |
 
 ## 目录结构
 
-每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试还覆盖 `ble_runtime`、`device_link_security`、`device_link_service`、`factory_reset_service` 和 `device_link`，入口均位于各组件的 `tests/host/`。
+每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试还覆盖 `ble_runtime`、`device_link_security`、`device_link_service`、`factory_reset_service`、`device_link` 和 `chore_service`，入口均位于各组件的 `tests/host/`。
 
 ## 集成与初始化
 
@@ -61,6 +62,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `device_link_security` 在 Cmd1 proof/Resp1 成功后立即标记认证；授权事务按 `PREPARED -> COMMIT_PROBED -> LOCALLY_CONFIRMED -> COMMITTED` 推进，本地确认同时核对 boot-scoped token 与 generation。durable Commit 的幂等结果在当前 ACL 内跨真实 long-term Security 2 重握手保留，并在 ACL 终态、replacement cutover、revoke/reset 时清除。Recovery Query 将确定不存在与 NVS/损坏记录的 ambiguous 失败分开映射。
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
 - `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。天气响应携带的 `location_key` 是服务端按 0.1° 网格派生的不透明作用域标识：同一网格恒定、不暴露坐标，key 变化即清空旧数据集并按“实时优先”全量刷新，避免跨网格的陈旧或混合快照；可选的 `district` 区县名为显示字段（本地化成功时出现、永不从设备头回显），不参与位置身份判定；缓存不落盘 key 与 district，重启后由会话定位重新建立。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
+- `chore_service` 的 job 是短时有界回调：运行在单 worker 上，串行执行；`run` 须主动轮询取消令牌并及时返回，不得调用 LVGL、发起同步 HTTP 或无限等待。`submit` 成功后参数所有权转移给服务，`release` 在完成、取消或关闭后于 worker 上恰好执行一次；`cancel` 是协作式静默等待（返回即保证 `release` 已执行），拒绝 worker 自身调用。周期 job 从完成时刻固定延迟调度，挂起期间到期不追补，唤醒后最多立即补一次。`suspend`/`resume` 遵循仓库 PAUSE/RESUME 握手（超时回滚），停机会用 STOPPED 位唤醒在途挂起/恢复等待者，不会死锁。job 类 API 可在任意任务调用且与 `deinit` 并发安全：deinit 先原子关闭接纳门再排空在途调用，之后才释放同步原语；仅 init 与并发 deinit 要求调用方串行化。休眠协调中该服务最先挂起、最后恢复。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 
@@ -69,7 +71,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
 IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
 stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
-256 KiB。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
+256 KiB，Chore stack 4096 和 job 容量 8。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
 `app_product_config_t` 在运行时传入。恢复出厂启动先清 Wi-Fi profile，再以 gated 模式
 清 Device Link 授权、bond/CCCD 和易失状态，并在广告暂停时预取得 slow lease；全局 marker
 清除后仅解除广告 pause，再允许平台及网络继续启动。marker 清除前任一持久化、擦除或广告
@@ -82,7 +84,7 @@ stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临
 - `event_bus` API 仅限任务上下文，不支持 ISR。最多 24 个订阅、24 个待处理 UI 回调和 24 份 UI payload；匹配 UI 订阅时 payload 最大 256 字节。发布者回调同步执行，UI 回调异步执行；取消订阅不是静默屏障，销毁 `user_data` 前仍需停止发布者并排空 UI 工作。
 - `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 只用于可覆盖的状态快照，不得用于边沿、命令、审计或计数事件。事件 payload 只在回调期间有效。
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
-- Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、天气、时间、电源、IMU、音频、SD 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。
+- Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 和个人网络密码上限分别为 32、63 字节。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、天气、时间、电源、IMU、音频、SD、Chore 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。`chore_service` 的 job 回调本身运行在 worker 上，可在其中调用其他服务 API，但必须短时返回并遵守各服务的上下文限制。
 - `system_pm` 接受 1 至 4 个唯一 RTC GPIO 唤醒源，且有效电平必须一致。唤醒回调应只通知其他 worker；外设准备和恢复钩子运行在 PM worker 中，可以阻塞但必须遵守配置超时。
 - `SYSTEM_PM_DEVELOPMENT_MODE=y` 不是让 USB Serial/JTAG 在 light sleep 中继续工作；ESP32-S3 硬件不支持这一点。该模式在 USB 主机连接时跳过 app standby（显示仍可熄灭），并启用 IDF 的自动睡眠连接保护；拔出 USB 后恢复正常 light sleep。
 - 当前板级 EXIO3/5/6 经过 TCA9554，只能由 time/power/IMU worker 轮询，不能成为 RTC GPIO 唤醒源。触摸唤醒尚未实现，GPIO21 未注册；实际 wake descriptor 仍只有 GPIO0 低电平。
@@ -114,6 +116,15 @@ cmake -S components/power_service/tests/host -B /tmp/mt-power -G Ninja \
     -DPOWER_SERVICE_SANITIZER=none
 cmake --build /tmp/mt-power
 ctest --test-dir /tmp/mt-power --output-on-failure
+```
+
+运行 chore worker 套件（一次性/延时/周期调度、池满、协作取消、挂起无追补与超时回滚、deinit 释放、自调用拒绝、并发取消）：
+
+```sh
+cmake -S components/chore_service/tests/host -B /tmp/mt-chore -G Ninja \
+    -DCHORE_SERVICE_SANITIZER=none
+cmake --build /tmp/mt-chore
+ctest --test-dir /tmp/mt-chore --output-on-failure
 ```
 
 运行 Device Link framing、protobuf 消费和生成校验套件：
