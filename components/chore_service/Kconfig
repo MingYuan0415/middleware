@@ -2,8 +2,13 @@ menu "Chore service resources"
 
 config CHORE_SERVICE_TASK_STACK_SIZE
     int "Chore worker stack size"
-    range 2048 16384
+    range 4096 16384
     default 4096
+    help
+        Worker stack size. The -Wframe-larger-than=2048 compile guard
+        bounds single frames but not total usage, so the minimum matches
+        the product default; reduce only after a real stack-watermark
+        measurement.
 
 config CHORE_SERVICE_JOB_CAPACITY
     int "Chore job capacity"

@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -588,7 +589,8 @@ static bool _test_deinit_racing_suspend(void)
     TEST_CHECK(_chore_test_wait_int(&arg.runs, 1, CHORE_TEST_TIMEOUT_MS));
     /* A WAIT_FOREVER suspend admitted while the worker is busy must not
        deadlock the teardown: deinit stops the worker, the STOPPED bit
-       wakes the suspend waiter, and the drain completes. */
+       wakes the suspend waiter, and the drain completes. The suspended
+       status proves the suspend thread was admitted and is waiting. */
     chore_test_suspend_thread_t request =
     {
         .result = ESP_FAIL,
@@ -596,7 +598,19 @@ static bool _test_deinit_racing_suspend(void)
     pthread_t suspend_thread;
     TEST_CHECK(pthread_create(&suspend_thread, NULL,
                               _chore_test_suspend_worker, &request) == 0);
-    usleep(50000);
+    chore_service_status_t status;
+    const int64_t deadline = _chore_test_real_ms() + CHORE_TEST_TIMEOUT_MS;
+    bool suspended_seen = false;
+    while (_chore_test_real_ms() < deadline)
+    {
+        if (chore_service_get_status(&status) == ESP_OK && status.suspended)
+        {
+            suspended_seen = true;
+            break;
+        }
+        usleep(CHORE_TEST_POLL_US);
+    }
+    TEST_CHECK(suspended_seen);
     TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
     TEST_CHECK(pthread_join(suspend_thread, NULL) == 0);
     TEST_CHECK(request.result == ESP_ERR_INVALID_STATE);
@@ -794,6 +808,233 @@ static bool _test_self_call_rejected(void)
                                     CHORE_TEST_TIMEOUT_MS));
     TEST_CHECK(_chore_test_wait_int(&arg.releases, 1,
                                     CHORE_TEST_TIMEOUT_MS));
+    /* The worker-context deinit rejection must not poison admission: the
+       service stays available and continues accepting jobs. */
+    TEST_CHECK(chore_service_is_available() == true);
+    chore_test_arg_t after;
+    _chore_test_arg_init(&after);
+    const chore_service_job_t after_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &after,
+    };
+    chore_service_handle_t after_handle = {0};
+    TEST_CHECK(chore_service_submit(&after_job, &after_handle) == ESP_OK);
+    TEST_CHECK(_chore_test_wait_int(&after.runs, 1, CHORE_TEST_TIMEOUT_MS));
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    return true;
+}
+
+static bool _test_old_handle_after_reinit(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_arg_t first;
+    _chore_test_arg_init(&first);
+    const chore_service_job_t first_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &first,
+        .delay_ms = 60000U,
+    };
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    chore_service_handle_t first_handle = {0};
+    TEST_CHECK(chore_service_submit(&first_job, &first_handle) == ESP_OK);
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    TEST_CHECK(atomic_load_explicit(&first.releases, memory_order_acquire) ==
+               1);
+    /* A handle from the previous instance must never cancel a job of the
+       new instance, even when the slot is reused. */
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    chore_test_arg_t second;
+    _chore_test_arg_init(&second);
+    const chore_service_job_t second_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &second,
+        .delay_ms = 60000U,
+    };
+    chore_service_handle_t second_handle = {0};
+    TEST_CHECK(chore_service_submit(&second_job, &second_handle) == ESP_OK);
+    TEST_CHECK(chore_service_cancel(&first_handle, 100U) == ESP_OK);
+    /* The stale handle must not have touched the new instance's job. */
+    TEST_CHECK(atomic_load_explicit(&second.releases, memory_order_acquire) ==
+               0);
+    TEST_CHECK(atomic_load_explicit(&second.runs, memory_order_acquire) == 0);
+    TEST_CHECK(chore_service_cancel(&second_handle, CHORE_TEST_TIMEOUT_MS) ==
+               ESP_OK);
+    TEST_CHECK(atomic_load_explicit(&second.releases, memory_order_acquire) ==
+               1);
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    TEST_CHECK(atomic_load_explicit(&second.releases, memory_order_acquire) ==
+               1);
+    return true;
+}
+
+static bool _test_suspend_resume_overtaking(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_arg_t arg;
+    _chore_test_arg_init(&arg);
+    arg.slow = true;
+    const chore_service_job_t job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &arg,
+    };
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    chore_service_handle_t handle = {0};
+    TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
+    TEST_CHECK(_chore_test_wait_int(&arg.runs, 1, CHORE_TEST_TIMEOUT_MS));
+    /* A concurrent resume must not coalesce with the pending suspend: the
+       lifecycle serialization lets the suspend complete first. */
+    chore_test_suspend_thread_t request =
+    {
+        .result = ESP_FAIL,
+    };
+    pthread_t suspend_thread;
+    TEST_CHECK(pthread_create(&suspend_thread, NULL,
+                              _chore_test_suspend_worker, &request) == 0);
+    chore_service_status_t status;
+    const int64_t deadline = _chore_test_real_ms() + CHORE_TEST_TIMEOUT_MS;
+    bool suspended_seen = false;
+    while (_chore_test_real_ms() < deadline)
+    {
+        if (chore_service_get_status(&status) == ESP_OK && status.suspended)
+        {
+            suspended_seen = true;
+            break;
+        }
+        usleep(CHORE_TEST_POLL_US);
+    }
+    TEST_CHECK(suspended_seen);
+    TEST_CHECK(chore_service_resume(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    TEST_CHECK(pthread_join(suspend_thread, NULL) == 0);
+    TEST_CHECK(request.result == ESP_OK);
+    TEST_CHECK(chore_service_cancel(&handle, CHORE_TEST_TIMEOUT_MS) == ESP_OK);
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    return true;
+}
+
+static bool _test_worker_self_lifecycle_no_deadlock(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_arg_t arg;
+    _chore_test_arg_init(&arg);
+    arg.self_call = true;
+    const chore_service_job_t job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &arg,
+    };
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    chore_service_handle_t handle = {0};
+    TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
+    TEST_CHECK(_chore_test_wait_int(&arg.runs, 1, CHORE_TEST_TIMEOUT_MS));
+    /* An external WAIT_FOREVER suspend holds the lifecycle mutex while
+       the worker is busy with the job; the job's own suspend/resume calls
+       must be rejected before acquiring that mutex, otherwise the worker
+       blocks forever and the teardown drain deadlocks. */
+    chore_test_suspend_thread_t request =
+    {
+        .result = ESP_FAIL,
+    };
+    pthread_t suspend_thread;
+    TEST_CHECK(pthread_create(&suspend_thread, NULL,
+                              _chore_test_suspend_worker, &request) == 0);
+    chore_service_status_t status;
+    const int64_t deadline = _chore_test_real_ms() + CHORE_TEST_TIMEOUT_MS;
+    bool suspended_seen = false;
+    while (_chore_test_real_ms() < deadline)
+    {
+        if (chore_service_get_status(&status) == ESP_OK && status.suspended)
+        {
+            suspended_seen = true;
+            break;
+        }
+        usleep(CHORE_TEST_POLL_US);
+    }
+    TEST_CHECK(suspended_seen);
+    arg.handle = handle;
+    atomic_store_explicit(&arg.handle_ready, true, memory_order_release);
+    TEST_CHECK(_chore_test_wait_int(&arg.self_rejected, 4,
+                                    CHORE_TEST_TIMEOUT_MS));
+    TEST_CHECK(pthread_join(suspend_thread, NULL) == 0);
+    TEST_CHECK(request.result == ESP_OK);
+    TEST_CHECK(chore_service_resume(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    return true;
+}
+
+static bool _test_generation_high_water(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    /* Cycle one-shot jobs through slot 0 past the capacity stride plus one
+       release so the final handle carries a generation that the next
+       instance's seed range would otherwise reach. */
+    chore_test_arg_t args[CONFIG_CHORE_SERVICE_JOB_CAPACITY + 2U];
+    chore_service_handle_t last_handle = {0};
+    for (unsigned index = 0; index < CONFIG_CHORE_SERVICE_JOB_CAPACITY + 2U;
+            ++index)
+    {
+        _chore_test_arg_init(&args[index]);
+        const chore_service_job_t job =
+        {
+            .run = _chore_test_job_run,
+            .release = _chore_test_job_release,
+            .arg = &args[index],
+        };
+        chore_service_handle_t handle = {0};
+        TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
+        TEST_CHECK(_chore_test_wait_int(&args[index].runs, 1,
+                                        CHORE_TEST_TIMEOUT_MS));
+        TEST_CHECK(_chore_test_wait_int(&args[index].releases, 1,
+                                        CHORE_TEST_TIMEOUT_MS));
+        last_handle = handle;
+    }
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    /* The next instance must seed strictly above the previous instance's
+       maximum issued generation. */
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    chore_test_arg_t second;
+    _chore_test_arg_init(&second);
+    const chore_service_job_t second_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &second,
+        .delay_ms = 60000U,
+    };
+    chore_service_handle_t second_handle = {0};
+    TEST_CHECK(chore_service_submit(&second_job, &second_handle) == ESP_OK);
+    TEST_CHECK(chore_service_cancel(&last_handle, 100U) == ESP_OK);
+    TEST_CHECK(atomic_load_explicit(&second.releases, memory_order_acquire) ==
+               0);
+    TEST_CHECK(chore_service_cancel(&second_handle, CHORE_TEST_TIMEOUT_MS) ==
+               ESP_OK);
+    TEST_CHECK(atomic_load_explicit(&second.releases, memory_order_acquire) ==
+               1);
     TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
     return true;
 }
@@ -828,11 +1069,20 @@ typedef struct chore_test_cancel_thread
     chore_service_handle_t handle;
     esp_err_t result;
     atomic_int finished;
+    const atomic_bool *start_gate;
 } chore_test_cancel_thread_t;
 
 static void *_chore_test_cancel_worker(void *context)
 {
     chore_test_cancel_thread_t *request = context;
+    if (request->start_gate != NULL)
+    {
+        while (!atomic_load_explicit(request->start_gate,
+                                     memory_order_acquire))
+        {
+            usleep(CHORE_TEST_POLL_US);
+        }
+    }
     request->result = chore_service_cancel(&request->handle,
                                            CHORE_SERVICE_WAIT_FOREVER);
     atomic_store_explicit(&request->finished, 1, memory_order_release);
@@ -919,6 +1169,10 @@ static bool _test_concurrent_cancel(void)
     };
     atomic_init(&first_request.finished, 0);
     atomic_init(&second_request.finished, 0);
+    atomic_bool start_gate;
+    atomic_init(&start_gate, false);
+    first_request.start_gate = &start_gate;
+    second_request.start_gate = &start_gate;
     pthread_t first_thread;
     pthread_t second_thread;
     TEST_CHECK(pthread_create(&first_thread, NULL,
@@ -927,6 +1181,9 @@ static bool _test_concurrent_cancel(void)
     TEST_CHECK(pthread_create(&second_thread, NULL,
                               _chore_test_cancel_worker,
                               &second_request) == 0);
+    /* Release both cancelers together so both validate the same live
+       generation and share the acknowledgement. */
+    atomic_store_explicit(&start_gate, true, memory_order_release);
     TEST_CHECK(pthread_join(first_thread, NULL) == 0);
     TEST_CHECK(pthread_join(second_thread, NULL) == 0);
     TEST_CHECK(first_request.result == ESP_OK);
@@ -934,6 +1191,215 @@ static bool _test_concurrent_cancel(void)
     TEST_CHECK(atomic_load_explicit(&arg.releases, memory_order_acquire) ==
                1);
     TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    return true;
+}
+
+static bool _test_submit_while_shutting_down(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_arg_t first;
+    _chore_test_arg_init(&first);
+    first.slow = true;
+    const chore_service_job_t first_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &first,
+    };
+    chore_service_handle_t first_handle = {0};
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    TEST_CHECK(chore_service_submit(&first_job, &first_handle) == ESP_OK);
+    TEST_CHECK(_chore_test_wait_int(&first.runs, 1, CHORE_TEST_TIMEOUT_MS));
+    /* Deinit times out while the slow job is still running: shutdown is
+       in progress and admission is closed. */
+    TEST_CHECK(chore_service_deinit(20U) == ESP_ERR_TIMEOUT);
+    chore_test_arg_t second;
+    _chore_test_arg_init(&second);
+    const chore_service_job_t second_job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &second,
+    };
+    chore_service_handle_t second_handle = {0};
+    /* A submit during shutdown must be refused; the argument ownership
+       must not transfer, so its release must never run. */
+    TEST_CHECK(chore_service_submit(&second_job, &second_handle) ==
+               ESP_ERR_INVALID_STATE);
+    TEST_CHECK(atomic_load_explicit(&second.runs, memory_order_acquire) ==
+               0);
+    TEST_CHECK(atomic_load_explicit(&second.releases,
+                                    memory_order_acquire) == 0);
+    TEST_CHECK(_chore_test_wait_int(&first.releases, 1,
+                                    CHORE_TEST_TIMEOUT_MS));
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    return true;
+}
+
+typedef struct chore_test_hammer_thread
+{
+    atomic_int ok_count;  /* submits accepted by the service */
+    atomic_int settled;   /* accepted arguments released exactly once */
+    atomic_bool stop;
+} chore_test_hammer_thread_t;
+
+typedef struct chore_test_hammer_arg
+{
+    chore_test_hammer_thread_t *state;
+} chore_test_hammer_arg_t;
+
+static void _chore_test_hammer_run(const chore_service_cancel_token_t *cancel,
+                                   void *context)
+{
+    (void)cancel;
+    (void)context;
+}
+
+static void _chore_test_hammer_release(void *context)
+{
+    chore_test_hammer_arg_t *arg = context;
+    atomic_fetch_add_explicit(&arg->state->settled, 1, memory_order_relaxed);
+    free(arg);
+}
+
+static void *_chore_test_submit_hammer(void *context)
+{
+    chore_test_hammer_thread_t *state = context;
+    while (!atomic_load_explicit(&state->stop, memory_order_acquire))
+    {
+        chore_test_hammer_arg_t *arg = malloc(sizeof(*arg));
+        if (arg == NULL)
+        {
+            continue;
+        }
+        arg->state = state;
+        const chore_service_job_t job =
+        {
+            .run = _chore_test_hammer_run,
+            .release = _chore_test_hammer_release,
+            .arg = arg,
+        };
+        chore_service_handle_t handle = {0};
+        if (chore_service_submit(&job, &handle) == ESP_OK)
+        {
+            /* Ownership transferred: the release callback settles it. */
+            atomic_fetch_add_explicit(&state->ok_count, 1,
+                                      memory_order_relaxed);
+        }
+        else
+        {
+            /* Refused: ownership never transferred, free it here. */
+            free(arg);
+        }
+    }
+    return NULL;
+}
+
+static bool _test_init_deinit_stress(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_hammer_thread_t first = {0};
+    chore_test_hammer_thread_t second = {0};
+    atomic_init(&first.ok_count, 0);
+    atomic_init(&first.settled, 0);
+    atomic_init(&first.stop, false);
+    atomic_init(&second.ok_count, 0);
+    atomic_init(&second.settled, 0);
+    atomic_init(&second.stop, false);
+    pthread_t first_thread;
+    pthread_t second_thread;
+    TEST_CHECK(pthread_create(&first_thread, NULL, _chore_test_submit_hammer,
+                              &first) == 0);
+    TEST_CHECK(pthread_create(&second_thread, NULL, _chore_test_submit_hammer,
+                              &second) == 0);
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    const int64_t deadline = _chore_test_real_ms() + 1500;
+    while (_chore_test_real_ms() < deadline)
+    {
+        const esp_err_t result = chore_service_deinit(10U);
+        TEST_CHECK(result == ESP_OK || result == ESP_ERR_TIMEOUT);
+        if (result == ESP_OK)
+        {
+            TEST_CHECK(chore_service_init(&config) == ESP_OK);
+        }
+        usleep(CHORE_TEST_POLL_US);
+    }
+    atomic_store_explicit(&first.stop, true, memory_order_release);
+    atomic_store_explicit(&second.stop, true, memory_order_release);
+    TEST_CHECK(pthread_join(first_thread, NULL) == 0);
+    TEST_CHECK(pthread_join(second_thread, NULL) == 0);
+    /* Finish any shutdown still in progress. */
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    /* Every accepted submit must have been released exactly once: a
+       submit that reports ESP_OK while dropping the job would leave the
+       argument unreleased and break this invariant. */
+    TEST_CHECK(atomic_load_explicit(&first.settled, memory_order_acquire) ==
+               atomic_load_explicit(&first.ok_count, memory_order_acquire));
+    TEST_CHECK(atomic_load_explicit(&second.settled, memory_order_acquire) ==
+               atomic_load_explicit(&second.ok_count, memory_order_acquire));
+    return true;
+}
+
+typedef struct chore_test_suspend_timeout_thread
+{
+    uint32_t timeout_ms;
+    esp_err_t result;
+} chore_test_suspend_timeout_thread_t;
+
+static void *_chore_test_suspend_timeout_worker(void *context)
+{
+    chore_test_suspend_timeout_thread_t *request = context;
+    request->result = chore_service_suspend(request->timeout_ms);
+    return NULL;
+}
+
+static bool _test_suspend_rollback_shutdown(void)
+{
+    const chore_service_config_t config =
+    {
+        .task_priority = 4U,
+        .warning_duration_ms = 500U,
+    };
+    chore_test_arg_t arg;
+    _chore_test_arg_init(&arg);
+    arg.poll_cancel = true;
+    const chore_service_job_t job =
+    {
+        .run = _chore_test_job_run,
+        .release = _chore_test_job_release,
+        .arg = &arg,
+    };
+    chore_service_handle_t handle = {0};
+    TEST_CHECK(chore_service_init(&config) == ESP_OK);
+    TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
+    TEST_CHECK(_chore_test_wait_int(&arg.runs, 1, CHORE_TEST_TIMEOUT_MS));
+    /* The suspend times out while the worker is busy; its rollback leaves
+       a RESUME pending and waits for quiescence. Deinit shuts the worker
+       down during that rollback wait, which must surface as
+       ESP_ERR_INVALID_STATE rather than a bare timeout. */
+    chore_test_suspend_timeout_thread_t request =
+    {
+        .timeout_ms = 200U,
+        .result = ESP_FAIL,
+    };
+    pthread_t suspend_thread;
+    TEST_CHECK(pthread_create(&suspend_thread, NULL,
+                              _chore_test_suspend_timeout_worker,
+                              &request) == 0);
+    usleep(250000);
+    TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
+    TEST_CHECK(pthread_join(suspend_thread, NULL) == 0);
+    TEST_CHECK(request.result == ESP_ERR_INVALID_STATE);
+    TEST_CHECK(atomic_load_explicit(&arg.releases, memory_order_acquire) ==
+               1);
     return true;
 }
 
@@ -957,13 +1423,23 @@ int main(void)
         { "deinit_timeout_retry", _test_deinit_timeout_retry },
         { "deinit_while_suspended", _test_deinit_while_suspended },
         { "deinit_racing_suspend", _test_deinit_racing_suspend },
+        { "old_handle_after_reinit", _test_old_handle_after_reinit },
+        { "generation_high_water", _test_generation_high_water },
+        { "suspend_resume_overtaking", _test_suspend_resume_overtaking },
         { "repeated_init_policy", _test_repeated_init_policy },
         { "suspend_no_catch_up", _test_suspend_no_catch_up },
         { "suspend_timeout_rollback", _test_suspend_timeout_rollback },
         { "deinit_releases_queued", _test_deinit_releases_queued },
         { "self_call_rejected", _test_self_call_rejected },
+        {
+            "worker_self_lifecycle_no_deadlock",
+            _test_worker_self_lifecycle_no_deadlock
+        },
         { "task_affinity_and_caps", _test_task_affinity_and_caps },
         { "concurrent_cancel", _test_concurrent_cancel },
+        { "submit_while_shutting_down", _test_submit_while_shutting_down },
+        { "init_deinit_stress", _test_init_deinit_stress },
+        { "suspend_rollback_shutdown", _test_suspend_rollback_shutdown },
     };
     unsigned failures = 0U;
     for (unsigned index = 0; index < sizeof(tests) / sizeof(tests[0]);

@@ -74,7 +74,7 @@ typedef struct chore_service_status
     bool initialized;      /**< Service is initialized. */
     bool suspended;        /**< Worker is paused or a pause is pending. */
     bool stopping;         /**< Shutdown is in progress. */
-    uint8_t queued_count;  /**< Pending or running job count. */
+    uint8_t queued_count;  /**< Pending, running, or being-released job count. */
     uint8_t running_count; /**< Jobs currently executing. */
     uint32_t stack_high_water; /**< Worker minimum free stack bytes. */
     uint64_t completed_count;  /**< Jobs completed since init. */
@@ -103,11 +103,14 @@ esp_err_t chore_service_init(const chore_service_config_t *config);
  *
  * Cancelled job arguments are released before this call returns successfully.
  * A timed-out deinit leaves the shutdown in progress; the release callbacks
- * still run when the worker finishes, and the call may be retried.
+ * still run when the worker finishes, and the call may be retried. Calling
+ * deinit from a job's run or release callback (the worker context) is
+ * rejected with ESP_ERR_INVALID_STATE and leaves the service running.
  *
  * @param timeout_ms quiescence deadline, or CHORE_SERVICE_WAIT_FOREVER.
  *
- * @return ESP_OK on success; ESP_ERR_TIMEOUT when the worker is still busy.
+ * @return ESP_OK on success; ESP_ERR_TIMEOUT when the worker is still busy;
+ *         ESP_ERR_INVALID_STATE when called from the worker context.
  */
 esp_err_t chore_service_deinit(uint32_t timeout_ms);
 
@@ -121,7 +124,8 @@ esp_err_t chore_service_deinit(uint32_t timeout_ms);
  * @param handle receives the pending-job handle when ESP_OK.
  *
  * @return ESP_OK; ESP_ERR_NO_MEM when the fixed pool is full;
- *         ESP_ERR_INVALID_STATE when the service is not running.
+ *         ESP_ERR_INVALID_STATE when the service is not initialized or
+ *         is shutting down.
  */
 esp_err_t chore_service_submit(const chore_service_job_t *job,
                                chore_service_handle_t *handle);
@@ -133,16 +137,23 @@ esp_err_t chore_service_submit(const chore_service_job_t *job,
  * a queued job is never started. The release callback runs before the
  * wait succeeds. Calling cancel on a handle that is no longer pending
  * returns ESP_OK; cancelling a still-pending job while the service is
- * shutting down returns ESP_ERR_INVALID_STATE. Handles stay valid for the
- * slot generation; after 2^32 slot releases the generation wraps and a
- * very old handle could alias a new job in the same slot.
+ * shutting down returns ESP_ERR_INVALID_STATE. Calling cancel from a
+ * job's run or release callback (the worker context) is rejected with
+ * ESP_ERR_INVALID_STATE, even for another job; a job observes its own
+ * cancellation through its token. Cancelling a queued job while the
+ * worker is suspended is acknowledged only after the worker resumes or
+ * shuts down, so the wait may span a pause. Slot generations advance
+ * from a process-lifetime high-water mark, so handles from a previous
+ * instance can never alias a job of a new instance; the 32-bit generation
+ * wraps only after 2^32 total releases across all instances.
  *
  * @param handle handle returned by chore_service_submit().
  * @param timeout_ms quiescence deadline, or CHORE_SERVICE_WAIT_FOREVER.
  *
  * @return ESP_OK when the job is quiescent; ESP_ERR_TIMEOUT when the job
  *         is still running past the deadline; the request remains pending;
- *         ESP_ERR_INVALID_STATE during shutdown.
+ *         ESP_ERR_INVALID_STATE during shutdown or from the worker
+ *         context.
  */
 esp_err_t chore_service_cancel(chore_service_handle_t *handle,
                                uint32_t timeout_ms);
@@ -159,7 +170,8 @@ esp_err_t chore_service_cancel(chore_service_handle_t *handle,
  *
  * @return ESP_OK when paused; ESP_ERR_TIMEOUT when the pause was not
  *         acknowledged in time (the pause request is rolled back);
- *         ESP_ERR_INVALID_STATE during shutdown.
+ *         ESP_ERR_INVALID_STATE during shutdown or when another
+ *         lifecycle transition is pending.
  */
 esp_err_t chore_service_suspend(uint32_t timeout_ms);
 
@@ -173,26 +185,34 @@ esp_err_t chore_service_suspend(uint32_t timeout_ms);
  * @param timeout_ms resume deadline, or CHORE_SERVICE_WAIT_FOREVER.
  *
  * @return ESP_OK when running again; ESP_ERR_TIMEOUT when the resume was
- *         not acknowledged in time; ESP_ERR_INVALID_STATE during shutdown.
+ *         not acknowledged in time; ESP_ERR_INVALID_STATE during shutdown
+ *         or when another lifecycle transition is pending.
  */
 esp_err_t chore_service_resume(uint32_t timeout_ms);
 
 /**
  * @brief Copy the current small service status.
  *
- * A stopping snapshot is still returned while shutdown is in progress.
+ * A stopping snapshot is returned to calls admitted before shutdown closed
+ * admission; new calls during shutdown are rejected at admission.
  *
  * @param status receives the current status when ESP_OK.
  *
  * @return ESP_OK on success; ESP_ERR_INVALID_ARG when status is NULL;
- *         ESP_ERR_INVALID_STATE when the service is not initialized.
+ *         ESP_ERR_INVALID_STATE when the service is not initialized or
+ *         when admission is closed.
  */
 esp_err_t chore_service_get_status(chore_service_status_t *status);
 
 /**
- * @brief Report whether the chore service is initialized and admits calls.
+ * @brief Report whether the chore service is initialized, running, and
+ * admits calls.
  *
- * Returns false while shutdown is in progress.
+ * Returns false while shutdown is in progress. A call admitted in an
+ * earlier instance is refused when it observes the new admission epoch;
+ * a call preempted across the whole transition may linearize into the
+ * new instance, which is fully constructed before admission reopens.
+ * The epoch wraps after 32768 successful instances.
  */
 bool chore_service_is_available(void);
 

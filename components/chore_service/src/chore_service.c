@@ -68,6 +68,7 @@ typedef struct chore_slot
 typedef struct chore_service_context
 {
     SemaphoreHandle_t mutex;
+    SemaphoreHandle_t lifecycle_mutex;
     EventGroupHandle_t events;
     TaskHandle_t worker;
     chore_slot_t slots[CONFIG_CHORE_SERVICE_JOB_CAPACITY];
@@ -79,48 +80,110 @@ typedef struct chore_service_context
     atomic_bool worker_tail_complete;
     chore_service_state_t state;
     atomic_bool initialized;
-    atomic_uint api_users;
     bool stopping;
     int64_t last_duration_warning_ms;
 } chore_service_context_t;
 
 static chore_service_context_t s_chore;
 
-#define CHORE_API_CLOSING (UINT32_C(1) << 31)
+/* Process-lifetime high-water mark of every slot generation ever issued
+   (seeded at init and advanced at each release finalize). New instances
+   seed strictly above it, so a handle from a previous instance can never
+   match a job of a new instance; the 32-bit wrap after 2^32 total
+   releases is the documented bound. Written by the worker under the
+   service mutex and by init, which is caller-serialized with deinit. */
+static uint32_t s_chore_generation_high_water;
 
-/* Public job APIs admit themselves so deinit can drain in-flight calls
-   before destroying the synchronization primitives. Deinit closes
-   admission with the closing bit before the drain begins: a refused caller
-   only ever reads the counter, so it cannot touch a torn-down context, and
-   the counter is only decremented by admitted callers. */
+/* The admission gate is a process-lifetime atomic that is never memset or
+   reinitialized: deinit closes it with the closing bit and drains in-flight
+   calls, while a successful init reopens it under a fresh epoch. The open
+   preserves the in-flight count, so every admitted call balances its own
+   increment exactly once and the count always equals the true number of
+   in-flight calls; the deinit drain therefore always terminates. */
+#define CHORE_API_CLOSING     (UINT32_C(1) << 31)
+#define CHORE_API_EPOCH_SHIFT 16U
+#define CHORE_API_EPOCH_VALUE (UINT32_C(0x7FFF))
+#define CHORE_API_EPOCH_MASK  (CHORE_API_EPOCH_VALUE << CHORE_API_EPOCH_SHIFT)
+#define CHORE_API_COUNT_MASK  (UINT32_C(0xFFFF))
+
+static atomic_uint s_chore_admission = ATOMIC_VAR_INIT(0U);
+
+static void _chore_api_leave(void)
+{
+    atomic_fetch_sub_explicit(&s_chore_admission, 1U, memory_order_acq_rel);
+}
+
 static esp_err_t _chore_api_enter(void)
 {
-    uint32_t value = atomic_load_explicit(&s_chore.api_users,
-                                          memory_order_relaxed);
     for (;;)
     {
+        const uint32_t value = atomic_load_explicit(&s_chore_admission,
+                               memory_order_relaxed);
         if ((value & CHORE_API_CLOSING) != 0U)
         {
             return ESP_ERR_INVALID_STATE;
         }
         if (atomic_compare_exchange_weak_explicit(
-                    &s_chore.api_users, &value, value + 1U,
+                    &s_chore_admission, &value, value + 1U,
                     memory_order_acq_rel, memory_order_relaxed))
         {
-            return ESP_OK;
+            /* The epoch is bumped only by init's _chore_admission_open,
+               which preserves the count. A mismatch here means this call
+               was admitted in a previous instance: balance the increment
+               and refuse. The post-CAS read may be satisfied by this
+               call's own CAS write on weakly-ordered hardware, in which
+               case the epochs match and the call proceeds against the new
+               instance — safe, because admission reopens only after the
+               new context is complete. */
+            const uint32_t current = atomic_load_explicit(
+                                         &s_chore_admission,
+                                         memory_order_acquire);
+            if ((current & CHORE_API_EPOCH_MASK) ==
+                    (value & CHORE_API_EPOCH_MASK))
+            {
+                return ESP_OK;
+            }
+            _chore_api_leave();
+            return ESP_ERR_INVALID_STATE;
         }
     }
 }
 
-static void _chore_api_leave(void)
+static void _chore_admission_close(void)
 {
-    atomic_fetch_sub_explicit(&s_chore.api_users, 1U, memory_order_acq_rel);
+    uint32_t value = atomic_load_explicit(&s_chore_admission,
+                                          memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(
+                &s_chore_admission, &value, value | CHORE_API_CLOSING,
+                memory_order_acq_rel, memory_order_relaxed))
+    {
+    }
+}
+
+static void _chore_admission_open(void)
+{
+    for (;;)
+    {
+        const uint32_t value = atomic_load_explicit(&s_chore_admission,
+                               memory_order_relaxed);
+        const uint32_t epoch = (value >> CHORE_API_EPOCH_SHIFT) &
+                               CHORE_API_EPOCH_VALUE;
+        const uint32_t next = (value & CHORE_API_COUNT_MASK) |
+                              (((epoch + 1U) & CHORE_API_EPOCH_VALUE)
+                               << CHORE_API_EPOCH_SHIFT);
+        if (atomic_compare_exchange_weak_explicit(
+                    &s_chore_admission, &value, next,
+                    memory_order_acq_rel, memory_order_relaxed))
+        {
+            return;
+        }
+    }
 }
 
 static void _chore_wait_api_drained(void)
 {
-    while (atomic_load_explicit(&s_chore.api_users, memory_order_acquire) !=
-            CHORE_API_CLOSING)
+    while ((atomic_load_explicit(&s_chore_admission, memory_order_acquire) &
+            CHORE_API_COUNT_MASK) != 0U)
     {
         vTaskDelay(1);
     }
@@ -246,11 +309,9 @@ static chore_slot_t *_chore_pick_locked(int64_t now_ms)
    bit stay untouched until the release callback has run, so cancelers
    keep waiting for quiescence until the argument is actually released. */
 static void _chore_begin_release_locked(chore_slot_t *slot,
-                                        uint32_t slot_index,
                                         void (**release_out)(void *),
                                         void **arg_out)
 {
-    (void)slot_index;
     slot->running = false;
     slot->releasing = true;
     *release_out = slot->release;
@@ -266,6 +327,10 @@ static void _chore_finalize_release_locked(chore_slot_t *slot,
     if (slot->generation == 0U)
     {
         slot->generation = 1U;
+    }
+    if (slot->generation > s_chore_generation_high_water)
+    {
+        s_chore_generation_high_water = slot->generation;
     }
     slot->queued = false;
     slot->run = NULL;
@@ -315,7 +380,7 @@ static void _chore_dispatch_job(chore_slot_t *slot, uint32_t slot_index)
     {
         void (*release)(void *) = NULL;
         void *arg = NULL;
-        _chore_begin_release_locked(slot, slot_index, &release, &arg);
+        _chore_begin_release_locked(slot, &release, &arg);
         xSemaphoreGive(s_chore.mutex);
         if (release != NULL)
         {
@@ -358,7 +423,7 @@ static void _chore_run_due_jobs(void)
             void (*release)(void *) = NULL;
             void *arg = NULL;
             ++s_chore.cancelled_count;
-            _chore_begin_release_locked(slot, slot_index, &release, &arg);
+            _chore_begin_release_locked(slot, &release, &arg);
             xSemaphoreGive(s_chore.mutex);
             if (release != NULL)
             {
@@ -475,22 +540,36 @@ esp_err_t chore_service_init(const chore_service_config_t *config)
                s_chore.warning_duration_ms == config->warning_duration_ms ?
                ESP_OK : ESP_ERR_INVALID_STATE;
     }
-    memset(&s_chore, 0, sizeof(s_chore));
+    /* Pre-init API calls only ever read s_chore.initialized, so the plain
+       reset must not cover that flag: zeroing it with a concurrent atomic
+       read would be a data race. Everything before it is only touched by
+       init or by calls admitted after initialization, which observe this
+       reset through the mutex. */
+    memset(&s_chore, 0, offsetof(chore_service_context_t, initialized));
+    s_chore.stopping = false;
+    s_chore.last_duration_warning_ms = 0;
     s_chore.task_priority = config->task_priority;
     s_chore.warning_duration_ms = config->warning_duration_ms;
     s_chore.state = CHORE_STATE_RUNNING;
     atomic_init(&s_chore.worker_tail_complete, false);
     atomic_init(&s_chore.minimum_stack_remaining, UINT32_MAX);
     atomic_init(&s_chore.initialized, false);
-    atomic_init(&s_chore.api_users, 0U);
     for (uint32_t slot = 0; slot < CONFIG_CHORE_SERVICE_JOB_CAPACITY; ++slot)
     {
         atomic_init(&s_chore.slots[slot].cancel_requested, false);
-        s_chore.slots[slot].generation = 1U;
+        uint32_t generation = s_chore_generation_high_water + 1U + slot;
+        if (generation == 0U)
+        {
+            generation = 1U;
+        }
+        s_chore.slots[slot].generation = generation;
     }
+    s_chore_generation_high_water += CONFIG_CHORE_SERVICE_JOB_CAPACITY + 1U;
     s_chore.mutex = xSemaphoreCreateMutex();
+    s_chore.lifecycle_mutex = xSemaphoreCreateMutex();
     s_chore.events = xEventGroupCreate();
-    if (s_chore.mutex == NULL || s_chore.events == NULL)
+    if (s_chore.mutex == NULL || s_chore.lifecycle_mutex == NULL ||
+            s_chore.events == NULL)
     {
         result = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -511,6 +590,9 @@ esp_err_t chore_service_init(const chore_service_config_t *config)
           (int)xTaskGetCoreID(s_chore.worker));
 #endif
     atomic_store_explicit(&s_chore.initialized, true, memory_order_release);
+    /* The admission gate reopens only once the new context is complete, so
+       calls admitted in a previous instance can never touch this one. */
+    _chore_admission_open();
     LOG_I("worker started, priority=%u", (unsigned)s_chore.task_priority);
     return ESP_OK;
 
@@ -523,7 +605,15 @@ cleanup:
     {
         vSemaphoreDelete(s_chore.mutex);
     }
-    memset(&s_chore, 0, sizeof(s_chore));
+    if (s_chore.lifecycle_mutex != NULL)
+    {
+        vSemaphoreDelete(s_chore.lifecycle_mutex);
+    }
+    /* Same discipline as the success path: never plain-reset the
+       initialized flag that pre-init API calls read concurrently. */
+    memset(&s_chore, 0, offsetof(chore_service_context_t, initialized));
+    s_chore.stopping = false;
+    s_chore.last_duration_warning_ms = 0;
     return result;
 }
 
@@ -533,21 +623,21 @@ esp_err_t chore_service_deinit(uint32_t timeout_ms)
     {
         return ESP_OK;
     }
-    /* Close admission before the drain begins: after this point every new
-       public call is refused without touching any shared state. */
-    uint32_t value = atomic_load_explicit(&s_chore.api_users,
-                                          memory_order_relaxed);
-    while (!atomic_compare_exchange_weak_explicit(
-                &s_chore.api_users, &value, value | CHORE_API_CLOSING,
-                memory_order_acq_rel, memory_order_relaxed))
-    {
-    }
+    /* A deinit issued from the worker context is rejected before admission
+       closes, otherwise the service would be left permanently unadmitted.
+       The handle is read under the mutex so it is ordered with the
+       worker's exit-block write. */
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
-    if (xTaskGetCurrentTaskHandle() == s_chore.worker)
+    const bool self_deinit = xTaskGetCurrentTaskHandle() == s_chore.worker;
+    xSemaphoreGive(s_chore.mutex);
+    if (self_deinit)
     {
-        xSemaphoreGive(s_chore.mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    /* Close admission before the drain begins: after this point every new
+       public call is refused without touching any shared state. */
+    _chore_admission_close();
+    xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     s_chore.stopping = true;
     for (uint32_t slot = 0; slot < CONFIG_CHORE_SERVICE_JOB_CAPACITY; ++slot)
     {
@@ -581,11 +671,11 @@ esp_err_t chore_service_deinit(uint32_t timeout_ms)
     _chore_wait_api_drained();
     vEventGroupDelete(s_chore.events);
     vSemaphoreDelete(s_chore.mutex);
+    vSemaphoreDelete(s_chore.lifecycle_mutex);
     memset(&s_chore, 0, sizeof(s_chore));
     atomic_init(&s_chore.initialized, false);
     atomic_init(&s_chore.worker_tail_complete, false);
     atomic_init(&s_chore.minimum_stack_remaining, UINT32_MAX);
-    atomic_init(&s_chore.api_users, 0U);
     for (uint32_t slot = 0; slot < CONFIG_CHORE_SERVICE_JOB_CAPACITY; ++slot)
     {
         atomic_init(&s_chore.slots[slot].cancel_requested, false);
@@ -613,6 +703,7 @@ esp_err_t chore_service_submit(const chore_service_job_t *job,
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     if (s_chore.stopping)
     {
+        result = ESP_ERR_INVALID_STATE;
         goto exit_locked;
     }
     chore_slot_t *slot = NULL;
@@ -687,7 +778,8 @@ esp_err_t chore_service_cancel(chore_service_handle_t *handle,
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     chore_slot_t *slot = &s_chore.slots[slot_index];
     /* The stale-handle check comes first so a completed job still reports
-       ESP_OK even while the worker is already shutting down. */
+       ESP_OK even while the worker is already shutting down. A still
+       pending job during shutdown is rejected per the public contract. */
     const bool pending = slot->generation == handle->generation &&
                          (slot->queued || slot->running ||
                           slot->releasing);
@@ -695,7 +787,7 @@ esp_err_t chore_service_cancel(chore_service_handle_t *handle,
     {
         goto exit_locked;
     }
-    if (s_chore.worker == NULL ||
+    if (s_chore.stopping || s_chore.worker == NULL ||
             xTaskGetCurrentTaskHandle() == s_chore.worker)
     {
         result = ESP_ERR_INVALID_STATE;
@@ -745,14 +837,27 @@ esp_err_t chore_service_suspend(uint32_t timeout_ms)
         result = ESP_OK;
         goto exit;
     }
+    /* The worker-context rejection must happen before the lifecycle mutex
+       is taken: a job calling suspend while another task holds the
+       lifecycle mutex would otherwise block forever before reaching the
+       self-check. The handle is read under the service mutex. */
+    xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
+    const bool self_suspend = xTaskGetCurrentTaskHandle() == s_chore.worker;
+    xSemaphoreGive(s_chore.mutex);
+    if (self_suspend)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    /* The lifecycle mutex serializes the whole suspend transaction against
+       a concurrent resume, so opposite commands can never coalesce in the
+       worker and opposite callers can never erase each other's
+       acknowledgements. Deinit does not take this mutex: the STOPPED bit
+       wakes the waiters. */
+    xSemaphoreTake(s_chore.lifecycle_mutex, portMAX_DELAY);
     bool send_suspend = false;
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     if (s_chore.stopping || s_chore.worker == NULL)
-    {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit_locked;
-    }
-    if (xTaskGetCurrentTaskHandle() == s_chore.worker)
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit_locked;
@@ -779,7 +884,7 @@ exit_locked:
     xSemaphoreGive(s_chore.mutex);
     if (!send_suspend)
     {
-        goto exit;
+        goto exit_lifecycle;
     }
     /* The STOPPED bit wakes the wait when deinit shuts the worker down, so
        a WAIT_FOREVER suspend cannot deadlock the teardown drain. */
@@ -790,12 +895,12 @@ exit_locked:
     if ((bits & CHORE_EVENT_PAUSED_BIT) != 0U)
     {
         result = ESP_OK;
-        goto exit;
+        goto exit_lifecycle;
     }
     if ((bits & CHORE_EVENT_STOPPED_BIT) != 0U)
     {
         result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        goto exit_lifecycle;
     }
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     if (s_chore.state == CHORE_STATE_PAUSE_PENDING ||
@@ -810,10 +915,15 @@ exit_locked:
         (void)xTaskNotify(s_chore.worker, CHORE_CMD_RESUME, eSetBits);
     }
     xSemaphoreGive(s_chore.mutex);
-    (void)xEventGroupWaitBits(s_chore.events, CHORE_EVENT_RUNNING_BIT |
-                              CHORE_EVENT_STOPPED_BIT,
-                              pdFALSE, pdFALSE, _chore_timeout_ticks(timeout_ms));
-    result = ESP_ERR_TIMEOUT;
+    EventBits_t rollback_bits = xEventGroupWaitBits(
+                                    s_chore.events, CHORE_EVENT_RUNNING_BIT |
+                                    CHORE_EVENT_STOPPED_BIT,
+                                    pdFALSE, pdFALSE,
+                                    _chore_timeout_ticks(timeout_ms));
+    result = (rollback_bits & CHORE_EVENT_STOPPED_BIT) != 0U ?
+             ESP_ERR_INVALID_STATE : ESP_ERR_TIMEOUT;
+exit_lifecycle:
+    xSemaphoreGive(s_chore.lifecycle_mutex);
 exit:
     _chore_api_leave();
     return result;
@@ -831,14 +941,21 @@ esp_err_t chore_service_resume(uint32_t timeout_ms)
         result = ESP_OK;
         goto exit;
     }
+    /* Worker-context rejection before the lifecycle mutex, mirroring
+       suspend: a job calling resume while another task holds the
+       lifecycle mutex must not block forever. */
+    xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
+    const bool self_resume = xTaskGetCurrentTaskHandle() == s_chore.worker;
+    xSemaphoreGive(s_chore.mutex);
+    if (self_resume)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    xSemaphoreTake(s_chore.lifecycle_mutex, portMAX_DELAY);
     bool send_resume = false;
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     if (s_chore.stopping || s_chore.worker == NULL)
-    {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit_locked;
-    }
-    if (xTaskGetCurrentTaskHandle() == s_chore.worker)
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit_locked;
@@ -866,7 +983,7 @@ exit_locked:
     xSemaphoreGive(s_chore.mutex);
     if (!send_resume)
     {
-        goto exit;
+        goto exit_lifecycle;
     }
     /* The STOPPED bit wakes the wait when deinit shuts the worker down. */
     EventBits_t bits = xEventGroupWaitBits(
@@ -876,10 +993,12 @@ exit_locked:
     if ((bits & CHORE_EVENT_RUNNING_BIT) != 0U)
     {
         result = ESP_OK;
-        goto exit;
+        goto exit_lifecycle;
     }
     result = (bits & CHORE_EVENT_STOPPED_BIT) != 0U ?
              ESP_ERR_INVALID_STATE : ESP_ERR_TIMEOUT;
+exit_lifecycle:
+    xSemaphoreGive(s_chore.lifecycle_mutex);
 exit:
     _chore_api_leave();
     return result;
@@ -937,8 +1056,13 @@ bool chore_service_is_available(void)
     {
         return false;
     }
-    const bool available = atomic_load_explicit(&s_chore.initialized,
-                           memory_order_acquire);
+    bool available = false;
+    if (atomic_load_explicit(&s_chore.initialized, memory_order_acquire))
+    {
+        xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
+        available = !s_chore.stopping;
+        xSemaphoreGive(s_chore.mutex);
+    }
     _chore_api_leave();
     return available;
 }
