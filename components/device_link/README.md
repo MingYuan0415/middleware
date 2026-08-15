@@ -1,37 +1,49 @@
-# device_link
+# Device Link Typed-TLV v2
 
-MicroTech Device Link BLE service primitives.
+`device_link` is the handwritten application-wire implementation for Device
+Link Core v2. It is deliberately independent of NimBLE, Protocomm and the
+ESP-IDF Security 2 implementation.
 
-## Framing
+## Wire layers
 
-`device_link_framing` implements the Device Link v1 fragment contract
-(`contracts/provisioning/docs/device-link-framing-v1.md`): an eight-byte header
-plus payload inside each GATT value, one reassembly slot per connection
-generation and channel, idempotent duplicate acceptance, and strict rejection
-of gaps, overlaps, unknown flags, and out-of-order starts. Fragment payload
-limits follow the ATT MTU boundaries (12/174/487 bytes at MTU 23/185/498).
+The component owns a fixed 16-byte application header, bounded BLE fragment
+framing, and a strict Typed-TLV payload codec. The codec rejects truncated
+fields, non-minimal integers, duplicate singular fields, invalid ordering and
+unknown values that are unsafe to interpret. Unknown fields with a registered
+wire type may be skipped, so minor additions do not require a firmware rebuild.
 
-The module is dependency-free and host-testable; it does not own NimBLE,
-Protocomm, or transport state. Session and control admission belong to the
-runtime layers that use it. The experimental Security 2 transport prototype
-from P0 is retained under `probe/` for evidence only and is not built.
+The router uses startup-frozen descriptors. Each method binds a domain and
+version, request/response schema, permission, payload limits and owner handler;
+there is no runtime registration or reflection. Core is domain `0`; Wi-Fi,
+Cloud and Location use reserved IDs `1`, `2` and `3`. Only Core is currently
+registered in the firmware manifest. Domain adapters must be complete and
+validated before a capability is published.
 
-## Pinned protocol consumer
+Replay protection uses fixed storage. A replay key includes boot ID, connection
+generation, Security 2 epoch, domain, method and call ID plus request length
+and digest. Responses are retained without sensitive request bytes. Operation
+state uses four statically allocated slots; no `malloc` or `realloc` is used on
+the protocol path. Sensitive buffers are cleared on completion, failure and
+disconnect.
 
-`src/generated/` holds protobuf-c sources generated from the pinned contract
-commit in `proto.lock`. `scripts/check_generated.sh` re-generates from the
-contract worktree and fails when the contract commit does not match the lock
-or the worktree is dirty, so generation is reproducible from clean commits.
-Generated C bytes and non-comment header declarations are compared exactly;
-contract wording copied only into protobuf-c header comments does not churn the
-checked-in generated files when the wire schema and generated ABI are unchanged.
+The component does not contain application protobuf schemas or generated C.
+The immutable contract pin is recorded in `contract.lock`; it contains the
+Device Link contract commit, profile, schema format, and normalized schema
+digest. It intentionally has no `protoc` or code-generator version because
+the application wire is handwritten Typed-TLV.
+expectedContractCommit=b82612f9c7c1e87c2aa2580302318db59207a855
+The only protobuf-c types in the middleware are the official ESP-IDF
+Protocomm Security 2 messages in `device_link_security`.
 
 ## Host tests
 
 ```sh
 cmake -S tests/host -B /tmp/mt-device-link -G Ninja \
-  && cmake --build /tmp/mt-device-link \
-  && ctest --test-dir /tmp/mt-device-link --output-on-failure
+  -DDEVICE_LINK_SANITIZER=none
+cmake --build /tmp/mt-device-link
+ctest --test-dir /tmp/mt-device-link --output-on-failure
 ```
 
-Sanitizer variants: `-DDEVICE_LINK_SANITIZER=address|thread` (default none).
+Use `-DDEVICE_LINK_SANITIZER=address` or `thread` in an independent build
+directory. Canonical YAML schemas and fixtures live in the contract submodule;
+this component keeps the corresponding C descriptors and golden byte tests.
