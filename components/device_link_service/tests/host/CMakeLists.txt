@@ -15,8 +15,10 @@ get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../../../..
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/device_link_service")
 set(BLE_RUNTIME "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(DEVICE_LINK_SECURITY "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
+set(DEVICE_LINK_WIRE "${PROJECT_ROOT}/layers/middleware/components/device_link")
 set(EVENT_BUS "${PROJECT_ROOT}/layers/middleware/components/event_bus")
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
+set(IDF_BT "$ENV{IDF_PATH}/components/bt")
 set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
 set(PROTOBUF_C "$ENV{IDF_PATH}/components/protobuf-c/protobuf-c")
 
@@ -24,6 +26,8 @@ add_executable(test_device_link_service
                test_device_link_service.c
                "${HOST_CONNECTIVITY}/freertos_host.c"
                "${COMPONENT}/src/device_link_service.c"
+               "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${CMAKE_CURRENT_LIST_DIR}/fakes/connectivity_manager.c"
                "${BLE_RUNTIME}/src/ble_runtime.c"
                "${BLE_RUNTIME}/src/ble_adv_manager.c"
                "${BLE_RUNTIME}/src/ble_link_session.c"
@@ -37,6 +41,14 @@ add_executable(test_device_link_service
                "${BLE_RUNTIME}/src/ble_link_reassembler.c"
                "${BLE_RUNTIME}/src/ble_link_events.c"
                "${BLE_RUNTIME}/src/ble_gatt_registry.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_core.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_digest.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_operation.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_router.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_tlv.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_wire.c"
+               "${IDF_BT}/common/tinycrypt/src/sha256.c"
+               "${IDF_BT}/common/tinycrypt/src/utils.c"
                "${DEVICE_LINK_SECURITY}/src/device_link_security.c"
                "${CMAKE_CURRENT_LIST_DIR}/fakes/esp_srp.c"
                "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
@@ -64,7 +76,10 @@ target_include_directories(test_device_link_service PRIVATE
                            "${HOST_CONNECTIVITY}/include"
                            "${COMPONENT}/include"
                            "${BLE_RUNTIME}/include"
+                           "${DEVICE_LINK_WIRE}/include"
                            "${EVENT_BUS}/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
+                           "${IDF_BT}/common/tinycrypt/include"
                           )
 target_compile_options(test_device_link_service PRIVATE
     -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
@@ -108,6 +123,35 @@ if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "thread" AND
         ${DEVICE_LINK_SERVICE_SETARCH} x86_64 -R
         $<TARGET_FILE:test_device_link_service>)
 else()
-    add_test(NAME device_link_service COMMAND test_device_link_service)
+add_test(NAME device_link_service COMMAND test_device_link_service)
             endif()
-            set_tests_properties(device_link_service PROPERTIES TIMEOUT 20)
+set_tests_properties(device_link_service PROPERTIES TIMEOUT 20)
+
+add_executable(test_device_link_wifi_adapter
+               test_device_link_wifi_adapter.c
+               fakes/connectivity_manager.c
+               "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_tlv.c")
+target_compile_features(test_device_link_wifi_adapter PRIVATE c_std_11)
+target_compile_definitions(test_device_link_wifi_adapter PRIVATE
+    _POSIX_C_SOURCE=200809L
+    UNIT_TEST_HOST)
+target_include_directories(test_device_link_wifi_adapter PRIVATE
+                           "${CMAKE_CURRENT_LIST_DIR}/fakes"
+                           "${BLE_RUNTIME}/tests/host/fakes"
+                           "${COMPONENT}/include"
+                           "${DEVICE_LINK_WIRE}/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+                           "${HOST_CONNECTIVITY}/include"
+                           "${PROJECT_ROOT}/tests/host"
+                          )
+target_compile_options(test_device_link_wifi_adapter PRIVATE
+    -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
+    -Wall
+    -Wextra
+    -Werror
+    -Wpedantic
+    -UNDEBUG)
+add_test(NAME device_link_wifi_adapter COMMAND test_device_link_wifi_adapter)
+set_tests_properties(device_link_wifi_adapter PROPERTIES TIMEOUT 10)

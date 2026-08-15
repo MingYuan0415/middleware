@@ -57,21 +57,34 @@
 
 static const uint8_t s_test_service_uuid[16] =
 {
-    0xa3, 0x4e, 0x85, 0x57, 0x11, 0x3d, 0x8a, 0xa2,
-    0x59, 0x4e, 0xbb, 0xb4, 0x92, 0x31, 0x20, 0x3e,
+    0x8b, 0x03, 0xdc, 0x36, 0xd0, 0x63, 0x05, 0x8d,
+    0x30, 0x42, 0x10, 0xc5, 0x8c, 0xe4, 0x77, 0x2c,
 };
 
 static const uint8_t s_test_session_rx_uuid[16] =
 {
-    0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
-    0xd8, 0x4d, 0x4c, 0xcb, 0x43, 0xe6, 0x01, 0x48,
+    0xf4, 0xeb, 0x8f, 0x50, 0x48, 0xee, 0x19, 0x83,
+    0xfe, 0x48, 0xf5, 0x60, 0xdb, 0xae, 0xbf, 0x1b,
 };
 
 static const uint8_t s_test_session_tx_uuid[16] =
 {
-    0x2a, 0x05, 0xaf, 0xd2, 0x5f, 0xec, 0xa1, 0x83,
-    0x2c, 0x40, 0xac, 0xbe, 0x10, 0x57, 0xe8, 0x2b,
+    0xec, 0x3d, 0x69, 0x58, 0xa5, 0xc1, 0xa2, 0x83,
+    0x5a, 0x4f, 0x1b, 0x57, 0x38, 0x5d, 0xc6, 0x2c,
 };
+
+static const uint8_t s_test_public_instance_id[3] =
+{
+    0x12U, 0x34U, 0x56U,
+};
+
+static void _set_test_grants(device_link_security_auth_record_t *record)
+{
+    record->granted_permission_count = 3U;
+    record->granted_permissions[0] = DEVICE_LINK_PERMISSION_CORE_READ;
+    record->granted_permissions[1] = DEVICE_LINK_PERMISSION_CORE_BIND;
+    record->granted_permissions[2] = DEVICE_LINK_PERMISSION_CORE_OPERATE;
+}
 
 typedef struct protocol_tx_capture
 {
@@ -442,7 +455,8 @@ static esp_err_t _fake_port_init(void)
     s_adv_config.short_name = (const uint8_t *)"MT";
     s_adv_config.short_name_len = 2U;
     s_adv_config.service_uuid = s_test_service_uuid;
-    s_adv_config.adv_version = 1U;
+    s_adv_config.adv_version = 2U;
+    s_adv_config.public_instance_id = s_test_public_instance_id;
     s_adv_config.now_ms = _adv_now_ms;
     s_adv_config.arm_timer = NULL;
     s_adv_config.timer_arg = NULL;
@@ -450,11 +464,10 @@ static esp_err_t _fake_port_init(void)
     s_adv_config.lock = _adv_lock_cb;
     s_adv_config.unlock = _adv_unlock_cb;
     s_adv_config.lock_arg = NULL;
-    s_adv_payload_buffer[0] = 1U;
+    s_adv_payload_buffer[0] = 2U;
     s_adv_payload_buffer[1] = 0U;
-    s_adv_payload_buffer[2] = 0U;
-    s_adv_payload_buffer[3] = 0U;
-    s_adv_payload_buffer[4] = 0U;
+    memcpy(&s_adv_payload_buffer[2], s_test_public_instance_id,
+           sizeof(s_test_public_instance_id));
     ble_adv_manager_init(&s_adv_config);
     _protocol_port_init();
     return ESP_OK;
@@ -1217,7 +1230,7 @@ static void _protocol_exchange(
 
 static const uint8_t s_protocol_prepare_request[] =
 {
-    0x08, 0x01, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
+    0x08, 0x02, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
     0x03, 0x02, 0x01, 0x52, 0x0b, 0x09, 0x03, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00,
 };
@@ -1260,7 +1273,7 @@ static size_t _protocol_build_commit(
     memcpy(&request[11], commit_body, sizeof(commit_body));
     assert(output_len <= capacity);
     out[0] = 0x08U;
-    out[1] = 0x01U;
+    out[1] = 0x02U;
     out[2] = 0x19U;
     for (size_t i = 0U; i < 8U; ++i)
     {
@@ -1280,7 +1293,7 @@ static size_t _protocol_build_recovery_query(
 
     assert(capacity >= 64U);
     out[pos++] = 0x08U;
-    out[pos++] = 0x01U;
+    out[pos++] = 0x02U;
     out[pos++] = 0x19U;
     for (size_t i = 0U; i < 8U; ++i)
     {
@@ -1296,7 +1309,7 @@ static size_t _protocol_build_recovery_query(
     {
         out[pos++] = (uint8_t)(request_id >> (8U * i));
     }
-    out[pos++] = 0x7aU;
+    out[pos++] = 0x72U;
     out[pos++] = 18U;
     out[pos++] = 0x0aU;
     out[pos++] = 16U;
@@ -1313,6 +1326,7 @@ static void _protocol_save_auth_record(uint8_t credential[16])
     memset(&record, 0, sizeof(record));
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < sizeof(record.credential_id); ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -1371,11 +1385,10 @@ static void _init_service(void)
     assert(s_adv_started);
     assert(s_adv_interval_ms == TEST_SLOW_INTERVAL_MS);
     assert(s_adv_service_data_len == 5U);
-    assert(s_adv_service_data[0] == 1U);
+    assert(s_adv_service_data[0] == 2U);
     assert(s_adv_service_data[1] == 0U);
-    assert(s_adv_service_data[2] == 0U);
-    assert(s_adv_service_data[3] == 0U);
-    assert(s_adv_service_data[4] == 0U);
+    assert(memcmp(&s_adv_service_data[2], s_test_public_instance_id,
+                  sizeof(s_test_public_instance_id)) == 0);
 }
 
 static void _deinit_service(void)
@@ -1696,6 +1709,7 @@ static void _test_revoke_async_retry(void)
     memset(&record, 0, sizeof(record));
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -1757,6 +1771,7 @@ static void _test_revoke_fail_retries(void)
     memset(&record, 0, sizeof(record));
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -2193,6 +2208,7 @@ static void _test_revoke_binding(void)
     memset(&record, 0, sizeof(record));
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -2253,12 +2269,12 @@ static void _test_window_lifecycle(void)
     char field[64];
 
     assert(_qr_field(qr, "ver", field, sizeof(field)) != NULL);
-    assert(strcmp(field, "link-v1") == 0);
+    assert(strcmp(field, "link-v2") == 0);
     assert(_qr_field(qr, "name", field, sizeof(field)) != NULL);
     assert(strcmp(field, "MT") == 0);
     assert(_qr_field(qr, "service", field, sizeof(field)) != NULL);
     assert(strcmp(field,
-                  "3e203192-b4bb-4e59-a28a-3d1157854ea3") == 0);
+                  "2c77e48c-c510-4230-8d05-63d036dc038b") == 0);
     assert(_qr_field(qr, "discriminator", field, sizeof(field)) != NULL);
     assert(strlen(field) == 4U);
     uint8_t qr_discriminator[3];

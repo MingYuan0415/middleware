@@ -13,6 +13,12 @@
 #include "esp_srp.h"
 #include "session.pb-c.h"
 
+#ifdef UNIT_TEST_HOST
+    #include "tinycrypt/sha256.h"
+#else
+    #include "mbedtls/md.h"
+#endif
+
 #include "nvs.h"
 
 #include "nv_storage.h"
@@ -29,6 +35,16 @@
 #define DEVICE_LINK_SECURITY_SALT_BYTES 16U
 #define DEVICE_LINK_SECURITY_STATIC_RANDOM_MASK 0xc0U
 #define DEVICE_LINK_SECURITY_RANDOM_PART_MASK 0x3fU
+/* Public-discovery derivation version byte (frozen in security.json). */
+#define DEVICE_LINK_SECURITY_PUBLIC_SRP_VERSION 0x02U
+#define DEVICE_LINK_SECURITY_PUBLIC_SRP_SEPARATOR 0x00U
+
+/* RFC 4122 network-order bytes of the v2 service UUID. */
+static const uint8_t s_public_srp_service_uuid_bytes[16] =
+{
+    0x2c, 0x77, 0xe4, 0x8c, 0xc5, 0x10, 0x42, 0x30,
+    0x8d, 0x05, 0x63, 0xd0, 0x36, 0xdc, 0x03, 0x8b,
+};
 
 typedef struct device_link_security
 {
@@ -45,6 +61,11 @@ typedef struct device_link_security
     size_t bt_salt_len;
     char *bt_verifier;
     size_t bt_verifier_len;
+    /* Public slot: derived password of the current public advertisement. */
+    char *pb_salt;
+    size_t pb_salt_len;
+    char *pb_verifier;
+    size_t pb_verifier_len;
     /* Selection pinned for the current Security 2 session. */
     device_link_security_verifier_kind_t selected_kind;
     uint8_t selected_peer_type;
@@ -53,6 +74,22 @@ typedef struct device_link_security
     bool authenticated;
     bool initialized;
 } device_link_security_t;
+
+static void _device_link_security_release_request_response(
+    uint8_t *response, size_t response_len,
+    device_link_security_response_release_fn release_cb, void *release_arg)
+{
+    if (response == NULL)
+    {
+        return;
+    }
+    if (release_cb != NULL)
+    {
+        release_cb(response, response_len, release_arg);
+        return;
+    }
+    free(response);
+}
 
 /* Boot-lifetime session generation: survives init/deinit resets (which
  * memset the state) and never wraps, so a retired session can never be
@@ -136,6 +173,22 @@ static bool _device_link_security_record_valid(
     bool auth_id_nonzero = false;
     bool salt_nonzero = false;
     bool verifier_nonzero = false;
+
+    if (record->granted_permission_count == 0U ||
+            record->granted_permission_count >
+            DEVICE_LINK_SECURITY_AUTH_MAX_GRANTS)
+    {
+        return false;
+    }
+    for (size_t i = 0U; i < record->granted_permission_count; ++i)
+    {
+        if (record->granted_permissions[i] == 0U ||
+                (i > 0U && record->granted_permissions[i - 1U] >=
+                 record->granted_permissions[i]))
+        {
+            return false;
+        }
+    }
 
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
@@ -259,6 +312,130 @@ static void _device_link_security_zeroize(void *data, size_t size)
     }
 }
 
+static esp_err_t _device_link_security_sha256(
+    const uint8_t *data, size_t length, uint8_t digest[32U])
+{
+    if ((data == NULL && length != 0U) || digest == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+#ifdef UNIT_TEST_HOST
+    struct tc_sha256_state_struct state;
+
+    memset(&state, 0, sizeof(state));
+    if (tc_sha256_init(&state) != 1 ||
+            tc_sha256_update(&state, data, length) != 1 ||
+            tc_sha256_final(digest, &state) != 1)
+    {
+        memset(&state, 0, sizeof(state));
+        memset(digest, 0, 32U);
+        return ESP_ERR_INVALID_STATE;
+    }
+    memset(&state, 0, sizeof(state));
+    return ESP_OK;
+#else
+    mbedtls_md_context_t ctx;
+
+    mbedtls_md_init(&ctx);
+    const int setup_result = mbedtls_md_setup(
+                                 &ctx,
+                                 mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                                 0);
+
+    if (setup_result != 0 ||
+            mbedtls_md_starts(&ctx) != 0 ||
+            mbedtls_md_update(&ctx, data, length) != 0 ||
+            mbedtls_md_finish(&ctx, digest) != 0)
+    {
+        mbedtls_md_free(&ctx);
+        memset(digest, 0, 32U);
+        return ESP_ERR_INVALID_STATE;
+    }
+    mbedtls_md_free(&ctx);
+    return ESP_OK;
+#endif
+}
+
+static void _device_link_security_base64url(
+    const uint8_t *in, size_t in_len, char *out)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t out_pos = 0U;
+    size_t in_pos = 0U;
+
+    while (in_len - in_pos >= 3U)
+    {
+        const uint32_t v = ((uint32_t)in[in_pos] << 16U) |
+                           ((uint32_t)in[in_pos + 1U] << 8U) |
+                           (uint32_t)in[in_pos + 2U];
+
+        out[out_pos++] = alphabet[(v >> 18U) & 0x3fU];
+        out[out_pos++] = alphabet[(v >> 12U) & 0x3fU];
+        out[out_pos++] = alphabet[(v >> 6U) & 0x3fU];
+        out[out_pos++] = alphabet[v & 0x3fU];
+        in_pos += 3U;
+    }
+    const size_t remaining = in_len - in_pos;
+
+    if (remaining == 1U)
+    {
+        const uint32_t v = (uint32_t)in[in_pos] << 16U;
+
+        out[out_pos++] = alphabet[(v >> 18U) & 0x3fU];
+        out[out_pos++] = alphabet[(v >> 12U) & 0x3fU];
+    }
+    else if (remaining == 2U)
+    {
+        const uint32_t v = ((uint32_t)in[in_pos] << 16U) |
+                           ((uint32_t)in[in_pos + 1U] << 8U);
+
+        out[out_pos++] = alphabet[(v >> 18U) & 0x3fU];
+        out[out_pos++] = alphabet[(v >> 12U) & 0x3fU];
+        out[out_pos++] = alphabet[(v >> 6U) & 0x3fU];
+    }
+    out[out_pos] = '\0';
+}
+
+static esp_err_t _device_link_security_derive_public_password(
+    const uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES],
+    char password[DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1U])
+{
+    if (instance_id == NULL || password == NULL ||
+            (instance_id[0] == 0U && instance_id[1] == 0U &&
+             instance_id[2] == 0U))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *const label = DEVICE_LINK_SECURITY_PUBLIC_SRP_LABEL;
+    const size_t label_len = strlen(label);
+    uint8_t input[128];
+    size_t pos = 0U;
+    uint8_t digest[32U];
+    esp_err_t result;
+
+    memcpy(&input[pos], label, label_len);
+    pos += label_len;
+    input[pos++] = DEVICE_LINK_SECURITY_PUBLIC_SRP_SEPARATOR;
+    memcpy(&input[pos], s_public_srp_service_uuid_bytes,
+           sizeof(s_public_srp_service_uuid_bytes));
+    pos += sizeof(s_public_srp_service_uuid_bytes);
+    input[pos++] = DEVICE_LINK_SECURITY_PUBLIC_SRP_VERSION;
+    memcpy(&input[pos], instance_id,
+           DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES);
+    pos += DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES;
+    result = _device_link_security_sha256(input, pos, digest);
+    _device_link_security_zeroize(input, pos);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    _device_link_security_base64url(
+        digest, sizeof(digest), password);
+    _device_link_security_zeroize(digest, sizeof(digest));
+    return ESP_OK;
+}
+
 static void _device_link_security_free_long_term(void)
 {
     if (s_security.lt_salt != NULL)
@@ -299,6 +476,26 @@ static void _device_link_security_free_bootstrap(void)
     s_security.bt_verifier_len = 0U;
 }
 
+static void _device_link_security_free_public(void)
+{
+    if (s_security.pb_salt != NULL)
+    {
+        _device_link_security_zeroize(s_security.pb_salt,
+                                      s_security.pb_salt_len);
+        free(s_security.pb_salt);
+    }
+    if (s_security.pb_verifier != NULL)
+    {
+        _device_link_security_zeroize(s_security.pb_verifier,
+                                      s_security.pb_verifier_len);
+        free(s_security.pb_verifier);
+    }
+    s_security.pb_salt = NULL;
+    s_security.pb_salt_len = 0U;
+    s_security.pb_verifier = NULL;
+    s_security.pb_verifier_len = 0U;
+}
+
 /**
  * @brief Whether the slot backing the pinned selection has material.
  */
@@ -310,6 +507,8 @@ static bool _device_link_security_selection_loaded(void)
         return s_security.bt_salt != NULL && s_security.bt_verifier != NULL;
     case DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM:
         return s_security.lt_salt != NULL && s_security.lt_verifier != NULL;
+    case DEVICE_LINK_SECURITY_VERIFIER_PUBLIC:
+        return s_security.pb_salt != NULL && s_security.pb_verifier != NULL;
     default:
         return false;
     }
@@ -375,6 +574,15 @@ static esp_err_t _device_link_security_rebuild(void)
         s_security.sec_params.verifier_len =
             (uint16_t)s_security.bt_verifier_len;
     }
+    else if (s_security.selected_kind ==
+             DEVICE_LINK_SECURITY_VERIFIER_PUBLIC)
+    {
+        s_security.sec_params.salt = (const char *)s_security.pb_salt;
+        s_security.sec_params.salt_len = (uint16_t)s_security.pb_salt_len;
+        s_security.sec_params.verifier = s_security.pb_verifier;
+        s_security.sec_params.verifier_len =
+            (uint16_t)s_security.pb_verifier_len;
+    }
     else
     {
         s_security.sec_params.salt = (const char *)s_security.lt_salt;
@@ -408,6 +616,7 @@ esp_err_t device_link_security_init(const device_link_security_config_t *config)
         _device_link_security_teardown_sec();
         _device_link_security_free_long_term();
         _device_link_security_free_bootstrap();
+        _device_link_security_free_public();
     }
     memset(&s_security, 0, sizeof(s_security));
     s_security.config = *config;
@@ -424,6 +633,7 @@ void device_link_security_deinit(void)
         _device_link_security_teardown_sec();
         _device_link_security_free_long_term();
         _device_link_security_free_bootstrap();
+        _device_link_security_free_public();
         memset(&s_security, 0, sizeof(s_security));
     }
     _device_link_security_unlock();
@@ -512,7 +722,122 @@ esp_err_t device_link_security_close_bootstrap(void)
     {
         s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
     }
+    else if (s_security.pb_salt != NULL || s_security.pb_verifier != NULL)
+    {
+        /* Closing the QR window returns to public discovery. */
+        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_PUBLIC;
+    }
     result = _device_link_security_rebuild();
+    _device_link_security_unlock();
+    return result;
+}
+
+esp_err_t device_link_security_close_public(void)
+{
+    esp_err_t result = ESP_OK;
+
+    _device_link_security_lock();
+    if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_PUBLIC)
+    {
+        _device_link_security_teardown_sec();
+    }
+    _device_link_security_free_public();
+    s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+    if (s_security.lt_salt != NULL || s_security.lt_verifier != NULL)
+    {
+        s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM;
+    }
+    result = _device_link_security_rebuild();
+    _device_link_security_unlock();
+    return result;
+}
+
+#ifdef UNIT_TEST_HOST
+esp_err_t device_link_security_test_derive_public_password(
+    const uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES],
+    char password[DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1U])
+{
+    if (instance_id == NULL || password == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return _device_link_security_derive_public_password(
+               instance_id, password);
+}
+#endif
+
+esp_err_t device_link_security_open_public(
+    const uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES])
+{
+    if (instance_id == NULL ||
+            (instance_id[0] == 0U && instance_id[1] == 0U &&
+             instance_id[2] == 0U))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _device_link_security_lock();
+    if (!s_security.initialized)
+    {
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    char password[DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1U];
+    const esp_err_t derive_result =
+        _device_link_security_derive_public_password(instance_id, password);
+
+    if (derive_result != ESP_OK)
+    {
+        _device_link_security_unlock();
+        return derive_result;
+    }
+    char *salt = NULL;
+    char *verifier = NULL;
+    int verifier_len = 0;
+    esp_err_t result = esp_srp_gen_salt_verifier(
+                           s_security.config.username != NULL ?
+                           s_security.config.username :
+                           DEVICE_LINK_SECURITY_USERNAME,
+                           (int)strlen(s_security.config.username != NULL ?
+                                       s_security.config.username :
+                                       DEVICE_LINK_SECURITY_USERNAME),
+                           password, (int)strlen(password),
+                           &salt, DEVICE_LINK_SECURITY_SALT_BYTES,
+                           &verifier, &verifier_len);
+
+    _device_link_security_zeroize(password, sizeof(password));
+    if (result != ESP_OK)
+    {
+        _device_link_security_unlock();
+        return result;
+    }
+    if (salt == NULL || verifier == NULL || verifier_len <= 0)
+    {
+        free(salt);
+        free(verifier);
+        _device_link_security_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_PUBLIC)
+    {
+        /* The instance references the old public buffers: replace them
+         * only after the teardown. */
+        _device_link_security_teardown_sec();
+    }
+    _device_link_security_free_public();
+    s_security.pb_salt = salt;
+    s_security.pb_salt_len = DEVICE_LINK_SECURITY_SALT_BYTES;
+    s_security.pb_verifier = verifier;
+    s_security.pb_verifier_len = (size_t)verifier_len;
+    if (s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_PUBLIC ||
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE)
+    {
+        result = _device_link_security_rebuild();
+    }
     _device_link_security_unlock();
     return result;
 }
@@ -576,6 +901,13 @@ esp_err_t device_link_security_select_verifier(
              s_security.bt_verifier != NULL)
     {
         kind = DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP;
+    }
+    else if (!pairing_window_open && s_security.pb_salt != NULL &&
+             s_security.pb_verifier != NULL)
+    {
+        /* Public discovery: the advertisement's derived password is the
+         * only bootstrap credential outside the QR window. */
+        kind = DEVICE_LINK_SECURITY_VERIFIER_PUBLIC;
     }
     _device_link_security_zeroize(&record, sizeof(record));
 
@@ -808,6 +1140,9 @@ esp_err_t device_link_security_unprotect(
     const device_link_security_request_fn request_cb =
         s_security.config.request_cb;
     void *const request_arg = s_security.config.request_arg;
+    const device_link_security_response_release_fn release_cb =
+        s_security.config.response_release_cb;
+    void *const release_arg = s_security.config.response_release_arg;
     esp_err_t result = protocomm_security2.decrypt(
                            s_security.sec_inst, s_security.config.session_id,
                            input, (ssize_t)input_len, &plain, &plain_len);
@@ -839,13 +1174,15 @@ esp_err_t device_link_security_unprotect(
             s_security.sec_inst != session_instance)
     {
         /* The session was replaced while the callback ran. */
-        free(plain_response);
+        _device_link_security_release_request_response(
+            plain_response, plain_response_len, release_cb, release_arg);
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     if (result != ESP_OK)
     {
-        free(plain_response);
+        _device_link_security_release_request_response(
+            plain_response, plain_response_len, release_cb, release_arg);
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
         return result;
@@ -855,7 +1192,8 @@ esp_err_t device_link_security_unprotect(
      * plaintext response is encrypted and returned. */
     if (plain_response == NULL || plain_response_len == 0U)
     {
-        free(plain_response);
+        _device_link_security_release_request_response(
+            plain_response, plain_response_len, release_cb, release_arg);
         if (!s_security.session_open || s_security.sec_inst == NULL)
         {
             _device_link_security_unlock();
@@ -872,7 +1210,8 @@ esp_err_t device_link_security_unprotect(
     if (!s_security.session_open || s_security.sec_inst == NULL ||
             protocomm_security2.encrypt == NULL)
     {
-        free(plain_response);
+        _device_link_security_release_request_response(
+            plain_response, plain_response_len, release_cb, release_arg);
         _device_link_security_unlock();
         return ESP_ERR_INVALID_STATE;
     }
@@ -880,7 +1219,8 @@ esp_err_t device_link_security_unprotect(
                  s_security.sec_inst, s_security.config.session_id,
                  plain_response, (ssize_t)plain_response_len,
                  &cipher, &cipher_len);
-    free(plain_response);
+    _device_link_security_release_request_response(
+        plain_response, plain_response_len, release_cb, release_arg);
     if (result != ESP_OK)
     {
         free(cipher);
@@ -995,13 +1335,8 @@ esp_err_t device_link_security_save_auth_record(
     {
         return ESP_ERR_INVALID_ARG;
     }
-    /* The reserved tail bytes must never carry stale stack data into the
-     * persisted blob. */
-    device_link_security_auth_record_t zeroed = *record;
-
-    memset(zeroed.reserved, 0, sizeof(zeroed.reserved));
     return nv_storage_set_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
-                               &zeroed, sizeof(zeroed));
+                               record, sizeof(*record));
 }
 
 esp_err_t device_link_security_load_auth_record(
@@ -1172,6 +1507,11 @@ esp_err_t device_link_security_load_long_term_verifier(void)
         if (rebuild)
         {
             s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+            if (s_security.pb_salt != NULL || s_security.pb_verifier != NULL)
+            {
+                s_security.selected_kind =
+                    DEVICE_LINK_SECURITY_VERIFIER_PUBLIC;
+            }
             const esp_err_t result = _device_link_security_rebuild();
 
             _device_link_security_unlock();

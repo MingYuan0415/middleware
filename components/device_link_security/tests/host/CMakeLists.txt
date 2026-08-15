@@ -15,12 +15,15 @@ set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/device_link_security
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
 set(PROTOBUF_C "$ENV{IDF_PATH}/components/protobuf-c/protobuf-c")
+set(IDF_BT "$ENV{IDF_PATH}/components/bt")
 
 add_executable(test_device_link_security
     test_device_link_security.c
     "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
     "${HOST_CONNECTIVITY}/freertos_host.c"
     "${COMPONENT}/src/device_link_security.c"
+    "${IDF_BT}/common/tinycrypt/src/sha256.c"
+    "${IDF_BT}/common/tinycrypt/src/utils.c"
     "${PROTOCOMM_PROTO}/constants.pb-c.c"
     "${PROTOCOMM_PROTO}/sec0.pb-c.c"
     "${PROTOCOMM_PROTO}/sec1.pb-c.c"
@@ -32,6 +35,7 @@ add_executable(test_device_link_security
 target_compile_features(test_device_link_security PRIVATE c_std_11)
 target_compile_definitions(test_device_link_security PRIVATE
     _POSIX_C_SOURCE=200809L
+    UNIT_TEST_HOST
 )
 target_include_directories(test_device_link_security PRIVATE
     "${PROTOCOMM_PROTO}"
@@ -39,6 +43,7 @@ target_include_directories(test_device_link_security PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/fakes"
     "${HOST_CONNECTIVITY}/include"
     "${COMPONENT}/include"
+    "${IDF_BT}/common/tinycrypt/include"
 )
 target_compile_options(test_device_link_security PRIVATE
     -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"

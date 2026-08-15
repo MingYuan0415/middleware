@@ -42,6 +42,7 @@ typedef struct device_link_service_config
 typedef enum
 {
     DEVICE_LINK_SERVICE_STATE_STOPPED = 0,
+    DEVICE_LINK_SERVICE_STATE_DISABLED,
     DEVICE_LINK_SERVICE_STATE_STARTING,
     DEVICE_LINK_SERVICE_STATE_ADVERTISING,
     DEVICE_LINK_SERVICE_STATE_CONNECTED,
@@ -67,6 +68,10 @@ typedef struct device_link_service_status
     int32_t last_error; /**< Local diagnostic error, never sent over BLE. */
     uint32_t window_remaining_ms; /**< Remaining binding window time. */
     bool available; /**< Service lifecycle is initialized. */
+    bool enabled; /**< Effective persistent Bluetooth policy. */
+    bool transitioning; /**< Runtime is converging to the requested policy. */
+    bool public_discovery; /**< Public discovery advertisement is active. */
+    uint8_t instance_id[3]; /**< Boot-scoped public discovery identifier. */
     bool active; /**< A binding window owns the bindable advertisement. */
     bool client_connected; /**< One BLE transport client is connected. */
     bool qr_ready; /**< QR bootstrap data may be copied. */
@@ -96,6 +101,20 @@ typedef device_link_service_status_t device_link_service_snapshot_t;
  * @return ESP_OK on success; otherwise an argument, lifecycle, or port error.
  */
 esp_err_t device_link_service_init(const device_link_service_config_t *config);
+
+/**
+ * @brief Persist and apply the local Bluetooth enable policy.
+ *
+ * This API is intended for the local settings owner. It is deliberately not
+ * exposed as a Device Link method: a remote peer must not be able to disable
+ * the only recovery transport. The worker persists the requested value before
+ * changing the NimBLE runtime and retains a bounded retry obligation when the
+ * physical transition fails.
+ *
+ * @param enabled Desired effective policy.
+ * @param timeout_ms Total wait for this transition, or WAIT_FOREVER.
+ */
+esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms);
 
 /**
  * @brief Release advertising after factory-reset recovery completed.

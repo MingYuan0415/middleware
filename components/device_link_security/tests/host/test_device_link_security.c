@@ -29,6 +29,14 @@ static size_t s_cmd0_wire_len;
 static uint8_t s_cmd1_wire[128];
 static size_t s_cmd1_wire_len;
 
+static void _set_test_grants(device_link_security_auth_record_t *record)
+{
+    record->granted_permission_count = 3U;
+    record->granted_permissions[0] = 0x0001U;
+    record->granted_permissions[1] = 0x0002U;
+    record->granted_permissions[2] = 0x0003U;
+}
+
 static size_t _pack_handshake_request(
     device_link_security_handshake_stage_t stage,
     uint8_t *out, size_t capacity)
@@ -813,6 +821,7 @@ static void _test_auth_record_persistence(void)
     /* Commit a valid record. */
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -888,6 +897,7 @@ static void _test_long_term_verifier(void)
     assert(nv_storage_fake_blob_len() == 0U);
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -960,6 +970,7 @@ static void _test_verifier_selection(void)
                record.salt, record.verifier) == ESP_OK);
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -1099,6 +1110,7 @@ static void _test_revoke_journal(void)
     memset(&record, 0, sizeof(record));
     record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
     record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
     for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
     {
         record.credential_id[i] = (uint8_t)(i + 1U);
@@ -1253,6 +1265,73 @@ static void _test_nv_commit_boundary(void)
            ESP_ERR_NVS_NOT_FOUND);
 }
 
+
+static void _test_public_verifier(void)
+{
+    static const uint8_t public_instance[3] = {0x12, 0x34, 0x56};
+    char password[DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1U];
+
+    /* Frozen KAT from fixtures/core/v2/security.json. */
+    assert(device_link_security_test_derive_public_password(
+               public_instance, password) == ESP_OK);
+    assert(strlen(password) == DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES);
+    assert(strcmp(password, "L_FahHWW-ZZHIURRoXgvSRBo1n1iTem9WrD4rysV1Tc") == 0);
+    /* Zero and NULL instance ids are invalid. */
+    static const uint8_t zero_instance[3] = {0x00, 0x00, 0x00};
+
+    assert(device_link_security_test_derive_public_password(
+               NULL, password) == ESP_ERR_INVALID_ARG);
+    assert(device_link_security_test_derive_public_password(
+               zero_instance, password) == ESP_ERR_INVALID_ARG);
+    assert(device_link_security_test_derive_public_password(
+               public_instance, NULL) == ESP_ERR_INVALID_ARG);
+
+    nv_storage_fake_reset();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    /* No window, no public slot: no verifier. */
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    /* Invalid open: NULL and zero instance ids. */
+    assert(device_link_security_open_public(NULL) == ESP_ERR_INVALID_ARG);
+    assert(device_link_security_open_public(zero_instance) ==
+           ESP_ERR_INVALID_ARG);
+    /* Install the public slot: outside the window the public password
+     * selects; inside the window the QR bootstrap wins. */
+    assert(device_link_security_open_public(public_instance) == ESP_OK);
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), true) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP);
+    device_link_security_close_session();
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_PUBLIC);
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+
+    assert(device_link_security_handshake(
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
+    free(out);
+    device_link_security_close_session();
+    /* Closing the QR window returns to the public verifier. */
+    assert(device_link_security_close_bootstrap() == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_PUBLIC);
+    /* Closing the public slot leaves no verifier. */
+    assert(device_link_security_close_public() == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    assert(device_link_security_select_verifier(
+               1U, TEST_PEER_ADDR, sizeof(TEST_PEER_ADDR), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+}
+
 int main(void)
 {
     _test_init_validation();
@@ -1261,6 +1340,7 @@ int main(void)
     _test_auth_record_persistence();
     _test_long_term_verifier();
     _test_verifier_selection();
+    _test_public_verifier();
     _test_revoke_journal();
     _test_revoke_journal_fail_closed();
     _test_nv_commit_boundary();
