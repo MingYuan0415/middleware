@@ -1218,6 +1218,90 @@ static size_t _build_commit_body(uint8_t *out, size_t out_cap,
     return len;
 }
 
+
+static void test_authorize_prepare_rejects_unregistered_permissions(void)
+{
+    /* The contract permission registry freezes the requestable ids; an
+     * unknown id and an id of an unadvertised domain must be refused at
+     * Prepare, before any transaction or durable grant exists. */
+    static const uint8_t unknown_permission_request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x03U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x04U, 0xb4U, 0x24U, /* requested_permissions = 0x1234 (unknown). */
+    };
+    static const uint8_t unadvertised_domain_request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x03U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x04U, 0x81U, 0x06U, /* location.read (0x0301), domain unregistered. */
+    };
+    static const uint8_t mixed_request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x03U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x04U, 0x01U, 0x04U, 0x81U, 0x06U, /* core.read + location.read. */
+    };
+    static const uint8_t valid_request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x03U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x04U, 0x01U, /* core.read. */
+    };
+    const uint8_t *cases[] =
+    {
+        unknown_permission_request,
+        unadvertised_domain_request,
+        mixed_request,
+    };
+    const size_t case_lengths[] =
+    {
+        sizeof(unknown_permission_request),
+        sizeof(unadvertised_domain_request),
+        sizeof(mixed_request),
+    };
+
+    for (size_t i = 0U; i < 3U; ++i)
+    {
+        device_link_wire_header_t header;
+        device_link_status_t status;
+
+        _reset();
+        _feed_single_channel(cases[i], case_lengths[i],
+                             BLE_LINK_SERVICE_RX_SESSION);
+        _reassemble_captured();
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                              s_outbound, s_outbound_len, &header));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_MESSAGE_RESPONSE, header.kind);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                              &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                              s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                              &status));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_INVALID_ARGUMENT, status);
+    }
+    /* A registered Core permission still prepares successfully. */
+    {
+        device_link_wire_header_t header;
+        device_link_status_t status;
+
+        _reset();
+        _feed_single_channel(valid_request, sizeof(valid_request),
+                             BLE_LINK_SERVICE_RX_SESSION);
+        _reassemble_captured();
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                              s_outbound, s_outbound_len, &header));
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                              &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                              s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                              &status));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, status);
+    }
+}
+
 static void test_authorize_flow(void)
 {
     ble_link_codec_envelope_t envelope;
@@ -3314,6 +3398,7 @@ int main(void)
     test_boot_mismatch_closes_session();
     test_one_transaction_at_a_time();
     test_authorize_prepare_produces_transaction();
+    test_authorize_prepare_rejects_unregistered_permissions();
     test_session_channel_reassembly();
     test_low_mtu_multi_fragment();
     test_idle_timeout_clears_state();

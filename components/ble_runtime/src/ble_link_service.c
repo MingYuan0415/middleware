@@ -1867,6 +1867,65 @@ static uint32_t _ble_link_service_handle_snapshot(
 }
 #endif
 
+/**
+ * @brief Whether a permission id is requestable on this device.
+ *
+ * The contract registry (registry/permissions.yaml) freezes the known
+ * permission ids; an unknown id is rejected outright. Non-core domains
+ * are requestable only while their startup-frozen domain descriptor is
+ * registered with the router: unadvertised domains must not be granted
+ * (their methods could never be admitted, and the durable grant would be
+ * dead weight at best).
+ */
+static bool _ble_link_service_permission_admissible(uint16_t permission)
+{
+    const uint16_t domain_id = (uint16_t)(permission >> 8U);
+    const uint16_t sequence = (uint16_t)(permission & 0x00ffU);
+
+    switch (domain_id)
+    {
+    case DEVICE_LINK_DOMAIN_CORE:
+        if (sequence < 1U || sequence > 3U)
+        {
+            return false;
+        }
+        break;
+    case DEVICE_LINK_DOMAIN_WIFI:
+        if (sequence < 1U || sequence > 3U)
+        {
+            return false;
+        }
+        break;
+    case DEVICE_LINK_DOMAIN_CLOUD:
+        if (sequence < 1U || sequence > 2U)
+        {
+            return false;
+        }
+        break;
+    case DEVICE_LINK_DOMAIN_LOCATION:
+        if (sequence < 1U || sequence > 2U)
+        {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+    if (domain_id == DEVICE_LINK_DOMAIN_CORE)
+    {
+        /* Core is always registered. */
+        return true;
+    }
+    for (size_t i = 0U; i < s_service.v2_domain_count; ++i)
+    {
+        if (s_service.v2_domains[i].domain_id == domain_id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static device_link_status_t _ble_link_service_authorize_prepare(
     uint32_t connection_generation, uint32_t security_epoch,
     const uint16_t *requested_permissions,
@@ -1877,6 +1936,14 @@ static device_link_status_t _ble_link_service_authorize_prepare(
             requested_permission_count == 0U)
     {
         return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t i = 0U; i < requested_permission_count; ++i)
+    {
+        if (!_ble_link_service_permission_admissible(
+                    requested_permissions[i]))
+        {
+            return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+        }
     }
     _ble_link_service_lock();
     bool txn_active =
@@ -2678,7 +2745,8 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
     {
         const device_link_domain_descriptor_t *domain =
             &s_service.v2_domains[d];
-        uint8_t domain_bytes[512];
+        /* Contract DomainDescriptor.max_encoded_bytes is 768. */
+        uint8_t domain_bytes[768];
         size_t domain_len = 0U;
         device_link_tlv_writer_t domain_writer;
 
