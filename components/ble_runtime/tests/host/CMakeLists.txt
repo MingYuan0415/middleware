@@ -11,6 +11,7 @@ get_filename_component(PROJECT_ROOT
     "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(DEVICE_LINK_SECURITY "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
+set(DEVICE_LINK_WIRE "${PROJECT_ROOT}/layers/middleware/components/device_link")
 set(ESP_ERR "${PROJECT_ROOT}/tests/connectivity/host/include")
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
@@ -19,6 +20,26 @@ set(PROTOBUF_C "$ENV{IDF_PATH}/components/protobuf-c/protobuf-c")
 project(ble_runtime_host_tests C)
 
 enable_testing()
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# Contract fixture vectors: generated from the pinned contract checkout
+# (contracts/provisioning/fixtures/core/v2). The generated include is a
+# build artifact; the fixture checkout is the source of truth.
+set(CONTRACT_FIXTURE_INC "${CMAKE_CURRENT_BINARY_DIR}/contract_fixtures.inc")
+add_custom_command(
+    OUTPUT "${CONTRACT_FIXTURE_INC}"
+    COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_LIST_DIR}/contract_fixtures_generate.py"
+        --fixtures "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2"
+        --out "${CONTRACT_FIXTURE_INC}"
+    DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/contract_fixtures_generate.py"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/wire.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/framing.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/authorization.json"
+    VERBATIM)
+add_custom_target(contract_fixtures_inc DEPENDS "${CONTRACT_FIXTURE_INC}")
 
 set(TEST_SOURCES
     "${COMPONENT}/src/ble_runtime.c"
@@ -43,6 +64,14 @@ set(TEST_SOURCES
     "${COMPONENT}/src/ble_link_service.c"
     "${COMPONENT}/src/ble_link_gatt.c"
     "${COMPONENT}/src/ble_event_router.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_core.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_digest.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_operation.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_router.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_tlv.c"
+    "${DEVICE_LINK_WIRE}/src/device_link_wire.c"
+    "$ENV{IDF_PATH}/components/bt/common/tinycrypt/src/sha256.c"
+    "$ENV{IDF_PATH}/components/bt/common/tinycrypt/src/utils.c"
     "${DEVICE_LINK_SECURITY}/src/device_link_security.c"
     "${HOST_CONNECTIVITY}/freertos_host.c"
     "${CMAKE_CURRENT_LIST_DIR}/fakes/esp_random.c"
@@ -80,7 +109,8 @@ foreach(test_target IN ITEMS
         test_ble_link_events
         test_ble_link_sec_state
         test_ble_link_service
-        test_ble_link_gatt)
+        test_ble_link_gatt
+        test_contract_fixtures)
     if(test_target STREQUAL test_ble_link_timer_deadline)
         add_executable(${test_target}
             ${test_target}.c
@@ -126,10 +156,17 @@ foreach(test_target IN ITEMS
         "${COMPONENT}/include"
         "${COMPONENT}/src"
         "${DEVICE_LINK_SECURITY}/include"
+        "${DEVICE_LINK_WIRE}/include"
+        "$ENV{IDF_PATH}/components/bt/common/tinycrypt/include"
         "${PROTOCOMM_PROTO}"
         "${PROTOBUF_C}"
         "${CMAKE_CURRENT_LIST_DIR}/fakes"
         "${ESP_ERR}")
+    if(test_target STREQUAL test_contract_fixtures)
+        target_include_directories(${test_target} PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}")
+        add_dependencies(${test_target} contract_fixtures_inc)
+    endif()
     target_compile_options(${test_target} PRIVATE
         -Wall -Wextra -Werror -Wpedantic -UNDEBUG)
     if(BLE_RUNTIME_SANITIZER STREQUAL "address")
@@ -166,7 +203,8 @@ set(BLE_RUNTIME_TESTS
     ble_nimble_store_reset
     ble_nimble_tx_tracker
     ble_link_session ble_link_events ble_link_sec_state
-    ble_link_service ble_link_gatt ble_event_router)
+    ble_link_service ble_link_gatt ble_event_router
+    contract_fixtures)
 
 if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND BLE_RUNTIME_SETARCH
         AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
