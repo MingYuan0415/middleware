@@ -563,12 +563,37 @@ static esp_err_t _fake_port_deinit(void)
     return ESP_OK;
 }
 
+static esp_err_t s_public_id_getter_result;
+static uint8_t s_public_id_bytes[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES];
+
+static unsigned s_public_id_getter_calls;
+
+static esp_err_t _fake_get_public_instance_id(uint8_t out_instance_id[3])
+{
+    memcpy(out_instance_id, s_public_id_bytes,
+           DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES);
+    s_public_id_getter_calls++;
+    return s_public_id_getter_result;
+}
+
 static const ble_runtime_host_port_t s_test_port =
 {
     .init = _fake_port_init,
     .start = _fake_port_start,
     .set_pairing_gate = _fake_set_pairing_gate,
     .reset_peer_store = _fake_reset_peer_store,
+    .stop = _fake_port_stop,
+    .deinit = _fake_port_deinit,
+};
+
+/* Port with a working public-instance-id getter. */
+static const ble_runtime_host_port_t s_public_test_port =
+{
+    .init = _fake_port_init,
+    .start = _fake_port_start,
+    .set_pairing_gate = _fake_set_pairing_gate,
+    .reset_peer_store = _fake_reset_peer_store,
+    .get_public_instance_id = _fake_get_public_instance_id,
     .stop = _fake_port_stop,
     .deinit = _fake_port_deinit,
 };
@@ -1356,6 +1381,8 @@ static esp_err_t _sec_stub_request(
     return ESP_ERR_NOT_SUPPORTED;
 }
 
+static const ble_runtime_host_port_t *s_runtime_port = &s_test_port;
+
 static void _init_service(void)
 {
     const device_link_security_config_t security_config =
@@ -1368,7 +1395,7 @@ static void _init_service(void)
 
     assert(device_link_security_init(&security_config) == ESP_OK);
     memset(&s_config, 0, sizeof(s_config));
-    s_config.runtime_port = &s_test_port;
+    s_config.runtime_port = s_runtime_port;
     s_config.task_priority = 4U;
     s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
@@ -3302,6 +3329,50 @@ static void _test_deinit_drains_journaled_revoke_after_acl_terminal(void)
     nv_storage_fake_reset();
 }
 
+
+static void test_public_verifier_getter_fail_closed(void)
+{
+    /* The public verifier is installed only from a definite, non-zero
+     * instance id. A failing getter must never install a verifier from
+     * uninitialized stack data. */
+    static const uint8_t peer_addr[6] = {0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xe5};
+
+    s_runtime_port = &s_public_test_port;
+    s_public_id_getter_calls = 0U;
+    s_public_id_getter_result = ESP_FAIL;
+    memset(s_public_id_bytes, 0x5a, sizeof(s_public_id_bytes));
+    _init_service();
+    /* Window closed, public getter failed: no verifier may be selected. */
+    assert(device_link_security_select_verifier(
+               1U, peer_addr, sizeof(peer_addr), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    _deinit_service();
+
+    /* Success path: a definite instance id installs the public verifier. */
+    s_public_id_getter_result = ESP_OK;
+    s_public_id_bytes[0] = 0x12U;
+    s_public_id_bytes[1] = 0x34U;
+    s_public_id_bytes[2] = 0x56U;
+    _init_service();
+    assert(device_link_security_select_verifier(
+               1U, peer_addr, sizeof(peer_addr), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_PUBLIC);
+    _deinit_service();
+
+    /* An all-zero instance id is equally fail-closed. */
+    s_public_id_getter_result = ESP_OK;
+    memset(s_public_id_bytes, 0, sizeof(s_public_id_bytes));
+    _init_service();
+    assert(device_link_security_select_verifier(
+               1U, peer_addr, sizeof(peer_addr), false) == ESP_OK);
+    assert(device_link_security_selected_verifier() ==
+           DEVICE_LINK_SECURITY_VERIFIER_NONE);
+    _deinit_service();
+    s_runtime_port = &s_test_port;
+}
+
 int main(void)
 {
     _test_bad_configuration();
@@ -3335,6 +3406,7 @@ int main(void)
     _test_suspend_waits_for_its_own_command();
     _test_deinit_while_window_open();
     _test_reinit_after_deinit();
+    test_public_verifier_getter_fail_closed();
     _test_protocol_commit_probe_confirmation();
     _test_protocol_stale_confirmation_token();
     _test_protocol_stale_generation_confirmation();

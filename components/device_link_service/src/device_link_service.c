@@ -698,10 +698,27 @@ static void _device_link_service_open_public_verifier(void)
     else
     {
         uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES];
+        esp_err_t getter_result;
 
-        (void)s_service.config.runtime_port->get_public_instance_id(
-            instance_id);
-        result = device_link_security_open_public(instance_id);
+        memset(instance_id, 0, sizeof(instance_id));
+        getter_result =
+            s_service.config.runtime_port->get_public_instance_id(
+                instance_id);
+        if (getter_result != ESP_OK ||
+                (instance_id[0] == 0U && instance_id[1] == 0U &&
+                 instance_id[2] == 0U))
+        {
+            /* A failed or empty instance id must never install a public
+             * verifier: the derivation input would be unknown and the
+             * endpoint would accept a wrong password. Fail closed. */
+            LOG_W("public instance id unavailable result=%d",
+                  getter_result);
+            result = device_link_security_close_public();
+        }
+        else
+        {
+            result = device_link_security_open_public(instance_id);
+        }
     }
     if (result != ESP_OK)
     {
@@ -1861,6 +1878,13 @@ static void _device_link_service_register_wifi_domain(void)
     {
         return;
     }
+    /* Explicit capability gate: the Wi-Fi domain is published only when
+     * the product enables it AND the owner adapter is ready. This removes
+     * the implicit startup-order dependence on connectivity readiness. */
+#if !CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
+    LOG_I("wifi domain not advertised (capability gate closed)");
+    return;
+#endif
     if (!device_link_wifi_adapter_is_ready())
     {
         LOG_W("wifi adapter not ready: domain not advertised");
@@ -2296,6 +2320,13 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     }
     if (result == ESP_OK && s_service.bluetooth_enabled)
     {
+        /* The Wi-Fi domain must be frozen into the router before the GATT
+         * service initializes the link service (boot_id is still zero).
+         * Startup and the runtime_start path share this registration. */
+        _device_link_service_register_wifi_domain();
+    }
+    if (result == ESP_OK && s_service.bluetooth_enabled)
+    {
         memset(&s_service.runtime_config, 0, sizeof(s_service.runtime_config));
         s_service.runtime_config.port = config->runtime_port;
         result = ble_runtime_init(&s_service.runtime_config);
@@ -2377,6 +2408,12 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
             s_service.startup_gate_released)
     {
         result = _device_link_service_acquire_slow_lease();
+    }
+    if (result == ESP_OK && s_service.bluetooth_enabled)
+    {
+        /* Public advertising is live after startup: install the derived
+         * public password, mirroring the runtime_start path. */
+        _device_link_service_open_public_verifier();
     }
     if (result != ESP_OK)
     {
