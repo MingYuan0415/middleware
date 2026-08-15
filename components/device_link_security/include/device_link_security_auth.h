@@ -15,7 +15,7 @@ extern "C" {
 #define DEVICE_LINK_SECURITY_AUTH_MAGIC 0x4d54444cU
 
 /** @brief Committed-record schema version. */
-#define DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION 1U
+#define DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION 2U
 
 /** @brief Credential identifier length (bytes). */
 #define DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES 16U
@@ -28,6 +28,9 @@ extern "C" {
 
 /** @brief SRP verifier length for the 3072-bit group (bytes). */
 #define DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES 384U
+
+/** @brief Maximum durable permission grants in one authorization. */
+#define DEVICE_LINK_SECURITY_AUTH_MAX_GRANTS 16U
 
 /** @brief Peer identity address length (bytes). */
 #define DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES 6U
@@ -44,19 +47,16 @@ extern "C" {
 /** @brief Resolved random identity address. */
 #define DEVICE_LINK_SECURITY_PEER_ADDR_RANDOM_ID 3U
 
-/** @brief Reserved tail bytes fixing the on-wire record size (no ABI
- * padding is ever persisted). */
-#define DEVICE_LINK_SECURITY_AUTH_RESERVED_BYTES 1U
-
 /**
  * @brief Committed authorization record.
  *
- * The only state that grants authorization (device-link-security-v1).
+ * The only state that grants authorization (Device Link v2).
  * The plaintext application password is never persisted.
  *
- * The record is persisted as a raw blob, so the layout is frozen: explicit
- * reserved tail bytes replace compiler padding and the static asserts below
- * pin every field offset. The reserved bytes are always written zeroed.
+ * The record is persisted as a raw blob, so the layout is frozen and the
+ * static asserts below pin every field offset. Grant identifiers are sorted,
+ * unique, and restored exactly; authorization is never inferred from a
+ * boolean bound state.
  */
 typedef struct device_link_security_auth_record
 {
@@ -66,9 +66,10 @@ typedef struct device_link_security_auth_record
     uint8_t device_auth_id[DEVICE_LINK_SECURITY_AUTH_ID_BYTES];
     uint8_t salt[DEVICE_LINK_SECURITY_AUTH_SALT_BYTES];
     uint8_t verifier[DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES];
+    uint16_t granted_permissions[DEVICE_LINK_SECURITY_AUTH_MAX_GRANTS];
+    uint8_t granted_permission_count;
     uint8_t peer_addr_type; /**< BLE peer identity address type. */
     uint8_t peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES];
-    uint8_t reserved[DEVICE_LINK_SECURITY_AUTH_RESERVED_BYTES];
 } device_link_security_auth_record_t;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -90,17 +91,21 @@ _Static_assert(
     offsetof(device_link_security_auth_record_t, verifier) == 56U,
     "auth record verifier offset");
 _Static_assert(
-    offsetof(device_link_security_auth_record_t, peer_addr_type) == 440U,
+    offsetof(device_link_security_auth_record_t, granted_permissions) == 440U,
+    "auth record grants offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, granted_permission_count) ==
+    472U,
+    "auth record grant count offset");
+_Static_assert(
+    offsetof(device_link_security_auth_record_t, peer_addr_type) == 473U,
     "auth record peer type offset");
 _Static_assert(
-    offsetof(device_link_security_auth_record_t, peer_addr) == 441U,
+    offsetof(device_link_security_auth_record_t, peer_addr) == 474U,
     "auth record peer addr offset");
 _Static_assert(
-    offsetof(device_link_security_auth_record_t, reserved) == 447U,
-    "auth record reserved offset");
-_Static_assert(
-    sizeof(device_link_security_auth_record_t) == 448U,
-    "auth record size is frozen at 448 bytes");
+    sizeof(device_link_security_auth_record_t) == 480U,
+    "auth record size is frozen at 480 bytes");
 #endif
 
 /**
