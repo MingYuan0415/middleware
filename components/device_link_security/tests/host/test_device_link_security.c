@@ -937,6 +937,45 @@ static void _test_long_term_verifier(void)
     assert(device_link_security_load_auth_record(&record) ==
            ESP_ERR_NOT_FOUND);
     assert(device_link_security_is_authenticated() == false);
+    /* Erase failure (storage fault) must not flip startup into a different
+     * class: the loader still reports unbound, and the next startup retries
+     * the erase until the corrupt slot is cleared. */
+    assert(nv_storage_set_blob(TEST_AUTH_KEY, legacy_blob,
+                               sizeof(legacy_blob)) == ESP_OK);
+    nv_storage_fake_fail_next_erase(ESP_FAIL);
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_NOT_FOUND);
+    assert(device_link_security_is_authenticated() == false);
+    /* A power cut between the erase and the next boot leaves the corrupt
+     * record or no record; both must still start unbound. */
+    nv_storage_fake_power_cycle();
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_NOT_FOUND);
+    assert(device_link_security_load_auth_record(&record) ==
+           ESP_ERR_NOT_FOUND);
+    assert(device_link_security_is_authenticated() == false);
+    /* Recovery matrix: after normalization the slot accepts a fresh bind
+     * and the long-term verifier loads again. */
+    assert(device_link_security_derive_long_term_verifier(
+               password, sizeof(password),
+               record.salt, record.verifier) == ESP_OK);
+    record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&record);
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        record.credential_id[i] = (uint8_t)(i + 1U);
+        record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    record.peer_addr_type = 1U;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES; ++i)
+    {
+        record.peer_addr[i] = (uint8_t)(0xa0U + i);
+    }
+    record.peer_addr[DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES - 1U] = 0xe5U;
+    assert(device_link_security_save_auth_record(&record) == ESP_OK);
+    assert(device_link_security_load_long_term_verifier() == ESP_OK);
+    assert(device_link_security_is_authenticated() == false);
     device_link_security_deinit();
 }
 

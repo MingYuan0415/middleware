@@ -3053,13 +3053,15 @@ static bool _ble_link_service_v2_parse_operation_id(
 }
 
 /**
- * @brief Whether an asynchronous method declares an operation result
- * payload in its startup-frozen descriptor.
+ * @brief Whether an asynchronous method declares a non-empty operation
+ * result payload in its startup-frozen descriptor.
  *
  * The contract freezes the operation result per method (e.g. start_scan
- * declares Empty, the profile-mutating Wi-Fi methods declare WifiStatus).
- * A SUCCEEDED record may only carry the payload of a method that declares
- * one; anything else is dropped defensively.
+ * declares core.v2.Empty, the profile-mutating Wi-Fi methods declare
+ * WifiStatus). A SUCCEEDED record may only carry the payload of a method
+ * that declares a non-empty result message: a declared Empty is still a
+ * declared result, but it must never be encoded, so it is excluded here
+ * explicitly rather than by payload presence.
  */
 static bool _ble_link_service_v2_operation_declares_result(
     uint8_t domain_id, uint8_t method_id)
@@ -3080,7 +3082,8 @@ static bool _ble_link_service_v2_operation_declares_result(
 
             if (desc->method_id == method_id)
             {
-                return desc->operation_result_schema != NULL;
+                return desc->operation_result_schema != NULL &&
+                       desc->operation_result_schema->field_count != 0U;
             }
         }
     }

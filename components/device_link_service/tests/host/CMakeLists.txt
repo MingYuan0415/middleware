@@ -66,6 +66,7 @@ target_compile_definitions(test_device_link_service PRIVATE
     UNIT_TEST_HOST
     CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144
     CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
+    CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED=1
 )
 target_include_directories(test_device_link_service PRIVATE
                            "${CMAKE_CURRENT_LIST_DIR}/fakes"

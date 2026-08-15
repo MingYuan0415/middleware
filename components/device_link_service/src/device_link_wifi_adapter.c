@@ -111,10 +111,17 @@ static const device_link_tlv_field_rule_t s_status_fields[] =
         .flags = DEVICE_LINK_TLV_RULE_NONZERO,
     },
 };
+/* WifiStatus operation result payloads never exceed this bound: it must
+ * stay equal to s_status_schema.maximum_encoded_bytes. A 256-byte stack
+ * buffer keeps the completion bridge out of the 3 KB operation-result
+ * cap, which would otherwise be an unnecessary 3000-byte frame on the
+ * connectivity publisher stack. */
+#define WIFI_STATUS_RESULT_MAX_BYTES 256U
+
 static const device_link_tlv_schema_t s_status_schema =
 {
     .fields = s_status_fields, .field_count = 11U,
-    .maximum_encoded_bytes = 256U,
+    .maximum_encoded_bytes = WIFI_STATUS_RESULT_MAX_BYTES,
 };
 
 static const device_link_tlv_field_rule_t s_network_fields[] =
@@ -875,7 +882,10 @@ static device_link_status_t _bridge_map_failure(
 static void _bridge_update_status(
     const connectivity_manager_status_snapshot_t *snapshot)
 {
-    uint8_t result[DEVICE_LINK_OPERATION_RESULT_BYTES];
+    /* WifiStatus payloads are bounded by WIFI_STATUS_RESULT_MAX_BYTES;
+     * the full operation-result cap (3 KB) would be wasted stack on the
+     * connectivity publisher context. */
+    uint8_t result[WIFI_STATUS_RESULT_MAX_BYTES];
     size_t result_len = 0U;
     device_link_status_t status = _bridge_map_failure(snapshot->failure);
     device_link_operation_state_t state = DEVICE_LINK_OPERATION_FAILED;
@@ -991,6 +1001,15 @@ void device_link_wifi_adapter_bridge_stop(void)
     {
         return;
     }
-    (void)event_bus_unsubscribe(s_bridge_handle);
+    const esp_err_t result = event_bus_unsubscribe(s_bridge_handle);
+
+    if (result != ESP_OK)
+    {
+        /* Retain the handle on failure so a retry can unsubscribe: clearing
+         * it would let bridge_start subscribe again and duplicate the live
+         * callback for the same connectivity events. */
+        LOG_W("bridge unsubscribe failed result=%d", result);
+        return;
+    }
     s_bridge_handle = EVENT_BUS_SUB_HANDLE_INVALID;
 }

@@ -2414,14 +2414,22 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
          * public password, mirroring the runtime_start path. */
         _device_link_service_open_public_verifier();
     }
-    if (result == ESP_OK && s_service.bluetooth_enabled)
+#if CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
+    if (result == ESP_OK)
     {
         /* The completion bridge consumes connectivity manager terminal
-         * snapshots into the Core v2 operation table; it is independent of
-         * the BLE runtime and survives runtime stop/start cycles, so it is
-         * installed once here and removed only at full teardown. */
+         * snapshots into the Core v2 operation table. It is deliberately
+         * independent of the BLE runtime and of the Bluetooth policy:
+         * a device that boots with the persisted Bluetooth-disabled policy
+         * and later enables the runtime must already have the bridge
+         * installed, otherwise the Wi-Fi domain registers while operation
+         * completions are never written back and table slots leak. The
+         * compile-time capability gate is the only subscription decision
+         * (matching the publish decision); with the gate closed there is
+         * no Wi-Fi domain and no operation record to complete. */
         result = device_link_wifi_adapter_bridge_start();
     }
+#endif
     if (result != ESP_OK)
     {
         return _device_link_service_rollback_init(result);

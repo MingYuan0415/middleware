@@ -1102,6 +1102,170 @@ static void test_snapshot_request(void)
     }
 }
 
+static device_link_status_t _empty_scan_handler(
+    const device_link_request_context_t *context,
+    const uint8_t *request, size_t request_len,
+    uint8_t *response, size_t response_capacity, size_t *response_len,
+    void *arg)
+{
+    (void)context;
+    (void)request;
+    (void)request_len;
+    (void)response;
+    (void)response_capacity;
+    (void)response_len;
+    (void)arg;
+    return DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION;
+}
+
+static void test_operation_declared_empty_result_never_encoded(void)
+{
+    /* A wifi-like async method whose descriptor declares core.v2.Empty.
+     * A SUCCEEDED record for such a method must never carry a result
+     * payload even if one was attached: the encoder excludes declared
+     * Empty results explicitly instead of trusting payload presence. */
+    static const device_link_tlv_schema_t s_test_empty_schema =
+    {
+        .fields = NULL,
+        .field_count = 0U,
+        .maximum_encoded_bytes = 0U,
+    };
+    static const device_link_method_descriptor_t s_test_methods[] =
+    {
+        {
+            .method_id = 2U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_SCAN,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_test_empty_schema,
+            .response_schema = &s_test_empty_schema,
+            .operation_result_schema = &s_test_empty_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _empty_scan_handler,
+        },
+    };
+    static const device_link_domain_descriptor_t s_test_domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U,
+        .minor = 0U,
+        .methods = s_test_methods,
+        .method_count = 1U,
+    };
+    static const uint8_t bogus_payload[] = {0x08U, 0x01U};
+    uint64_t operation_id = 0U;
+
+    /* Register before init (boot_id is still zero), like the service does
+     * before the router seals its startup descriptor set. */
+    ble_link_service_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_set_domain_descriptors(
+                          &s_test_domain, 1U));
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
+    ble_link_events_init();
+    _establish_session();
+    _set_facts(true, true, true);
+    (void)device_link_security_init(&s_sec_config);
+    /* GetOperation is a CORE_OPERATE method: the session must be
+     * authorized against a matching auth record. */
+    device_link_security_auth_record_t auth_record;
+
+    memset(&auth_record, 0, sizeof(auth_record));
+    auth_record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    auth_record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&auth_record);
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        auth_record.credential_id[i] = (uint8_t)(i + 1U);
+        auth_record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    auth_record.peer_addr_type = 1U;
+    auth_record.peer_addr[0] = 0x11U;
+    auth_record.peer_addr[5] = 0xeaU;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        auth_record.salt[i] = (uint8_t)(0x80U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        auth_record.verifier[i] = (uint8_t)(0xa0U + i);
+    }
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_save_auth_record(&auth_record));
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 2U, 777U, NULL, NULL,
+                          &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    /* A buggy bridge attaches a payload despite the Empty declaration;
+     * update() admits it defensively, the encoder must not expose it. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
+                          777U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, bogus_payload,
+                          sizeof(bogus_payload)));
+    uint8_t request[DEVICE_LINK_WIRE_HEADER_BYTES + 16U];
+    device_link_wire_header_t header;
+    device_link_tlv_writer_t writer;
+    size_t body_len = 0U;
+
+    memset(&header, 0, sizeof(header));
+    header.kind = DEVICE_LINK_MESSAGE_REQUEST;
+    header.domain_id = DEVICE_LINK_DOMAIN_CORE;
+    header.domain_major = 2U;
+    header.method_id = 6U; /* GetOperation */
+    header.call_id = 1U;
+    header.boot_id = BOOT_ID;
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_encode_header(
+                          &header, request));
+    device_link_tlv_writer_init(
+        &writer, &request[DEVICE_LINK_WIRE_HEADER_BYTES], 16U);
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_put_fixed64(
+                          &writer, 1U, operation_id));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_writer_finish(
+                          &writer, &body_len));
+
+    _clear_capture();
+    _feed_single(request, DEVICE_LINK_WIRE_HEADER_BYTES + body_len);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                          s_outbound, s_outbound_len, &header));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_MESSAGE_RESPONSE, header.kind);
+
+    device_link_status_t status = DEVICE_LINK_STATUS_INTERNAL;
+    size_t body_offset = DEVICE_LINK_WIRE_HEADER_BYTES;
+
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                          &s_outbound[body_offset],
+                          s_outbound_len - body_offset, &status));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, status);
+    body_offset += DEVICE_LINK_RESPONSE_STATUS_BYTES;
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    bool saw_state_succeeded = false;
+    bool saw_result_payload = false;
+
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                          &reader, &s_outbound[body_offset],
+                          s_outbound_len - body_offset));
+    while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
+            ESP_OK && has_field)
+    {
+        if (field.id == 4U && field.value.unsigned_value ==
+                DEVICE_LINK_OPERATION_SUCCEEDED)
+        {
+            saw_state_succeeded = true;
+        }
+        if (field.id == 6U)
+        {
+            saw_result_payload = true;
+        }
+    }
+    TEST_ASSERT_TRUE(saw_state_succeeded);
+    TEST_ASSERT_TRUE(!saw_result_payload);
+}
+
 static void test_snapshot_zero_baseline_returns_internal(void)
 {
     static const uint8_t request[] =
@@ -3376,6 +3540,7 @@ int main(void)
     test_manifest_response_bytes();
     test_typed_tlv_manifest_request();
     test_typed_tlv_snapshot_has_fixed_link_state();
+    test_operation_declared_empty_result_never_encoded();
     test_snapshot_request();
     test_snapshot_zero_baseline_returns_internal();
     test_authorize_flow();

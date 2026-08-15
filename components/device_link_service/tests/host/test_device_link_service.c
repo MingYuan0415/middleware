@@ -3482,6 +3482,73 @@ static void _test_operation_bridge_completes_table(void)
     assert(s_connectivity_callback == NULL);
 }
 
+static void _test_bridge_survives_disabled_boot_enable(void)
+{
+    /* Persisted Bluetooth-disabled policy blob (little-endian host):
+     * {magic 0x444c4254, version 1, enabled 0, reserved 0}. */
+    static const uint8_t policy_disabled[8] =
+    {
+        0x54U, 0x42U, 0x4cU, 0x44U, 0x01U, 0x00U, 0x00U, 0x00U,
+    };
+    device_link_service_status_t status;
+
+    _reset_host();
+    nv_storage_fake_reset();
+    assert(nv_storage_set_blob("dl_bt_policy", policy_disabled,
+                               sizeof(policy_disabled)) == ESP_OK);
+    const device_link_security_config_t security_config =
+    {
+        .username = "microtech",
+        .session_id = 1U,
+        .request_cb = _sec_stub_request,
+        .request_arg = NULL,
+    };
+
+    assert(device_link_security_init(&security_config) == ESP_OK);
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = s_runtime_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = TEST_WINDOW_MS;
+    assert(device_link_service_init(&s_config) == ESP_OK);
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(!status.enabled);
+    assert(!s_port_started);
+    /* The completion bridge is installed at init even though BLE is off:
+     * the Wi-Fi domain registers when the runtime is enabled later, and
+     * operation completions must not be lost. */
+    assert(s_connectivity_callback != NULL);
+    assert(device_link_service_set_enabled(true,
+                                           DEVICE_LINK_SERVICE_WAIT_FOREVER) == ESP_OK);
+    assert(device_link_service_get_status(&status) == ESP_OK);
+    assert(status.enabled);
+    assert(s_port_started);
+    assert(s_connectivity_callback != NULL);
+    /* End-to-end after enable: admit, publish terminal, table completes. */
+    uint64_t table_id = 0U;
+
+    assert(ble_link_service_async_operation_start(
+               DEVICE_LINK_DOMAIN_WIFI, 4U, 71U, NULL, NULL,
+               &table_id) == ESP_OK);
+    assert(table_id != 0U);
+    connectivity_manager_status_snapshot_t terminal;
+
+    memset(&terminal, 0, sizeof(terminal));
+    terminal.generation = 1U;
+    terminal.operation_id = 71U;
+    terminal.operation_complete = true;
+    terminal.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    terminal.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+    terminal.last_error = ESP_OK;
+    terminal.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+    terminal.auto_connect = true;
+    _test_publish_connectivity_status(&terminal);
+    assert(ble_link_service_async_operation_update(
+               71U, DEVICE_LINK_OPERATION_RUNNING, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_ERR_NOT_FOUND);
+    _deinit_service();
+    assert(s_connectivity_callback == NULL);
+}
+
 static void test_public_verifier_getter_fail_closed(void)
 {
     /* The public verifier is installed only from a definite, non-zero
@@ -3570,6 +3637,7 @@ int main(void)
     _test_deinit_rechecks_after_final_host_barrier();
     _test_deinit_drains_journaled_revoke_after_acl_terminal();
     _test_operation_bridge_completes_table();
+    _test_bridge_survives_disabled_boot_enable();
     puts("device_link_service host tests passed");
     return 0;
 }

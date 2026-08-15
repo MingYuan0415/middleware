@@ -17,7 +17,8 @@ version, request/response schema, permission, payload limits and owner handler;
 there is no runtime registration or reflection. Core is domain `0`; Wi-Fi,
 Cloud and Location use reserved IDs `1`, `2` and `3`. Core is always
 registered; the Wi-Fi domain is registered conditionally (explicit
-DEVICE_LINK_SERVICE_WIFI_ADVERTISED capability gate plus a ready adapter) and
+DEVICE_LINK_SERVICE_WIFI_ADVERTISED capability gate; the compile-time gate is
+the only publish decision) and
 is currently not advertised in production builds. Domain adapters must be
 complete and validated before a capability is published.
 
