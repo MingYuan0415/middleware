@@ -36,6 +36,114 @@ static uint64_t _read_le64(const uint8_t *bytes)
     return value;
 }
 
+
+static void _test_invalid_response_statuses(void)
+{
+    for (size_t i = 0U; i < s_invalid_resp_count; ++i)
+    {
+        device_link_status_t status = 0;
+
+        assert(device_link_wire_decode_status(
+                   s_invalid_resp_hex[i], s_invalid_resp_len[i],
+                   &status) == ESP_ERR_INVALID_RESPONSE);
+    }
+    printf("invalid response statuses: %zu rejected\n",
+           s_invalid_resp_count);
+}
+
+static void _test_direction_cases(void)
+{
+    for (size_t i = 0U; i < s_direction_count; ++i)
+    {
+        device_link_wire_header_t header;
+        const esp_err_t decode_result = device_link_wire_decode_header(
+                                            s_direction_hex[i],
+                                            s_direction_len[i], &header);
+        const bool expected_valid = s_direction_valid[i] != 0;
+        /* The device receives requests (kind 1) and the App receives
+         * responses (kind 2); the opposite direction is invalid. */
+        const bool direction_ok =
+            (s_direction_receiver[i] == 1 &&
+             header.kind == DEVICE_LINK_MESSAGE_REQUEST) ||
+            (s_direction_receiver[i] == 2 &&
+             header.kind == DEVICE_LINK_MESSAGE_RESPONSE);
+
+        assert(decode_result == ESP_OK);
+        assert(direction_ok == expected_valid);
+    }
+    printf("direction cases: %zu checked\n", s_direction_count);
+}
+
+static void _test_advertising_vectors(void)
+{
+    assert(s_adv_public[0] == 2U);
+    assert(s_adv_public[1] == 0U);
+    assert(s_adv_public[2] != 0U || s_adv_public[3] != 0U ||
+           s_adv_public[4] != 0U);
+    assert(s_adv_bindable[0] == 2U);
+    assert(s_adv_bindable[1] == 1U);
+    assert(s_adv_bindable[2] != 0U || s_adv_bindable[3] != 0U ||
+           s_adv_bindable[4] != 0U);
+    printf("advertising vectors: public/bindable checked\n");
+}
+
+static device_link_status_t _dummy_core_method(
+    const device_link_request_context_t *context,
+    const uint8_t *request, size_t request_len,
+    uint8_t *response, size_t response_capacity, size_t *response_len,
+    void *arg)
+{
+    (void)context;
+    (void)request;
+    (void)request_len;
+    (void)response;
+    (void)response_capacity;
+    (void)response_len;
+    (void)arg;
+    return DEVICE_LINK_STATUS_INTERNAL;
+}
+
+static void _test_channel_methods_matrix(void)
+{
+    /* The frozen matrix lists the Core methods with their session/control
+     * channel; the startup-frozen Core descriptor must agree. */
+    device_link_core_t core;
+    device_link_core_callbacks_t callbacks;
+
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.method = _dummy_core_method;
+    assert(device_link_core_init(&core, &callbacks) == ESP_OK);
+    for (size_t i = 0U; i < s_channel_method_count; ++i)
+    {
+        bool found = false;
+
+        if (s_channel_domain[i] != DEVICE_LINK_DOMAIN_CORE)
+        {
+            /* Non-core domains are validated by their own adapters once
+             * registered; this matrix row is not checkable here. */
+            continue;
+        }
+        for (size_t m = 0U; m < core.domain.method_count; ++m)
+        {
+            if (core.domain.methods[m].method_id == s_channel_method[i])
+            {
+                const device_link_channel_t expected_channel =
+                    s_channel_kind[i] == 1 ?
+                    DEVICE_LINK_CHANNEL_SESSION :
+                    DEVICE_LINK_CHANNEL_CONTROL;
+
+                assert(core.domain.methods[m].channel == expected_channel);
+                found = true;
+                break;
+            }
+        }
+        assert(found);
+    }
+    printf("channel methods matrix: %zu entries checked\n",
+           s_channel_method_count);
+}
+
+
 static void _test_link_state_vectors(void)
 {
     size_t skipped = 0U;
@@ -237,17 +345,27 @@ static void _test_authorization_schemas(void)
         bool response;
     } vectors[] =
     {
-        {s_auth_prepare, s_auth_prepare_len, s_auth_prepare_method,
-         s_auth_prepare_is_response},
-        {s_auth_prepare_response, s_auth_prepare_response_len,
-         s_auth_prepare_response_method, s_auth_prepare_response_is_response},
-        {s_auth_commit_probe, s_auth_commit_probe_len,
-         s_auth_commit_probe_method, s_auth_commit_probe_is_response},
-        {s_auth_confirmation_required, s_auth_confirmation_required_len,
-         s_auth_confirmation_required_method,
-         s_auth_confirmation_required_is_response},
-        {s_auth_commit_success, s_auth_commit_success_len,
-         s_auth_commit_success_method, s_auth_commit_success_is_response},
+        {
+            s_auth_prepare, s_auth_prepare_len, s_auth_prepare_method,
+            s_auth_prepare_is_response
+        },
+        {
+            s_auth_prepare_response, s_auth_prepare_response_len,
+            s_auth_prepare_response_method, s_auth_prepare_response_is_response
+        },
+        {
+            s_auth_commit_probe, s_auth_commit_probe_len,
+            s_auth_commit_probe_method, s_auth_commit_probe_is_response
+        },
+        {
+            s_auth_confirmation_required, s_auth_confirmation_required_len,
+            s_auth_confirmation_required_method,
+            s_auth_confirmation_required_is_response
+        },
+        {
+            s_auth_commit_success, s_auth_commit_success_len,
+            s_auth_commit_success_method, s_auth_commit_success_is_response
+        },
     };
 
     for (size_t i = 0U; i < sizeof(vectors) / sizeof(vectors[0]); ++i)
@@ -269,6 +387,10 @@ int main(void)
     _test_link_state_vectors();
     _test_application_headers();
     _test_response_statuses();
+    _test_invalid_response_statuses();
+    _test_direction_cases();
+    _test_advertising_vectors();
+    _test_channel_methods_matrix();
     _test_framing_vectors();
     _test_authorization_schemas();
     puts("contract_fixtures: all fixture vectors passed");

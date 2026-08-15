@@ -114,6 +114,25 @@ esp_err_t device_link_operation_update(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* Frozen operation-state semantics (core v2 OperationStatus): in-flight
+     * states report OK, SUCCEEDED reports OK and may carry the declared
+     * result payload, FAILED requires a non-OK error, and non-success
+     * terminal records never carry a result payload. */
+    const bool in_flight = state == DEVICE_LINK_OPERATION_PENDING ||
+                           state == DEVICE_LINK_OPERATION_RUNNING;
+    const bool non_success_terminal =
+        state == DEVICE_LINK_OPERATION_FAILED ||
+        state == DEVICE_LINK_OPERATION_CANCELED;
+
+    if ((in_flight && status != DEVICE_LINK_STATUS_OK) ||
+            (state == DEVICE_LINK_OPERATION_SUCCEEDED &&
+             status != DEVICE_LINK_STATUS_OK) ||
+            (state == DEVICE_LINK_OPERATION_FAILED &&
+             status == DEVICE_LINK_STATUS_OK) ||
+            (non_success_terminal && result_len != 0U))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     device_link_operation_t *operation = _find(table, operation_id);
 
     if (operation == NULL)

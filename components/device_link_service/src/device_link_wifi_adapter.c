@@ -370,20 +370,20 @@ static device_link_status_t _encode_status(
             device_link_tlv_put_uint(&writer, 3U,
                                      (uint64_t)status->failure + 1U) != ESP_OK ||
             (status->ssid[0] != '\0' && device_link_tlv_put_bytes(
-                &writer, 4U, (const uint8_t *)status->ssid,
-                strlen(status->ssid)) != ESP_OK) ||
+                 &writer, 4U, (const uint8_t *)status->ssid,
+                 strlen(status->ssid)) != ESP_OK) ||
             device_link_tlv_put_bool(&writer, 5U, status->ipv4_address != 0U) !=
             ESP_OK || device_link_tlv_put_bool(&writer, 6U,
-                                                status->saved_profile) != ESP_OK ||
+                    status->saved_profile) != ESP_OK ||
             device_link_tlv_put_bool(&writer, 7U,
                                      status->profile_persisted) != ESP_OK ||
             device_link_tlv_put_bool(&writer, 8U, status->auto_connect) !=
             ESP_OK || device_link_tlv_put_bool(&writer, 9U, status->manual_hold) !=
             ESP_OK || device_link_tlv_put_fixed64(&writer, 10U,
-                                                  status->profile_revision) !=
+                    status->profile_revision) !=
             ESP_OK || (status->applied_client_sync_id != 0U &&
                        device_link_tlv_put_fixed64(&writer, 11U,
-                           status->applied_client_sync_id) != ESP_OK) ||
+                               status->applied_client_sync_id) != ESP_OK) ||
             device_link_tlv_writer_finish(&writer, response_len) != ESP_OK)
     {
         return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
@@ -421,14 +421,23 @@ static device_link_status_t _wifi_handler(
     }
     if (method == WIFI_METHOD_START_SCAN)
     {
-        if (!_read_message(request, request_len, &s_start_scan_schema,
-                           &(device_link_tlv_reader_t){0}))
+        /* The optional force_refresh field is accepted and validated by
+         * the schema. The connectivity manager has no scan cache: every
+         * request starts a fresh scan, so the "always refresh" behavior
+         * is a strict superset of force_refresh=false semantics. The field
+         * is decoded so the wire value is never silently dropped. */
+        bool force_refresh = false;
+
+        if (request_len != 0U &&
+                !_read_bool(request, request_len, &s_start_scan_schema,
+                            &force_refresh))
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        (void)force_refresh;
         result = connectivity_manager_request_scan(&operation_id);
         return _encode_operation(method, result, operation_id, response,
-                                  response_capacity, response_len);
+                                 response_capacity, response_len);
     }
     if (method == WIFI_METHOD_GET_SCAN_RESULTS)
     {
@@ -483,7 +492,7 @@ static device_link_status_t _wifi_handler(
             /* The requested page is past the end of the snapshot. */
             if (device_link_tlv_put_bool(&writer, 4U, false) != ESP_OK ||
                     device_link_tlv_put_bool(&writer, 5U,
-                        scan.truncated) != ESP_OK ||
+                                             scan.truncated) != ESP_OK ||
                     device_link_tlv_writer_finish(&writer, response_len) !=
                     ESP_OK)
             {
@@ -502,19 +511,19 @@ static device_link_status_t _wifi_handler(
 
             device_link_tlv_writer_init(&nested, network, sizeof(network));
             if (device_link_tlv_put_bytes(&nested, 1U,
-                    (const uint8_t *)scan.records[i].ssid,
-                    strlen(scan.records[i].ssid)) != ESP_OK ||
+                                          (const uint8_t *)scan.records[i].ssid,
+                                          strlen(scan.records[i].ssid)) != ESP_OK ||
                     device_link_tlv_put_sint(&nested, 2U,
-                        scan.records[i].rssi) != ESP_OK ||
+                                             scan.records[i].rssi) != ESP_OK ||
                     device_link_tlv_put_uint(&nested, 3U,
-                        scan.records[i].channel) != ESP_OK ||
+                                             scan.records[i].channel) != ESP_OK ||
                     device_link_tlv_put_uint(&nested, 4U,
-                        (uint64_t)scan.records[i].security + 1U) != ESP_OK ||
+                                             (uint64_t)scan.records[i].security + 1U) != ESP_OK ||
                     device_link_tlv_put_bool(&nested, 5U,
-                        scan.records[i].saved) != ESP_OK ||
+                                             scan.records[i].saved) != ESP_OK ||
                     device_link_tlv_writer_finish(&nested, &network_len) !=
                     ESP_OK || device_link_tlv_put_bytes(&writer, 3U, network,
-                        network_len) != ESP_OK)
+                            network_len) != ESP_OK)
             {
                 return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
             }
@@ -610,7 +619,7 @@ static device_link_status_t _wifi_handler(
         result = connectivity_manager_request_sync_profile(
                      &credentials, sync_id, auto_connect, &operation_id);
         return _encode_operation(method, result, operation_id, response,
-                                  response_capacity, response_len);
+                                 response_capacity, response_len);
     }
     if (method == WIFI_METHOD_DISCONNECT)
     {
@@ -664,7 +673,7 @@ static const device_link_method_descriptor_t s_methods[] =
         .request_schema = &s_empty_schema,
         .response_schema = &s_status_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
-                                         DEVICE_LINK_STATUS_OK),
+            DEVICE_LINK_STATUS_OK),
         .handler = _wifi_handler,
     },
     {
@@ -677,7 +686,7 @@ static const device_link_method_descriptor_t s_methods[] =
         .request_schema = &s_start_scan_schema,
         .response_schema = &s_operation_accepted_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
-                                         DEVICE_LINK_STATUS_OK),
+            DEVICE_LINK_STATUS_OK),
         .handler = _wifi_handler,
     },
     {
@@ -689,7 +698,7 @@ static const device_link_method_descriptor_t s_methods[] =
         .request_schema = &s_scan_query_schema,
         .response_schema = &s_scan_results_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
-                                         DEVICE_LINK_STATUS_OK),
+            DEVICE_LINK_STATUS_OK),
         .handler = _wifi_handler,
     },
 #define WIFI_ASYNC_METHOD(id, permission, request_limit, request_type) \

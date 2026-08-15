@@ -114,7 +114,7 @@ static void _test_router(void)
             .request_schema = &s_value_schema,
             .response_schema = &s_value_schema,
             .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
-                                             DEVICE_LINK_STATUS_OK),
+                DEVICE_LINK_STATUS_OK),
             .handler = _handler,
             .handler_arg = &handler,
         },
@@ -254,6 +254,38 @@ static void _test_operations(void)
     assert(device_link_operation_update(
                &table, 20U, ids[0], DEVICE_LINK_OPERATION_RUNNING,
                DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_OK);
+    /* Frozen operation-state semantics: in-flight states report OK,
+     * FAILED requires a non-OK error, and non-success terminal records
+     * never carry a result payload. */
+    static const uint8_t payload[4] = {1U, 2U, 3U, 4U};
+
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_RUNNING,
+               DEVICE_LINK_STATUS_STORAGE, NULL, 0U) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_PENDING,
+               DEVICE_LINK_STATUS_INTERNAL, NULL, 0U) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_FAILED,
+               DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_FAILED,
+               DEVICE_LINK_STATUS_NOT_FOUND, payload,
+               sizeof(payload)) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_CANCELED,
+               DEVICE_LINK_STATUS_OK, payload,
+               sizeof(payload)) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_SUCCEEDED,
+               DEVICE_LINK_STATUS_CONFLICT, NULL, 0U) == ESP_ERR_INVALID_ARG);
+    /* The legal shapes still apply. */
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_FAILED,
+               DEVICE_LINK_STATUS_STORAGE, NULL, 0U) == ESP_OK);
+    assert(device_link_operation_update(
+               &table, 21U, ids[2], DEVICE_LINK_OPERATION_SUCCEEDED,
+               DEVICE_LINK_STATUS_OK, payload, sizeof(payload)) == ESP_OK);
     assert(device_link_operation_cancel(
                &table, 30U, ids[0]) == ESP_OK);
     assert(canceled_owner == 100U);

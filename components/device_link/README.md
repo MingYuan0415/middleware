@@ -15,9 +15,11 @@ wire type may be skipped, so minor additions do not require a firmware rebuild.
 The router uses startup-frozen descriptors. Each method binds a domain and
 version, request/response schema, permission, payload limits and owner handler;
 there is no runtime registration or reflection. Core is domain `0`; Wi-Fi,
-Cloud and Location use reserved IDs `1`, `2` and `3`. Only Core is currently
-registered in the firmware manifest. Domain adapters must be complete and
-validated before a capability is published.
+Cloud and Location use reserved IDs `1`, `2` and `3`. Core is always
+registered; the Wi-Fi domain is registered conditionally (explicit
+DEVICE_LINK_SERVICE_WIFI_ADVERTISED capability gate plus a ready adapter) and
+is currently not advertised in production builds. Domain adapters must be
+complete and validated before a capability is published.
 
 Replay protection uses fixed storage. A replay key includes boot ID, connection
 generation, Security 2 epoch, domain, method and call ID plus request length

@@ -99,16 +99,52 @@ def generate(fixture_dir: Path, out_path: Path) -> None:
                [])
 
     # --- wire.json: response statuses. ---
+    out.write("\n/* wire.json direction_cases. */\n")
+    emit_group(out, "s_direction",
+               [{"hex": vector["header_hex"],
+                 "receiver": 1 if vector["receiver"] == "device" else 2,
+                 "valid": vector["valid"]}
+                for vector in wire["direction_cases"]],
+               ["receiver", "valid"])
+
     out.write("\n/* wire.json responses (status bytes). */\n")
     emit_group(out, "s_response_status",
                [{"hex": vector["status_hex"]} for vector in wire["responses"]],
                [])
 
     # --- wire.json: link errors (status value -> status_hex). ---
+    out.write("\n/* wire.json invalid_responses. */\n")
+    emit_group(out, "s_invalid_resp",
+               [{"hex": vector["status_hex"]}
+                for vector in wire["invalid_responses"]], [])
+
     out.write("\n/* wire.json link_errors (value, status_hex). */\n")
     emit_group(out, "s_link_error",
                [{"hex": vector["status_hex"], "value": vector["value"]}
                 for vector in wire["link_errors"]], ["value"])
+
+    # --- wire.json: advertising service data. ---
+    out.write("\n/* wire.json advertising (service data, 5 bytes). */\n")
+    adv_public = bytes.fromhex(wire["advertising"]["public"])
+    adv_bindable = bytes.fromhex(wire["advertising"]["bindable"])
+    out.write("static const uint8_t s_adv_public[] = {" +
+              ", ".join(f"0x{b:02x}" for b in adv_public) + "};\n")
+    out.write("static const uint8_t s_adv_bindable[] = {" +
+              ", ".join(f"0x{b:02x}" for b in adv_bindable) + "};\n")
+
+    # --- wire.json: channel_methods matrix. ---
+    out.write("\n/* wire.json channel_methods. */\n")
+    out.write("static const uint8_t s_channel_domain[] = {" +
+              ", ".join(str(v["domain_id"])
+                        for v in wire["channel_methods"]) + "};\n")
+    out.write("static const uint8_t s_channel_method[] = {" +
+              ", ".join(str(v["method_id"])
+                        for v in wire["channel_methods"]) + "};\n")
+    out.write("static const uint8_t s_channel_kind[] = {" +
+              ", ".join("1" if v["channel"] == "session" else "2"
+                        for v in wire["channel_methods"]) + "};\n")
+    out.write(f"static const size_t s_channel_method_count = "
+              f"{len(wire['channel_methods'])};\n")
 
     # --- framing.json: valid standalone fragments. ---
     out.write("\n/* framing.json valid fragments. */\n")
