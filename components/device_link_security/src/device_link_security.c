@@ -1492,7 +1492,19 @@ esp_err_t device_link_security_load_long_term_verifier(void)
     const esp_err_t load_result =
         device_link_security_load_auth_record(&record);
 
-    if (load_result == ESP_ERR_NOT_FOUND)
+    if (load_result == ESP_ERR_INVALID_STATE)
+    {
+        /* A present but corrupt or schema-mismatched record (for example
+         * written by an older firmware revision) can never authenticate a
+         * session. Clear it and treat the device as unbound: startup stays
+         * available and a fresh bind overwrites the slot. The recovery
+         * path keeps its STORAGE/INTERNAL distinction via load_auth_record,
+         * so only this startup-oriented loader normalizes the damage. */
+        LOG_W("auth record invalid; erasing and continuing as unbound");
+        (void)device_link_security_erase_auth_record();
+    }
+    if (load_result == ESP_ERR_NOT_FOUND ||
+            load_result == ESP_ERR_INVALID_STATE)
     {
         const bool rebuild =
             s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM ||

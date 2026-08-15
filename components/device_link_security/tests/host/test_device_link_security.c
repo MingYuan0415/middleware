@@ -924,6 +924,19 @@ static void _test_long_term_verifier(void)
     assert(device_link_security_load_long_term_verifier() ==
            ESP_ERR_NOT_FOUND);
     assert(device_link_security_is_authenticated() == false);
+    /* A corrupt or schema-mismatched record (e.g. left by an older
+     * firmware) must not block startup: the startup loader erases it and
+     * reports unbound, while load_auth_record keeps reporting the damage
+     * for recovery paths. */
+    static const uint8_t legacy_blob[sizeof(record)] = {0x00, 0x11, 0x22};
+
+    assert(nv_storage_set_blob(TEST_AUTH_KEY, legacy_blob,
+                               sizeof(legacy_blob)) == ESP_OK);
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_NOT_FOUND);
+    assert(device_link_security_load_auth_record(&record) ==
+           ESP_ERR_NOT_FOUND);
+    assert(device_link_security_is_authenticated() == false);
     device_link_security_deinit();
 }
 

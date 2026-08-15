@@ -6246,9 +6246,13 @@ static esp_err_t _ble_nimble_port_link_security_init(void)
     result = device_link_security_load_long_term_verifier();
     if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
     {
-        device_link_security_deinit();
-        s_port.link_security_initialized = false;
-        return result;
+        /* A load failure (storage, allocation) must not block BLE startup:
+         * the device stays bindable, sessions fail closed per-session
+         * without a long-term verifier, and a fresh bind replaces the
+         * record. The security adapter itself remains initialized. */
+        LOG_W("long-term verifier load failed result=%d; continuing",
+              result);
+        result = ESP_OK;
     }
     return ESP_OK;
 }
