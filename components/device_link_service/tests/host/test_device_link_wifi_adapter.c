@@ -6,13 +6,25 @@
 #include <string.h>
 
 #include "connectivity_manager.h"
+#include "device_link_operation.h"
 #include "device_link_protocol.h"
 #include "device_link_tlv.h"
 #include "device_link_wifi_adapter.h"
+#include "event_bus.h"
 
-/* Test-only fake hook (fakes/connectivity_manager.c). */
+/* Test-only fake hooks (fakes/connectivity_manager.c, fakes/event_bus.c,
+ * fakes/ble_link_service_fake.c). */
 extern void connectivity_manager_fake_set_scan(
     const connectivity_manager_scan_snapshot_t *snapshot);
+extern void event_bus_fake_publish(event_bus_msg_id_t msg_id,
+                                   uint32_t sub_type, const void *payload,
+                                   size_t payload_size);
+extern void ble_link_service_fake_reset(void);
+extern unsigned ble_link_service_fake_update_count(void);
+extern uint64_t ble_link_service_fake_last_owner(void);
+extern device_link_operation_state_t ble_link_service_fake_last_state(void);
+extern device_link_status_t ble_link_service_fake_last_status(void);
+extern size_t ble_link_service_fake_last_result_len(void);
 
 static bool contains_byte(const uint8_t *data, size_t len, uint8_t value)
 {
@@ -249,11 +261,171 @@ static void test_unauthorized_calls_are_rejected(void)
            DEVICE_LINK_STATUS_PERMISSION_DENIED);
 }
 
+static void test_bridge_forwards_terminal_status(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 1U;
+    status.operation_id = 7U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+    status.last_error = ESP_OK;
+    status.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+    status.auto_connect = true;
+    status.operation_complete = true;
+
+    ble_link_service_fake_reset();
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    /* Idempotent. */
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_update_count() == 1U);
+    assert(ble_link_service_fake_last_owner() == 7U);
+    assert(ble_link_service_fake_last_state() ==
+           DEVICE_LINK_OPERATION_SUCCEEDED);
+    assert(ble_link_service_fake_last_status() == DEVICE_LINK_STATUS_OK);
+    /* WifiStatus payload attached for a result-declaring method. */
+    assert(ble_link_service_fake_last_result_len() != 0U);
+
+    /* A failed terminal maps the classified failure and drops the payload. */
+    status.operation_id = 8U;
+    status.state = CONNECTIVITY_MANAGER_STATE_OFFLINE;
+    status.failure = CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION;
+    status.last_error = ESP_ERR_INVALID_STATE;
+    status.operation_complete = true;
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_update_count() == 2U);
+    assert(ble_link_service_fake_last_owner() == 8U);
+    assert(ble_link_service_fake_last_state() == DEVICE_LINK_OPERATION_FAILED);
+    assert(ble_link_service_fake_last_status() ==
+           DEVICE_LINK_STATUS_PERMISSION_DENIED);
+    assert(ble_link_service_fake_last_result_len() == 0U);
+
+    /* Non-terminal snapshots are ignored. */
+    status.operation_complete = false;
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_update_count() == 2U);
+
+    device_link_wifi_adapter_bridge_stop();
+    /* Stop is idempotent and unsubscribes: no further updates. */
+    device_link_wifi_adapter_bridge_stop();
+    status.operation_complete = true;
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_update_count() == 2U);
+}
+
+static void test_bridge_forwards_terminal_scan(void)
+{
+    connectivity_manager_scan_snapshot_t scan;
+
+    memset(&scan, 0, sizeof(scan));
+    scan.generation = 1U;
+    scan.operation_id = 11U;
+    scan.running = false;
+    scan.last_error = ESP_OK;
+
+    ble_link_service_fake_reset();
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                           &scan, sizeof(scan));
+    assert(ble_link_service_fake_update_count() == 1U);
+    assert(ble_link_service_fake_last_owner() == 11U);
+    assert(ble_link_service_fake_last_state() ==
+           DEVICE_LINK_OPERATION_SUCCEEDED);
+    assert(ble_link_service_fake_last_status() == DEVICE_LINK_STATUS_OK);
+    /* start_scan declares core.v2.Empty: no result payload. */
+    assert(ble_link_service_fake_last_result_len() == 0U);
+
+    scan.operation_id = 12U;
+    scan.last_error = ESP_ERR_TIMEOUT;
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                           &scan, sizeof(scan));
+    assert(ble_link_service_fake_update_count() == 2U);
+    assert(ble_link_service_fake_last_owner() == 12U);
+    assert(ble_link_service_fake_last_state() == DEVICE_LINK_OPERATION_FAILED);
+    assert(ble_link_service_fake_last_status() ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(ble_link_service_fake_last_result_len() == 0U);
+
+    /* A running scan snapshot is not terminal. */
+    scan.running = true;
+    event_bus_fake_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                           &scan, sizeof(scan));
+    assert(ble_link_service_fake_update_count() == 2U);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_admit_uses_table_operation_id(void)
+{
+    const device_link_domain_descriptor_t *descriptor = NULL;
+    uint8_t request[64];
+    uint8_t response[128];
+    size_t request_len = 0U;
+    size_t response_len = 0U;
+    device_link_tlv_writer_t writer;
+
+    device_link_tlv_writer_init(&writer, request, sizeof(request));
+    assert(device_link_tlv_writer_finish(&writer, &request_len) == ESP_OK);
+    const device_link_request_context_t context =
+    {
+        .header =
+        {
+            .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+            .domain_major = 1U,
+            .method_id = 2U,
+            .call_id = 1U,
+            .boot_id = 1U,
+        },
+        .security_authenticated = true,
+        .authorized = true,
+    };
+
+    assert(device_link_wifi_adapter_get_descriptor(&descriptor) == ESP_OK);
+    assert(descriptor->methods[1].handler(&context, request, request_len,
+                                          response, sizeof(response),
+                                          &response_len,
+                                          descriptor->methods[1].handler_arg) ==
+           DEVICE_LINK_STATUS_OK);
+    /* The accepted operation encodes the table id, not the manager id. */
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has = false;
+    uint64_t table_id = 0U;
+
+    assert(device_link_tlv_reader_init(&reader, response, response_len) ==
+           ESP_OK);
+    while (device_link_tlv_reader_next(&reader, &field, &has) == ESP_OK &&
+            has)
+    {
+        if (field.id == 1U)
+        {
+            table_id = field.value.unsigned_value;
+        }
+    }
+    /* The accepted operation encodes the table operation id. */
+    assert(table_id != 0U);
+}
+
 int main(void)
 {
     test_descriptor_is_static_and_complete();
     test_credentials_are_delegated_without_echo();
     test_unauthorized_calls_are_rejected();
     test_scan_results_are_paged();
+    test_bridge_forwards_terminal_status();
+    test_bridge_forwards_terminal_scan();
+    test_admit_uses_table_operation_id();
     return 0;
 }

@@ -54,6 +54,11 @@ typedef struct device_link_method_descriptor
     uint16_t maximum_response_bytes;
     const device_link_tlv_schema_t *request_schema;
     const device_link_tlv_schema_t *response_schema;
+    /* Asynchronous methods declare the operation result message frozen in
+     * the domain contract: NULL when the method has no operation result,
+     * the Empty schema when a SUCCEEDED record must carry no result
+     * payload, or the result message schema (e.g. wifi.v1.WifiStatus). */
+    const device_link_tlv_schema_t *operation_result_schema;
     uint32_t response_body_status_mask;
     device_link_method_handler_t handler;
     void *handler_arg;

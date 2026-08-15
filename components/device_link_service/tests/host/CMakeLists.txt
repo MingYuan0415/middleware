@@ -130,6 +130,8 @@ set_tests_properties(device_link_service PROPERTIES TIMEOUT 20)
 add_executable(test_device_link_wifi_adapter
                test_device_link_wifi_adapter.c
                fakes/connectivity_manager.c
+               fakes/event_bus.c
+               fakes/ble_link_service_fake.c
                "${COMPONENT}/src/device_link_wifi_adapter.c"
                "${DEVICE_LINK_WIRE}/src/device_link_tlv.c")
 target_compile_features(test_device_link_wifi_adapter PRIVATE c_std_11)
@@ -140,6 +142,8 @@ target_include_directories(test_device_link_wifi_adapter PRIVATE
                            "${CMAKE_CURRENT_LIST_DIR}/fakes"
                            "${BLE_RUNTIME}/tests/host/fakes"
                            "${COMPONENT}/include"
+                           "${BLE_RUNTIME}/include"
+                           "${DEVICE_LINK_SECURITY}/include"
                            "${DEVICE_LINK_WIRE}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
                            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"

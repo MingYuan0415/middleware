@@ -3052,6 +3052,41 @@ static bool _ble_link_service_v2_parse_operation_id(
     return true;
 }
 
+/**
+ * @brief Whether an asynchronous method declares an operation result
+ * payload in its startup-frozen descriptor.
+ *
+ * The contract freezes the operation result per method (e.g. start_scan
+ * declares Empty, the profile-mutating Wi-Fi methods declare WifiStatus).
+ * A SUCCEEDED record may only carry the payload of a method that declares
+ * one; anything else is dropped defensively.
+ */
+static bool _ble_link_service_v2_operation_declares_result(
+    uint8_t domain_id, uint8_t method_id)
+{
+    for (size_t d = 0U; d < s_service.v2_domain_count; ++d)
+    {
+        const device_link_domain_descriptor_t *domain =
+            &s_service.v2_domains[d];
+
+        if (domain->domain_id != domain_id)
+        {
+            continue;
+        }
+        for (size_t m = 0U; m < domain->method_count; ++m)
+        {
+            const device_link_method_descriptor_t *desc =
+                &domain->methods[m];
+
+            if (desc->method_id == method_id)
+            {
+                return desc->operation_result_schema != NULL;
+            }
+        }
+    }
+    return false;
+}
+
 static device_link_status_t _ble_link_service_v2_encode_operation(
     const device_link_operation_t *operation, uint8_t *response,
     size_t capacity, size_t *response_len)
@@ -3076,7 +3111,9 @@ static device_link_status_t _ble_link_service_v2_encode_operation(
     {
         return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
     }
-    if (operation->result_len != 0U &&
+    if (_ble_link_service_v2_operation_declares_result(
+                operation->domain_id, operation->method_id) &&
+            operation->result_len != 0U &&
             device_link_tlv_put_bytes(
                 &writer, 6U, operation->result, operation->result_len) !=
             ESP_OK)
@@ -3624,6 +3661,60 @@ uint64_t ble_link_service_confirmation_token(void)
     }
     _ble_link_service_unlock();
     return token;
+}
+
+esp_err_t ble_link_service_async_operation_start(
+    uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
+    device_link_operation_cancel_t cancel, void *cancel_arg,
+    uint64_t *out_operation_id)
+{
+    if (out_operation_id == NULL || owner_id == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    if (!s_service.v2_ready)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = device_link_operation_start(
+                                 &s_service.v2_operations,
+                                 _ble_link_service_v2_now_ms(),
+                                 domain_id, method_id, owner_id,
+                                 cancel, cancel_arg, out_operation_id);
+
+    _ble_link_service_unlock();
+    return result;
+}
+
+esp_err_t ble_link_service_async_operation_update(
+    uint64_t owner_id, device_link_operation_state_t state,
+    device_link_status_t status, const uint8_t *result, size_t result_len)
+{
+    if (owner_id == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    device_link_operation_t operation;
+    const esp_err_t find_result = device_link_operation_find_by_owner(
+                                      &s_service.v2_operations, owner_id,
+                                      &operation);
+
+    if (find_result != ESP_OK)
+    {
+        _ble_link_service_unlock();
+        return find_result;
+    }
+    const esp_err_t result_status = device_link_operation_update(
+                                        &s_service.v2_operations,
+                                        _ble_link_service_v2_now_ms(),
+                                        operation.id, state, status,
+                                        result, result_len);
+
+    _ble_link_service_unlock();
+    return result_status;
 }
 
 esp_err_t ble_link_service_set_domain_descriptors(

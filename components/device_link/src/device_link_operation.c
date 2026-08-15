@@ -25,6 +25,28 @@ static device_link_operation_t *_find(
     return NULL;
 }
 
+esp_err_t device_link_operation_find_by_owner(
+    device_link_operation_table_t *table, uint64_t owner_id,
+    device_link_operation_t *out)
+{
+    if (table == NULL || out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_MAX_OPERATIONS; ++i)
+    {
+        const device_link_operation_t *operation = &table->slots[i];
+
+        if (operation->id != 0U && operation->owner_id == owner_id &&
+                !_terminal(operation->state))
+        {
+            *out = *operation;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
 void device_link_operation_sweep(
     device_link_operation_table_t *table, uint64_t now_ms)
 {

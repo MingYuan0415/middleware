@@ -74,6 +74,19 @@ esp_err_t device_link_operation_cancel(
     device_link_operation_table_t *table, uint64_t now_ms,
     uint64_t operation_id);
 
+/**
+ * @brief Find the live operation owned by @p owner_id.
+ *
+ * @param[in]  table   Operation table.
+ * @param[in]  owner_id Owner identity (e.g. an adapter's lower-layer
+ *                      operation id).
+ * @param[out] out     Live (non-terminal) operation, if any.
+ * @return ESP_OK, ESP_ERR_NOT_FOUND, or ESP_ERR_INVALID_ARG.
+ */
+esp_err_t device_link_operation_find_by_owner(
+    device_link_operation_table_t *table, uint64_t owner_id,
+    device_link_operation_t *out);
+
 void device_link_operation_sweep(
     device_link_operation_table_t *table, uint64_t now_ms);
 

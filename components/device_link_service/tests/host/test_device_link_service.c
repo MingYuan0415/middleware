@@ -37,6 +37,7 @@
 #include "ble_port_ops.h"
 #include "ble_runtime.h"
 #include "ble_tx_scheduler.h"
+#include "connectivity_manager.h"
 #include "device_link_service.h"
 #include "device_link_security.h"
 #include "device_link_security_auth.h"
@@ -606,11 +607,36 @@ static device_link_service_snapshot_t s_last_published;
 static bool s_published;
 static unsigned s_publish_count_value;
 
+/* Single-slot event-bus fake for the completion bridge: one connectivity
+ * subscriber at a time, delivered synchronously in publisher context. */
+static event_bus_cb_t s_connectivity_callback = NULL;
+static void *s_connectivity_callback_arg = NULL;
+static event_bus_sub_handle_t s_connectivity_handle =
+    EVENT_BUS_SUB_HANDLE_INVALID;
+
+EVENT_BUS_DEFINE_ID(CONNECTIVITY_MANAGER_MSG);
+
+static void _test_dispatch_connectivity(
+    uint32_t sub_type, const void *payload, size_t payload_size)
+{
+    if (s_connectivity_callback != NULL)
+    {
+        s_connectivity_callback(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                                sub_type, payload, payload_size,
+                                s_connectivity_callback_arg);
+    }
+}
+
 esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
                             const void *payload, size_t payload_size,
                             uint32_t flags)
 {
     (void)flags;
+    if (msg_id == EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG))
+    {
+        _test_dispatch_connectivity(sub_type, payload, payload_size);
+        return ESP_OK;
+    }
     assert(msg_id == DEVICE_LINK_SERVICE_MSG);
     assert(sub_type == DEVICE_LINK_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT);
     assert(payload != NULL &&
@@ -621,6 +647,58 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
     s_publish_count_value++;
     (void)pthread_mutex_unlock(&s_publish_lock);
     return ESP_OK;
+}
+
+esp_err_t event_bus_subscribe(event_bus_msg_id_t msg_id, uint32_t sub_type,
+                              event_bus_cb_t callback, void *user_data,
+                              event_bus_dispatch_context_t context,
+                              event_bus_sub_handle_t *out_handle)
+{
+    assert(msg_id == EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG));
+    assert(callback != NULL);
+    assert(context == EVENT_BUS_DISPATCH_PUBLISHER);
+    assert(out_handle != NULL);
+    if (s_connectivity_callback != NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    s_connectivity_callback = callback;
+    s_connectivity_callback_arg = user_data;
+    s_connectivity_handle = 1U;
+    *out_handle = 1U;
+    (void)sub_type;
+    return ESP_OK;
+}
+
+esp_err_t event_bus_unsubscribe(event_bus_sub_handle_t handle)
+{
+    assert(handle == 1U);
+    if (s_connectivity_callback == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_connectivity_callback = NULL;
+    s_connectivity_callback_arg = NULL;
+    s_connectivity_handle = EVENT_BUS_SUB_HANDLE_INVALID;
+    return ESP_OK;
+}
+
+/* Test hook: publish one terminal connectivity snapshot through the fake
+ * bus, as the connectivity worker would. */
+static void _test_publish_connectivity_status(
+    const connectivity_manager_status_snapshot_t *snapshot)
+{
+    (void)event_bus_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                            CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                            snapshot, sizeof(*snapshot), 0U);
+}
+
+static void _test_publish_connectivity_scan(
+    const connectivity_manager_scan_snapshot_t *snapshot)
+{
+    (void)event_bus_publish(EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                            CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                            snapshot, sizeof(*snapshot), 0U);
 }
 
 static unsigned _publish_count(void)
@@ -3330,6 +3408,80 @@ static void _test_deinit_drains_journaled_revoke_after_acl_terminal(void)
 }
 
 
+static void _test_operation_bridge_completes_table(void)
+{
+    _reset_host();
+    _init_service();
+    /* Admit one wifi operation through the public async API; the domain is
+     * capability-gated off, but the boot-available table is not. */
+    uint64_t table_id = 0U;
+
+    assert(ble_link_service_async_operation_start(
+               DEVICE_LINK_DOMAIN_WIFI, 4U, 42U, NULL, NULL,
+               &table_id) == ESP_OK);
+    assert(table_id != 0U);
+    /* The terminal snapshot published by the connectivity worker is
+     * bridged into the table: SUCCEEDED with the WifiStatus payload. */
+    connectivity_manager_status_snapshot_t terminal;
+
+    memset(&terminal, 0, sizeof(terminal));
+    terminal.generation = 1U;
+    terminal.operation_id = 42U;
+    terminal.operation_complete = true;
+    terminal.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    terminal.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+    terminal.last_error = ESP_OK;
+    terminal.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+    terminal.auto_connect = true;
+    _test_publish_connectivity_status(&terminal);
+    /* The record is terminal: updating the same owner is rejected. */
+    assert(ble_link_service_async_operation_update(
+               42U, DEVICE_LINK_OPERATION_RUNNING, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_ERR_NOT_FOUND);
+    /* Unknown owners (manager operations this service never admitted) are
+     * ignored without affecting the table. */
+    terminal.operation_id = 99U;
+    terminal.operation_complete = true;
+    terminal.last_error = ESP_ERR_INVALID_STATE;
+    terminal.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+    _test_publish_connectivity_status(&terminal);
+    assert(ble_link_service_async_operation_update(
+               99U, DEVICE_LINK_OPERATION_RUNNING, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_ERR_NOT_FOUND);
+    /* A failed terminal maps the classified failure to FAILED without a
+     * result payload. */
+    assert(ble_link_service_async_operation_start(
+               DEVICE_LINK_DOMAIN_WIFI, 4U, 43U, NULL, NULL,
+               &table_id) == ESP_OK);
+    terminal.operation_id = 43U;
+    terminal.operation_complete = true;
+    terminal.last_error = ESP_ERR_INVALID_STATE;
+    terminal.failure = CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION;
+    _test_publish_connectivity_status(&terminal);
+    assert(ble_link_service_async_operation_update(
+               43U, DEVICE_LINK_OPERATION_RUNNING, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_ERR_NOT_FOUND);
+    /* A scan terminal completes a start_scan record with no payload. */
+    connectivity_manager_scan_snapshot_t scan;
+
+    assert(ble_link_service_async_operation_start(
+               DEVICE_LINK_DOMAIN_WIFI, 2U, 44U, NULL, NULL,
+               &table_id) == ESP_OK);
+    memset(&scan, 0, sizeof(scan));
+    scan.generation = 1U;
+    scan.operation_id = 44U;
+    scan.running = false;
+    scan.last_error = ESP_OK;
+    _test_publish_connectivity_scan(&scan);
+    assert(ble_link_service_async_operation_update(
+               44U, DEVICE_LINK_OPERATION_RUNNING, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_ERR_NOT_FOUND);
+    /* The bridge subscription dies with the service. */
+    assert(s_connectivity_callback != NULL);
+    _deinit_service();
+    assert(s_connectivity_callback == NULL);
+}
+
 static void test_public_verifier_getter_fail_closed(void)
 {
     /* The public verifier is installed only from a definite, non-zero
@@ -3417,6 +3569,7 @@ int main(void)
     _test_deinit_drains_replacement_before_runtime_stop();
     _test_deinit_rechecks_after_final_host_barrier();
     _test_deinit_drains_journaled_revoke_after_acl_terminal();
+    _test_operation_bridge_completes_table();
     puts("device_link_service host tests passed");
     return 0;
 }

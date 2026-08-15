@@ -1866,11 +1866,11 @@ static esp_err_t _device_link_service_acquire_slow_lease(void);
  * @brief Register the Wi-Fi domain with the link service before the
  * router seals its startup descriptor set.
  *
- * The domain is advertised only when its owner adapter is ready: a device
- * without an operational connectivity manager never publishes Wi-Fi
- * methods. Registration is idempotent for the boot; a failed or skipped
- * registration is logged and leaves the Manifest without the Wi-Fi domain
- * (fail closed) rather than failing the runtime start.
+ * The compile-time capability gate is the only publish decision: a product
+ * that has not completed the Wi-Fi on-device matrix keeps the domain out
+ * of the Manifest (fail closed). Registration is idempotent for the boot; a
+ * failed registration is logged and leaves the Manifest without the Wi-Fi
+ * domain rather than failing the runtime start.
  */
 static void _device_link_service_register_wifi_domain(void)
 {
@@ -1879,17 +1879,13 @@ static void _device_link_service_register_wifi_domain(void)
         return;
     }
     /* Explicit capability gate: the Wi-Fi domain is published only when
-     * the product enables it AND the owner adapter is ready. This removes
-     * the implicit startup-order dependence on connectivity readiness. */
+     * the product enables it. Connectivity readiness is deliberately NOT a
+     * publish decision: the manager starts after this service and the
+     * domain stays static for the boot. */
 #if !CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
     LOG_I("wifi domain not advertised (capability gate closed)");
     return;
 #endif
-    if (!device_link_wifi_adapter_is_ready())
-    {
-        LOG_W("wifi adapter not ready: domain not advertised");
-        return;
-    }
     const device_link_domain_descriptor_t *descriptor = NULL;
     esp_err_t result = device_link_wifi_adapter_get_descriptor(&descriptor);
 
@@ -2119,6 +2115,9 @@ static void _device_link_service_release_resources(void)
     s_service.stopped = NULL;
     s_service.mutex = NULL;
     ble_link_gatt_set_work_submit(NULL, NULL);
+    /* The completion bridge subscription dies with the service: no table
+     * survives to consume terminal snapshots after teardown. */
+    device_link_wifi_adapter_bridge_stop();
     atomic_store_explicit(&s_worker_exited, false, memory_order_release);
     atomic_store_explicit(&s_deinit_command_admitted, false,
                           memory_order_release);
@@ -2414,6 +2413,14 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         /* Public advertising is live after startup: install the derived
          * public password, mirroring the runtime_start path. */
         _device_link_service_open_public_verifier();
+    }
+    if (result == ESP_OK && s_service.bluetooth_enabled)
+    {
+        /* The completion bridge consumes connectivity manager terminal
+         * snapshots into the Core v2 operation table; it is independent of
+         * the BLE runtime and survives runtime stop/start cycles, so it is
+         * installed once here and removed only at full teardown. */
+        result = device_link_wifi_adapter_bridge_start();
     }
     if (result != ESP_OK)
     {

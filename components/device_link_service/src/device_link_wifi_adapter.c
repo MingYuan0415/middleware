@@ -3,10 +3,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "ble_link_service.h"
 #include "connectivity_manager.h"
 #include "device_link_protocol.h"
 #include "device_link_tlv.h"
 #include "device_link_wifi_adapter.h"
+#include "event_bus.h"
+#include "mt_log.h"
 
 #define WIFI_METHOD_GET_STATUS 1U
 #define WIFI_METHOD_START_SCAN 2U
@@ -391,6 +394,57 @@ static device_link_status_t _encode_status(
     return DEVICE_LINK_STATUS_OK;
 }
 
+/**
+ * @brief Cancel the lower-layer operation behind a Core operation id.
+ *
+ * Invoked by CancelOperation through the operation table.
+ */
+static esp_err_t _wifi_operation_cancel(uint64_t owner_id, void *arg)
+{
+    (void)arg;
+    return connectivity_manager_cancel(
+               (connectivity_manager_operation_id_t)owner_id);
+}
+
+/**
+ * @brief Admit an accepted asynchronous manager operation into the Core
+ * v2 operation table.
+ *
+ * The table id (not the manager id) is encoded into OperationAccepted and
+ * drives GetOperation/CancelOperation. The manager id is retained as the
+ * table owner id so the completion bridge can match terminal snapshots.
+ * An admission failure of the manager request is mapped without an
+ * operation identity.
+ */
+static device_link_status_t _admit_async_operation(
+    uint8_t method_id, esp_err_t manager_result,
+    connectivity_manager_operation_id_t manager_operation_id,
+    uint8_t *response, size_t response_capacity, size_t *response_len)
+{
+    if (manager_result != ESP_OK)
+    {
+        return _encode_operation(method_id, manager_result, 0U, response,
+                                 response_capacity, response_len);
+    }
+    uint64_t table_operation_id = 0U;
+    const esp_err_t admit_result = ble_link_service_async_operation_start(
+                                       DEVICE_LINK_DOMAIN_WIFI, method_id,
+                                       (uint64_t)manager_operation_id,
+                                       _wifi_operation_cancel, NULL,
+                                       &table_operation_id);
+
+    if (admit_result != ESP_OK)
+    {
+        /* The manager admitted the work but the Core table is full or
+         * unavailable: cancel the manager side and report exhaustion. */
+        (void)connectivity_manager_cancel(manager_operation_id);
+        return _encode_operation(method_id, ESP_ERR_NO_MEM, 0U, response,
+                                 response_capacity, response_len);
+    }
+    return _encode_operation(method_id, ESP_OK, table_operation_id,
+                             response, response_capacity, response_len);
+}
+
 static device_link_status_t _wifi_handler(
     const device_link_request_context_t *context,
     const uint8_t *request, size_t request_len,
@@ -436,8 +490,9 @@ static device_link_status_t _wifi_handler(
         }
         (void)force_refresh;
         result = connectivity_manager_request_scan(&operation_id);
-        return _encode_operation(method, result, operation_id, response,
-                                 response_capacity, response_len);
+        return _admit_async_operation(method, result, operation_id,
+                                      response, response_capacity,
+                                      response_len);
     }
     if (method == WIFI_METHOD_GET_SCAN_RESULTS)
     {
@@ -618,8 +673,9 @@ static device_link_status_t _wifi_handler(
         };
         result = connectivity_manager_request_sync_profile(
                      &credentials, sync_id, auto_connect, &operation_id);
-        return _encode_operation(method, result, operation_id, response,
-                                 response_capacity, response_len);
+        return _admit_async_operation(method, result, operation_id,
+                                      response, response_capacity,
+                                      response_len);
     }
     if (method == WIFI_METHOD_DISCONNECT)
     {
@@ -659,8 +715,9 @@ static device_link_status_t _wifi_handler(
     {
         return DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION;
     }
-    return _encode_operation(method, result, operation_id, response,
-                             response_capacity, response_len);
+    return _admit_async_operation(method, result, operation_id,
+                                  response, response_capacity,
+                                  response_len);
 }
 
 static const device_link_method_descriptor_t s_methods[] =
@@ -685,6 +742,9 @@ static const device_link_method_descriptor_t s_methods[] =
         .maximum_response_bytes = 16U,
         .request_schema = &s_start_scan_schema,
         .response_schema = &s_operation_accepted_schema,
+        /* start_scan declares core.v2.Empty: a SUCCEEDED record carries no
+         * result payload; scan pages are read via GetScanResults. */
+        .operation_result_schema = &s_empty_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
             DEVICE_LINK_STATUS_OK),
         .handler = _wifi_handler,
@@ -711,6 +771,7 @@ static const device_link_method_descriptor_t s_methods[] =
         .maximum_response_bytes = 16U, \
         .request_schema = (request_type), \
         .response_schema = &s_operation_accepted_schema, \
+        .operation_result_schema = &s_status_schema, \
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK( \
                                          DEVICE_LINK_STATUS_OK), \
         .handler = _wifi_handler, \
@@ -750,7 +811,186 @@ esp_err_t device_link_wifi_adapter_get_descriptor(
     return ESP_OK;
 }
 
-bool device_link_wifi_adapter_is_ready(void)
+esp_err_t device_link_wifi_adapter_encode_operation_result(
+    const connectivity_manager_status_snapshot_t *status,
+    uint8_t *response, size_t capacity, size_t *response_len)
 {
-    return connectivity_manager_is_available();
+    const device_link_status_t encode_result =
+        _encode_status(status, response, capacity, response_len);
+
+    return encode_result == DEVICE_LINK_STATUS_OK ? ESP_OK :
+           ESP_ERR_INVALID_ARG;
+}
+
+/* ---------------------------------------------------------------------------
+ * Completion bridge.
+ *
+ * Terminal connectivity manager snapshots are forwarded into the Core v2
+ * operation table as OperationStatus transitions: the manager operation id
+ * that was recorded as the table owner id at admission is matched back
+ * through find_by_owner, and the terminal WifiStatus payload is attached to
+ * SUCCEEDED records of result-declaring methods. The callback runs in the
+ * connectivity publisher context and only touches the link service table
+ * lock, so it can never wait on the manager worker.
+ * ------------------------------------------------------------------------- */
+
+static event_bus_sub_handle_t s_bridge_handle = EVENT_BUS_SUB_HANDLE_INVALID;
+
+/**
+ * @brief Map a classified manager failure to the LinkError taxonomy.
+ *
+ * AUTHENTICATION is a client-credential rejection (PERMISSION_DENIED),
+ * AP_NOT_FOUND maps to NOT_FOUND, transient radio/network conditions map
+ * to UNAVAILABLE, and the remaining classes carry their obvious LinkError
+ * counterparts. The mapping is total: an unknown classification degrades
+ * to INTERNAL.
+ */
+static device_link_status_t _bridge_map_failure(
+    connectivity_manager_failure_t failure)
+{
+    switch (failure)
+    {
+    case CONNECTIVITY_MANAGER_FAILURE_NONE:
+        return DEVICE_LINK_STATUS_OK;
+    case CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION:
+        return DEVICE_LINK_STATUS_PERMISSION_DENIED;
+    case CONNECTIVITY_MANAGER_FAILURE_AP_NOT_FOUND:
+        return DEVICE_LINK_STATUS_NOT_FOUND;
+    case CONNECTIVITY_MANAGER_FAILURE_ASSOCIATION_TIMEOUT:
+    case CONNECTIVITY_MANAGER_FAILURE_DHCP_TIMEOUT:
+    case CONNECTIVITY_MANAGER_FAILURE_LINK_LOST:
+    case CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE:
+        return DEVICE_LINK_STATUS_UNAVAILABLE;
+    case CONNECTIVITY_MANAGER_FAILURE_STORAGE:
+        return DEVICE_LINK_STATUS_STORAGE;
+    case CONNECTIVITY_MANAGER_FAILURE_CONFLICT:
+        return DEVICE_LINK_STATUS_CONFLICT;
+    case CONNECTIVITY_MANAGER_FAILURE_INTERNAL:
+        return DEVICE_LINK_STATUS_INTERNAL;
+    default:
+        return DEVICE_LINK_STATUS_INTERNAL;
+    }
+}
+
+static void _bridge_update_status(
+    const connectivity_manager_status_snapshot_t *snapshot)
+{
+    uint8_t result[DEVICE_LINK_OPERATION_RESULT_BYTES];
+    size_t result_len = 0U;
+    device_link_status_t status = _bridge_map_failure(snapshot->failure);
+    device_link_operation_state_t state = DEVICE_LINK_OPERATION_FAILED;
+
+    if (snapshot->last_error == ESP_OK)
+    {
+        state = DEVICE_LINK_OPERATION_SUCCEEDED;
+        status = DEVICE_LINK_STATUS_OK;
+        if (device_link_wifi_adapter_encode_operation_result(
+                    snapshot, result, sizeof(result), &result_len) != ESP_OK)
+        {
+            /* A SUCCEEDED record for a result-declaring method must carry
+             * the WifiStatus payload. Encoding failed on a malformed
+             * snapshot, so fail the record honestly instead of publishing
+             * a contract violation. */
+            state = DEVICE_LINK_OPERATION_FAILED;
+            status = DEVICE_LINK_STATUS_INTERNAL;
+            result_len = 0U;
+        }
+    }
+    else if (status == DEVICE_LINK_STATUS_OK)
+    {
+        /* Terminal failure without a classified failure value: fall back
+         * to the diagnostic error. */
+        status = _map_result((esp_err_t)snapshot->last_error);
+    }
+    const esp_err_t update_result = ble_link_service_async_operation_update(
+                                        snapshot->operation_id, state, status,
+                                        result, result_len);
+
+    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
+    {
+        LOG_W("operation bridge update failed result=%d", update_result);
+    }
+}
+
+static void _bridge_update_scan(
+    const connectivity_manager_scan_snapshot_t *snapshot)
+{
+    /* start_scan declares core.v2.Empty: a SUCCEEDED record carries no
+     * result payload; scan pages are read via GetScanResults. */
+    device_link_status_t status =
+        _map_result((esp_err_t)snapshot->last_error);
+    const device_link_operation_state_t state =
+        status == DEVICE_LINK_STATUS_OK ?
+        DEVICE_LINK_OPERATION_SUCCEEDED : DEVICE_LINK_OPERATION_FAILED;
+    const esp_err_t update_result = ble_link_service_async_operation_update(
+                                        snapshot->operation_id, state, status,
+                                        NULL, 0U);
+
+    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
+    {
+        LOG_W("scan bridge update failed result=%d", update_result);
+    }
+}
+
+static void _bridge_event(event_bus_msg_id_t msg_id, uint32_t sub_type,
+                          const void *payload, size_t payload_size,
+                          void *user_data)
+{
+    (void)msg_id;
+    (void)user_data;
+    if (sub_type == CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT)
+    {
+        const connectivity_manager_status_snapshot_t *snapshot = payload;
+
+        if (payload == NULL ||
+                payload_size != sizeof(connectivity_manager_status_snapshot_t) ||
+                !snapshot->operation_complete || snapshot->operation_id == 0U)
+        {
+            return;
+        }
+        _bridge_update_status(snapshot);
+        return;
+    }
+    if (sub_type == CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT)
+    {
+        const connectivity_manager_scan_snapshot_t *snapshot = payload;
+
+        if (payload == NULL ||
+                payload_size != sizeof(connectivity_manager_scan_snapshot_t) ||
+                snapshot->running || snapshot->operation_id == 0U)
+        {
+            return;
+        }
+        _bridge_update_scan(snapshot);
+    }
+}
+
+esp_err_t device_link_wifi_adapter_bridge_start(void)
+{
+    if (s_bridge_handle != EVENT_BUS_SUB_HANDLE_INVALID)
+    {
+        return ESP_OK;
+    }
+    event_bus_sub_handle_t handle = EVENT_BUS_SUB_HANDLE_INVALID;
+    const esp_err_t result = event_bus_subscribe(
+                                 EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                                 EVENT_BUS_SUB_TYPE_ANY, _bridge_event, NULL,
+                                 EVENT_BUS_DISPATCH_PUBLISHER, &handle);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    s_bridge_handle = handle;
+    return ESP_OK;
+}
+
+void device_link_wifi_adapter_bridge_stop(void)
+{
+    if (s_bridge_handle == EVENT_BUS_SUB_HANDLE_INVALID)
+    {
+        return;
+    }
+    (void)event_bus_unsubscribe(s_bridge_handle);
+    s_bridge_handle = EVENT_BUS_SUB_HANDLE_INVALID;
 }

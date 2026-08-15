@@ -10,6 +10,7 @@
 #include "ble_link_events.h"
 #include "ble_link_reassembler.h"
 #include "ble_link_security_ops.h"
+#include "device_link_operation.h"
 #include "device_link_security_auth.h"
 #include "device_link_router.h"
 
@@ -122,6 +123,51 @@ void ble_link_service_init(
  */
 esp_err_t ble_link_service_set_domain_descriptors(
     const device_link_domain_descriptor_t *domains, size_t domain_count);
+
+/**
+ * @brief Admit one asynchronous domain operation into the Core v2 table.
+ *
+ * Called by a domain adapter when it accepts an asynchronous method: the
+ * table allocates the operation id returned in @p out_operation_id (this
+ * id, not the adapter's lower-layer id, is encoded into OperationAccepted
+ * and used by GetOperation/CancelOperation). @p owner_id carries the
+ * adapter's own operation identity so the completion bridge can match
+ * terminal events back to the record.
+ *
+ * @param[in]  domain_id   Registered domain id.
+ * @param[in]  method_id   Asynchronous method id.
+ * @param[in]  owner_id    Adapter-owned operation identity.
+ * @param[in]  cancel      Cancel callback invoked by CancelOperation.
+ * @param[in]  cancel_arg  Cancel callback argument.
+ * @param[out] out_operation_id Table operation id (nonzero).
+ * @return ESP_OK, ESP_ERR_INVALID_STATE when the v2 table is unavailable,
+ *         or an allocation error.
+ */
+esp_err_t ble_link_service_async_operation_start(
+    uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
+    device_link_operation_cancel_t cancel, void *cancel_arg,
+    uint64_t *out_operation_id);
+
+/**
+ * @brief Update the live operation owned by @p owner_id.
+ *
+ * The completion bridge calls this when the adapter's lower layer reports
+ * a terminal or progress event. The frozen operation-state semantics
+ * (in-flight error=OK, FAILED non-OK, non-success no payload) are enforced
+ * by the table.
+ *
+ * @param[in] owner_id Adapter-owned operation identity.
+ * @param[in] state    New state.
+ * @param[in] status   LinkError status.
+ * @param[in] result   Result payload (only for SUCCEEDED with a declared
+ *                     operation result).
+ * @param[in] result_len Payload length.
+ * @return ESP_OK, ESP_ERR_NOT_FOUND for an unknown or terminal owner, or
+ *         ESP_ERR_INVALID_ARG for a semantics violation.
+ */
+esp_err_t ble_link_service_async_operation_update(
+    uint64_t owner_id, device_link_operation_state_t state,
+    device_link_status_t status, const uint8_t *result, size_t result_len);
 
 /**
  * @brief Reset the service (new boot or full teardown).
