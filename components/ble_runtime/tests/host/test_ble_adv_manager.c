@@ -197,6 +197,7 @@ static ble_nimble_adv_start_ops_t _guard_ops(void)
 static void _init_manager(void)
 {
     static const uint8_t short_name[] = "MT";
+    static const uint8_t public_instance_id[] = {0x12U, 0x34U, 0x56U};
     static const ble_adv_manager_config_t config =
     {
         .fast_interval_ms = 100U,
@@ -205,7 +206,8 @@ static void _init_manager(void)
         .short_name = short_name,
         .short_name_len = sizeof(short_name) - 1U,
         .service_uuid = s_uuid,
-        .adv_version = 1U,
+        .adv_version = 2U,
+        .public_instance_id = public_instance_id,
         .now_ms = _fake_now_ms,
         .arm_timer = _fake_arm_timer,
         .timer_arg = NULL,
@@ -635,7 +637,7 @@ static void test_bindable_payload_built(void)
                           discriminator));
     TEST_ASSERT_TRUE(s_last_config_valid);
     TEST_ASSERT_EQUAL(5U, s_last_config.service_data_len);
-    TEST_ASSERT_EQUAL(0x01U, s_last_config.service_data[0]);
+    TEST_ASSERT_EQUAL(0x02U, s_last_config.service_data[0]);
     TEST_ASSERT_EQUAL(0x01U, s_last_config.service_data[1]);
     TEST_ASSERT_EQUAL(0xefU, s_last_config.service_data[2]);
     TEST_ASSERT_EQUAL(0xcdU, s_last_config.service_data[3]);
@@ -675,9 +677,9 @@ static void test_bindable_lease_release_clears_payload(void)
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
     TEST_ASSERT_EQUAL(0x00U, s_last_config.service_data[1]);
-    TEST_ASSERT_EQUAL(0x00U, s_last_config.service_data[2]);
-    TEST_ASSERT_EQUAL(0x00U, s_last_config.service_data[3]);
-    TEST_ASSERT_EQUAL(0x00U, s_last_config.service_data[4]);
+    TEST_ASSERT_EQUAL(0x12U, s_last_config.service_data[2]);
+    TEST_ASSERT_EQUAL(0x34U, s_last_config.service_data[3]);
+    TEST_ASSERT_EQUAL(0x56U, s_last_config.service_data[4]);
 }
 
 static void test_lease_capacity_enforced(void)

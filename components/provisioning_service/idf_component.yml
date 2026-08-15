@@ -1,4 +1,0 @@
-version: "0.1.0"
-description: "MicroTech BLE Wi-Fi provisioning service"
-dependencies:
-  idf: ">=6.0"

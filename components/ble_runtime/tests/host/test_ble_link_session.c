@@ -356,21 +356,52 @@ static void test_state_flags(void)
     _authenticate(GEN1);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
-    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BINDABLE,
-                      ble_link_session_get_state_flags());
-    _authorize(GEN1, 1U);
+    /* AUTHENTICATED implies BOUND: a bootstrap session without a
+     * committed record does not publish the flag. */
     TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BINDABLE |
-                      BLE_LINK_STATE_FLAG_BOUND,
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED,
+                      ble_link_session_get_state_flags());
+    /* An authorization transaction in flight drives TRANSITIONING. */
+    ble_link_session_set_authorization_transitioning(true);
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BINDABLE |
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
+                      BLE_LINK_STATE_FLAG_TRANSITIONING,
+                      ble_link_session_get_state_flags());
+    ble_link_session_set_authorization_transitioning(false);
+    _authorize(GEN1, 1U);
+    /* BINDABLE excludes BOUND once a record is committed. */
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND |
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
+                      BLE_LINK_STATE_FLAG_AUTHENTICATED |
+                      BLE_LINK_STATE_FLAG_AUTHORIZED,
                       ble_link_session_get_state_flags());
     /* The record persists across disconnect. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
                           GEN1,
                           BLE_LINK_SESSION_EVENT_ACL_DISCONNECTED));
-    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BINDABLE |
-                      BLE_LINK_STATE_FLAG_BOUND,
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND,
                       ble_link_session_get_state_flags());
     ble_link_session_set_pairing_window(false);
     TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND,
+                      ble_link_session_get_state_flags());
+
+    _connect(GEN2);
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND |
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
+                      BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY,
+                      ble_link_session_get_state_flags());
+    /* ERROR latches until the next boot. */
+    ble_link_session_set_error(true);
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND |
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
+                      BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY |
+                      BLE_LINK_STATE_FLAG_ERROR,
+                      ble_link_session_get_state_flags());
+    ble_link_session_set_error(false);
+    TEST_ASSERT_EQUAL(BLE_LINK_STATE_FLAG_BOUND |
+                      BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
+                      BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY |
+                      BLE_LINK_STATE_FLAG_ERROR,
                       ble_link_session_get_state_flags());
 }
 

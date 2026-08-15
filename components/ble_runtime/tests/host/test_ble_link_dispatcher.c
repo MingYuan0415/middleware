@@ -105,7 +105,7 @@ static void _reset_dispatcher(void)
     ble_link_dispatcher_reset();
     s_handler_calls = 0U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_register_request(
-                          BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES,
+                          BLE_LINK_CODEC_REQUEST_GET_MANIFEST,
                           _ok_handler, NULL));
 }
 
@@ -115,9 +115,9 @@ static void test_ok_dispatch_invokes_handler(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -132,9 +132,9 @@ static void test_unsupported_version_rejected(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(2U, s_boot_id, 0U);
+        _make_envelope(1U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -149,9 +149,9 @@ static void test_boot_id_mismatch_rejected(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id + 1U, 0U);
+        _make_envelope(2U, s_boot_id + 1U, 0U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -166,9 +166,9 @@ static void test_unknown_flag_rejected(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 2U);
+        _make_envelope(2U, s_boot_id, 2U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -183,9 +183,9 @@ static void test_recovery_query_flag_accepted(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, BLE_LINK_CODEC_FLAG_RECOVERY_QUERY);
+        _make_envelope(2U, s_boot_id, BLE_LINK_CODEC_FLAG_RECOVERY_QUERY);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -200,9 +200,9 @@ static void test_zero_request_id_rejected(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(0U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(0U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -217,9 +217,9 @@ static void test_duplicate_request_id_conflict(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(7U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(7U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -237,7 +237,7 @@ static void test_unknown_body_unsupported_operation(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
         _make_request(1U, (ble_link_codec_request_tag_t)99U);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
@@ -257,7 +257,7 @@ static void test_handler_error_propagated(void)
                           BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT,
                           _conflict_handler, NULL));
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
         _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
@@ -273,9 +273,9 @@ static void test_clear_session_resets_ids(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(7U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(7U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -291,13 +291,13 @@ static void test_registration_rules(void)
 {
     _reset_dispatcher();
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_dispatcher_register_request(
-                          BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES,
+                          BLE_LINK_CODEC_REQUEST_GET_MANIFEST,
                           NULL, NULL));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_dispatcher_register_request(
                           (ble_link_codec_request_tag_t)99U,
                           _ok_handler, NULL));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_dispatcher_register_request(
-                          BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES,
+                          BLE_LINK_CODEC_REQUEST_GET_MANIFEST,
                           _ok_handler, NULL));
 }
 
@@ -307,9 +307,9 @@ static void test_conflict_priority_over_unknown_body(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
@@ -329,14 +329,14 @@ static void test_session_id_grows_beyond_initial_capacity(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
     uint64_t request_id = 1U;
 
     for (size_t i = 0U; i < 64U; ++i)
     {
         ble_link_codec_request_t request =
-            _make_request(request_id, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+            _make_request(request_id, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
 
         TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
                               &envelope, &request, &facts, &error));
@@ -345,7 +345,7 @@ static void test_session_id_grows_beyond_initial_capacity(void)
     }
     /* The grown set still rejects duplicates as CONFLICT. */
     ble_link_codec_request_t duplicate =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
                           &envelope, &duplicate, &facts, &error));
@@ -370,7 +370,7 @@ static void test_all_five_handlers_registered(void)
                           BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT,
                           _ok_handler, NULL));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_register_request(
-                          BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS,
+                          BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION,
                           _ok_handler, NULL));
 }
 
@@ -380,9 +380,9 @@ static void test_invalid_arguments_rejected(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_codec_request_t request =
-        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(1U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_dispatcher_handle_request(
@@ -401,7 +401,7 @@ static void test_unknown_body_consumes_request_id(void)
 
     _reset_dispatcher();
     ble_link_codec_envelope_t envelope =
-        _make_envelope(1U, s_boot_id, 0U);
+        _make_envelope(2U, s_boot_id, 0U);
     ble_link_dispatcher_facts_t facts = _make_facts(true, true, false);
 
     /* Unknown body consumes the request id on first use. */
@@ -413,7 +413,7 @@ static void test_unknown_body_consumes_request_id(void)
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_UNSUPPORTED_OPERATION, error);
     /* The same id with a valid body is rejected as CONFLICT. */
     ble_link_codec_request_t valid =
-        _make_request(5U, BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES);
+        _make_request(5U, BLE_LINK_CODEC_REQUEST_GET_MANIFEST);
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_dispatcher_handle_request(
                           &envelope, &valid, &facts, &error));

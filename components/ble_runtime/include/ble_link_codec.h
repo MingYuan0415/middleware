@@ -11,6 +11,13 @@
 extern "C" {
 #endif
 
+/*
+ * This is the retired v1 envelope codec kept only for host regression
+ * fixtures and internal business-adapter compatibility. Production ingress
+ * accepts the Device Link v2 fixed header and Typed-TLV wire only. The
+ * official ESP-IDF Security 2 protobuf-c types are unrelated to this codec.
+ */
+
 /** @brief Maximum retained unknown fields per message. */
 #define BLE_LINK_CODEC_MAX_UNKNOWN_FIELDS 8U
 
@@ -24,7 +31,7 @@ typedef struct ble_link_codec_unknown_field
     size_t len;
 } ble_link_codec_unknown_field_t;
 
-/** @brief Envelope body tags, frozen by microtech.link.v1.Envelope. */
+/** @brief Retired host-adapter body tags; not part of the v2 wire. */
 typedef enum
 {
     BLE_LINK_CODEC_BODY_NONE = 0,
@@ -32,30 +39,32 @@ typedef enum
     BLE_LINK_CODEC_BODY_RESPONSE = 11,
     BLE_LINK_CODEC_BODY_EVENT = 12,
     BLE_LINK_CODEC_BODY_SNAPSHOT = 13,
-    BLE_LINK_CODEC_BODY_TRANSFER_CONTROL = 14,
 } ble_link_codec_body_t;
 
-/** @brief Request body tags, frozen by microtech.link.v1.Request. */
+/** @brief Retired host-adapter request tags; not part of the v2 wire. */
 typedef enum
 {
     BLE_LINK_CODEC_REQUEST_NONE = 0,
-    BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES = 10,
+    BLE_LINK_CODEC_REQUEST_GET_MANIFEST = 10,
     BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT = 11,
     BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE = 12,
     BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT = 13,
-    BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS = 14,
-    BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION = 15,
+    BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION = 14,
+    BLE_LINK_CODEC_REQUEST_DOMAIN_CALL = 15,
+    BLE_LINK_CODEC_REQUEST_GET_OPERATION = 16,
+    BLE_LINK_CODEC_REQUEST_CANCEL_OPERATION = 17,
 } ble_link_codec_request_tag_t;
 
-/** @brief Response body tags, frozen by microtech.link.v1.Response. */
+/** @brief Retired host-adapter response tags; not part of the v2 wire. */
 typedef enum
 {
     BLE_LINK_CODEC_RESPONSE_NONE = 0,
-    BLE_LINK_CODEC_RESPONSE_CAPABILITIES = 10,
+    BLE_LINK_CODEC_RESPONSE_MANIFEST = 10,
     BLE_LINK_CODEC_RESPONSE_SNAPSHOT = 11,
     BLE_LINK_CODEC_RESPONSE_AUTHORIZE_PREPARE = 12,
     BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT = 13,
-    BLE_LINK_CODEC_RESPONSE_EVENT_SUBSCRIPTION = 14,
+    BLE_LINK_CODEC_RESPONSE_DOMAIN_RESULT = 14,
+    BLE_LINK_CODEC_RESPONSE_OPERATION = 15,
 } ble_link_codec_response_tag_t;
 
 /** @brief Decoded envelope shell; bodies are exposed as opaque slices. */

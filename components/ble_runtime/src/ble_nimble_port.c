@@ -179,6 +179,13 @@ static esp_err_t _ble_nimble_port_security_request(
             response, response_len);
 }
 
+static void _ble_nimble_port_release_plaintext(
+    uint8_t *response, size_t response_len, void *arg)
+{
+    (void)arg;
+    ble_link_service_release_plaintext(response, response_len);
+}
+
 static esp_err_t _ble_nimble_port_sec_authenticated(void *arg)
 {
     (void)arg;
@@ -304,6 +311,7 @@ typedef struct ble_nimble_port
     esp_err_t deinit_error;
     ble_nimble_store_guard_t storage_guard;
     ble_nimble_store_callback_guard_t store_write_guard;
+    uint8_t discovery_instance_id[3];
     int stop_result;
 } ble_nimble_port_t;
 
@@ -2676,8 +2684,8 @@ static esp_err_t _ble_nimble_port_adv_manager_init(void)
 {
     static const uint8_t device_link_uuid[16] =
     {
-        0xa3, 0x4e, 0x85, 0x57, 0x11, 0x3d, 0x8a, 0xa2,
-        0x59, 0x4e, 0xbb, 0xb4, 0x92, 0x31, 0x20, 0x3e,
+        0x8b, 0x03, 0xdc, 0x36, 0xd0, 0x63, 0x05, 0x8d,
+        0x30, 0x42, 0x10, 0xc5, 0x8c, 0xe4, 0x77, 0x2c,
     };
     static const uint8_t short_name[] = "MT";
     static ble_adv_manager_config_t config =
@@ -2688,7 +2696,8 @@ static esp_err_t _ble_nimble_port_adv_manager_init(void)
         .short_name = short_name,
         .short_name_len = sizeof(short_name) - 1U,
         .service_uuid = device_link_uuid,
-        .adv_version = 1U,
+        .adv_version = 2U,
+        .public_instance_id = s_port.discovery_instance_id,
         .now_ms = _ble_nimble_port_adv_now_ms,
         .arm_timer = _ble_nimble_port_adv_arm_timer,
         .timer_arg = NULL,
@@ -6222,6 +6231,8 @@ static esp_err_t _ble_nimble_port_link_security_init(void)
         .session_id = 1U,
         .request_cb = _ble_nimble_port_security_request,
         .request_arg = NULL,
+        .response_release_cb = _ble_nimble_port_release_plaintext,
+        .response_release_arg = NULL,
         .authenticated_cb = _ble_nimble_port_sec_authenticated,
         .authenticated_arg = NULL,
     };
@@ -6253,6 +6264,20 @@ static esp_err_t _ble_nimble_port_init(void)
     s_port.deinitialized = false;
     s_port.nimble_init_attempted = false;
     s_port.quiescing = false;
+    if (s_port.discovery_instance_id[0] == 0U &&
+            s_port.discovery_instance_id[1] == 0U &&
+            s_port.discovery_instance_id[2] == 0U)
+    {
+        uint32_t instance = esp_random() & UINT32_C(0x00ffffff);
+
+        if (instance == 0U)
+        {
+            instance = UINT32_C(0x005a5a5a);
+        }
+        s_port.discovery_instance_id[0] = (uint8_t)instance;
+        s_port.discovery_instance_id[1] = (uint8_t)(instance >> 8U);
+        s_port.discovery_instance_id[2] = (uint8_t)(instance >> 16U);
+    }
     atomic_store_explicit(&s_adv_host_ready, false, memory_order_release);
     ble_nimble_store_guard_reset(&s_port.storage_guard);
     s_adv_conn_handle = 0U;
@@ -6807,6 +6832,7 @@ static const ble_runtime_host_port_t s_nimble_port =
     .start = _ble_nimble_port_start,
     .set_pairing_gate = ble_nimble_port_set_pairing_window,
     .reset_peer_store = _ble_nimble_port_reset_peer_store,
+    .get_public_instance_id = ble_nimble_port_get_public_instance_id,
     .stop = _ble_nimble_port_stop,
     .deinit = _ble_nimble_port_deinit,
 };
@@ -6841,4 +6867,20 @@ const ble_port_ops_t *ble_nimble_port_get_ops(void)
 const ble_runtime_host_port_t *ble_nimble_port_get(void)
 {
     return &s_nimble_port;
+}
+
+esp_err_t ble_nimble_port_get_public_instance_id(uint8_t out_instance_id[3])
+{
+    if (out_instance_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_port.discovery_instance_id[0] == 0U &&
+            s_port.discovery_instance_id[1] == 0U &&
+            s_port.discovery_instance_id[2] == 0U)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(out_instance_id, s_port.discovery_instance_id, 3U);
+    return ESP_OK;
 }

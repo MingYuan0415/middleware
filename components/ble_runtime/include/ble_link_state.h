@@ -11,12 +11,22 @@
 extern "C" {
 #endif
 
-/** @brief PublicLinkState flags, frozen by microtech.link.v1. */
-#define BLE_LINK_STATE_FLAG_BINDABLE 1U
-#define BLE_LINK_STATE_FLAG_BOUND 2U
+/** @brief PublicLinkState flags, frozen by microtech.link.core.v2. */
+#define BLE_LINK_STATE_FLAG_BINDABLE UINT32_C(0x01)
+#define BLE_LINK_STATE_FLAG_BOUND UINT32_C(0x02)
+#define BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY UINT32_C(0x04)
+#define BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED UINT32_C(0x08)
+#define BLE_LINK_STATE_FLAG_TRANSITIONING UINT32_C(0x10)
+#define BLE_LINK_STATE_FLAG_AUTHENTICATED UINT32_C(0x20)
+#define BLE_LINK_STATE_FLAG_AUTHORIZED UINT32_C(0x40)
+#define BLE_LINK_STATE_FLAG_ERROR UINT32_C(0x80)
+#define BLE_LINK_STATE_PROTOCOL_MAJOR 2U
+#define BLE_LINK_STATE_PROTOCOL_MINOR 0U
+#define BLE_LINK_STATE_PROFILE_MAJOR 2U
+#define BLE_LINK_STATE_PROFILE_MINOR 0U
 
 /** @brief Contract maximum encoded PublicLinkState size. */
-#define BLE_LINK_STATE_MAX_ENCODED_BYTES 20U
+#define BLE_LINK_STATE_MAX_ENCODED_BYTES 16U
 
 /** @brief PublicLinkState fields to encode. */
 typedef struct ble_link_state
@@ -33,12 +43,11 @@ typedef struct ble_link_state
  * @brief Encode PublicLinkState as the raw link_state characteristic value.
  *
  * The value carries no framing header and no Security 2 protection. The
- * contract value domain is enforced: version fields must fit a single-byte
- * varint (0-127), boot_id must be nonzero, and state_flags must only use the
- * two defined low bits.
+ * public value is always exactly 16 bytes: four one-byte versions, a
+ * little-endian uint32 flags word, and a little-endian uint64 boot ID.
  *
  * @param[in]  state    State to encode.
- * @param[out] out      Buffer, or NULL to query the size.
+ * @param[out] out      Buffer. NULL is not a valid encoding destination.
  * @param[in]  capacity Buffer capacity.
  * @param[out] out_len  Bytes written or required.
  * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_NO_MEM when the buffer is

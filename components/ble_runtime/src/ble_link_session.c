@@ -31,6 +31,8 @@ typedef struct ble_link_session
     bool authorized;
     uint32_t authorization_revision;
     bool bound;                  /**< Committed authorization record exists. */
+    bool authorization_transitioning; /**< Authorization txn in flight. */
+    bool error_latched;          /**< Unrecoverable runtime state. */
     /* The pairing window is written by the project-core device-link worker
      * and read by NimBLE host-core admission paths, so it must be atomic. */
     atomic_bool pairing_window_open;
@@ -478,16 +480,74 @@ static uint32_t _ble_link_session_get_state_flags_locked(void)
 {
     uint32_t flags = 0U;
 
+    /* The characteristic is readable on an accepted ACL.  An active ACL is
+     * therefore the session owner's reliable indication that the Bluetooth
+     * runtime is enabled; the discovery bit describes the current policy,
+     * not whether connectable advertising is physically running for this ACL. */
+    if (s_session.active)
+    {
+        flags |= BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED;
+    }
+    /* BINDABLE advertises the QR bind window; it is mutually exclusive with
+     * BOUND (a bound device no longer binds) and with PUBLIC_DISCOVERY.
+     * PUBLIC_DISCOVERY reflects the advertising policy (window closed) and
+     * stays independent of BOUND: a bound device keeps advertising its
+     * public bootstrap endpoint. */
     if (atomic_load_explicit(&s_session.pairing_window_open,
-                             memory_order_acquire))
+                             memory_order_acquire) &&
+            !s_session.bound)
     {
         flags |= BLE_LINK_STATE_FLAG_BINDABLE;
+    }
+    else if (s_session.active &&
+             !atomic_load_explicit(&s_session.pairing_window_open,
+                                   memory_order_acquire))
+    {
+        flags |= BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY;
     }
     if (s_session.bound)
     {
         flags |= BLE_LINK_STATE_FLAG_BOUND;
     }
+    /* AUTHENTICATED implies BOUND: a bootstrap Security 2 session without a
+     * committed record does not publish the flag. */
+    if (s_session.bound && s_session.encrypted && s_session.bond_verified &&
+            s_session.identity_known && s_session.security2_open)
+    {
+        flags |= BLE_LINK_STATE_FLAG_AUTHENTICATED;
+    }
+    if (s_session.authorized)
+    {
+        flags |= BLE_LINK_STATE_FLAG_AUTHORIZED;
+    }
+    if (s_session.security2_handshaking ||
+            s_session.authorization_transitioning)
+    {
+        flags |= BLE_LINK_STATE_FLAG_TRANSITIONING;
+    }
+    if (s_session.error_latched ||
+            s_session.security2_epoch == UINT32_MAX)
+    {
+        flags |= BLE_LINK_STATE_FLAG_ERROR;
+    }
     return flags;
+}
+
+void ble_link_session_set_authorization_transitioning(bool active)
+{
+    _ble_link_session_lock();
+    s_session.authorization_transitioning = active;
+    _ble_link_session_unlock();
+}
+
+void ble_link_session_set_error(bool error)
+{
+    _ble_link_session_lock();
+    if (error)
+    {
+        s_session.error_latched = true;
+    }
+    _ble_link_session_unlock();
 }
 
 void ble_link_session_reset(void)

@@ -218,6 +218,11 @@ static bool _ble_adv_manager_payload_changed(void)
     {
         return false;
     }
+    if (!bindable && s_manager.config->public_instance_id != NULL)
+    {
+        memcpy(discriminator, s_manager.config->public_instance_id,
+               sizeof(discriminator));
+    }
     return s_manager.service_data[1] != (bindable
                                          ? BLE_ADV_MANAGER_FLAG_BINDABLE
                                          : 0U) ||
@@ -272,6 +277,11 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
     s_manager.adv_config.service_uuid = config->service_uuid;
     s_manager.service_data[0] = config->adv_version;
     s_manager.service_data[1] = bindable ? BLE_ADV_MANAGER_FLAG_BINDABLE : 0U;
+    if (!bindable && config->public_instance_id != NULL)
+    {
+        memcpy(discriminator, config->public_instance_id,
+               sizeof(discriminator));
+    }
     memcpy(&s_manager.service_data[2], discriminator,
            BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     s_manager.adv_config.service_data = s_manager.service_data;

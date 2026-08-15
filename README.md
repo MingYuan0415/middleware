@@ -18,13 +18,12 @@
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `ble_runtime` | NimBLE host、静态 GATT、GAP/ADV、Device Link transport、不可变异步身份和 TX/deadline 调度的唯一底层 owner | `bt`；`device_link_security`、`freertos`、`mt_log`（私有） |
-| `device_link_security` | 使用 ESP-IDF protobuf-c 类型实现 Security 2、bootstrap/long-term verifier 和授权记录 journal | `nv_storage`、`protocomm`；`mbedtls`、`protobuf-c`（私有） |
+| `device_link_security` | 使用 ESP-IDF 官方 Protocomm Security 2 类型实现握手、bootstrap/long-term verifier 和授权记录 journal；这些 protobuf-c 类型仅属于 ESP-IDF 内部安全实现 | `nv_storage`、`protocomm`；`mbedtls`、`protobuf-c`（私有） |
 | `device_link_service` | 串行拥有绑定窗口、Security 2 会话、授权/清理事务、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link_security`、`event_bus` |
 | `factory_reset_service` | 持有版本化恢复出厂 journal；marker 持久化后才重启，并在全部 reset domain 与广告前置条件收敛后清除 marker | `nv_storage`；`mt_log`（私有） |
-| `provisioning_service` | 手动开启的 Protocomm BLE Security 2 配网服务；实现 v1.0 轮询协议并将 Wi-Fi 操作交给 `connectivity_manager` | `connectivity_manager`, `event_bus` |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
 | `chore_service` | 单一后台杂活 worker：任意任务可提交一次性或周期 job（固定槽位池、协作式取消、挂起后不追补），用于不便在 GUI worker 或调用上下文执行的短时有界工作；禁止 LVGL 调用与长阻塞 | `mt_log`、`esp_timer`、`freertos`、`heap`（私有） |
-| `device_link` | Device Link v1 协议原语：framing 重组、冻结契约的 protobuf-c 消费代码与可复现生成校验；不拥有 NimBLE/Protocomm | `protobuf-c`（私有） |
+| `device_link` | Device Link Core v2 应用层 Typed-TLV、固定分片头、静态领域描述符、路由、操作和 replay 原语；不拥有 NimBLE/Protocomm，不包含应用层 protobuf | 无 |
 
 ## 目录结构
 
@@ -55,7 +54,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `sd_storage_service` 的 adapter 提供 mount/unmount/is_mounted；普通 `init/start(config)` 从不格式化。破坏性恢复只能由显式 `sd_storage_service_recover_and_mount(config)` 发起。
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
-- `connectivity_manager` 用 NVS 单键 `wifi_profile` 保存一个 Open/Personal IPv4 网络；仅在取得 IPv4 后提交新凭据。它发布不含密码的状态和扫描快照，统一分类认证、AP、关联、DHCP、链路、射频、存储和内部错误。长期自动重试为 30 秒、2 分钟、10 分钟、30 分钟并封顶；手动断开只在本次启动保持离线。
+- `connectivity_manager` 是 Wi-Fi profile、自动连接和无感同步的唯一 owner。`connectivity_manager_request_sync_profile()` 以非零 client sync ID 接受凭据；相同 ID/相同凭据幂等，相同 ID/不同凭据冲突，新 profile 只有 IPv4 和 durable store 都成功后替换旧 profile。密码永不读回；存储结果不明确时保留旧 profile 并返回可恢复的 storage/internal 错误。
 - `device_link_service` worker 是 ACL、Security 2 epoch、授权事务、`link_state` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤；ACL 终态以 generation/handle 清理该 ACL 的全部 epoch，会话级失败仍核对 epoch/flow。Cmd0 只分配一次 epoch，Cmd1 在同一 epoch 认证。`link_state` 的当前值与投递 stamp 在 GATT 锁下分离，认证/CCCD 变化立即要求 fresh 值，提交或异步 completion 失败在 100 ms cooldown 后由 worker retained retry。
 - provisional/orphan/replacement cleanup 由 owner 按 100/200/400/800/1000 ms 退避保留，port 以固定 `4 + 1 overflow` 容量和物理目标合并避免队列满丢失。pending cleanup 拒绝新 ACL；live terminal cleanup 保留 session/control write fence 和 host-serialized terminate retry，公开 `link_state` 仍可读，广告仅在所有 cleanup 清空后恢复。peer-store 删除采用单次 explicit delete、逐类型 readback 和完整 host-run sticky error，持久化失败不能被同 run 的 RAM absence 冒充成功；deinit 通过双 host barrier 的 fixed-point drain 保留 revoke/cleanup 义务。
 - `ble_runtime` 的 TX scheduler 以固定 `queue_depth + 1` credit 覆盖 queued、in-flight 和待投递 completion，每个成功提交只产生一个终态。ADV START/STOP 失败保留 generation-scoped obligation，并按 100/200/400/800/1000 ms 退避；普通窗口取消使用不受 ADV 队列容量影响的通知唤醒。pairing gate 的 requested-open 与 cleanup/rejected/revoke/drain hold 独立，effective open 仅在 hold mask 为空时成立；被拒绝 ACL 在 CONNECT host callback 内先关 gate 再保留终止义务。
@@ -127,7 +126,8 @@ cmake --build /tmp/mt-chore
 ctest --test-dir /tmp/mt-chore --output-on-failure
 ```
 
-运行 Device Link framing、protobuf 消费和生成校验套件：
+运行 Device Link Typed-TLV、router、operation 和 wire 套件：
+
 
 ```sh
 cmake -S components/device_link/tests/host -B /tmp/mt-device-link -G Ninja \

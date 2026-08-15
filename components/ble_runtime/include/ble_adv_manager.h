@@ -67,7 +67,7 @@ typedef struct ble_adv_lease
  *
  * Fast and slow intervals and the fast window duration are runtime policy,
  * calibrated on hardware; the contract only freezes the advertisement
- * content. The service data layout (adv version, flags, discriminator)
+ * content. The service data layout (adv version, flags, identifier)
  * follows the Device Link discovery contract. The service UUID is in
  * little-endian wire order, matching the frozen advertising fixture.
  *
@@ -86,7 +86,8 @@ typedef struct ble_adv_manager_config
     const uint8_t *short_name;   /**< Short local name bytes, e.g. "MT". */
     size_t short_name_len;
     const uint8_t *service_uuid; /**< 16-byte 128-bit Device Link UUID. */
-    uint8_t adv_version;         /**< Advertising version, 1 for v1. */
+    uint8_t adv_version;         /**< Published Device Link advertisement version. */
+    const uint8_t *public_instance_id; /**< Boot-scoped public identifier. */
     uint32_t (*now_ms)(void);    /**< Monotonic millisecond clock. */
     void (*arm_timer)(uint32_t delay_ms, void *arg); /**< Window notify. */
     void *timer_arg;

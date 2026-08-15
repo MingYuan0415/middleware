@@ -17,7 +17,7 @@ extern "C" {
 /** @brief Contract-frozen Snapshot max encoded size. */
 #define BLE_LINK_EVENTS_SNAPSHOT_MAX_BYTES 64U
 
-/** @brief LinkState values, frozen by microtech.link.v1. */
+/** @brief LinkState values, frozen by Device Link Core v2. */
 typedef enum
 {
     BLE_LINK_BINDING_UNSPECIFIED = 0,

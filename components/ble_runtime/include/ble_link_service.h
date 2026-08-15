@@ -11,6 +11,7 @@
 #include "ble_link_reassembler.h"
 #include "ble_link_security_ops.h"
 #include "device_link_security_auth.h"
+#include "device_link_router.h"
 
 #ifdef UNIT_TEST_HOST
     /** @brief Test-only seam: force the authorize deadline value. */
@@ -24,13 +25,16 @@ extern "C" {
 /** @brief Maximum bytes of one assembled control message (profile 4096). */
 #define BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES 4096U
 
+/** @brief Fixed ingress work slots owned by the service worker boundary. */
+#define BLE_LINK_SERVICE_WORK_SLOTS 4U
+
 /** @brief Maximum bytes of one assembled session message (profile 1024). */
 #define BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES 1024U
 
 /** @brief Transport type byte: Security 2 handshake wire. */
 #define BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE 0x00U
 
-/** @brief Transport type byte: AES-GCM ciphertext of an Envelope. */
+/** @brief Transport type byte: protected Device Link v2 application data. */
 #define BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED 0x01U
 
 /** @brief Maximum number of concurrent event subscribers. */
@@ -40,15 +44,15 @@ extern "C" {
 #define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES \
     DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES
 
-/** @brief Authorization txn expiry (frozen authorize-prepare-response). */
-#define BLE_LINK_SERVICE_AUTH_EXPIRES_MS 600000U
+/** @brief Authorization txn expiry (frozen authorize-prepare-response).
+ *          Contract bound: expires_in_ms in [1, 120000]. */
+#define BLE_LINK_SERVICE_AUTH_EXPIRES_MS 120000U
 
 /** @brief TX characteristic and PDU kind for the framed value. */
 typedef enum
 {
     BLE_LINK_SERVICE_TX_SESSION = 0,    /**< session_tx, indication. */
     BLE_LINK_SERVICE_TX_CONTROL_RESPONSE, /**< control_tx, indication. */
-    BLE_LINK_SERVICE_TX_CONTROL_EVENT,    /**< control_tx, notification. */
 } ble_link_service_tx_channel_t;
 
 /**
@@ -110,6 +114,16 @@ void ble_link_service_init(
     const ble_link_security_ops_t *security, size_t max_pending_frames);
 
 /**
+ * @brief Freeze optional domain descriptors before the next service init.
+ *
+ * Descriptors are copied into the service's static startup table and cannot
+ * be changed while the service is initialized. Passing NULL/zero clears the
+ * optional set; Core v2 remains registered in all cases.
+ */
+esp_err_t ble_link_service_set_domain_descriptors(
+    const device_link_domain_descriptor_t *domains, size_t domain_count);
+
+/**
  * @brief Reset the service (new boot or full teardown).
  */
 void ble_link_service_reset(void);
@@ -130,8 +144,8 @@ typedef esp_err_t (*ble_link_work_submit_fn)(ble_link_work_t *work, void *arg);
 /**
  * @brief Feed one raw characteristic write value.
  *
- * Runs the production path: fragment parse and reassembly, envelope and
- * request decode, channel admission, request dispatch, and response
+ * Runs the production path: fragment parse and reassembly, fixed v2 header
+ * and Typed-TLV request decode, channel admission, request dispatch, and response
  * framing through the output sink. The bootstrap flow
  * (authorize_prepare/authorize_commit/get_authorization) and the
  * capabilities/snapshot reads are admitted on the session channel with an
@@ -411,23 +425,27 @@ bool ble_link_service_pending_confirmation(void);
 uint64_t ble_link_service_confirmation_token(void);
 
 /**
- * @brief Process one plaintext Envelope and produce the plaintext response
- * envelope.
+ * @brief Process one decrypted Device Link v2 message and produce its
+ * plaintext response message.
  *
  * Invoked by the Security 2 adapter's request callback after decryption.
- * Decodes and validates the Envelope, dispatches the request, and fills
- * the response Envelope (allocated). Failures return an error and the
+ * Decodes and validates the fixed header and Typed-TLV request, dispatches
+ * it, and fills the response message (allocated). Failures return an error and the
  * caller closes the session.
  *
- * @param[in] msg Plaintext Envelope bytes.
- * @param[in] len Envelope length.
- * @param[out] response Allocated response Envelope.
+ * @param[in] msg Decrypted Device Link v2 request bytes.
+ * @param[in] len Request length.
+ * @param[out] response Allocated Device Link v2 response bytes.
  * @param[out] response_len Response length.
  * @return ESP_OK, or a protocol/admission error.
  */
 esp_err_t ble_link_service_process_plaintext(
     const uint8_t *msg, size_t len,
     uint8_t **response, size_t *response_len);
+
+/** @brief Release a response returned by ble_link_service_process_plaintext. */
+void ble_link_service_release_plaintext(
+    uint8_t *response, size_t response_len);
 
 #ifdef __cplusplus
 }

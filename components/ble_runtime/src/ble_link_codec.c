@@ -139,28 +139,30 @@ static bool _ble_link_codec_valid_envelope_body(ble_link_codec_body_t body)
     return body == BLE_LINK_CODEC_BODY_REQUEST ||
            body == BLE_LINK_CODEC_BODY_RESPONSE ||
            body == BLE_LINK_CODEC_BODY_EVENT ||
-           body == BLE_LINK_CODEC_BODY_SNAPSHOT ||
-           body == BLE_LINK_CODEC_BODY_TRANSFER_CONTROL;
+           body == BLE_LINK_CODEC_BODY_SNAPSHOT;
 }
 
 static bool _ble_link_codec_valid_request_body(ble_link_codec_request_tag_t body)
 {
-    return body == BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES ||
+    return body == BLE_LINK_CODEC_REQUEST_GET_MANIFEST ||
            body == BLE_LINK_CODEC_REQUEST_GET_LINK_SNAPSHOT ||
            body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_PREPARE ||
            body == BLE_LINK_CODEC_REQUEST_AUTHORIZE_COMMIT ||
-           body == BLE_LINK_CODEC_REQUEST_SUBSCRIBE_EVENTS ||
-           body == BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION;
+           body == BLE_LINK_CODEC_REQUEST_GET_AUTHORIZATION ||
+           body == BLE_LINK_CODEC_REQUEST_DOMAIN_CALL ||
+           body == BLE_LINK_CODEC_REQUEST_GET_OPERATION ||
+           body == BLE_LINK_CODEC_REQUEST_CANCEL_OPERATION;
 }
 
 static bool _ble_link_codec_valid_response_body(
     ble_link_codec_response_tag_t body)
 {
-    return body == BLE_LINK_CODEC_RESPONSE_CAPABILITIES ||
+    return body == BLE_LINK_CODEC_RESPONSE_MANIFEST ||
            body == BLE_LINK_CODEC_RESPONSE_SNAPSHOT ||
            body == BLE_LINK_CODEC_RESPONSE_AUTHORIZE_PREPARE ||
            body == BLE_LINK_CODEC_RESPONSE_AUTHORIZATION_RESULT ||
-           body == BLE_LINK_CODEC_RESPONSE_EVENT_SUBSCRIPTION;
+           body == BLE_LINK_CODEC_RESPONSE_DOMAIN_RESULT ||
+           body == BLE_LINK_CODEC_RESPONSE_OPERATION;
 }
 
 /**
@@ -236,7 +238,7 @@ esp_err_t ble_link_codec_decode_envelope(
         }
         field = (uint32_t)(tag >> 3U);
         if (!(field == 1U || field == 2U || field == 3U || field == 4U ||
-                (field >= 10U && field <= 15U)))
+                (field >= 10U && field <= 13U)))
         {
             /* Unknown field: skip the payload and retain the raw span. */
             if (out->unknown_fields_count >= BLE_LINK_CODEC_MAX_UNKNOWN_FIELDS)
@@ -385,7 +387,6 @@ esp_err_t ble_link_codec_decode_envelope(
         case 11U: /* response */
         case 12U: /* event */
         case 13U: /* snapshot */
-        case 14U: /* transfer_control */
             if (wire != BLE_LINK_CODEC_WIRE_LEN)
             {
                 return ESP_ERR_INVALID_STATE;
@@ -492,12 +493,14 @@ esp_err_t ble_link_codec_decode_request(
                 return ESP_ERR_INVALID_STATE;
             }
             break;
-        case 10U: /* get_capabilities */
+        case 10U: /* get_manifest */
         case 11U: /* get_link_snapshot */
         case 12U: /* authorize_prepare */
         case 13U: /* authorize_commit */
-        case 14U: /* subscribe_events */
-        case 15U: /* get_authorization */
+        case 14U: /* get_authorization */
+        case 15U: /* domain_call */
+        case 16U: /* get_operation */
+        case 17U: /* cancel_operation */
             if (wire != BLE_LINK_CODEC_WIRE_LEN)
             {
                 return ESP_ERR_INVALID_STATE;
@@ -619,11 +622,12 @@ esp_err_t ble_link_codec_decode_response(
                 out->error = (uint32_t)value;
             }
             break;
-        case 10U: /* capabilities */
+        case 10U: /* manifest */
         case 11U: /* snapshot */
-        case 12U: /* authorization_prepare */
+        case 12U: /* authorize_prepare */
         case 13U: /* authorization_result */
-        case 14U: /* event_subscription */
+        case 14U: /* domain_result */
+        case 15U: /* operation */
             if (wire != BLE_LINK_CODEC_WIRE_LEN)
             {
                 return ESP_ERR_INVALID_STATE;

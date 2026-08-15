@@ -70,6 +70,9 @@ typedef struct ble_runtime_host_port
      */
     esp_err_t (*reset_peer_store)(void);
 
+    /** @brief Copy the boot-scoped public discovery instance identifier. */
+    esp_err_t (*get_public_instance_id)(uint8_t out_instance_id[3]);
+
     /** @brief Stop the host stack; must not return before teardown completes. */
     esp_err_t (*stop)(void);
 

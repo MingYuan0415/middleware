@@ -11,8 +11,37 @@
 extern "C" {
 #endif
 
+/** @brief Derived public password length in ASCII bytes. */
+#define DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES 43U
+
+/** @brief Bytes of the advertised public instance identifier. */
+#define DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES 3U
+
 /** @brief Default SRP username (also used when the config leaves it NULL). */
 #define DEVICE_LINK_SECURITY_USERNAME "microtech"
+
+/** @brief Public-discovery SRP derivation label (frozen in security.json). */
+#define DEVICE_LINK_SECURITY_PUBLIC_SRP_LABEL \
+    "microtech.device-link.v2.public-srp"
+
+/** @brief Public-discovery SRP derivation service UUID (RFC 4122 form). */
+#define DEVICE_LINK_SECURITY_PUBLIC_SRP_SERVICE_UUID \
+    "2c77e48c-c510-4230-8d05-63d036dc038b"
+
+#ifdef UNIT_TEST_HOST
+/**
+ * @brief Test-only seam: derive the public SRP password for an
+ * advertisement instance id (frozen KAT in security.json).
+ *
+ * @param[in]  instance_id Non-zero advertisement instance id.
+ * @param[out] password    Buffer of at least
+ *                         DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1.
+ * @return ESP_OK, or ESP_ERR_INVALID_ARG.
+ */
+esp_err_t device_link_security_test_derive_public_password(
+    const uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES],
+    char password[DEVICE_LINK_SECURITY_PUBLIC_PASSWORD_BYTES + 1U]);
+#endif
 
 /** @brief Verifier slot selected for a Security 2 handshake. */
 typedef enum
@@ -20,6 +49,8 @@ typedef enum
     DEVICE_LINK_SECURITY_VERIFIER_NONE = 0, /**< No verifier: handshake not admitted. */
     DEVICE_LINK_SECURITY_VERIFIER_BOOTSTRAP, /**< QR POP of the open pairing window. */
     DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM, /**< Committed authorization record. */
+    DEVICE_LINK_SECURITY_VERIFIER_PUBLIC, /**< Public-discovery password of the
+                                           *  current advertisement. */
 } device_link_security_verifier_kind_t;
 
 /** @brief Security 2 handshake command accepted by the adapter. */
@@ -79,6 +110,10 @@ typedef esp_err_t (*device_link_security_request_fn)(
     const uint8_t *request, size_t request_len,
     uint8_t **response, size_t *response_len, void *arg);
 
+/** @brief Release a response returned by the application request callback. */
+typedef void (*device_link_security_response_release_fn)(
+    uint8_t *response, size_t response_len, void *arg);
+
 /** @brief Security adapter configuration. */
 typedef struct device_link_security_config
 {
@@ -86,6 +121,8 @@ typedef struct device_link_security_config
     uint32_t session_id; /**< Protocomm session id, e.g. connection generation. */
     device_link_security_request_fn request_cb; /**< Protected request sink. */
     void *request_arg; /**< Callback argument. */
+    device_link_security_response_release_fn response_release_cb;
+    void *response_release_arg;
     device_link_security_authenticated_fn authenticated_cb; /**< Optional
                                                              *  authentication
                                                              *  transition. */
@@ -132,6 +169,43 @@ esp_err_t device_link_security_open_bootstrap(
  * @return ESP_OK or a verifier rebuild error.
  */
 esp_err_t device_link_security_close_bootstrap(void);
+
+/**
+ * @brief Install the public-discovery verifier for the current
+ * advertisement.
+ *
+ * Derives the public SRP password from the advertisement per the frozen
+ * derivation:
+ *
+ * ```text
+ * input = UTF-8("microtech.device-link.v2.public-srp")
+ *         || 0x00
+ *         || UUID_BYTES("2c77e48c-c510-4230-8d05-63d036dc038b")
+ *         || 0x02
+ *         || instance_id[3]
+ * password = BASE64URL_NO_PADDING(SHA-256(input))
+ * ```
+ *
+ * A fresh random 16-byte salt is generated when the verifier is installed;
+ * the salt is never derived from the instance ID. The password is public
+ * input, stable across Bluetooth disable/enable within one boot, and
+ * changes on a new boot. The long-term and bootstrap slots are preserved.
+ * The public slot is kept until close_public, close_bootstrap-side
+ * transitions, deinit, or a fresh boot.
+ *
+ * @param[in] instance_id Current non-zero advertisement instance id.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG for a NULL or all-zero instance id,
+ *         or a derivation/rebuild error.
+ */
+esp_err_t device_link_security_open_public(
+    const uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES]);
+
+/**
+ * @brief Remove the public-discovery verifier and rebuild the instance
+ * with the long-term verifier if one is committed, otherwise none.
+ * @return ESP_OK or a verifier rebuild error.
+ */
+esp_err_t device_link_security_close_public(void);
 
 /**
  * @brief Select and pin the verifier for the next Security 2 handshake.

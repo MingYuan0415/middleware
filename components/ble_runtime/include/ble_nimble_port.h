@@ -62,6 +62,9 @@ const ble_port_ops_t *ble_nimble_port_get_ops(void);
  */
 const ble_runtime_host_port_t *ble_nimble_port_get(void);
 
+/** @brief Copy the boot-scoped public discovery instance identifier. */
+esp_err_t ble_nimble_port_get_public_instance_id(uint8_t out_instance_id[3]);
+
 /**
  * @brief Request a local binding revoke (bond/CCCD deletion on the host
  * core).

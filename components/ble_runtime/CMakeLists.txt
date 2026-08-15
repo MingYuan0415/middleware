@@ -13,8 +13,6 @@ idf_component_register(
         "src/ble_adv_manager.c"
         "src/ble_tx_scheduler.c"
         "src/ble_response_cache.c"
-        "src/ble_link_codec.c"
-        "src/ble_link_dispatcher.c"
         "src/ble_link_state.c"
         "src/ble_link_reassembler.c"
         "src/ble_link_cleanup_obligation.c"
@@ -27,9 +25,11 @@ idf_component_register(
         "src/ble_link_gatt.c"
         "src/ble_event_router.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt
-    PRIV_REQUIRES
+    REQUIRES
+        bt
+        device_link
         device_link_security
+    PRIV_REQUIRES
         freertos
         mt_log
         nvs_flash

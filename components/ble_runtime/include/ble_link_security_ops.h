@@ -44,12 +44,13 @@ typedef struct ble_link_security_ops
         uint8_t **output, size_t *output_len,
         device_link_security_handshake_result_t *handshake_result);
 
-    /** @brief Decrypt and dispatch one protected frame; response ciphertext
-     *  is allocated. */
+    /** @brief Decrypt one protected Device Link v2 message; response
+     *  ciphertext is allocated. */
     esp_err_t (*unprotect)(const uint8_t *input, size_t input_len,
                            uint8_t **output, size_t *output_len);
 
-    /** @brief Encrypt one outbound plaintext frame; ciphertext allocated. */
+    /** @brief Protect one outbound Device Link v2 message; ciphertext is
+     *  allocated. */
     esp_err_t (*protect)(const uint8_t *plain, size_t plain_len,
                          uint8_t **cipher, size_t *cipher_len);
 

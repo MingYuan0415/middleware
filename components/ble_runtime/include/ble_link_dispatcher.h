@@ -13,13 +13,19 @@
 extern "C" {
 #endif
 
-/** @brief Frozen Link v1 envelope flag values. */
+/*
+ * This dispatcher describes the retired v1 envelope adapter used by existing
+ * host regression fixtures. The production Device Link ingress is v2-only;
+ * it routes through device_link_wire/device_link_router instead.
+ */
+
+/** @brief Frozen Core v2 envelope flag values. */
 #define BLE_LINK_CODEC_FLAG_RECOVERY_QUERY 1U
 
-/** @brief Frozen Link v1 protocol major. */
-#define BLE_LINK_CODEC_PROTOCOL_MAJOR 1U
+/** @brief Frozen Core v2 protocol major. */
+#define BLE_LINK_CODEC_PROTOCOL_MAJOR 2U
 
-/** @brief Link v1 application error codes (microtech.link.v1.LinkError). */
+/** @brief Core v2 application errors (microtech.link.core.v2.LinkError). */
 typedef enum
 {
     BLE_LINK_ERROR_UNSPECIFIED = 0,
@@ -53,7 +59,7 @@ typedef struct ble_link_dispatcher_facts
     bool encrypted;             /**< Link encrypted. */
     bool session_authenticated; /**< Security 2 session authenticated. */
     bool authorized;            /**< Session matches the committed record. */
-    bool recovery_query;        /**< Envelope carried RECOVERY_QUERY. */
+    bool recovery_query;        /**< Retired adapter recovery marker. */
 } ble_link_dispatcher_facts_t;
 
 /**

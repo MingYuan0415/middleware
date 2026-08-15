@@ -35,74 +35,46 @@
     #define BLE_ATT_ERR_INSUFFICIENT_RES 0x11
 #endif
 
-/* Device Link profile service UUID: 3e203192-b4bb-4e59-a28a-3d1157854ea3. */
+/* Device Link v2 service: 2c77e48c-c510-4230-8d05-63d036dc038b. */
 static const uint8_t s_device_link_uuid[16] =
 {
-    0xa3, 0x4e, 0x85, 0x57, 0x11, 0x3d, 0x8a, 0xa2,
-    0x59, 0x4e, 0xbb, 0xb4, 0x92, 0x31, 0x20, 0x3e,
+    0x8b, 0x03, 0xdc, 0x36, 0xd0, 0x63, 0x05, 0x8d,
+    0x30, 0x42, 0x10, 0xc5, 0x8c, 0xe4, 0x77, 0x2c,
 };
 
-/* link_state: a4781f24-dc6b-44eb-864f-23a8a4ef82b5. */
+/* link_state: f91f51f0-b202-4f98-9114-a2003688cc35. */
 static const uint8_t s_link_state_uuid[16] =
 {
-    0xb5, 0x82, 0xef, 0xa4, 0xa8, 0x23, 0x4f, 0x86,
-    0xeb, 0x44, 0x6b, 0xdc, 0x24, 0x1f, 0x78, 0xa4,
+    0x35, 0xcc, 0x88, 0x36, 0x00, 0xa2, 0x14, 0x91,
+    0x98, 0x4f, 0x02, 0xb2, 0xf0, 0x51, 0x1f, 0xf9,
 };
 
-/* session_rx: 4801e643-cb4c-4dd8-b85c-e6e0fccdf0a2. */
+/* session_rx: 1bbfaedb-60f5-48fe-8319-ee48508febf4. */
 static const uint8_t s_session_rx_uuid[16] =
 {
-    0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
-    0xd8, 0x4d, 0x4c, 0xcb, 0x43, 0xe6, 0x01, 0x48,
+    0xf4, 0xeb, 0x8f, 0x50, 0x48, 0xee, 0x19, 0x83,
+    0xfe, 0x48, 0xf5, 0x60, 0xdb, 0xae, 0xbf, 0x1b,
 };
 
-/* session_tx: 2be85710-beac-402c-83a1-ec5fd2af052a. */
+/* session_tx: 2cc65d38-571b-4f5a-83a2-c1a558693dec. */
 static const uint8_t s_session_tx_uuid[16] =
 {
-    0x2a, 0x05, 0xaf, 0xd2, 0x5f, 0xec, 0xa1, 0x83,
-    0x2c, 0x40, 0xac, 0xbe, 0x10, 0x57, 0xe8, 0x2b,
+    0xec, 0x3d, 0x69, 0x58, 0xa5, 0xc1, 0xa2, 0x83,
+    0x5a, 0x4f, 0x1b, 0x57, 0x38, 0x5d, 0xc6, 0x2c,
 };
 
-/* control_rx: 81a14662-669d-4772-8e0c-fb3d403d13c8. */
+/* control_rx: 29dfcc56-cd1d-4113-85db-5e26a3b46748. */
 static const uint8_t s_control_rx_uuid[16] =
 {
-    0xc8, 0x13, 0x3d, 0x40, 0x3d, 0xfb, 0x0c, 0x8e,
-    0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
+    0x48, 0x67, 0xb4, 0xa3, 0x26, 0x5e, 0xdb, 0x85,
+    0x13, 0x41, 0x1d, 0xcd, 0x56, 0xcc, 0xdf, 0x29,
 };
 
-/* control_tx: 11735ac7-1e40-4a9c-b562-b8f64c03883a. */
+/* control_tx: 7c6ec06a-4f47-47a8-be90-b86431c84b79. */
 static const uint8_t s_control_tx_uuid[16] =
 {
-    0x3a, 0x88, 0x03, 0x4c, 0xf6, 0xb8, 0x62, 0xb5,
-    0x9c, 0x4a, 0x40, 0x1e, 0xc7, 0x5a, 0x73, 0x11,
-};
-
-/* transfer service: 2b837278-c4ef-426e-9fa0-4e32880ac31c. */
-static const uint8_t s_transfer_service_uuid[16] =
-{
-    0x1c, 0xc3, 0x0a, 0x88, 0x32, 0x4e, 0xa0, 0x9f,
-    0x6e, 0x42, 0xef, 0xc4, 0x78, 0x72, 0x83, 0x2b,
-};
-
-/* transfer_rx: f3598d4d-e9ff-471e-97ac-76728628f0a1. */
-static const uint8_t s_transfer_rx_uuid[16] =
-{
-    0xa1, 0xf0, 0x28, 0x86, 0x72, 0x76, 0xac, 0x97,
-    0x1e, 0x47, 0xff, 0xe9, 0x4d, 0x8d, 0x59, 0xf3,
-};
-
-/* transfer_tx: a99aa0f1-7dd0-46de-a17d-a619efb2c595. */
-static const uint8_t s_transfer_tx_uuid[16] =
-{
-    0x95, 0xc5, 0xb2, 0xef, 0x19, 0xa6, 0x7d, 0xa1,
-    0xde, 0x46, 0xd0, 0x7d, 0xf1, 0xa0, 0x9a, 0xa9,
-};
-
-/* transfer_state: ec4125f1-16d5-4a02-96ba-b7efb894d49b. */
-static const uint8_t s_transfer_state_uuid[16] =
-{
-    0x9b, 0xd4, 0x94, 0xb8, 0xef, 0xb7, 0xba, 0x96,
-    0x02, 0x4a, 0xd5, 0x16, 0xf1, 0x25, 0x41, 0xec,
+    0x79, 0x4b, 0xc8, 0x31, 0x64, 0xb8, 0x90, 0xbe,
+    0xa8, 0x47, 0x4f, 0x4f, 0x6a, 0xc0, 0x6e, 0x7c,
 };
 
 typedef struct ble_link_gatt
@@ -192,8 +164,7 @@ static ble_gatt_registry_characteristic_t s_characteristics[5] =
     },
     {
         .uuid = s_control_tx_uuid,
-        .properties = BLE_GATT_REGISTRY_PROP_INDICATE |
-        BLE_GATT_REGISTRY_PROP_NOTIFY,
+        .properties = BLE_GATT_REGISTRY_PROP_INDICATE,
         .read_admission = BLE_GATT_REGISTRY_ADMISSION_PUBLIC_MINIMUM,
         .write_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED,
         .tx_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED,
@@ -205,39 +176,6 @@ static const ble_gatt_registry_service_t s_service =
     .uuid = s_device_link_uuid,
     .characteristics = s_characteristics,
     .characteristic_count = 5U,
-};
-
-static ble_gatt_registry_characteristic_t s_transfer_characteristics[3] =
-{
-    {
-        .uuid = s_transfer_rx_uuid,
-        .properties = BLE_GATT_REGISTRY_PROP_WRITE_NO_RESPONSE,
-        .read_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-        .write_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-        .tx_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-    },
-    {
-        .uuid = s_transfer_tx_uuid,
-        .properties = BLE_GATT_REGISTRY_PROP_NOTIFY,
-        .read_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-        .write_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-        .tx_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED_TRANSFER,
-    },
-    {
-        .uuid = s_transfer_state_uuid,
-        .properties = BLE_GATT_REGISTRY_PROP_READ |
-        BLE_GATT_REGISTRY_PROP_NOTIFY,
-        .read_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED,
-        .write_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED,
-        .tx_admission = BLE_GATT_REGISTRY_ADMISSION_AUTHORIZED,
-    },
-};
-
-static const ble_gatt_registry_service_t s_transfer_service =
-{
-    .uuid = s_transfer_service_uuid,
-    .characteristics = s_transfer_characteristics,
-    .characteristic_count = 3U,
 };
 
 /**
@@ -332,10 +270,6 @@ static esp_err_t _ble_link_gatt_output(
         handle = handles[4];
         kind = BLE_TX_SCHEDULER_KIND_INDICATE;
         break;
-    case BLE_LINK_SERVICE_TX_CONTROL_EVENT:
-        handle = handles[4];
-        kind = BLE_TX_SCHEDULER_KIND_NOTIFY;
-        break;
     default:
         return ESP_ERR_INVALID_ARG;
     }
@@ -375,8 +309,8 @@ static int _ble_link_gatt_read_link_state(
     ble_link_service_facts_t facts;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 1U;
-    state.profile_major = 1U;
+    state.protocol_major = 2U;
+    state.profile_major = 2U;
     if (_ble_link_gatt_service_facts(&facts) != ESP_OK)
     {
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
@@ -390,18 +324,6 @@ static int _ble_link_gatt_read_link_state(
     }
     *context->read_len = (uint16_t)len;
     return 0;
-}
-
-static int _ble_link_gatt_transfer_access(
-    uint16_t conn_handle, uint16_t attr_handle,
-    ble_gatt_registry_access_context_t *context, void *arg)
-{
-    (void)conn_handle;
-    (void)attr_handle;
-    (void)context;
-    (void)arg;
-    /* Transfer is not implemented; the service exists and rejects. */
-    return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
 }
 
 static int _ble_link_gatt_access(
@@ -538,11 +460,6 @@ esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
     {
         s_characteristics[i].access_cb = _ble_link_gatt_access;
     }
-    for (size_t i = 0U; i < 3U; ++i)
-    {
-        s_transfer_characteristics[i].access_cb =
-            _ble_link_gatt_transfer_access;
-    }
     ble_link_session_init(config->boot_id);
     const size_t queue_depth = (config->tx_queue_depth > 0U) ?
                                config->tx_queue_depth : 32U;
@@ -551,14 +468,9 @@ esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
                           NULL, config->security_ops, queue_depth);
     if (!registered)
     {
-        /* The registry is process-global; the services register once. */
+        /* The registry is process-global; the v2 service registers once. */
         esp_err_t result = ble_gatt_registry_register(&s_service);
 
-        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
-        {
-            return result;
-        }
-        result = ble_gatt_registry_register(&s_transfer_service);
         if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
         {
             return result;
@@ -621,11 +533,6 @@ esp_err_t ble_link_gatt_restart(void)
     {
         s_characteristics[i].access_cb = _ble_link_gatt_access;
     }
-    for (size_t i = 0U; i < 3U; ++i)
-    {
-        s_transfer_characteristics[i].access_cb =
-            _ble_link_gatt_transfer_access;
-    }
     ble_link_service_init(boot_id, _ble_link_gatt_output, NULL,
                           security_ops, queue_depth);
     return ESP_OK;
@@ -676,8 +583,8 @@ esp_err_t ble_link_gatt_refresh_link_state(void)
     }
     config = s_gatt.config;
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 1U;
-    state.profile_major = 1U;
+    state.protocol_major = 2U;
+    state.profile_major = 2U;
     state.boot_id = facts.active_boot_id;
     state.state_flags = ble_link_session_get_state_flags();
     if (ble_link_state_encode(&state, value, sizeof(value), &len) != ESP_OK)

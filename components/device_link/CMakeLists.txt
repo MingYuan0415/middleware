@@ -1,16 +1,11 @@
-set(DEVICE_LINK_SOURCES
-    "src/device_link_framing.c"
-    "src/generated/microtech/link/v1/capabilities.pb-c.c"
-    "src/generated/microtech/link/v1/envelope.pb-c.c"
-    "src/generated/microtech/link/v1/errors.pb-c.c"
-    "src/generated/microtech/link/v1/events.pb-c.c"
-    "src/generated/microtech/link/v1/session.pb-c.c"
-    "src/generated/microtech/link/v1/transfer.pb-c.c"
-)
-
 idf_component_register(
-    SRCS ${DEVICE_LINK_SOURCES}
+    SRCS
+        "src/device_link_operation.c"
+        "src/device_link_core.c"
+        "src/device_link_digest.c"
+        "src/device_link_router.c"
+        "src/device_link_tlv.c"
+        "src/device_link_wire.c"
     INCLUDE_DIRS "include"
-    PRIV_INCLUDE_DIRS "src/generated"
-    PRIV_REQUIRES protobuf-c
+    PRIV_REQUIRES bt
 )

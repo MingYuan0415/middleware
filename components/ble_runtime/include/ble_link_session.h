@@ -297,13 +297,41 @@ esp_err_t ble_link_session_get_security_facts(
 /**
  * @brief Current PublicLinkState flags for the boot.
  *
- * BINDABLE reflects the local pairing window; BOUND reflects the existence
- * of a committed authorization record (a persistent device fact, not tied
- * to the current connection).
+ * BINDABLE reflects the local pairing window and is mutually exclusive
+ * with BOUND; BOUND reflects the existence of a committed authorization
+ * record (a persistent device fact, not tied to the current connection).
+ * AUTHENTICATED is only published for a bound session, and AUTHORIZED
+ * implies AUTHENTICATED and BOUND.
  *
- * @return BLE_LINK_STATE_FLAG_BINDABLE and/or BLE_LINK_STATE_FLAG_BOUND.
+ * @return BLE_LINK_STATE_FLAG_* combination valid under the v2 GATT
+ *         cross-flag implications.
  */
 uint32_t ble_link_session_get_state_flags(void);
+
+/**
+ * @brief Drive the TRANSITIONING link-state flag for binding and
+ * authorization transitions.
+ *
+ * The service arms this while an authorization transaction is live
+ * (Prepare through durable Commit) and clears it when the transaction is
+ * cleared, denied, or retired. Security 2 handshakes set the flag
+ * internally.
+ *
+ * @param[in] active True while an authorization transition is in progress.
+ */
+void ble_link_session_set_authorization_transitioning(bool active);
+
+/**
+ * @brief Latch the ERROR link-state flag for an unrecoverable runtime
+ * state.
+ *
+ * Once latched, the flag stays set until the next boot; clients must stop
+ * sensitive retries and wait for a fresh boot ID. The session also latches
+ * ERROR itself when its boot-scoped epoch allocator is exhausted.
+ *
+ * @param[in] error True to enter the unrecoverable error state.
+ */
+void ble_link_session_set_error(bool error);
 
 #ifdef __cplusplus
 }

@@ -75,10 +75,10 @@ static void _from_hex(const char *hex, uint8_t *out, size_t *out_len)
     *out_len = len;
 }
 
-static void test_capabilities_request_roundtrip(void)
+static void test_manifest_request_roundtrip(void)
 {
     static const char hex[] =
-        "0801190807060504030201520b0901000000000000005200";
+        "0802190807060504030201520b0901000000000000005200";
     uint8_t bytes[64];
     size_t len = 0U;
     ble_link_codec_envelope_t envelope;
@@ -86,7 +86,7 @@ static void test_capabilities_request_roundtrip(void)
     _from_hex(hex, bytes, &len);
     TEST_ASSERT_EQUAL(ESP_OK,
                       ble_link_codec_decode_envelope(bytes, len, &envelope));
-    TEST_ASSERT_EQUAL(1U, envelope.protocol_major);
+    TEST_ASSERT_EQUAL(2U, envelope.protocol_major);
     TEST_ASSERT_EQUAL(0U, envelope.protocol_minor);
     TEST_ASSERT_EQUAL(72623859790382856ULL, envelope.boot_id);
     TEST_ASSERT_EQUAL(0U, envelope.flags);
@@ -98,7 +98,7 @@ static void test_capabilities_request_roundtrip(void)
                           envelope.body_data, envelope.body_len,
                           &request));
     TEST_ASSERT_EQUAL(1U, request.request_id);
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES, request.body);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_REQUEST_GET_MANIFEST, request.body);
     TEST_ASSERT_EQUAL(0U, request.body_len);
     uint8_t reencoded[64];
     size_t reencoded_len = 0U;
@@ -192,7 +192,7 @@ static void test_snapshot_envelope_roundtrip(void)
     TEST_ASSERT_EQUAL(0, memcmp(reencoded, bytes, len));
 }
 
-static void test_transfer_control_envelope_roundtrip(void)
+static void test_legacy_transfer_is_unknown(void)
 {
     static const char hex[] =
         "08011908070605040302017238098877665544332211522d08011100000100000000"
@@ -209,7 +209,8 @@ static void test_transfer_control_envelope_roundtrip(void)
                       ble_link_codec_decode_envelope(bytes, len, &envelope));
     TEST_ASSERT_EQUAL(1U, envelope.protocol_major);
     TEST_ASSERT_EQUAL(72623859790382856ULL, envelope.boot_id);
-    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_BODY_TRANSFER_CONTROL, envelope.body);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_BODY_NONE, envelope.body);
+    TEST_ASSERT_EQUAL(1U, envelope.unknown_fields_count);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_encode_envelope(
                           &envelope, reencoded, sizeof(reencoded),
                           &reencoded_len));
@@ -462,14 +463,14 @@ static void test_encoder_overflow_and_capacity_rejected(void)
                           &envelope, NULL, 0U, &out_len));
     memset(&request, 0, sizeof(request));
     request.request_id = 1U;
-    request.body = BLE_LINK_CODEC_REQUEST_GET_CAPABILITIES;
+    request.body = BLE_LINK_CODEC_REQUEST_GET_MANIFEST;
     request.body_data = dummy;
     request.body_len = SIZE_MAX;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_request(
                           &request, NULL, 0U, &out_len));
     memset(&response, 0, sizeof(response));
     response.request_id = 1U;
-    response.body = BLE_LINK_CODEC_RESPONSE_CAPABILITIES;
+    response.body = BLE_LINK_CODEC_RESPONSE_MANIFEST;
     response.body_data = dummy;
     response.body_len = SIZE_MAX;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_codec_encode_response(
@@ -647,11 +648,11 @@ static void test_flags_aggregate_consistency(void)
 
 int main(void)
 {
-    test_capabilities_request_roundtrip();
+    test_manifest_request_roundtrip();
     test_authorize_prepare_response_roundtrip();
     test_unknown_field_roundtrip();
     test_snapshot_envelope_roundtrip();
-    test_transfer_control_envelope_roundtrip();
+    test_legacy_transfer_is_unknown();
     test_invalid_envelopes_rejected();
     test_packed_and_unpacked_flags();
     test_duplicate_body_rejected();
