@@ -675,7 +675,7 @@ static bool _wifi_service_credentials_valid(
     {
         valid = credentials->security == WIFI_SERVICE_SECURITY_PERSONAL &&
                 credentials->password != NULL &&
-                credentials->password_length >= 8 &&
+                credentials->password_length >= 1 &&
                 credentials->password_length <=
                 WIFI_SERVICE_PASSWORD_MAX_BYTES &&
                 memchr(credentials->password, '\0',

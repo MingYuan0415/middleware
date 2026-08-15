@@ -13,9 +13,10 @@ extern "C" {
 #endif
 
 #define CONNECTIVITY_MANAGER_SSID_MAX_BYTES     32U
-#define CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES 63U
+#define CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES 64U
 #define CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS   5U
 #define CONNECTIVITY_MANAGER_WAIT_FOREVER       UINT32_MAX
+#define CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL UINT64_C(1)
 
 EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG);
 
@@ -53,6 +54,7 @@ typedef enum
     CONNECTIVITY_MANAGER_FAILURE_LINK_LOST,
     CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE,
     CONNECTIVITY_MANAGER_FAILURE_STORAGE,
+    CONNECTIVITY_MANAGER_FAILURE_CONFLICT,
     CONNECTIVITY_MANAGER_FAILURE_INTERNAL,
 } connectivity_manager_failure_t;
 
@@ -80,6 +82,9 @@ typedef struct connectivity_manager_credentials
     size_t password_length;                   /**< Number of password bytes. */
     connectivity_manager_security_t security; /**< Requested security mode. */
 } connectivity_manager_credentials_t;
+
+/** @brief Nonzero client identity used to make profile sync idempotent. */
+typedef uint64_t connectivity_manager_client_sync_id_t;
 
 /** @brief One sanitized bounded scan result. */
 typedef struct connectivity_manager_scan_record
@@ -109,6 +114,9 @@ typedef struct connectivity_manager_status_snapshot
     bool auto_connect;                              /**< Persistent policy switch. */
     bool manual_hold;                               /**< Offline for this boot. */
     bool operation_complete;                        /**< Foreground terminal event. */
+    uint64_t profile_revision;                       /**< Durable profile revision. */
+    connectivity_manager_client_sync_id_t
+    applied_client_sync_id;                         /**< Last durable sync id. */
     char ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U]; /**< Target SSID. */
 } connectivity_manager_status_snapshot_t;
 
@@ -188,6 +196,13 @@ esp_err_t connectivity_manager_request_scan(
  */
 esp_err_t connectivity_manager_request_connect(
     const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_operation_id_t *out_operation_id);
+
+/** @brief Synchronize a saved profile without per-command confirmation. */
+esp_err_t connectivity_manager_request_sync_profile(
+    const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_client_sync_id_t client_sync_id,
+    bool auto_connect,
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**

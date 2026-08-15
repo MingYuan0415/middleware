@@ -15,7 +15,7 @@ extern "C" {
 /** @brief Maximum SSID length accepted by the service. */
 #define WIFI_SERVICE_SSID_MAX_BYTES 32U
 /** @brief Maximum personal-network password length. */
-#define WIFI_SERVICE_PASSWORD_MAX_BYTES 63U
+#define WIFI_SERVICE_PASSWORD_MAX_BYTES 64U
 /** @brief Maximum records retained in a scan snapshot. */
 #define WIFI_SERVICE_MAX_SCAN_RECORDS 5U
 /** @brief Infinite timeout value for blocking lifecycle operations. */

@@ -35,7 +35,8 @@
 #define CONNECTIVITY_MANAGER_POLL_MS        20U
 #define CONNECTIVITY_MANAGER_PROFILE_KEY    "wifi_profile"
 #define CONNECTIVITY_MANAGER_PROFILE_MAGIC  UINT32_C(0x57465031)
-#define CONNECTIVITY_MANAGER_PROFILE_VERSION UINT16_C(1)
+#define CONNECTIVITY_MANAGER_PROFILE_VERSION UINT16_C(2)
+#define CONNECTIVITY_MANAGER_LEGACY_PROFILE_VERSION UINT16_C(1)
 #define CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY \
     (CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH + 2U)
 #define CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY \
@@ -48,6 +49,7 @@ typedef enum
     MANAGER_COMMAND_INIT = 0,
     MANAGER_COMMAND_SCAN,
     MANAGER_COMMAND_CONNECT,
+    MANAGER_COMMAND_SYNC_PROFILE,
     MANAGER_COMMAND_DISCONNECT,
     MANAGER_COMMAND_RECONNECT,
     MANAGER_COMMAND_FORGET,
@@ -100,9 +102,27 @@ typedef struct manager_profile
     uint8_t password_length;
     uint8_t reserved[2];
     uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES];
+    /* One byte of the trailing reserve backs the contract maximum 64-byte
+     * password; the frozen record size (128) is preserved. */
     uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
-    uint8_t trailing_reserved[4];
+    uint8_t trailing_reserved[3];
+    uint64_t profile_revision;
+    uint64_t last_client_sync_id;
 } manager_profile_t;
+
+typedef struct manager_legacy_profile
+{
+    uint32_t magic;
+    uint16_t version;
+    uint8_t security;
+    uint8_t auto_connect;
+    uint8_t ssid_length;
+    uint8_t password_length;
+    uint8_t reserved[2];
+    uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES];
+    uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
+    uint8_t trailing_reserved[3];
+} manager_legacy_profile_t;
 
 typedef struct manager_command
 {
@@ -111,6 +131,8 @@ typedef struct manager_command
     uint64_t control_generation;
     uint32_t timeout_ms;
     bool enabled;
+    bool sync_auto_connect;
+    uint64_t client_sync_id;
     manager_profile_t credentials;
 } manager_command_t;
 
@@ -147,6 +169,9 @@ typedef struct manager_worker
     bool target_candidate;
     bool target_persisted;
     bool target_reconnectable;
+    bool active_sync;
+    bool active_sync_auto_connect;
+    connectivity_manager_client_sync_id_t active_client_sync_id;
     bool radio_initialized;
     bool suspended;
     bool retry_pending;
@@ -207,14 +232,18 @@ static atomic_int s_manager_lifecycle =
 static atomic_uint s_manager_api_users = ATOMIC_VAR_INIT(0U);
 static atomic_bool s_manager_deinit_active = ATOMIC_VAR_INIT(false);
 
+static esp_err_t _manager_profile_store(const manager_profile_t *profile);
+
 _Static_assert(CONNECTIVITY_MANAGER_SSID_MAX_BYTES ==
                WIFI_SERVICE_SSID_MAX_BYTES, "SSID limits must match");
 _Static_assert(CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES ==
                WIFI_SERVICE_PASSWORD_MAX_BYTES, "password limits must match");
 _Static_assert(CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS ==
                WIFI_SERVICE_MAX_SCAN_RECORDS, "scan limits must match");
-_Static_assert(sizeof(manager_profile_t) == 112U,
-               "Wi-Fi profile record size changed");
+_Static_assert(sizeof(manager_profile_t) == 128U,
+               "Wi-Fi profile v2 record size changed");
+_Static_assert(sizeof(manager_legacy_profile_t) == 112U,
+               "Wi-Fi profile v1 record size changed");
 _Static_assert(sizeof(connectivity_manager_status_snapshot_t) <=
                EVENT_BUS_MAX_UI_PAYLOAD_SIZE, "status snapshot too large");
 _Static_assert(sizeof(connectivity_manager_scan_snapshot_t) <=
@@ -461,6 +490,7 @@ static bool _manager_profile_valid(const manager_profile_t *profile)
             profile->version != CONNECTIVITY_MANAGER_PROFILE_VERSION ||
             profile->auto_connect > 1U || profile->ssid_length == 0U ||
             profile->ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
+            profile->profile_revision == 0U ||
             profile->security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
             !_manager_bytes_are_zero(profile->reserved,
                                      sizeof(profile->reserved)) ||
@@ -491,26 +521,87 @@ static bool _manager_profile_valid(const manager_profile_t *profile)
                sizeof(profile->password) - profile->password_length);
 }
 
+static bool _manager_profile_credentials_equal(
+    const manager_profile_t *left, const manager_profile_t *right)
+{
+    return left != NULL && right != NULL &&
+           left->security == right->security &&
+           left->ssid_length == right->ssid_length &&
+           left->password_length == right->password_length &&
+           memcmp(left->ssid, right->ssid, sizeof(left->ssid)) == 0 &&
+           memcmp(left->password, right->password,
+                  sizeof(left->password)) == 0;
+}
+
 static esp_err_t _manager_profile_load(manager_worker_t *worker)
 {
+    uint8_t raw[sizeof(manager_profile_t)];
     manager_profile_t profile;
+    memset(raw, 0, sizeof(raw));
     memset(&profile, 0, sizeof(profile));
-    size_t size = sizeof(profile);
+    size_t size = sizeof(raw);
     esp_err_t result = nv_storage_get_blob(CONNECTIVITY_MANAGER_PROFILE_KEY,
-                                           &profile, &size);
+                                           raw, &size);
     if (result == ESP_ERR_NVS_NOT_FOUND)
     {
+        _manager_secure_zero(raw, sizeof(raw));
         return ESP_OK;
     }
-    if (result != ESP_OK || size != sizeof(profile) ||
-            !_manager_profile_valid(&profile))
+    if (result != ESP_OK)
+    {
+        _manager_secure_zero(raw, sizeof(raw));
+        return result;
+    }
+    if (size == sizeof(manager_legacy_profile_t))
+    {
+        manager_legacy_profile_t legacy;
+        memcpy(&legacy, raw, sizeof(legacy));
+        if (legacy.magic != CONNECTIVITY_MANAGER_PROFILE_MAGIC ||
+                legacy.version != CONNECTIVITY_MANAGER_LEGACY_PROFILE_VERSION ||
+                legacy.auto_connect > 1U || legacy.ssid_length == 0U ||
+                legacy.ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
+                legacy.security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
+                !_manager_bytes_are_zero(legacy.reserved,
+                                         sizeof(legacy.reserved)) ||
+                !_manager_bytes_are_zero(legacy.trailing_reserved,
+                                         sizeof(legacy.trailing_reserved)))
+        {
+            _manager_secure_zero(&legacy, sizeof(legacy));
+            _manager_secure_zero(raw, sizeof(raw));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        profile.magic = legacy.magic;
+        profile.version = CONNECTIVITY_MANAGER_PROFILE_VERSION;
+        profile.security = legacy.security;
+        profile.auto_connect = legacy.auto_connect;
+        profile.ssid_length = legacy.ssid_length;
+        profile.password_length = legacy.password_length;
+        memcpy(profile.ssid, legacy.ssid, sizeof(profile.ssid));
+        memcpy(profile.password, legacy.password, sizeof(profile.password));
+        profile.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+        profile.last_client_sync_id = 0U;
+        (void)_manager_profile_store(&profile);
+        _manager_secure_zero(&legacy, sizeof(legacy));
+    }
+    else if (size == sizeof(profile))
+    {
+        memcpy(&profile, raw, sizeof(profile));
+    }
+    else
+    {
+        _manager_secure_zero(raw, sizeof(raw));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!_manager_profile_valid(&profile))
     {
         _manager_secure_zero(&profile, sizeof(profile));
-        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+        _manager_secure_zero(raw, sizeof(raw));
+        return ESP_ERR_INVALID_RESPONSE;
     }
     worker->profile = profile;
     worker->profile_valid = true;
     _manager_secure_zero(&profile, sizeof(profile));
+    _manager_secure_zero(raw, sizeof(raw));
     return ESP_OK;
 }
 
@@ -814,6 +905,11 @@ static void _manager_set_target_status(manager_worker_t *worker)
                                   worker->profile.auto_connect != 0U;
     worker->status.profile_persisted = worker->target_valid &&
                                        worker->target_persisted;
+    worker->status.profile_revision = worker->profile_valid ?
+                                      worker->profile.profile_revision :
+                                      CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+    worker->status.applied_client_sync_id = worker->profile_valid ?
+                                            worker->profile.last_client_sync_id : 0U;
     if (worker->target_valid)
     {
         const manager_profile_t *target = worker->target_persisted ?
@@ -852,6 +948,9 @@ static void _manager_clear_active_operation(manager_worker_t *worker)
     worker->operation_id = 0U;
     worker->service_operation_id = 0U;
     worker->active_cancel_requested = false;
+    worker->active_sync = false;
+    worker->active_sync_auto_connect = false;
+    worker->active_client_sync_id = 0U;
 }
 
 static void _manager_complete_status_operation(
@@ -880,6 +979,7 @@ static unsigned _manager_command_priority(manager_command_type_t type)
     case MANAGER_COMMAND_DISCONNECT:
         return 3U;
     case MANAGER_COMMAND_CONNECT:
+    case MANAGER_COMMAND_SYNC_PROFILE:
     case MANAGER_COMMAND_RECONNECT:
         return 2U;
     case MANAGER_COMMAND_SCAN:
@@ -1175,7 +1275,22 @@ static void _manager_handle_connected(manager_worker_t *worker,
         manager_profile_t saved = worker->target;
         saved.magic = CONNECTIVITY_MANAGER_PROFILE_MAGIC;
         saved.version = CONNECTIVITY_MANAGER_PROFILE_VERSION;
-        saved.auto_connect = 1U;
+        saved.auto_connect = worker->active_sync ?
+                             (worker->active_sync_auto_connect ? 1U : 0U) :
+                             1U;
+        saved.last_client_sync_id = worker->active_sync ?
+                                    worker->active_client_sync_id : 0U;
+        if (saved.profile_revision == 0U)
+        {
+            saved.profile_revision = worker->profile_valid &&
+                                     worker->profile.profile_revision < UINT64_MAX ?
+                                     worker->profile.profile_revision + 1U :
+                                     CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+            if (saved.profile_revision == 0U)
+            {
+                saved.profile_revision = UINT64_MAX;
+            }
+        }
         esp_err_t result = _manager_profile_store(&saved);
         if (result == ESP_OK)
         {
@@ -1470,10 +1585,79 @@ static void _manager_command_connect(manager_worker_t *worker,
     worker->target_candidate = true;
     worker->target_persisted = false;
     worker->target_reconnectable = true;
+    worker->active_sync = false;
+    worker->active_sync_auto_connect = true;
+    worker->active_client_sync_id = 0U;
     worker->retry_count = 0U;
     worker->status.manual_hold = false;
     (void)_manager_start_connect(worker, command->operation_id,
                                  MANAGER_COMMAND_CONNECT);
+}
+
+static void _manager_command_sync_profile(
+    manager_worker_t *worker, const manager_command_t *command)
+{
+    const manager_defer_result_t defer_result =
+        _manager_defer_foreground(worker, command);
+    if (defer_result != MANAGER_DEFER_NONE)
+    {
+        return;
+    }
+    if (worker->profile_valid && worker->profile.last_client_sync_id ==
+            command->client_sync_id)
+    {
+        if (!_manager_profile_credentials_equal(
+                    &worker->profile, &command->credentials))
+        {
+            worker->status.last_error = ESP_ERR_INVALID_STATE;
+            worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_CONFLICT;
+            _manager_publish_status_terminal(
+                worker, command->operation_id, ESP_ERR_INVALID_STATE,
+                CONNECTIVITY_MANAGER_FAILURE_CONFLICT);
+            return;
+        }
+        if (worker->profile.auto_connect !=
+                (command->sync_auto_connect ? 1U : 0U))
+        {
+            manager_profile_t changed = worker->profile;
+            changed.auto_connect = command->sync_auto_connect ? 1U : 0U;
+            const esp_err_t store_result = _manager_profile_store(&changed);
+            if (store_result == ESP_OK)
+            {
+                worker->profile = changed;
+            }
+            _manager_secure_zero(&changed, sizeof(changed));
+            if (store_result != ESP_OK)
+            {
+                worker->status.last_error = store_result;
+                worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+                _manager_set_target_status(worker);
+                _manager_publish_status_terminal(
+                    worker, command->operation_id, store_result,
+                    CONNECTIVITY_MANAGER_FAILURE_STORAGE);
+                return;
+            }
+        }
+        _manager_set_target_status(worker);
+        _manager_publish_status_terminal(
+            worker, command->operation_id, ESP_OK,
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
+        return;
+    }
+    worker->retry_pending = false;
+    worker->retry_count = 0U;
+    _manager_secure_zero(&worker->target, sizeof(worker->target));
+    worker->target = command->credentials;
+    worker->target_valid = true;
+    worker->target_candidate = true;
+    worker->target_persisted = false;
+    worker->target_reconnectable = true;
+    worker->active_sync = true;
+    worker->active_sync_auto_connect = command->sync_auto_connect;
+    worker->active_client_sync_id = command->client_sync_id;
+    worker->status.manual_hold = false;
+    (void)_manager_start_connect(worker, command->operation_id,
+                                 MANAGER_COMMAND_SYNC_PROFILE);
 }
 
 static void _manager_command_disconnect(manager_worker_t *worker,
@@ -1971,6 +2155,9 @@ static void _manager_process_command(manager_worker_t *worker,
         break;
     case MANAGER_COMMAND_CONNECT:
         _manager_command_connect(worker, command);
+        break;
+    case MANAGER_COMMAND_SYNC_PROFILE:
+        _manager_command_sync_profile(worker, command);
         break;
     case MANAGER_COMMAND_DISCONNECT:
         _manager_command_disconnect(worker, command);
@@ -2484,7 +2671,7 @@ static bool _manager_credentials_valid(
         return credentials->password_length == 0U;
     }
     return credentials->password != NULL &&
-           credentials->password_length >= 8U &&
+           credentials->password_length >= 1U &&
            credentials->password_length <=
            CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES &&
            memchr(credentials->password, '\0',
@@ -2512,6 +2699,39 @@ esp_err_t connectivity_manager_request_connect(
     memcpy(command.credentials.ssid, credentials->ssid,
            credentials->ssid_length);
     if (credentials->password_length > 0U)
+    {
+        memcpy(command.credentials.password, credentials->password,
+               credentials->password_length);
+    }
+    return _manager_submit(&command, out_operation_id);
+}
+
+esp_err_t connectivity_manager_request_sync_profile(
+    const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_client_sync_id_t client_sync_id,
+    bool auto_connect,
+    connectivity_manager_operation_id_t *out_operation_id)
+{
+    if (!_manager_credentials_valid(credentials) || client_sync_id == 0U ||
+            out_operation_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    manager_command_t command;
+    memset(&command, 0, sizeof(command));
+    command.type = MANAGER_COMMAND_SYNC_PROFILE;
+    command.client_sync_id = client_sync_id;
+    command.sync_auto_connect = auto_connect;
+    command.credentials.magic = CONNECTIVITY_MANAGER_PROFILE_MAGIC;
+    command.credentials.version = CONNECTIVITY_MANAGER_PROFILE_VERSION;
+    command.credentials.security = (uint8_t)credentials->security;
+    command.credentials.auto_connect = auto_connect ? 1U : 0U;
+    command.credentials.ssid_length = (uint8_t)credentials->ssid_length;
+    command.credentials.password_length =
+        (uint8_t)credentials->password_length;
+    memcpy(command.credentials.ssid, credentials->ssid,
+           credentials->ssid_length);
+    if (credentials->password_length != 0U)
     {
         memcpy(command.credentials.password, credentials->password,
                credentials->password_length);
