@@ -5518,7 +5518,7 @@ static int _ble_nimble_port_access_bridge(
                 /* One characteristic value must fit the 495-byte framing
                  * budget; reject cleanly instead of relying on the
                  * negotiated MTU alone. */
-                return BLE_ATT_ERR_INVALID_ATT_LEN;
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             }
             port_context.write_data = access_buffer;
             port_context.write_len = write_len;
