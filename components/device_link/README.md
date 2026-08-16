@@ -38,6 +38,14 @@ expectedContractCommit=b82612f9c7c1e87c2aa2580302318db59207a855
 The only protobuf-c types in the middleware are the official ESP-IDF
 Protocomm Security 2 messages in `device_link_security`.
 
+Schema boundaries mirror the contract: `AuthorizePrepareResponse.expires_in_ms`
+is frozen in `[1, 120000]` and permission list entries are nonzero
+(`minimum_unsigned = 1`), both enforced by the TLV validator. The
+`ble_runtime` host suite consumes the contract fixture goldens
+(wire/framing/authorization/error-responses/operation-result bodies) in
+CTest; the `device_link_service` host suite consumes the Wi-Fi invalid
+credential cases and the `WifiStatus` result payloads.
+
 ## Host tests
 
 ```sh
