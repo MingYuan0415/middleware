@@ -127,12 +127,15 @@ static size_t _pack_real_handshake_request(
 }
 
 /* Capture sink state. */
-static uint8_t s_capture[16][512];
-static size_t s_capture_lens[16];
+/* Enough capture slots for a 3000-byte control result at the 23-byte ATT
+ * MTU (about 254 fragments of 12 payload bytes each). */
+#define TEST_CAPTURE_SLOTS 320U
+static uint8_t s_capture[TEST_CAPTURE_SLOTS][512];
+static size_t s_capture_lens[TEST_CAPTURE_SLOTS];
 static size_t s_capture_count;
-static ble_link_service_tx_channel_t s_capture_channels[16];
-static uint32_t s_capture_flow_ids[16];
-static bool s_capture_last[16];
+static ble_link_service_tx_channel_t s_capture_channels[TEST_CAPTURE_SLOTS];
+static uint32_t s_capture_flow_ids[TEST_CAPTURE_SLOTS];
+static bool s_capture_last[TEST_CAPTURE_SLOTS];
 static bool s_auto_confirm;
 static uint16_t s_next_frame_id;
 static unsigned int s_provisional_discard_count;
@@ -323,7 +326,7 @@ static const ble_link_security_ops_t s_handshake_security_ops =
 };
 
 /* Reassembly of the captured outbound fragments. */
-static uint8_t s_outbound[1024];
+static uint8_t s_outbound[BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES];
 static size_t s_outbound_len;
 
 static ble_link_service_facts_t s_facts;
@@ -333,7 +336,7 @@ static esp_err_t _capture(const uint8_t *value, size_t len,
                           bool is_last, uint32_t flow_id, void *arg)
 {
     (void)arg;
-    TEST_ASSERT_TRUE(s_capture_count < 16U);
+    TEST_ASSERT_TRUE(s_capture_count < TEST_CAPTURE_SLOTS);
     TEST_ASSERT_TRUE(len <= sizeof(s_capture[0]));
     memcpy(s_capture[s_capture_count], value, len);
     s_capture_lens[s_capture_count] = len;
@@ -388,6 +391,68 @@ static void _feed_single(const uint8_t *payload, size_t payload_len)
 {
     _feed_single_channel(payload, payload_len,
                          BLE_LINK_SERVICE_RX_CONTROL);
+}
+
+/**
+ * @brief Frame one message payload as multiple fragments and feed them.
+ *
+ * Used when the negotiated ATT MTU cannot carry the whole message in one
+ * write (e.g. the 23-byte minimum): the payload plus its transport byte is
+ * split into contiguously offset fragments.
+ */
+static void _feed_fragmented_channel(
+    const uint8_t *payload, size_t payload_len,
+    ble_link_service_rx_channel_t channel, uint32_t att_mtu)
+{
+    const size_t total = payload_len + 1U;
+    const size_t max_chunk = att_mtu - BLE_LINK_FRAMING_HEADER_BYTES;
+    uint8_t staged[BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES + 1U];
+    const uint16_t frame_id = s_next_frame_id;
+
+    TEST_ASSERT_TRUE(max_chunk != 0U);
+    TEST_ASSERT_TRUE(total <= sizeof(staged));
+    staged[0] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
+    memcpy(&staged[1], payload, payload_len);
+    s_next_frame_id++;
+    if (s_next_frame_id == 0U)
+    {
+        s_next_frame_id = 1U;
+    }
+    for (size_t offset = 0U; offset < total;)
+    {
+        const size_t chunk = (total - offset > max_chunk) ?
+                             max_chunk : total - offset;
+        uint8_t framed[64];
+        uint8_t flags = 0U;
+
+        if (offset == 0U)
+        {
+            flags |= BLE_LINK_FRAMING_FLAG_START;
+        }
+        if (offset + chunk == total)
+        {
+            flags |= BLE_LINK_FRAMING_FLAG_END;
+        }
+        memset(framed, 0, sizeof(framed));
+        framed[0] = 1U;
+        framed[1] = flags;
+        framed[2] = (uint8_t)(frame_id & 0xffU);
+        framed[3] = (uint8_t)(frame_id >> 8U);
+        framed[4] = (uint8_t)(total & 0xffU);
+        framed[5] = (uint8_t)((total >> 8U) & 0xffU);
+        framed[6] = (uint8_t)(offset & 0xffU);
+        framed[7] = (uint8_t)((offset >> 8U) & 0xffU);
+        memcpy(&framed[8], &staged[offset], chunk);
+        /* Intermediate fragments are buffered (NOT_FINISHED); only the
+         * final fragment completes the frame and dispatches. */
+        const esp_err_t expected = (offset + chunk == total) ?
+                                   ESP_OK : ESP_ERR_NOT_FINISHED;
+
+        TEST_ASSERT_EQUAL(expected, ble_link_service_feed(
+                              &s_facts, channel, framed,
+                              BLE_LINK_FRAMING_HEADER_BYTES + chunk));
+        offset += chunk;
+    }
 }
 
 static esp_err_t _accept_handshake_single(
@@ -996,6 +1061,8 @@ static void test_typed_tlv_manifest_request(void)
     device_link_tlv_field_t field;
     bool has_field = false;
     bool security_seen = false;
+    bool protocol_seen = false;
+    bool profile_seen = false;
 
     _reset();
     _feed_single_channel(request, sizeof(request),
@@ -1026,6 +1093,47 @@ static void test_typed_tlv_manifest_request(void)
     while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
             ESP_OK && has_field)
     {
+        if (field.id == 1U || field.id == 2U)
+        {
+            device_link_tlv_reader_t nested;
+            device_link_tlv_field_t nested_field;
+            bool nested_has = false;
+            uint64_t major = 0U;
+            uint64_t minor = 0U;
+
+            TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                                  &nested, field.value.bytes.data,
+                                  field.value.bytes.len));
+            while (device_link_tlv_reader_next(
+                        &nested, &nested_field, &nested_has) == ESP_OK &&
+                    nested_has)
+            {
+                if (nested_field.id == 1U)
+                {
+                    major = nested_field.value.unsigned_value;
+                }
+                else if (nested_field.id == 2U)
+                {
+                    minor = nested_field.value.unsigned_value;
+                }
+            }
+            /* Field 1 is the protocol version, field 2 the independent
+             * profile version: the encoder must never reuse the protocol
+             * buffer for the profile (both are 2.0 today, so the constant
+             * comparison pins the source, not just the value). */
+            if (field.id == 1U)
+            {
+                protocol_seen = true;
+                TEST_ASSERT_EQUAL(DEVICE_LINK_CORE_MAJOR, major);
+                TEST_ASSERT_EQUAL(DEVICE_LINK_CORE_MINOR, minor);
+            }
+            else
+            {
+                profile_seen = true;
+                TEST_ASSERT_EQUAL(DEVICE_LINK_PROFILE_MAJOR, major);
+                TEST_ASSERT_EQUAL(DEVICE_LINK_PROFILE_MINOR, minor);
+            }
+        }
         if (field.id == 4U)
         {
             device_link_tlv_reader_t nested;
@@ -1050,6 +1158,8 @@ static void test_typed_tlv_manifest_request(void)
         }
     }
     TEST_ASSERT_TRUE(security_seen);
+    TEST_ASSERT_TRUE(protocol_seen);
+    TEST_ASSERT_TRUE(profile_seen);
 }
 
 static void test_typed_tlv_snapshot_has_fixed_link_state(void)
@@ -1616,6 +1726,198 @@ static void test_operation_declared_empty_result_never_encoded(void)
     }
     TEST_ASSERT_TRUE(saw_state_succeeded);
     TEST_ASSERT_TRUE(!saw_result_payload);
+}
+
+static void test_v2_get_operation_large_result_emits_fully(void)
+{
+    /* C-1 regression: the outbound framing staged every channel through a
+     * session-sized (1 KiB) buffer, so a control response beyond ~1024 bytes
+     * was rejected and the session torn down. A 3000-byte terminal result
+     * must arrive whole at both the preferred MTU and the 23-byte minimum,
+     * and the session must stay usable afterwards. */
+    static const device_link_tlv_field_rule_t s_test_result_fields[] =
+    {
+        {
+            .id = 1U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED,
+            .maximum_unsigned = UINT8_MAX
+        },
+    };
+    static const device_link_tlv_schema_t s_test_result_schema =
+    {
+        .fields = s_test_result_fields, .field_count = 1U,
+        .maximum_encoded_bytes = 16U,
+    };
+    static const device_link_tlv_schema_t s_test_request_schema =
+    {
+        .fields = NULL, .field_count = 0U, .maximum_encoded_bytes = 0U,
+    };
+    static const device_link_method_descriptor_t s_test_methods[] =
+    {
+        {
+            .method_id = 4U, /* set_credentials: WifiStatus result */
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_CONTROL,
+            .maximum_request_bytes = 160U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_test_request_schema,
+            .response_schema = &s_test_request_schema,
+            .operation_result_schema = &s_test_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _empty_scan_handler,
+        },
+    };
+    static const device_link_domain_descriptor_t s_test_domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U, .minor = 0U,
+        .methods = s_test_methods, .method_count = 1U,
+    };
+    static uint8_t result_payload[3000];
+    uint64_t operation_id = 0U;
+    device_link_wire_header_t header;
+    device_link_status_t status;
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    bool payload_seen = false;
+    uint8_t request[DEVICE_LINK_WIRE_HEADER_BYTES + 16U];
+    device_link_tlv_writer_t writer;
+    size_t body_len = 0U;
+
+    for (size_t i = 0U; i < sizeof(result_payload); ++i)
+    {
+        result_payload[i] = (uint8_t)(i * 31U + 7U);
+    }
+
+    /* Register the domain descriptor before init (boot id still zero),
+     * exactly like the service does before the router seals. */
+    ble_link_service_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_set_domain_descriptors(
+                          &s_test_domain, 1U));
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
+    ble_link_events_init();
+    _establish_session();
+    _set_facts(true, true, true);
+    (void)device_link_security_init(&s_sec_config);
+    /* GetOperation is a CORE_READ method on the authorized control channel:
+     * the session must be authorized against a matching durable record. */
+    device_link_security_auth_record_t auth_record;
+
+    memset(&auth_record, 0, sizeof(auth_record));
+    auth_record.magic = DEVICE_LINK_SECURITY_AUTH_MAGIC;
+    auth_record.schema_version = DEVICE_LINK_SECURITY_AUTH_SCHEMA_VERSION;
+    _set_test_grants(&auth_record);
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES; ++i)
+    {
+        auth_record.credential_id[i] = (uint8_t)(i + 1U);
+        auth_record.device_auth_id[i] = (uint8_t)(0x60U + i);
+    }
+    auth_record.peer_addr_type = 1U;
+    auth_record.peer_addr[0] = 0x11U;
+    auth_record.peer_addr[5] = 0xeaU;
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_SALT_BYTES; ++i)
+    {
+        auth_record.salt[i] = (uint8_t)(0x80U + i);
+    }
+    for (size_t i = 0U; i < DEVICE_LINK_SECURITY_AUTH_VERIFIER_BYTES; ++i)
+    {
+        auth_record.verifier[i] = (uint8_t)(0xa0U + i);
+    }
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      device_link_security_save_auth_record(&auth_record));
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x4000U, NULL, NULL,
+                          &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
+                          0x4000U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, result_payload,
+                          sizeof(result_payload)));
+
+    memset(&header, 0, sizeof(header));
+    header.kind = DEVICE_LINK_MESSAGE_REQUEST;
+    header.domain_id = DEVICE_LINK_DOMAIN_CORE;
+    header.domain_major = 2U;
+    header.method_id = 6U; /* GetOperation */
+    header.call_id = 1U;
+    header.boot_id = BOOT_ID;
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_encode_header(
+                          &header, request));
+    device_link_tlv_writer_init(
+        &writer, &request[DEVICE_LINK_WIRE_HEADER_BYTES], 16U);
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_put_fixed64(
+                          &writer, 1U, operation_id));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_writer_finish(
+                          &writer, &body_len));
+
+    for (uint32_t pass = 0U; pass < 2U; ++pass)
+    {
+        s_facts.preferred_att_mtu = (pass == 0U) ? 498U : 23U;
+        _clear_capture();
+        if (pass == 0U)
+        {
+            _feed_single(request, DEVICE_LINK_WIRE_HEADER_BYTES + body_len);
+        }
+        else
+        {
+            /* At the 23-byte MTU the request itself no longer fits one
+             * write and must arrive as multiple fragments. */
+            _feed_fragmented_channel(request,
+                                     DEVICE_LINK_WIRE_HEADER_BYTES + body_len,
+                                     BLE_LINK_SERVICE_RX_CONTROL, 23U);
+        }
+        TEST_ASSERT_TRUE(s_capture_count > 1U);
+        TEST_ASSERT_TRUE(!ble_link_service_response_in_flight());
+        _reassemble_captured();
+        /* The regression line: the body alone exceeds the old 1024-byte
+         * session budget that used to abort the session. */
+        TEST_ASSERT_TRUE(s_outbound_len > 1024U);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                              s_outbound, s_outbound_len, &header));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_MESSAGE_RESPONSE, header.kind);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                              &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                              s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                              &status));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, status);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                              &reader,
+                              &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
+                                          DEVICE_LINK_RESPONSE_STATUS_BYTES],
+                              s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES -
+                              DEVICE_LINK_RESPONSE_STATUS_BYTES));
+        payload_seen = false;
+        while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
+                ESP_OK && has_field)
+        {
+            if (field.id == 6U)
+            {
+                payload_seen = true;
+                TEST_ASSERT_EQUAL(DEVICE_LINK_TLV_LENGTH, field.wire_type);
+                TEST_ASSERT_EQUAL(sizeof(result_payload),
+                                  field.value.bytes.len);
+                TEST_ASSERT_EQUAL(0, memcmp(field.value.bytes.data,
+                                            result_payload,
+                                            sizeof(result_payload)));
+            }
+        }
+        TEST_ASSERT_TRUE(payload_seen);
+        /* A second request is served with the next call id: the session
+         * survived both large deliveries. Rebuild the request header from
+         * scratch (the loop decoded the response into @p header above). */
+        memset(&header, 0, sizeof(header));
+        header.kind = DEVICE_LINK_MESSAGE_REQUEST;
+        header.domain_id = DEVICE_LINK_DOMAIN_CORE;
+        header.domain_major = 2U;
+        header.method_id = 6U;
+        header.call_id = 2U + pass;
+        header.boot_id = BOOT_ID;
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_encode_header(
+                              &header, request));
+    }
 }
 
 static void test_snapshot_zero_baseline_returns_internal(void)
@@ -3989,6 +4291,7 @@ int main(void)
     test_typed_tlv_manifest_request();
     test_typed_tlv_snapshot_has_fixed_link_state();
     test_operation_declared_empty_result_never_encoded();
+    test_v2_get_operation_large_result_emits_fully();
     test_snapshot_request();
     test_snapshot_zero_baseline_returns_internal();
     test_authorize_flow();

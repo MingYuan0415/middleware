@@ -1618,15 +1618,15 @@ static bool _ble_link_service_stream_emit_locked(void)
  * 23 independent of the local TX queue depth.
  */
 static bool _ble_link_service_emit_fragments(
-    const uint8_t *payload, size_t payload_len, uint32_t att_mtu,
-    ble_link_service_tx_channel_t channel)
+    const uint8_t *payload, size_t payload_len, uint8_t transport_type,
+    uint32_t att_mtu, ble_link_service_tx_channel_t channel)
 {
     if (payload == NULL || payload_len == 0U ||
             _ble_link_service_max_fragment_payload(att_mtu) == 0U)
     {
         return false;
     }
-    if (payload_len > sizeof(s_service.stream_storage))
+    if (1U + payload_len > sizeof(s_service.stream_storage))
     {
         return false;
     }
@@ -1642,9 +1642,10 @@ static bool _ble_link_service_emit_fragments(
     {
         return false;
     }
-    memcpy(copy, payload, payload_len);
+    copy[0] = transport_type;
+    memcpy(&copy[1], payload, payload_len);
     s_service.stream.payload = copy;
-    s_service.stream.payload_len = payload_len;
+    s_service.stream.payload_len = 1U + payload_len;
     s_service.stream.next_offset = 0U;
     s_service.stream.att_mtu = att_mtu;
     s_service.stream.channel = channel;
@@ -1765,10 +1766,6 @@ static bool _ble_link_service_emit_protected(
     const uint8_t *message, size_t message_len, uint8_t transport_type,
     uint32_t att_mtu, ble_link_service_tx_channel_t channel)
 {
-    uint8_t framed[1U + BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
-    size_t framed_len = 0U;
-
-    framed[0] = transport_type;
     if (transport_type == BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED &&
             s_service.security != NULL &&
             s_service.security->protect != NULL)
@@ -1778,27 +1775,21 @@ static bool _ble_link_service_emit_protected(
 
         if (s_service.security->protect(message, message_len,
                                         &cipher, &cipher_len) != ESP_OK ||
-                cipher == NULL ||
-                cipher_len > sizeof(framed) - 1U)
+                cipher == NULL)
         {
             free(cipher);
             return false;
         }
-        memcpy(&framed[1], cipher, cipher_len);
-        framed_len = 1U + cipher_len;
+        const bool emitted = _ble_link_service_emit_fragments(
+                                 cipher, cipher_len, transport_type,
+                                 att_mtu, channel);
+
         free(cipher);
+        return emitted;
     }
-    else
-    {
-        if (message_len > sizeof(framed) - 1U)
-        {
-            return false;
-        }
-        memcpy(&framed[1], message, message_len);
-        framed_len = 1U + message_len;
-    }
-    return _ble_link_service_emit_fragments(framed, framed_len,
-                                            att_mtu, channel);
+    return _ble_link_service_emit_fragments(message, message_len,
+                                            transport_type, att_mtu,
+                                            channel);
 }
 
 #ifdef UNIT_TEST_HOST
@@ -2753,10 +2744,12 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
     uint8_t *response, size_t capacity, size_t *response_len)
 {
     uint8_t version[16];
+    uint8_t profile_version[16];
     uint8_t framing[64];
     uint8_t security[64];
     device_link_tlv_writer_t writer;
     size_t version_len = 0U;
+    size_t profile_version_len = 0U;
     size_t framing_len = 0U;
     size_t security_len = 0U;
 
@@ -2769,6 +2762,17 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
     (void)device_link_tlv_put_uint(&writer, 1U, DEVICE_LINK_CORE_MAJOR);
     (void)device_link_tlv_put_uint(&writer, 2U, DEVICE_LINK_CORE_MINOR);
     if (device_link_tlv_writer_finish(&writer, &version_len) != ESP_OK)
+    {
+        return DEVICE_LINK_STATUS_INTERNAL;
+    }
+    /* profile_version is a frozen protocol-version-shaped field of its own:
+     * the profile may bump independently of the core protocol, so it must
+     * never be emitted from the protocol version buffer. */
+    device_link_tlv_writer_init(&writer, profile_version,
+                                sizeof(profile_version));
+    (void)device_link_tlv_put_uint(&writer, 1U, DEVICE_LINK_PROFILE_MAJOR);
+    (void)device_link_tlv_put_uint(&writer, 2U, DEVICE_LINK_PROFILE_MINOR);
+    if (device_link_tlv_writer_finish(&writer, &profile_version_len) != ESP_OK)
     {
         return DEVICE_LINK_STATUS_INTERNAL;
     }
@@ -2810,7 +2814,8 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
      * ble_link_service_set_domain_descriptors() before init seals them. */
     device_link_tlv_writer_init(&writer, response, capacity);
     (void)_ble_link_service_v2_put_nested(&writer, 1U, version, version_len);
-    (void)_ble_link_service_v2_put_nested(&writer, 2U, version, version_len);
+    (void)_ble_link_service_v2_put_nested(
+        &writer, 2U, profile_version, profile_version_len);
     (void)_ble_link_service_v2_put_nested(&writer, 3U, framing, framing_len);
     (void)_ble_link_service_v2_put_nested(&writer, 4U, security, security_len);
     for (size_t d = 0U; d < s_service.v2_domain_count; ++d)
@@ -4768,31 +4773,17 @@ static esp_err_t _ble_link_service_process_handshake_locked(
     {
         s_service.handshake_active = false;
     }
-    uint8_t framed[1U + BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
-
-    framed[0] = BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE;
-    const size_t framed_len = (out_len <= sizeof(framed) - 1U) ?
-                              1U + out_len : 0U;
-
-    if (framed_len != 0U)
-    {
-        memcpy(&framed[1], out, out_len);
-    }
-    free(out);
-    if (framed_len == 0U)
-    {
-        _ble_link_service_abort_session(facts->connection_generation);
-        return ESP_ERR_NO_MEM;
-    }
     s_service.pending_transactions++;
     if (!_ble_link_service_emit_fragments(
-                framed, framed_len, facts->preferred_att_mtu,
-                BLE_LINK_SERVICE_TX_SESSION))
+                out, out_len, BLE_LINK_SERVICE_TRANSPORT_TYPE_HANDSHAKE,
+                facts->preferred_att_mtu, BLE_LINK_SERVICE_TX_SESSION))
     {
+        free(out);
         s_service.pending_transactions = 0U;
         _ble_link_service_abort_session(facts->connection_generation);
         return ESP_ERR_NO_MEM;
     }
+    free(out);
     return ESP_OK;
 }
 
@@ -4941,23 +4932,13 @@ static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work)
         }
         if (out != NULL)
         {
-            uint8_t framed[1U + BLE_LINK_SERVICE_MAX_SESSION_MESSAGE_BYTES];
-
-            if (out_len > sizeof(framed) - 1U)
-            {
-                free(out);
-                _ble_link_service_abort_session(
-                    facts->connection_generation);
-                return ESP_ERR_NO_MEM;
-            }
-            framed[0] = BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED;
-            memcpy(&framed[1], out, out_len);
-            free(out);
             s_service.pending_transactions++;
             if (!_ble_link_service_emit_fragments(
-                        framed, 1U + out_len, facts->preferred_att_mtu,
+                        out, out_len, BLE_LINK_SERVICE_TRANSPORT_TYPE_PROTECTED,
+                        facts->preferred_att_mtu,
                         _ble_link_service_response_channel()))
             {
+                free(out);
                 /* The response could not be handed to the transport: return
                  * the failure so the adapter closes the request session. */
                 emitted = false;
@@ -4966,6 +4947,7 @@ static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work)
                     facts->connection_generation);
                 return ESP_ERR_NO_MEM;
             }
+            free(out);
         }
         /* One-shot, generation-scoped post-response actions: they consume
          * only after the response was encrypted and handed to the

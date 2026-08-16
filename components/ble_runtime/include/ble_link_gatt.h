@@ -55,10 +55,10 @@ extern "C" {
      * the link service.
      *
      * Must be called before the registry is sealed. Registers the five frozen
-     * characteristics (link_state read/notify public, session_rx write
-     * encrypted-sc-bond, session_tx indicate encrypted-sc-bond, control_rx
-     * write authorized, control_tx indicate/notify authorized) and wires the
-     * access callbacks to the link service.
+     * characteristics (link_state read public / notify authorized, session_rx
+     * write encrypted-sc-bond, session_tx indicate encrypted-sc-bond,
+     * control_rx write authorized, control_tx indicate authorized) and wires
+     * the access callbacks to the link service.
      *
      * @param[in] config Configuration, kept for the lifetime.
      * @return ESP_OK or an error from the registry or service init.
