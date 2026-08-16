@@ -54,7 +54,6 @@
 #include "ble_nimble_tx_tracker.h"
 #include "ble_link_session.h"
 #include "ble_link_timer_deadline.h"
-#include "ble_response_cache.h"
 #include "ble_runtime.h"
 #include "ble_tx_scheduler.h"
 
@@ -2739,17 +2738,6 @@ static esp_err_t _ble_nimble_port_tx_manager_init(void)
         .unlock = _ble_nimble_port_tx_unlock_cb,
         .lock_arg = NULL,
     };
-    static const ble_response_cache_config_t cache_config =
-    {
-        .max_entries = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_ENTRIES,
-        .max_entry_bytes = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_ENTRY_BYTES,
-        .max_key_bytes = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_KEY_BYTES,
-        .ttl_ms = CONFIG_BLE_RUNTIME_RESPONSE_CACHE_TTL_MS,
-        .now_ms = _ble_nimble_port_adv_now_ms,
-        .lock = _ble_nimble_port_tx_lock_cb,
-        .unlock = _ble_nimble_port_tx_unlock_cb,
-        .lock_arg = NULL,
-    };
 
     if (s_port.adv_lock == NULL)
     {
@@ -2768,8 +2756,9 @@ static esp_err_t _ble_nimble_port_tx_manager_init(void)
             return scheduler_result;
         }
     }
-    ble_response_cache_init(&cache_config);
-    ble_used_id_set_init(&cache_config);
+    /* The legacy response cache/used-id layer is retired: v2 monotonic
+     * request-id replay is owned by the device_link router. The modules
+     * remain host-test-only. */
     return ESP_OK;
 }
 
@@ -6836,8 +6825,6 @@ static esp_err_t _ble_nimble_port_deinit(void)
         vSemaphoreDelete(s_timer_exit);
         s_timer_exit = NULL;
     }
-    ble_used_id_set_deinit();
-    ble_response_cache_deinit();
     ble_tx_scheduler_deinit();
     ble_adv_manager_deinit();
     atomic_store_explicit(&s_adv_host_ready, false, memory_order_release);

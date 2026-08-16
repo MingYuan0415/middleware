@@ -12,7 +12,6 @@ idf_component_register(
         "src/ble_gap_manager.c"
         "src/ble_adv_manager.c"
         "src/ble_tx_scheduler.c"
-        "src/ble_response_cache.c"
         "src/ble_link_state.c"
         "src/ble_link_reassembler.c"
         "src/ble_link_cleanup_obligation.c"

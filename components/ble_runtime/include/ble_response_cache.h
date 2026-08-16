@@ -16,8 +16,11 @@ extern "C" {
  *
  * The cache stores the last response payload for a (generation,
  * characteristic, key) triple so a re-read or a retried request is served
- * without re-execution. Entries are invalidated on read, on disconnect, and
- * on timeout.
+ * without re-execution. Entries are served until eviction, an explicit
+ * clear, or timeout; a successful read does not invalidate the entry.
+ *
+ * Retired in production: v2 monotonic request-id replay is owned by the
+ * device_link router. This module is compiled by host tests only.
  */
 typedef struct ble_response_cache_config
 {
