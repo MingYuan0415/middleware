@@ -117,6 +117,8 @@ esp_err_t device_link_domain_descriptors_validate(
                     method->maximum_response_bytes >
                     DEVICE_LINK_MAX_DOMAIN_PAYLOAD_BYTES ||
                     method->response_body_status_mask == 0U ||
+                    (method->allowed_statuses_mask &
+                     DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK)) == 0U ||
                     (j > 0U && domain->methods[j - 1U].method_id >=
                      method->method_id))
             {
@@ -239,11 +241,13 @@ static esp_err_t _emit_status_response(
     {
         return result;
     }
-    if (payload_len != 0U)
+    uint8_t *const destination = &response[
+                                     DEVICE_LINK_WIRE_HEADER_BYTES +
+                                     DEVICE_LINK_RESPONSE_STATUS_BYTES];
+
+    if (payload_len != 0U && payload != destination)
     {
-        memcpy(&response[DEVICE_LINK_WIRE_HEADER_BYTES +
-                         DEVICE_LINK_RESPONSE_STATUS_BYTES],
-               payload, payload_len);
+        memcpy(destination, payload, payload_len);
     }
     *response_len = DEVICE_LINK_WIRE_HEADER_BYTES +
                     DEVICE_LINK_RESPONSE_STATUS_BYTES + payload_len;
@@ -345,6 +349,19 @@ static size_t _select_replay_slot(
         }
     }
     return router->next_replay_slot;
+}
+
+static bool _status_globally_allowed(device_link_status_t status)
+{
+    /* operations.md: global routing errors may always be returned with an
+     * empty body, independent of the method's allowed_statuses. */
+    return status == DEVICE_LINK_STATUS_MALFORMED_FRAME ||
+           status == DEVICE_LINK_STATUS_UNSUPPORTED_VERSION ||
+           status == DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION ||
+           status == DEVICE_LINK_STATUS_UNSUPPORTED_CAPABILITY ||
+           status == DEVICE_LINK_STATUS_UNAUTHENTICATED ||
+           status == DEVICE_LINK_STATUS_PERMISSION_DENIED ||
+           status == DEVICE_LINK_STATUS_CONFLICT;
 }
 
 static device_link_status_t _admit_method(
@@ -453,7 +470,12 @@ esp_err_t device_link_router_process(
     {
         return result;
     }
-    if (request_len > DEVICE_LINK_MAX_MESSAGE_BYTES)
+    const size_t channel_limit =
+        facts->channel == DEVICE_LINK_CHANNEL_SESSION ?
+        DEVICE_LINK_MAX_SESSION_MESSAGE_BYTES :
+        DEVICE_LINK_MAX_CONTROL_MESSAGE_BYTES;
+
+    if (request_len > channel_limit)
     {
         return _emit_status_response(
                    &header, DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED, NULL, 0U,
@@ -535,10 +557,13 @@ esp_err_t device_link_router_process(
                          handler_capacity,
                          &body_len,
                          method->handler_arg);
+            bool sanitized = false;
+
             if (status < DEVICE_LINK_STATUS_OK ||
                     status > DEVICE_LINK_STATUS_INTERNAL ||
                     body_len > method->maximum_response_bytes)
             {
+                sanitized = true;
                 status = DEVICE_LINK_STATUS_INTERNAL;
                 body_len = 0U;
             }
@@ -546,6 +571,7 @@ esp_err_t device_link_router_process(
                       DEVICE_LINK_STATUS_MASK(status)) == 0U &&
                      body_len != 0U)
             {
+                sanitized = true;
                 status = DEVICE_LINK_STATUS_INTERNAL;
                 body_len = 0U;
             }
@@ -555,8 +581,28 @@ esp_err_t device_link_router_process(
                          &response[prefix], body_len,
                          method->response_schema) != ESP_OK)
             {
+                sanitized = true;
                 status = DEVICE_LINK_STATUS_INTERNAL;
                 body_len = 0U;
+            }
+            else if (status != DEVICE_LINK_STATUS_INTERNAL &&
+                     !_status_globally_allowed(status) &&
+                     (method->allowed_statuses_mask &
+                      DEVICE_LINK_STATUS_MASK(status)) == 0U)
+            {
+                /* The contract freezes the method-specific empty-body
+                 * allowed_statuses; a handler status outside them (and not a
+                 * global routing error) collapses to the device-wide
+                 * INTERNAL escape hatch with an empty body. */
+                sanitized = true;
+                status = DEVICE_LINK_STATUS_INTERNAL;
+                body_len = 0U;
+            }
+            if (sanitized)
+            {
+                /* A sanitized handler never keeps its (possibly partial)
+                 * output: scrub every byte it could have written. */
+                _secure_zero(&response[prefix], handler_capacity);
             }
         }
     }

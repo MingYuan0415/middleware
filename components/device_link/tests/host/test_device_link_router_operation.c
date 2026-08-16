@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "device_link_core.h"
 #include "device_link_operation.h"
 #include "device_link_router.h"
 #include "device_link_wire.h"
@@ -115,6 +116,14 @@ static void _test_router(void)
             .response_schema = &s_value_schema,
             .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
                 DEVICE_LINK_STATUS_OK),
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFLICT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
             .handler = _handler,
             .handler_arg = &handler,
         },
@@ -224,6 +233,139 @@ static void _test_router(void)
            ESP_ERR_INVALID_ARG);
 }
 
+static device_link_status_t _busy_handler(
+    const device_link_request_context_t *context,
+    const uint8_t *request, size_t request_len,
+    uint8_t *response, size_t response_capacity, size_t *response_len,
+    void *arg)
+{
+    (void)context;
+    (void)request;
+    (void)request_len;
+    (void)arg;
+    /* Pretend a partial write so the scrub path is observable. */
+    if (response_capacity != 0U)
+    {
+        response[0] = 0xa5U;
+    }
+    *response_len = 0U;
+    return DEVICE_LINK_STATUS_BUSY;
+}
+
+static void _test_allowed_status_mask(void)
+{
+    /* A handler status outside the frozen allowed_statuses collapses to the
+     * device-wide INTERNAL escape hatch with an empty, scrubbed body. */
+    const device_link_method_descriptor_t methods[] =
+    {
+        {
+            .method_id = 4U,
+            .channel = DEVICE_LINK_CHANNEL_CONTROL,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .maximum_request_bytes = 2U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_value_schema,
+            .response_schema = &s_value_schema,
+            .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
+                DEVICE_LINK_STATUS_OK),
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+            .handler = _busy_handler,
+        },
+    };
+    const device_link_domain_descriptor_t domains[] =
+    {
+        {
+            .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+            .major = 1U,
+            .methods = methods,
+            .method_count = 1U,
+        },
+    };
+    uint8_t replay_response[DEVICE_LINK_REPLAY_SLOTS][64];
+    device_link_call_replay_t replay[DEVICE_LINK_REPLAY_SLOTS];
+    memset(replay, 0, sizeof(replay));
+    for (size_t i = 0U; i < DEVICE_LINK_REPLAY_SLOTS; ++i)
+    {
+        replay[i].response = replay_response[i];
+        replay[i].response_capacity = sizeof(replay_response[i]);
+    }
+    device_link_router_t router;
+    const uint64_t boot_id = UINT64_C(0x0102030405060708);
+    const uint16_t permissions[] = {DEVICE_LINK_PERMISSION_WIFI_WRITE};
+    device_link_request_context_t facts =
+    {
+        .channel = DEVICE_LINK_CHANNEL_CONTROL,
+        .admission = DEVICE_LINK_ADMISSION_AUTHORIZED,
+        .security_authenticated = true,
+        .authorized = true,
+        .permissions = permissions,
+        .permission_count = 1U,
+    };
+    uint8_t request[64];
+    uint8_t response[64];
+    size_t response_len = 0U;
+    const size_t request_len = _make_request(
+                                   1U, boot_id, 7U,
+                                   request, sizeof(request));
+
+    assert(device_link_router_init(
+               &router, boot_id, domains, 1U, replay,
+               DEVICE_LINK_REPLAY_SLOTS,
+               _digest, NULL) == ESP_OK);
+    memset(response, 0xaaU, sizeof(response));
+    assert(device_link_router_process(
+               &router, &facts, request, request_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(_response_status(response, response_len) ==
+           DEVICE_LINK_STATUS_INTERNAL);
+    assert(response_len == DEVICE_LINK_WIRE_HEADER_BYTES +
+           DEVICE_LINK_RESPONSE_STATUS_BYTES);
+    /* The handler's partial write was scrubbed. */
+    assert(response[DEVICE_LINK_WIRE_HEADER_BYTES +
+                    DEVICE_LINK_RESPONSE_STATUS_BYTES] == 0U);
+}
+
+static void _test_permission_list_rules(void)
+{
+    /* The generic validator enforces the contract permission-list rules on
+     * the real AuthorizePrepareRequest schema: values >= 1, strictly
+     * ascending (unique and sorted). */
+    const device_link_tlv_schema_t *schema =
+        device_link_core_test_request_schema(3U);
+    uint8_t buffer[80];
+    device_link_tlv_writer_t writer;
+    size_t len = 0U;
+
+    assert(schema != NULL);
+
+    device_link_tlv_writer_init(&writer, buffer, sizeof(buffer));
+    assert(device_link_tlv_put_uint(&writer, 1U, 1U) == ESP_OK);
+    assert(device_link_tlv_put_uint(&writer, 1U, 2U) == ESP_OK);
+    assert(device_link_tlv_put_uint(&writer, 1U, 3U) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+    assert(device_link_tlv_validate_message(buffer, len, schema) == ESP_OK);
+
+    device_link_tlv_writer_init(&writer, buffer, sizeof(buffer));
+    assert(device_link_tlv_put_uint(&writer, 1U, 0U) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+    assert(device_link_tlv_validate_message(buffer, len, schema) != ESP_OK);
+
+    device_link_tlv_writer_init(&writer, buffer, sizeof(buffer));
+    assert(device_link_tlv_put_uint(&writer, 1U, 2U) == ESP_OK);
+    assert(device_link_tlv_put_uint(&writer, 1U, 2U) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+    assert(device_link_tlv_validate_message(buffer, len, schema) != ESP_OK);
+
+    device_link_tlv_writer_init(&writer, buffer, sizeof(buffer));
+    assert(device_link_tlv_put_uint(&writer, 1U, 3U) == ESP_OK);
+    assert(device_link_tlv_put_uint(&writer, 1U, 1U) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+    assert(device_link_tlv_validate_message(buffer, len, schema) != ESP_OK);
+}
+
 static esp_err_t _cancel_owner(uint64_t owner_id, void *arg)
 {
     uint64_t *seen = arg;
@@ -289,10 +431,11 @@ static void _test_operations(void)
     assert(device_link_operation_cancel(
                &table, 30U, ids[0]) == ESP_OK);
     assert(canceled_owner == 100U);
-    device_link_operation_t operation;
+    const device_link_operation_t *operation = NULL;
     assert(device_link_operation_get(
                &table, 30U, ids[0], &operation) == ESP_OK);
-    assert(operation.state == DEVICE_LINK_OPERATION_CANCELED);
+    assert(operation != NULL);
+    assert(operation->state == DEVICE_LINK_OPERATION_CANCELED);
     assert(device_link_operation_get(
                &table, 30U + DEVICE_LINK_OPERATION_RETENTION_MS,
                ids[0], &operation) == ESP_ERR_NOT_FOUND);
@@ -321,6 +464,14 @@ static void _test_wrong_channel(void)
             .response_schema = &s_value_schema,
             .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
                 DEVICE_LINK_STATUS_OK),
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFLICT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
             .handler = _handler,
             .handler_arg = &handler,
         },
@@ -400,6 +551,8 @@ int main(void)
     _test_router();
     _test_wrong_channel();
     _test_operations();
+    _test_allowed_status_mask();
+    _test_permission_list_rules();
     puts("device_link router/operation tests passed");
     return 0;
 }

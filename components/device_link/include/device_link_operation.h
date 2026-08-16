@@ -66,9 +66,24 @@ esp_err_t device_link_operation_update(
     uint64_t operation_id, device_link_operation_state_t state,
     device_link_status_t status, const uint8_t *result, size_t result_len);
 
+/**
+ * @brief Locate an operation by id without copying the ~3 KB slot.
+ *
+ * The returned pointer names the table slot and stays valid until the next
+ * table mutation (start/update/cancel/sweep). The caller must hold its own
+ * serialization (e.g. the service mutex) while reading the slot and must
+ * not retain the pointer past it.
+ *
+ * @param[in]  table        Operation table.
+ * @param[in]  now_ms       Current monotonic time; terminal records past the
+ *                          retention window are swept first.
+ * @param[in]  operation_id Non-zero operation id.
+ * @param[out] operation    On ESP_OK, the table slot (never NULL).
+ * @return ESP_OK, ESP_ERR_NOT_FOUND, or ESP_ERR_INVALID_ARG.
+ */
 esp_err_t device_link_operation_get(
     device_link_operation_table_t *table, uint64_t now_ms,
-    uint64_t operation_id, device_link_operation_t *operation);
+    uint64_t operation_id, const device_link_operation_t **operation);
 
 esp_err_t device_link_operation_cancel(
     device_link_operation_table_t *table, uint64_t now_ms,

@@ -534,6 +534,10 @@ static void _test_operation_results(void)
             .operation_result_schema = &s_empty_result_schema,
             .response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },
         {
@@ -546,6 +550,10 @@ static void _test_operation_results(void)
             .response_schema = &s_empty_result_schema,
             .operation_result_schema = &s_status_result_schema,
             .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },
@@ -560,6 +568,10 @@ static void _test_operation_results(void)
             .operation_result_schema = &s_status_result_schema,
             .response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },
         {
@@ -572,6 +584,10 @@ static void _test_operation_results(void)
             .response_schema = &s_empty_result_schema,
             .operation_result_schema = &s_status_result_schema,
             .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },
@@ -586,6 +602,10 @@ static void _test_operation_results(void)
             .operation_result_schema = &s_status_result_schema,
             .response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },
         {
@@ -598,6 +618,10 @@ static void _test_operation_results(void)
             .response_schema = &s_empty_result_schema,
             .operation_result_schema = &s_status_result_schema,
             .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* Never invoked: only the descriptor registration and the
+             * OperationStatus encoder gate are exercised here. */
+            .allowed_statuses_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
             .handler = _fixture_handler,
         },

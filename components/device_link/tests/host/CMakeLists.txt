@@ -30,6 +30,7 @@ function(add_device_link_test target source)
     target_compile_features(${target} PRIVATE c_std_11)
     target_compile_definitions(${target} PRIVATE
         _POSIX_C_SOURCE=200809L
+        UNIT_TEST_HOST
     )
     target_include_directories(${target} PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/fakes"

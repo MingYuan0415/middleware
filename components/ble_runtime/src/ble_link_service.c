@@ -3281,7 +3281,7 @@ static device_link_status_t _ble_link_service_v2_method(
             return DEVICE_LINK_STATUS_UNAVAILABLE;
         }
         uint64_t operation_id = 0U;
-        device_link_operation_t operation;
+        const device_link_operation_t *operation = NULL;
 
         if (!_ble_link_service_v2_parse_operation_id(
                     request, request_len, &operation_id))
@@ -3297,7 +3297,9 @@ static device_link_status_t _ble_link_service_v2_method(
          * (ble_link_service_async_operation_update), and GetLinkSnapshot
          * reads it under the same lock. Cancel and GetOperation must hold
          * it too, otherwise a terminal bridge write can race the
-         * cancel/get copy and publish a torn or stale OperationStatus. */
+         * cancel/get read and publish a torn or stale OperationStatus. The
+         * get returns the table slot pointer, so the encode below must stay
+         * inside the same critical section. */
         _ble_link_service_lock();
         if (context->header.method_id == 7U)
         {
@@ -3325,7 +3327,7 @@ static device_link_status_t _ble_link_service_v2_method(
         if (op_status == DEVICE_LINK_STATUS_OK)
         {
             op_status = _ble_link_service_v2_encode_operation(
-                            &operation, response, response_capacity,
+                            operation, response, response_capacity,
                             response_len);
         }
         _ble_link_service_unlock();
@@ -4044,11 +4046,16 @@ esp_err_t ble_link_service_test_copy_operation(
         return ESP_ERR_INVALID_ARG;
     }
     _ble_link_service_lock();
+    const device_link_operation_t *slot = NULL;
     const esp_err_t result = device_link_operation_get(
                                  &s_service.v2_operations,
                                  _ble_link_service_v2_now_ms(),
-                                 operation_id, operation);
+                                 operation_id, &slot);
 
+    if (result == ESP_OK)
+    {
+        *operation = *slot;
+    }
     _ble_link_service_unlock();
     return result;
 }

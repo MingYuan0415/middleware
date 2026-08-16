@@ -60,6 +60,14 @@ typedef struct device_link_method_descriptor
      * payload, or the result message schema (e.g. wifi.v1.WifiStatus). */
     const device_link_tlv_schema_t *operation_result_schema;
     uint32_t response_body_status_mask;
+    /**
+     * @brief Method-specific empty-body statuses frozen in the contract
+     * (`allowed_statuses`).
+     *
+     * A handler status outside this mask is sanitized to INTERNAL (the
+     * device-wide escape hatch); INTERNAL itself never needs to be listed.
+     */
+    uint32_t allowed_statuses_mask;
     device_link_method_handler_t handler;
     void *handler_arg;
 } device_link_method_descriptor_t;

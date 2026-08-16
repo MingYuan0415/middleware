@@ -288,8 +288,11 @@ static const device_link_tlv_field_rule_t s_auth_prepare_fields[] =
         .id = 1U,
         .wire_type = DEVICE_LINK_TLV_UNSIGNED,
         .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
-        DEVICE_LINK_TLV_RULE_REPEATED,
+        DEVICE_LINK_TLV_RULE_REPEATED |
+        DEVICE_LINK_TLV_RULE_UNIQUE |
+        DEVICE_LINK_TLV_RULE_SORTED,
         .maximum_count = 16U,
+        .minimum_unsigned = 1U,
         .maximum_unsigned = UINT16_MAX,
     },
 };
@@ -326,7 +329,8 @@ static const device_link_tlv_field_rule_t s_auth_prepare_response_fields[] =
     },
     {
         .id = 5U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
-        .flags = DEVICE_LINK_TLV_RULE_REQUIRED | DEVICE_LINK_TLV_RULE_REPEATED,
+        .flags = DEVICE_LINK_TLV_RULE_REQUIRED | DEVICE_LINK_TLV_RULE_REPEATED |
+        DEVICE_LINK_TLV_RULE_UNIQUE | DEVICE_LINK_TLV_RULE_SORTED,
         .minimum_unsigned = 1U, .maximum_count = 16U,
         .maximum_unsigned = UINT16_MAX
     },
@@ -402,8 +406,10 @@ static const device_link_tlv_field_rule_t s_authorization_result_fields[] =
     },
     {
         .id = 4U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
-        .flags = DEVICE_LINK_TLV_RULE_REQUIRED | DEVICE_LINK_TLV_RULE_REPEATED,
-        .maximum_count = 16U, .maximum_unsigned = UINT16_MAX
+        .flags = DEVICE_LINK_TLV_RULE_REQUIRED | DEVICE_LINK_TLV_RULE_REPEATED |
+        DEVICE_LINK_TLV_RULE_UNIQUE | DEVICE_LINK_TLV_RULE_SORTED,
+        .maximum_count = 16U, .minimum_unsigned = 1U,
+        .maximum_unsigned = UINT16_MAX
     },
     {
         .id = 5U, .wire_type = DEVICE_LINK_TLV_FIXED64,
@@ -508,11 +514,15 @@ esp_err_t device_link_core_init(
     };
     static const uint8_t flags[] =
     {
+        /* profile channels.session.bootstrap_methods freezes [1, 2, 3]:
+         * pending_commit (4) and recovery (5) are not bootstrap methods.
+         * The router's candidate admission table hardcodes the contract
+         * method IDs, so these flags are documentation, not policy input. */
         DEVICE_LINK_METHOD_BOOTSTRAP,
         DEVICE_LINK_METHOD_BOOTSTRAP,
         DEVICE_LINK_METHOD_BOOTSTRAP,
-        DEVICE_LINK_METHOD_BOOTSTRAP,
-        DEVICE_LINK_METHOD_BOOTSTRAP,
+        0U,
+        0U,
         0U,
         0U,
     };
@@ -529,6 +539,38 @@ esp_err_t device_link_core_init(
     static const uint16_t request_limits[] = {0U, 0U, 80U, 64U, 20U, 32U, 32U};
     static const uint16_t response_limits[] =
     {1005U, 1005U, 256U, 256U, 256U, 3072U, 3072U};
+    /* Method-specific empty-body statuses frozen in schemas/core/v2.yaml
+     * (allowed_statuses). INTERNAL is the device-wide escape hatch and is
+     * accepted by the router without being listed. */
+    static const uint32_t allowed_masks[] =
+    {
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_BUSY) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFIRMATION_REQUIRED) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_NOT_FOUND) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_NOT_FOUND) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_NOT_FOUND) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_NOT_FOUND) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_BUSY) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
+    };
 
     for (size_t i = 0U; i < 7U; ++i)
     {
@@ -542,6 +584,7 @@ esp_err_t device_link_core_init(
         core->methods[i].response_schema = s_response_schemas[i];
         core->methods[i].response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK);
+        core->methods[i].allowed_statuses_mask = allowed_masks[i];
         if (i == 3U)
         {
             core->methods[i].response_body_status_mask |=

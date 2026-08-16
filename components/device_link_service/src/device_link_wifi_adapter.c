@@ -429,7 +429,9 @@ static device_link_status_t _encode_status(
                                status->applied_client_sync_id) != ESP_OK) ||
             device_link_tlv_writer_finish(&writer, response_len) != ESP_OK)
     {
-        return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+        /* Encode overflow is an internal invariant failure: the get_status
+         * allowed_statuses freeze no exhaustion status. */
+        return DEVICE_LINK_STATUS_INTERNAL;
     }
     return DEVICE_LINK_STATUS_OK;
 }
@@ -590,7 +592,10 @@ static device_link_status_t _wifi_handler(
         if (device_link_tlv_put_fixed64(&writer, 1U, scan.generation) != ESP_OK ||
                 device_link_tlv_put_uint(&writer, 2U, page) != ESP_OK)
         {
-            return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+            /* Encode overflow is an internal invariant failure: the
+             * get_scan_results allowed_statuses freeze no exhaustion
+             * status. */
+            return DEVICE_LINK_STATUS_INTERNAL;
         }
         /* Pages of at most eight networks; has_more reflects the tail. */
         const size_t page_size = 8U;
@@ -605,7 +610,7 @@ static device_link_status_t _wifi_handler(
                     device_link_tlv_writer_finish(&writer, response_len) !=
                     ESP_OK)
             {
-                return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+                return DEVICE_LINK_STATUS_INTERNAL;
             }
             return DEVICE_LINK_STATUS_OK;
         }
@@ -634,7 +639,7 @@ static device_link_status_t _wifi_handler(
                     ESP_OK || device_link_tlv_put_bytes(&writer, 3U, network,
                             network_len) != ESP_OK)
             {
-                return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+                return DEVICE_LINK_STATUS_INTERNAL;
             }
         }
         const bool has_more = last < scan.record_count;
@@ -643,7 +648,7 @@ static device_link_status_t _wifi_handler(
                 device_link_tlv_put_bool(&writer, 5U, scan.truncated) != ESP_OK ||
                 device_link_tlv_writer_finish(&writer, response_len) != ESP_OK)
         {
-            return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+            return DEVICE_LINK_STATUS_INTERNAL;
         }
         return DEVICE_LINK_STATUS_OK;
     }
@@ -797,6 +802,11 @@ static const device_link_method_descriptor_t s_methods[] =
         .response_schema = &s_status_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
             DEVICE_LINK_STATUS_OK),
+        .allowed_statuses_mask =
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL),
         .handler = _wifi_handler,
     },
     {
@@ -813,6 +823,12 @@ static const device_link_method_descriptor_t s_methods[] =
         .operation_result_schema = &s_empty_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
             DEVICE_LINK_STATUS_OK),
+        .allowed_statuses_mask =
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_BUSY) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL),
         .handler = _wifi_handler,
     },
     {
@@ -825,9 +841,15 @@ static const device_link_method_descriptor_t s_methods[] =
         .response_schema = &s_scan_results_schema,
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
             DEVICE_LINK_STATUS_OK),
+        .allowed_statuses_mask =
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_NOT_FOUND) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE) |
+        DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL),
         .handler = _wifi_handler,
     },
-#define WIFI_ASYNC_METHOD(id, permission, request_limit, request_type) \
+#define WIFI_ASYNC_METHOD(id, permission, request_limit, request_type, \
+                          allowed_mask) \
     { \
         .method_id = (id), \
         .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS, \
@@ -840,20 +862,56 @@ static const device_link_method_descriptor_t s_methods[] =
         .operation_result_schema = &s_status_schema, \
         .response_body_status_mask = DEVICE_LINK_STATUS_MASK( \
                                          DEVICE_LINK_STATUS_OK), \
+        .allowed_statuses_mask = (allowed_mask), \
         .handler = _wifi_handler, \
     }
     WIFI_ASYNC_METHOD(WIFI_METHOD_SET_CREDENTIALS,
                       DEVICE_LINK_PERMISSION_WIFI_WRITE, 160U,
-                      &s_set_credentials_schema),
+                      &s_set_credentials_schema,
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFLICT) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_UNAVAILABLE)),
     WIFI_ASYNC_METHOD(WIFI_METHOD_DISCONNECT,
-                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema),
+                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema,
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_BUSY) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_UNAVAILABLE) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL)),
     WIFI_ASYNC_METHOD(WIFI_METHOD_RECONNECT_SAVED,
-                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema),
+                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema,
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_NOT_FOUND) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_BUSY) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_UNAVAILABLE) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL)),
     WIFI_ASYNC_METHOD(WIFI_METHOD_FORGET_SAVED,
-                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema),
+                      DEVICE_LINK_PERMISSION_WIFI_WRITE, 0U, &s_empty_schema,
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_NOT_FOUND) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_UNAVAILABLE)),
     WIFI_ASYNC_METHOD(WIFI_METHOD_SET_AUTO_CONNECT,
                       DEVICE_LINK_PERMISSION_WIFI_WRITE, 8U,
-                      &s_auto_connect_schema),
+                      &s_auto_connect_schema,
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+                      DEVICE_LINK_STATUS_MASK(
+                          DEVICE_LINK_STATUS_UNAVAILABLE) |
+                      DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL)),
 #undef WIFI_ASYNC_METHOD
 };
 
@@ -900,6 +958,11 @@ esp_err_t device_link_wifi_adapter_encode_operation_result(
  * lock, so it can never wait on the manager worker.
  * ------------------------------------------------------------------------- */
 
+/* Written only from the service task during init/deinit; read on the
+ * connectivity publisher context. Pointer-sized stores and loads are atomic
+ * on Xtensa and start/stop are serialized by the service lifecycle, so no
+ * lock is taken around the handle itself (the event bus unsubscribe is
+ * synchronized internally). */
 static event_bus_sub_handle_t s_bridge_handle = EVENT_BUS_SUB_HANDLE_INVALID;
 
 /**

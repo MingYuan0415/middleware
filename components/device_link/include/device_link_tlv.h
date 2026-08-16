@@ -64,6 +64,8 @@ typedef struct device_link_tlv_writer
 #define DEVICE_LINK_TLV_RULE_NONZERO 0x08U
 #define DEVICE_LINK_TLV_RULE_BOOL 0x10U
 #define DEVICE_LINK_TLV_RULE_MESSAGE 0x20U
+#define DEVICE_LINK_TLV_RULE_UNIQUE 0x40U
+#define DEVICE_LINK_TLV_RULE_SORTED 0x80U
 
 struct device_link_tlv_schema;
 

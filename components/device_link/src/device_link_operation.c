@@ -183,12 +183,13 @@ esp_err_t device_link_operation_update(
 
 esp_err_t device_link_operation_get(
     device_link_operation_table_t *table, uint64_t now_ms,
-    uint64_t operation_id, device_link_operation_t *operation)
+    uint64_t operation_id, const device_link_operation_t **operation)
 {
     if (table == NULL || operation_id == 0U || operation == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    *operation = NULL;
     device_link_operation_sweep(table, now_ms);
     device_link_operation_t *found = _find(table, operation_id);
 
@@ -196,7 +197,7 @@ esp_err_t device_link_operation_get(
     {
         return ESP_ERR_NOT_FOUND;
     }
-    *operation = *found;
+    *operation = found;
     return ESP_OK;
 }
 

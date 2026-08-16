@@ -450,7 +450,10 @@ static esp_err_t _schema_valid(const device_link_tlv_schema_t *schema)
                 rule->wire_type > DEVICE_LINK_TLV_FIXED64 ||
                 (i > 0U && schema->fields[i - 1U].id >= rule->id) ||
                 ((rule->flags & DEVICE_LINK_TLV_RULE_REPEATED) != 0U &&
-                 rule->maximum_count == 0U))
+                 rule->maximum_count == 0U) ||
+                ((rule->flags & (DEVICE_LINK_TLV_RULE_UNIQUE |
+                                 DEVICE_LINK_TLV_RULE_SORTED)) != 0U &&
+                 rule->wire_type != DEVICE_LINK_TLV_UNSIGNED))
         {
             return ESP_ERR_INVALID_ARG;
         }
@@ -469,6 +472,9 @@ static esp_err_t _validate_message_depth(
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t counts[63] = {0};
+    /* Strictly ascending previous values for repeated UNIQUE/SORTED uint
+     * lists (the permission lists of the authorization contract). */
+    uint64_t previous[63] = {0};
     device_link_tlv_reader_t reader;
     esp_err_t result = device_link_tlv_reader_init(&reader, data, len);
 
@@ -506,6 +512,19 @@ static esp_err_t _validate_message_depth(
                  counts[rule_index] > rule->maximum_count))
         {
             return ESP_ERR_INVALID_RESPONSE;
+        }
+        if ((rule->flags & (DEVICE_LINK_TLV_RULE_UNIQUE |
+                            DEVICE_LINK_TLV_RULE_SORTED)) != 0U)
+        {
+            /* The schema validator restricts these flags to uint rules.
+             * Both flags require a strictly ascending value sequence, which
+             * is unique by construction. */
+            if (counts[rule_index] > 1U &&
+                    field.value.unsigned_value <= previous[rule_index])
+            {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            previous[rule_index] = field.value.unsigned_value;
         }
         if ((rule->flags & DEVICE_LINK_TLV_RULE_MESSAGE) != 0U)
         {

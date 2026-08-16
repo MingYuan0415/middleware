@@ -1605,6 +1605,16 @@ static void test_operation_declared_empty_result_never_encoded(void)
             .operation_result_schema = &s_test_empty_schema,
             .response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* The handler is never dispatched in these tests; the mask
+             * mirrors the production set_credentials allowed_statuses. */
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFLICT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
             .handler = _empty_scan_handler,
         },
     };
@@ -1765,6 +1775,16 @@ static void test_v2_get_operation_large_result_emits_fully(void)
             .operation_result_schema = &s_test_result_schema,
             .response_body_status_mask =
             DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            /* The handler is never dispatched in these tests; the mask
+             * mirrors the production set_credentials allowed_statuses. */
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INVALID_ARGUMENT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_CONFLICT) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_STORAGE) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_INTERNAL) |
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_UNAVAILABLE),
             .handler = _empty_scan_handler,
         },
     };
