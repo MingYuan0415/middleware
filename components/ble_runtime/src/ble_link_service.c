@@ -1713,6 +1713,7 @@ static bool _ble_link_service_emit_deferred_busy_locked(void)
  * this helper remains only for legacy regression fixtures and business
  * adapter coverage.
  */
+#ifdef UNIT_TEST_HOST
 static void _ble_link_service_build_response(
     uint64_t request_id, uint32_t error, ble_link_codec_response_tag_t body_tag,
     const uint8_t *body, size_t body_len)
@@ -1750,6 +1751,7 @@ static void _ble_link_service_build_response(
         s_service.response_envelope_len = 0U;
     }
 }
+#endif /* UNIT_TEST_HOST */
 
 /**
  * @brief Encrypt (when wired) and fragment one outbound message.
