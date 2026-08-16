@@ -172,6 +172,8 @@ esp_err_t ble_link_service_async_operation_update(
     uint64_t owner_id, device_link_operation_state_t state,
     device_link_status_t status, const uint8_t *result, size_t result_len);
 
+bool ble_link_service_async_operation_in_flight(uint8_t domain_id);
+
 /**
  * @brief Reset the service (new boot or full teardown).
  */

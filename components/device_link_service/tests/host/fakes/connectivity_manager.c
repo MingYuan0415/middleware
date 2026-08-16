@@ -21,12 +21,22 @@ static connectivity_manager_scan_snapshot_t s_scan =
     .generation = 1U,
 };
 static connectivity_manager_operation_id_t s_next_operation = 1U;
+static esp_err_t s_request_result = ESP_OK;
+
+void connectivity_manager_fake_set_request_result(esp_err_t result)
+{
+    s_request_result = result;
+}
 
 static esp_err_t _admit(connectivity_manager_operation_id_t *operation_id)
 {
     if (operation_id == NULL)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_request_result != ESP_OK)
+    {
+        return s_request_result;
     }
     *operation_id = s_next_operation++;
     if (*operation_id == 0U)

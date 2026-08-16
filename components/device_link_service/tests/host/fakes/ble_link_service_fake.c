@@ -10,6 +10,8 @@ static uint64_t s_last_owner_id = 0U;
 static device_link_operation_state_t s_last_state;
 static device_link_status_t s_last_status;
 static size_t s_last_result_len = 0U;
+static bool s_in_flight = false;
+static esp_err_t s_start_result = ESP_OK;
 
 esp_err_t ble_link_service_async_operation_start(
     uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
@@ -23,6 +25,10 @@ esp_err_t ble_link_service_async_operation_start(
     if (out_operation_id == NULL || owner_id == 0U)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_start_result != ESP_OK)
+    {
+        return s_start_result;
     }
     *out_operation_id = s_next_operation_id++;
     return ESP_OK;
@@ -45,13 +51,32 @@ esp_err_t ble_link_service_async_operation_update(
     return ESP_OK;
 }
 
+bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
+{
+    (void)domain_id;
+    return s_in_flight;
+}
+
 /* Test hooks. */
 void ble_link_service_fake_reset(void)
 {
     s_update_count = 0U;
     s_last_owner_id = 0U;
     s_last_result_len = 0U;
+    s_in_flight = false;
+    s_start_result = ESP_OK;
 }
+
+void ble_link_service_fake_set_in_flight(bool in_flight)
+{
+    s_in_flight = in_flight;
+}
+
+void ble_link_service_fake_set_start_result(esp_err_t result)
+{
+    s_start_result = result;
+}
+
 
 unsigned ble_link_service_fake_update_count(void)
 {

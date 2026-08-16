@@ -12,14 +12,27 @@
 #include "device_link_wifi_adapter.h"
 #include "event_bus.h"
 
+#define WIFI_METHOD_GET_STATUS 1U
+#define WIFI_METHOD_START_SCAN 2U
+#define WIFI_METHOD_GET_SCAN_RESULTS 3U
+#define WIFI_METHOD_SET_CREDENTIALS 4U
+#define WIFI_METHOD_DISCONNECT 5U
+#define WIFI_METHOD_RECONNECT_SAVED 6U
+#define WIFI_METHOD_FORGET_SAVED 7U
+#define WIFI_METHOD_SET_AUTO_CONNECT 8U
+
 /* Test-only fake hooks (fakes/connectivity_manager.c, fakes/event_bus.c,
  * fakes/ble_link_service_fake.c). */
 extern void connectivity_manager_fake_set_scan(
     const connectivity_manager_scan_snapshot_t *snapshot);
+extern void connectivity_manager_fake_set_request_result(esp_err_t result);
 extern void event_bus_fake_publish(event_bus_msg_id_t msg_id,
                                    uint32_t sub_type, const void *payload,
                                    size_t payload_size);
 extern void ble_link_service_fake_reset(void);
+extern void ble_link_service_fake_set_in_flight(bool in_flight);
+extern void ble_link_service_fake_set_start_result(esp_err_t result);
+extern unsigned ble_link_service_fake_defer_count(void);
 extern unsigned ble_link_service_fake_update_count(void);
 extern uint64_t ble_link_service_fake_last_owner(void);
 extern device_link_operation_state_t ble_link_service_fake_last_state(void);
@@ -36,6 +49,33 @@ static bool contains_byte(const uint8_t *data, size_t len, uint8_t value)
         }
     }
     return false;
+}
+
+static device_link_status_t _call_method(uint8_t method_id,
+        const uint8_t *request, size_t request_len)
+{
+    const device_link_domain_descriptor_t *descriptor = NULL;
+    uint8_t response[128];
+    size_t response_len = 0U;
+    const device_link_request_context_t context =
+    {
+        .header =
+        {
+            .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+            .domain_major = 1U,
+            .method_id = method_id,
+            .call_id = 1U,
+            .boot_id = 1U,
+        },
+        .security_authenticated = true,
+        .authorized = true,
+    };
+
+    assert(device_link_wifi_adapter_get_descriptor(&descriptor) == ESP_OK);
+    assert(method_id >= 1U && method_id <= descriptor->method_count);
+    return descriptor->methods[method_id - 1U].handler(
+               &context, request, request_len, response, sizeof(response),
+               &response_len, descriptor->methods[method_id - 1U].handler_arg);
 }
 
 static void _fill_scan(connectivity_manager_scan_snapshot_t *scan)
@@ -418,6 +458,108 @@ static void test_admit_uses_table_operation_id(void)
     assert(table_id != 0U);
 }
 
+static void _make_empty_request(uint8_t *request, size_t *request_len)
+{
+    device_link_tlv_writer_t writer;
+
+    device_link_tlv_writer_init(&writer, request, 64U);
+    assert(device_link_tlv_writer_finish(&writer, request_len) == ESP_OK);
+}
+
+static void test_admission_errors_follow_allowed_statuses(void)
+{
+    uint8_t request[64];
+    size_t request_len = 0U;
+
+    _make_empty_request(request, &request_len);
+    ble_link_service_fake_reset();
+    /* Manager lifecycle unavailable (cold-start/shutdown) is UNAVAILABLE
+     * for every asynchronous method, never CONFLICT. */
+    connectivity_manager_fake_set_request_result(ESP_ERR_INVALID_STATE);
+    assert(_call_method(WIFI_METHOD_START_SCAN, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_DISCONNECT, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_RECONNECT_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_FORGET_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    /* set_auto_connect rejects an empty request body before admission. */
+    uint8_t auto_connect_request[8];
+    device_link_tlv_writer_t auto_writer;
+
+    device_link_tlv_writer_init(&auto_writer, auto_connect_request,
+                                sizeof(auto_connect_request));
+    assert(device_link_tlv_put_bool(&auto_writer, 1U, true) == ESP_OK);
+    size_t auto_connect_len = 0U;
+
+    assert(device_link_tlv_writer_finish(&auto_writer,
+                                         &auto_connect_len) == ESP_OK);
+    assert(_call_method(WIFI_METHOD_SET_AUTO_CONNECT,
+                        auto_connect_request, auto_connect_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+
+    /* Queue full maps to RESOURCE_EXHAUSTED only for start_scan and
+     * set_credentials (their allowed sets); the other methods express it
+     * as UNAVAILABLE. */
+    connectivity_manager_fake_set_request_result(ESP_ERR_NO_MEM);
+    assert(_call_method(WIFI_METHOD_START_SCAN, request, request_len) ==
+           DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED);
+    assert(_call_method(WIFI_METHOD_DISCONNECT, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_RECONNECT_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_FORGET_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_SET_AUTO_CONNECT,
+                        auto_connect_request, auto_connect_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    connectivity_manager_fake_set_request_result(ESP_OK);
+}
+
+static void test_table_admission_failure_maps_per_method(void)
+{
+    uint8_t request[64];
+    size_t request_len = 0U;
+
+    _make_empty_request(request, &request_len);
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_start_result(ESP_ERR_NO_MEM);
+    assert(_call_method(WIFI_METHOD_START_SCAN, request, request_len) ==
+           DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED);
+    assert(_call_method(WIFI_METHOD_DISCONNECT, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_RECONNECT_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(_call_method(WIFI_METHOD_FORGET_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_UNAVAILABLE);
+    ble_link_service_fake_set_start_result(ESP_OK);
+}
+
+static void test_busy_admission_for_allowed_methods(void)
+{
+    uint8_t request[64];
+    size_t request_len = 0U;
+
+    _make_empty_request(request, &request_len);
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_in_flight(true);
+    /* start_scan, disconnect and reconnect_saved freeze BUSY in their
+     * allowed_statuses and must reject synchronously while another Wi-Fi
+     * operation is live. */
+    assert(_call_method(WIFI_METHOD_START_SCAN, request, request_len) ==
+           DEVICE_LINK_STATUS_BUSY);
+    assert(_call_method(WIFI_METHOD_DISCONNECT, request, request_len) ==
+           DEVICE_LINK_STATUS_BUSY);
+    assert(_call_method(WIFI_METHOD_RECONNECT_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_BUSY);
+    /* forget_saved has no BUSY in its allowed set and stays deferred by
+     * the manager owner. */
+    assert(_call_method(WIFI_METHOD_FORGET_SAVED, request, request_len) ==
+           DEVICE_LINK_STATUS_OK);
+    ble_link_service_fake_set_in_flight(false);
+}
+
 int main(void)
 {
     test_descriptor_is_static_and_complete();
@@ -427,5 +569,8 @@ int main(void)
     test_bridge_forwards_terminal_status();
     test_bridge_forwards_terminal_scan();
     test_admit_uses_table_operation_id();
+    test_admission_errors_follow_allowed_statuses();
+    test_table_admission_failure_maps_per_method();
+    test_busy_admission_for_allowed_methods();
     return 0;
 }

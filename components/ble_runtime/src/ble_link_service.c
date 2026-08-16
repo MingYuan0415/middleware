@@ -3839,6 +3839,30 @@ esp_err_t ble_link_service_async_operation_update(
     return result_status;
 }
 
+bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
+{
+    bool in_flight = false;
+
+    _ble_link_service_lock();
+    for (size_t i = 0U; i < DEVICE_LINK_MAX_OPERATIONS; ++i)
+    {
+        const device_link_operation_t *operation =
+            &s_service.v2_operations.slots[i];
+
+        if (operation->id != 0U &&
+                operation->domain_id == domain_id &&
+                operation->state != DEVICE_LINK_OPERATION_SUCCEEDED &&
+                operation->state != DEVICE_LINK_OPERATION_FAILED &&
+                operation->state != DEVICE_LINK_OPERATION_CANCELED)
+        {
+            in_flight = true;
+            break;
+        }
+    }
+    _ble_link_service_unlock();
+    return in_flight;
+}
+
 #ifdef UNIT_TEST_HOST
 esp_err_t ble_link_service_test_copy_operation(
     uint64_t operation_id, device_link_operation_t *operation)

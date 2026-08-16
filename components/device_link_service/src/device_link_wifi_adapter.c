@@ -293,13 +293,37 @@ static device_link_status_t _map_result(esp_err_t result)
     }
     if (result == ESP_ERR_INVALID_STATE)
     {
-        return DEVICE_LINK_STATUS_CONFLICT;
+        /* The manager lifecycle is not running (cold-start window or
+         * shutdown). Core v2 maps a disabled/unavailable owner to
+         * UNAVAILABLE; CONFLICT is reserved for duplicate-request replay
+         * and client-sync conflicts. */
+        return DEVICE_LINK_STATUS_UNAVAILABLE;
     }
     if (result == ESP_ERR_TIMEOUT)
     {
         return DEVICE_LINK_STATUS_UNAVAILABLE;
     }
     return DEVICE_LINK_STATUS_INTERNAL;
+}
+
+/**
+ * @brief Map an admission failure to the statuses frozen in the Wi-Fi v1
+ * method allowed_statuses.
+ *
+ * RESOURCE_EXHAUSTED is allowed only for start_scan and set_credentials;
+ * the other asynchronous methods express table/queue exhaustion as
+ * UNAVAILABLE (their allowed sets do not contain RESOURCE_EXHAUSTED).
+ */
+static device_link_status_t _map_admission_result(
+    uint8_t method_id, esp_err_t result)
+{
+    if (result != ESP_ERR_NO_MEM ||
+            method_id == WIFI_METHOD_START_SCAN ||
+            method_id == WIFI_METHOD_SET_CREDENTIALS)
+    {
+        return _map_result(result);
+    }
+    return DEVICE_LINK_STATUS_UNAVAILABLE;
 }
 
 static bool _read_message(const uint8_t *request, size_t request_len,
@@ -332,8 +356,8 @@ static bool _read_bool(const uint8_t *request, size_t request_len,
            !has && reader.offset == reader.len;
 }
 
-static device_link_status_t _encode_operation(
-    uint8_t method_id, esp_err_t result, uint64_t operation_id,
+static device_link_status_t _encode_operation_status(
+    uint8_t method_id, device_link_status_t status, uint64_t operation_id,
     uint8_t *response, size_t capacity, size_t *response_len)
 {
     device_link_tlv_writer_t writer;
@@ -343,10 +367,10 @@ static device_link_status_t _encode_operation(
         return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
     }
     *response_len = 0U;
-    if (result != ESP_OK)
+    if (status != DEVICE_LINK_STATUS_OK)
     {
         /* Admission failures have no operation identity to expose. */
-        return _map_result(result);
+        return status;
     }
     if (operation_id == 0U)
     {
@@ -359,7 +383,16 @@ static device_link_status_t _encode_operation(
     {
         return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
     }
-    return _map_result(result);
+    return DEVICE_LINK_STATUS_OK;
+}
+
+static device_link_status_t _encode_operation(
+    uint8_t method_id, esp_err_t result, uint64_t operation_id,
+    uint8_t *response, size_t capacity, size_t *response_len)
+{
+    return _encode_operation_status(
+               method_id, _map_admission_result(method_id, result),
+               operation_id, response, capacity, response_len);
 }
 
 static device_link_status_t _encode_status(
@@ -468,6 +501,20 @@ static device_link_status_t _wifi_handler(
     connectivity_manager_operation_id_t operation_id = 0U;
     esp_err_t result;
 
+    if ((method == WIFI_METHOD_START_SCAN ||
+            method == WIFI_METHOD_DISCONNECT ||
+            method == WIFI_METHOD_RECONNECT_SAVED) &&
+            ble_link_service_async_operation_in_flight(
+                DEVICE_LINK_DOMAIN_WIFI))
+    {
+        /* The Wi-Fi v1 allowed_statuses freeze BUSY for these methods when
+         * another operation is still live; the lower layer would otherwise
+         * silently defer the command and report the conflict only as a
+         * late terminal event. */
+        return _encode_operation_status(
+                   method, DEVICE_LINK_STATUS_BUSY, 0U, response,
+                   response_capacity, response_len);
+    }
     if (method == WIFI_METHOD_GET_STATUS)
     {
         connectivity_manager_status_snapshot_t status;
