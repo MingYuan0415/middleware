@@ -181,9 +181,10 @@ static void _ble_tx_scheduler_drop_flow_locked(
             _ble_tx_scheduler_queue_completion(
                 frame->kind, &frame->identity, frame->value_handle,
                 status, frame->is_last);
-            /* The descriptor is pool-owned and reused on the next submit;
-             * NULL the dead slot so a dropped frame is never mistaken for a
-             * queued one and the compaction below cannot strand it. */
+            /* The descriptor is pool-owned: a dropped flow frees the
+             * slot allocation (a later submit allocates afresh) and the
+             * slot is NULLed so the compaction cannot strand it. */
+            free(frame);
             s_scheduler.frames[source] = NULL;
             continue;
         }
