@@ -992,6 +992,13 @@ esp_err_t device_link_security_handshake_ex(
     if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD0 &&
             s_security.session_open)
     {
+        /* Cmd0 replaces the current session (retire + new epoch), the
+         * documented AUTHENTICATED + CMD0 -> HANDSHAKING transition. The
+         * adapter is a single global session: true concurrent handshakes
+         * from two ACLs cannot occur because the transport admits only
+         * one connection, so "concurrent_handshake: BUSY" from the
+         * security_adapter fixture is covered by the single-connection
+         * GATT gate rather than by a per-ACL session table. */
         _device_link_security_close_session_locked();
     }
     else if (request_stage == DEVICE_LINK_SECURITY_HANDSHAKE_CMD1 &&
@@ -1044,6 +1051,10 @@ esp_err_t device_link_security_handshake_ex(
 
     if (result != ESP_OK || response == NULL || response_len <= 0)
     {
+        if (response != NULL && response_len > 0)
+        {
+            _device_link_security_zeroize(response, (size_t)response_len);
+        }
         free(response);
         /* A failed handshake (e.g. wrong POP or proof) closes the
          * session so no stale state accumulates. */
@@ -1057,6 +1068,7 @@ esp_err_t device_link_security_handshake_ex(
                  response, (size_t)response_len, true, &response_stage);
     if (result != ESP_OK || response_stage != request_stage)
     {
+        _device_link_security_zeroize(response, (size_t)response_len);
         free(response);
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
@@ -1094,6 +1106,7 @@ esp_err_t device_link_security_handshake_ex(
             {
                 _device_link_security_close_session_locked();
             }
+            _device_link_security_zeroize(*output, *output_len);
             free(*output);
             *output = NULL;
             *output_len = 0U;
@@ -1168,6 +1181,9 @@ esp_err_t device_link_security_unprotect(
                  plain, (size_t)plain_len,
                  &plain_response, &plain_response_len,
                  request_arg);
+    /* The decrypted request envelope is sensitive: wipe it before the
+     * heap block is returned. */
+    _device_link_security_zeroize(plain, (size_t)plain_len);
     free(plain);
     _device_link_security_lock();
     if (s_session_epoch != session_epoch ||
