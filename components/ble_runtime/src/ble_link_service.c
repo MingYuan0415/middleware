@@ -3266,28 +3266,46 @@ static device_link_status_t _ble_link_service_v2_method(
         }
         const uint64_t now_ms = _ble_link_service_v2_now_ms();
         esp_err_t operation_result;
+        device_link_status_t op_status = DEVICE_LINK_STATUS_OK;
 
+        /* The completion bridge writes the operation table from the
+         * connectivity publisher context under _ble_link_service_lock()
+         * (ble_link_service_async_operation_update), and GetLinkSnapshot
+         * reads it under the same lock. Cancel and GetOperation must hold
+         * it too, otherwise a terminal bridge write can race the
+         * cancel/get copy and publish a torn or stale OperationStatus. */
+        _ble_link_service_lock();
         if (context->header.method_id == 7U)
         {
             operation_result = device_link_operation_cancel(
                                    &s_service.v2_operations, now_ms,
                                    operation_id);
-            if (operation_result != ESP_OK && operation_result != ESP_ERR_INVALID_STATE)
+            if (operation_result != ESP_OK &&
+                    operation_result != ESP_ERR_INVALID_STATE)
             {
-                return operation_result == ESP_ERR_NOT_FOUND ?
-                       DEVICE_LINK_STATUS_NOT_FOUND :
-                       DEVICE_LINK_STATUS_UNAVAILABLE;
+                op_status = operation_result == ESP_ERR_NOT_FOUND ?
+                            DEVICE_LINK_STATUS_NOT_FOUND :
+                            DEVICE_LINK_STATUS_UNAVAILABLE;
             }
         }
-        operation_result = device_link_operation_get(
-                               &s_service.v2_operations, now_ms,
-                               operation_id, &operation);
-        if (operation_result != ESP_OK)
+        if (op_status == DEVICE_LINK_STATUS_OK)
         {
-            return DEVICE_LINK_STATUS_NOT_FOUND;
+            operation_result = device_link_operation_get(
+                                   &s_service.v2_operations, now_ms,
+                                   operation_id, &operation);
+            if (operation_result != ESP_OK)
+            {
+                op_status = DEVICE_LINK_STATUS_NOT_FOUND;
+            }
         }
-        return _ble_link_service_v2_encode_operation(
-                   &operation, response, response_capacity, response_len);
+        if (op_status == DEVICE_LINK_STATUS_OK)
+        {
+            op_status = _ble_link_service_v2_encode_operation(
+                            &operation, response, response_capacity,
+                            response_len);
+        }
+        _ble_link_service_unlock();
+        return op_status;
     }
 
     uint16_t requested_permissions[DEVICE_LINK_MAX_PERMISSIONS] = {0};
@@ -3820,6 +3838,25 @@ esp_err_t ble_link_service_async_operation_update(
     _ble_link_service_unlock();
     return result_status;
 }
+
+#ifdef UNIT_TEST_HOST
+esp_err_t ble_link_service_test_copy_operation(
+    uint64_t operation_id, device_link_operation_t *operation)
+{
+    if (operation_id == 0U || operation == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    const esp_err_t result = device_link_operation_get(
+                                 &s_service.v2_operations,
+                                 _ble_link_service_v2_now_ms(),
+                                 operation_id, operation);
+
+    _ble_link_service_unlock();
+    return result;
+}
+#endif
 
 esp_err_t ble_link_service_set_domain_descriptors(
     const device_link_domain_descriptor_t *domains, size_t domain_count)

@@ -1,7 +1,9 @@
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/task.h"
 #include "esp_err.h"
@@ -1174,6 +1176,75 @@ static void test_v2_snapshot_includes_operation_summaries(void)
     TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
                           &reader, &field, &has_field));
     TEST_ASSERT_TRUE(!has_field);
+}
+
+
+typedef struct operation_race_thread_arg
+{
+    uint64_t owner_id;
+    unsigned iterations;
+    unsigned failures;
+} operation_race_thread_arg_t;
+
+static void *_operation_update_thread(void *arg)
+{
+    operation_race_thread_arg_t *thread_arg =
+        (operation_race_thread_arg_t *)arg;
+
+    for (unsigned i = 0U; i < thread_arg->iterations; ++i)
+    {
+        const esp_err_t result = ble_link_service_async_operation_update(
+                                     thread_arg->owner_id,
+                                     DEVICE_LINK_OPERATION_RUNNING,
+                                     DEVICE_LINK_STATUS_OK, NULL, 0U);
+
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE &&
+                result != ESP_ERR_NOT_FOUND)
+        {
+            thread_arg->failures++;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void test_operation_table_reads_are_synchronized(void)
+{
+    /* CancelOperation/GetOperation share the operation table with the
+     * completion bridge. A writer task updates the record while this task
+     * repeatedly reads the whole 3 KB record through the same lock; the
+     * copy must stay coherent (TSan guards the data race). */
+    enum { ITERATIONS = 200U };
+    uint64_t operation_id = 0U;
+    pthread_t writer;
+    operation_race_thread_arg_t arg =
+    {
+        .owner_id = 0x4000U,
+        .iterations = ITERATIONS,
+        .failures = 0U,
+    };
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, arg.owner_id,
+                          NULL, NULL, &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(0, pthread_create(&writer, NULL, _operation_update_thread,
+                                        &arg));
+    for (unsigned i = 0U; i < ITERATIONS; ++i)
+    {
+        device_link_operation_t record;
+
+        TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                              operation_id, &record));
+        TEST_ASSERT_EQUAL(DEVICE_LINK_DOMAIN_WIFI, record.domain_id);
+        TEST_ASSERT_EQUAL(4U, record.method_id);
+        TEST_ASSERT_TRUE(record.state == DEVICE_LINK_OPERATION_PENDING ||
+                         record.state == DEVICE_LINK_OPERATION_RUNNING);
+        TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, record.status);
+    }
+    TEST_ASSERT_EQUAL(0, pthread_join(writer, NULL));
+    TEST_ASSERT_EQUAL(0U, arg.failures);
 }
 
 static void _commit_auth_record(void);
@@ -3787,6 +3858,7 @@ int main(void)
     test_get_authorization_requires_recovery_flag();
     test_prepare_retires_previous_transaction();
     test_v2_snapshot_includes_operation_summaries();
+    test_operation_table_reads_are_synchronized();
     test_v2_get_authorization_without_recovery_malformed();
     test_authorize_expiry_clears_transaction();
     test_response_flow_identity_and_deferred_busy();

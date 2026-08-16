@@ -17,6 +17,9 @@
 #ifdef UNIT_TEST_HOST
     /** @brief Test-only seam: force the authorize deadline value. */
     void ble_link_service_test_set_auth_deadline_ticks(uint32_t ticks);
+    /** @brief Test-only seam: copy one operation-table record by id. */
+    esp_err_t ble_link_service_test_copy_operation(
+        uint64_t operation_id, device_link_operation_t *operation);
 #endif
 
 #ifdef __cplusplus
