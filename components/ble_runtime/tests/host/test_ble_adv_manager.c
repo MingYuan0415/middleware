@@ -1484,6 +1484,53 @@ static void test_pause_retries_failed_stop(void)
                       ble_adv_manager_get_state());
 }
 
+static void test_zero_identifier_never_published(void)
+{
+    /* The v2 service data identifier must be non-zero in both modes: a
+     * zero public instance id or zero bindable discriminator must fault
+     * the start instead of publishing a zero identifier. */
+    static const uint8_t short_name[] = "MT";
+    static const uint8_t zero_public_instance_id[3] = {0U, 0U, 0U};
+    static const ble_adv_manager_config_t zero_config =
+    {
+        .fast_interval_ms = 100U,
+        .slow_interval_ms = 700U,
+        .fast_window_ms = 30000U,
+        .short_name = short_name,
+        .short_name_len = sizeof(short_name) - 1U,
+        .service_uuid = s_uuid,
+        .adv_version = 2U,
+        .public_instance_id = zero_public_instance_id,
+        .now_ms = _fake_now_ms,
+        .arm_timer = _fake_arm_timer,
+        .timer_arg = NULL,
+        .ops = &s_fake_ops,
+        .lock = NULL,
+        .unlock = NULL,
+        .lock_arg = NULL,
+    };
+    const uint8_t zero_discriminator[3] = {0U, 0U, 0U};
+    ble_adv_lease_t lease;
+
+    _reset_harness();
+    ble_adv_manager_init(&zero_config);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_adv_manager_acquire_lease(
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW,
+                          false, NULL));
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED,
+                      ble_adv_manager_get_state());
+
+    _reset_harness();
+    _init_manager();
+    /* The bindable path rejects a zero discriminator at lease admission;
+     * the start-time check remains as publication-point defense. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_adv_manager_acquire_lease(
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW,
+                          true, zero_discriminator));
+}
+
 int main(void)
 {
     test_acquire_fast_starts_fast_adv();
@@ -1509,6 +1556,7 @@ int main(void)
     test_reset_retires_queued_stop_command();
     test_adv_complete_cannot_discharge_failed_stop();
     test_reset_quarantines_late_stop();
+    test_zero_identifier_never_published();
     test_adv_complete_without_connection_restarts();
     test_pause_preserves_lease_and_resumes();
     test_pause_reasons_are_independent();

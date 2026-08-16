@@ -329,6 +329,13 @@ static esp_err_t _ble_link_session_report_session_match_locked(
     {
         return ESP_ERR_INVALID_STATE;
     }
+    /* AUTHORIZED implies AUTHENTICATED: refuse the fact before its link
+     * prerequisites converge, so the published flag set stays coherent. */
+    if (!s_session.encrypted || !s_session.bond_verified ||
+            !s_session.identity_known)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_session.bound ||
             (revision != 0U &&
              revision != s_session.authorization_revision))
@@ -368,6 +375,12 @@ static esp_err_t _ble_link_session_query_admission_locked(
         *out_error = BLE_LINK_ERROR_OK;
         break;
     case BLE_LINK_SESSION_CHANNEL_SESSION:
+        /* "Security 2 candidate or verified bond": the provisioning flow
+         * always completes LE Secure Connections pairing and bonding
+         * FIRST (pairing window), then runs the Security 2 handshake over
+         * session_rx. Requiring the full bond facts here therefore admits
+         * exactly the Security 2 candidate set; an unbonded peer cannot
+         * touch the characteristic. */
         if (s_session.encrypted && s_session.bond_verified &&
                 s_session.identity_known)
         {
@@ -516,7 +529,13 @@ static uint32_t _ble_link_session_get_state_flags_locked(void)
     {
         flags |= BLE_LINK_STATE_FLAG_AUTHENTICATED;
     }
-    if (s_session.authorized)
+    /* AUTHORIZED implies AUTHENTICATED and BOUND: the flag is masked with
+     * the full AUTHENTICATED fact set so the published 16-byte value is
+     * always a coherent combination even if a future path sets the
+     * authorized fact before its prerequisites converge. */
+    if (s_session.authorized && s_session.bound && s_session.encrypted &&
+            s_session.bond_verified && s_session.identity_known &&
+            s_session.security2_open)
     {
         flags |= BLE_LINK_STATE_FLAG_AUTHORIZED;
     }

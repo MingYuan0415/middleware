@@ -282,6 +282,14 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
         memcpy(discriminator, config->public_instance_id,
                sizeof(discriminator));
     }
+    if (_ble_adv_manager_discriminator_is_zero(discriminator))
+    {
+        /* The v2 service data identifier must be non-zero in both modes:
+         * a zero identifier would break scan correlation and must never
+         * be published, regardless of what the caller supplied. */
+        s_manager.state = BLE_ADV_MANAGER_STATE_FAULTED;
+        return ESP_ERR_INVALID_STATE;
+    }
     memcpy(&s_manager.service_data[2], discriminator,
            BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     s_manager.adv_config.service_data = s_manager.service_data;

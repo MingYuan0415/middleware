@@ -371,13 +371,20 @@ static int _ble_link_gatt_access(
     {
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
-    const ble_link_service_rx_channel_t channel =
-        (memcmp(characteristic->uuid, s_session_rx_uuid, 16U) == 0) ?
-        BLE_LINK_SERVICE_RX_SESSION : BLE_LINK_SERVICE_RX_CONTROL;
+    ble_link_service_rx_channel_t channel;
 
-    if (channel == BLE_LINK_SERVICE_RX_SESSION &&
-            memcmp(characteristic->uuid, s_session_rx_uuid, 16U) != 0)
+    if (memcmp(characteristic->uuid, s_session_rx_uuid, 16U) == 0)
     {
+        channel = BLE_LINK_SERVICE_RX_SESSION;
+    }
+    else if (memcmp(characteristic->uuid, s_control_rx_uuid, 16U) == 0)
+    {
+        channel = BLE_LINK_SERVICE_RX_CONTROL;
+    }
+    else
+    {
+        /* Only the two RX characteristics carry WRITE in this service; a
+         * future characteristic with WRITE must be routed explicitly. */
         return -1;
     }
     /* Admission is checked before any fragment enters the reassembler, so

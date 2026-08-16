@@ -311,6 +311,46 @@ static void test_authorize_before_authentication_rejected(void)
                       ble_link_session_report_session_match(GEN1, 5U, 1U));
 }
 
+static void test_authorized_match_requires_authenticated_facts(void)
+{
+    /* AUTHORIZED implies AUTHENTICATED: the session match that grants the
+     * authorized fact must never run before the link facts (encrypted,
+     * verified SC bond, known identity) converge, so the published flag
+     * set stays coherent. */
+    uint32_t epoch = 0U;
+
+    ble_link_session_init(BOOT1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_authorization(
+                          true, 1U));
+    _connect(GEN1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_security2_open(
+                          GEN1, &epoch));
+    /* Security 2 open and bound, but no verified bond yet: refused, and
+     * the AUTHORIZED flag must stay masked. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_report_session_match(GEN1, 1U, 1U));
+    TEST_ASSERT_EQUAL(0U, ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_AUTHORIZED);
+    /* Bond verified but identity still unknown: refused. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_session_report_session_match(GEN1, 1U, 1U));
+    TEST_ASSERT_EQUAL(0U, ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_AUTHORIZED);
+    /* All facts present: the match succeeds and the flag publishes. */
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_set_identity_known(
+                          GEN1, true));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_report_session_match(
+                          GEN1, 1U, 1U));
+    TEST_ASSERT_TRUE((ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_AUTHORIZED) != 0U);
+    TEST_ASSERT_TRUE((ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U);
+}
+
 static void test_invalid_channel_rejected(void)
 {
     uint32_t error = 0U;
@@ -693,6 +733,7 @@ int main(void)
     test_disconnect_clears_session();
     test_second_acl_rejected();
     test_authorize_before_authentication_rejected();
+    test_authorized_match_requires_authenticated_facts();
     test_invalid_channel_rejected();
     test_facts_reflect_state();
     test_state_flags();

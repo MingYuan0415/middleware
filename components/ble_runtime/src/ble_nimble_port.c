@@ -19,6 +19,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 
+#include "host/ble_att.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -223,6 +224,11 @@ static const ble_link_security_ops_t s_security_ops =
 #define BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS 10000U
 #define BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS 2000U
 #define BLE_NIMBLE_PORT_ACCESS_BUFFER_BYTES 512U
+/* Profile framing caps one ATT value at 495 bytes (preferred ATT MTU 498
+ * minus the three-byte ATT write header); the negotiated MTU must never
+ * exceed it on the server side. */
+#define BLE_NIMBLE_PORT_PREFERRED_ATT_MTU 498U
+#define BLE_NIMBLE_PORT_MAX_ATT_VALUE_BYTES 495U
 #define BLE_NIMBLE_PORT_ADV_QUEUE_DEPTH 4U
 #define BLE_NIMBLE_PORT_ADV_TASK_STACK 2048U
 #define BLE_NIMBLE_PORT_ADV_TASK_PRIORITY 2U
@@ -5507,6 +5513,13 @@ static int _ble_nimble_port_access_bridge(
             {
                 return BLE_ATT_ERR_UNLIKELY;
             }
+            if (write_len > BLE_NIMBLE_PORT_MAX_ATT_VALUE_BYTES)
+            {
+                /* One characteristic value must fit the 495-byte framing
+                 * budget; reject cleanly instead of relying on the
+                 * negotiated MTU alone. */
+                return BLE_ATT_ERR_INVALID_ATT_LEN;
+            }
             port_context.write_data = access_buffer;
             port_context.write_len = write_len;
         }
@@ -6449,6 +6462,10 @@ static esp_err_t _ble_nimble_port_init(void)
         return _ble_nimble_port_rollback_init(result, false, false, false);
     }
     s_port.nimble_init_attempted = true;
+    /* Cap the negotiated ATT MTU at the profile's preferred value (498)
+     * so one inbound characteristic value never exceeds the 495-byte
+     * framing budget, matching the outbound fragment cap. */
+    (void)ble_att_set_preferred_mtu(BLE_NIMBLE_PORT_PREFERRED_ATT_MTU);
     result = _ble_nimble_port_install_store_write_guard();
     if (result != ESP_OK)
     {
