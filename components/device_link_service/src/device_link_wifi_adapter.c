@@ -963,7 +963,21 @@ static void _bridge_update_status(
                                         snapshot->operation_id, state, status,
                                         result, result_len);
 
-    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
+    if (update_result == ESP_ERR_NOT_FOUND)
+    {
+        /* The manager terminal arrived before the Core v2 table admission:
+         * retain it briefly; async_operation_start merges it into the
+         * freshly admitted record. */
+        const esp_err_t defer_result =
+            ble_link_service_async_operation_defer_update(
+                snapshot->operation_id, state, status, result, result_len);
+
+        if (defer_result != ESP_OK)
+        {
+            LOG_W("operation bridge defer failed result=%d", defer_result);
+        }
+    }
+    else if (update_result != ESP_OK)
     {
         LOG_W("operation bridge update failed result=%d", update_result);
     }
@@ -983,7 +997,18 @@ static void _bridge_update_scan(
                                         snapshot->operation_id, state, status,
                                         NULL, 0U);
 
-    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
+    if (update_result == ESP_ERR_NOT_FOUND)
+    {
+        const esp_err_t defer_result =
+            ble_link_service_async_operation_defer_update(
+                snapshot->operation_id, state, status, NULL, 0U);
+
+        if (defer_result != ESP_OK)
+        {
+            LOG_W("scan bridge defer failed result=%d", defer_result);
+        }
+    }
+    else if (update_result != ESP_OK)
     {
         LOG_W("scan bridge update failed result=%d", update_result);
     }

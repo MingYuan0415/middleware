@@ -172,6 +172,42 @@ esp_err_t ble_link_service_async_operation_update(
     uint64_t owner_id, device_link_operation_state_t state,
     device_link_status_t status, const uint8_t *result, size_t result_len);
 
+/**
+ * @brief Apply a terminal completion, or retain it briefly when the table
+ * admission has not run yet.
+ *
+ * The completion bridge calls this when
+ * ble_link_service_async_operation_update() reports ESP_ERR_NOT_FOUND:
+ * on SMP the adapter's lower layer may already have published its terminal
+ * event while the admission of the Core v2 table record is still in
+ * flight. The terminal is retained for
+ * BLE_LINK_SERVICE_DEFERRED_COMPLETION_TTL_MS and is merged by the next
+ * ble_link_service_async_operation_start() whose owner_id matches. If the
+ * admission landed between the two calls, the terminal is applied directly.
+ *
+ * @param[in] owner_id Adapter-owned operation identity.
+ * @param[in] state    Terminal state.
+ * @param[in] status   LinkError status.
+ * @param[in] result   Result payload (may be NULL when result_len is 0).
+ * @param[in] result_len Payload length.
+ * @return ESP_OK when applied now or retained, ESP_ERR_INVALID_ARG for a
+ *         semantics violation, ESP_ERR_INVALID_STATE when the v2 table is
+ *         unavailable.
+ */
+esp_err_t ble_link_service_async_operation_defer_update(
+    uint64_t owner_id, device_link_operation_state_t state,
+    device_link_status_t status, const uint8_t *result, size_t result_len);
+
+/**
+ * @brief Whether any non-terminal operation of @p domain_id is live.
+ *
+ * Domain adapters use this to implement the synchronous BUSY admission
+ * allowed by their method status sets before asking the lower layer to
+ * start another operation.
+ *
+ * @param[in] domain_id Registered domain id.
+ * @return true when at least one PENDING/RUNNING record exists.
+ */
 bool ble_link_service_async_operation_in_flight(uint8_t domain_id);
 
 /**

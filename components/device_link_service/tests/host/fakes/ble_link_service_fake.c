@@ -6,6 +6,7 @@
 
 static uint64_t s_next_operation_id = 1U;
 static unsigned s_update_count = 0U;
+static unsigned s_defer_count = 0U;
 static uint64_t s_last_owner_id = 0U;
 static device_link_operation_state_t s_last_state;
 static device_link_status_t s_last_status;
@@ -51,6 +52,19 @@ esp_err_t ble_link_service_async_operation_update(
     return ESP_OK;
 }
 
+esp_err_t ble_link_service_async_operation_defer_update(
+    uint64_t owner_id, device_link_operation_state_t state,
+    device_link_status_t status, const uint8_t *result, size_t result_len)
+{
+    (void)owner_id;
+    (void)state;
+    (void)status;
+    (void)result;
+    (void)result_len;
+    s_defer_count++;
+    return ESP_OK;
+}
+
 bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
 {
     (void)domain_id;
@@ -61,6 +75,7 @@ bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
 void ble_link_service_fake_reset(void)
 {
     s_update_count = 0U;
+    s_defer_count = 0U;
     s_last_owner_id = 0U;
     s_last_result_len = 0U;
     s_in_flight = false;
@@ -77,6 +92,10 @@ void ble_link_service_fake_set_start_result(esp_err_t result)
     s_start_result = result;
 }
 
+unsigned ble_link_service_fake_defer_count(void)
+{
+    return s_defer_count;
+}
 
 unsigned ble_link_service_fake_update_count(void)
 {

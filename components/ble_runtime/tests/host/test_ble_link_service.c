@@ -1178,6 +1178,83 @@ static void test_v2_snapshot_includes_operation_summaries(void)
     TEST_ASSERT_TRUE(!has_field);
 }
 
+static void test_async_defer_completion_merges_on_admission(void)
+{
+    /* A completion bridge event may beat the Core v2 table admission on
+     * SMP. The deferred terminal is retained briefly and merged into the
+     * freshly admitted record, so the slot reaches a terminal state
+     * instead of leaking as an eternal PENDING record. */
+    static const uint8_t result_payload[] = {0xa5U, 0x5aU};
+    uint64_t operation_id = 0U;
+    device_link_operation_t record;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
+                          0x2000U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, result_payload,
+                          sizeof(result_payload)));
+    TEST_ASSERT_TRUE(!ble_link_service_async_operation_in_flight(
+                         DEVICE_LINK_DOMAIN_WIFI));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x2000U, NULL, NULL,
+                          &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                          operation_id, &record));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_SUCCEEDED, record.state);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, record.status);
+    TEST_ASSERT_EQUAL(sizeof(result_payload), record.result_len);
+    TEST_ASSERT_EQUAL(0, memcmp(record.result, result_payload,
+                                sizeof(result_payload)));
+
+    /* A second admission for a different owner must not consume the
+     * already-merged terminal. */
+    uint64_t fresh_id = 0U;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x2001U, NULL, NULL,
+                          &fresh_id));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                          fresh_id, &record));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
+}
+
+static void test_async_defer_completion_expires(void)
+{
+    uint64_t operation_id = 0U;
+    device_link_operation_t record;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
+                          0x3000U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, NULL, 0U));
+    /* The deferred window is 1000 ms; a later admission starts PENDING.
+     * The host FreeRTOS shim caps vTaskDelay at 1 ms, so sleep against the
+     * real monotonic clock that backs xTaskGetTickCount(). */
+    const struct timespec sleep_1100ms = { .tv_sec = 1, .tv_nsec = 100000000L };
+
+    TEST_ASSERT_EQUAL(0, nanosleep(&sleep_1100ms, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x3000U, NULL, NULL,
+                          &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                          operation_id, &record));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
+}
+
+static void test_async_defer_completion_rejects_invalid(void)
+{
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_link_service_async_operation_defer_update(
+                          0x3100U, DEVICE_LINK_OPERATION_FAILED,
+                          DEVICE_LINK_STATUS_OK, NULL, 0U));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_link_service_async_operation_defer_update(
+                          0x3100U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, NULL, 1U));
+}
 
 typedef struct operation_race_thread_arg
 {
@@ -3858,6 +3935,9 @@ int main(void)
     test_get_authorization_requires_recovery_flag();
     test_prepare_retires_previous_transaction();
     test_v2_snapshot_includes_operation_summaries();
+    test_async_defer_completion_merges_on_admission();
+    test_async_defer_completion_expires();
+    test_async_defer_completion_rejects_invalid();
     test_operation_table_reads_are_synchronized();
     test_v2_get_authorization_without_recovery_malformed();
     test_authorize_expiry_clears_transaction();
