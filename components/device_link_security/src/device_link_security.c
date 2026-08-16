@@ -215,6 +215,27 @@ static device_link_security_t s_security;
 static SemaphoreHandle_t s_mutex;
 static StaticSemaphore_t s_mutex_control;
 
+#if CONFIG_DEVICE_LINK_SECURITY_STORAGE_FAULT_TEST
+static unsigned int s_storage_fault_writes;
+
+static esp_err_t _device_link_security_storage_fault(void)
+{
+    s_storage_fault_writes++;
+    if (CONFIG_DEVICE_LINK_SECURITY_STORAGE_FAULT_WRITE_N == 0 ||
+            s_storage_fault_writes ==
+            (unsigned int)CONFIG_DEVICE_LINK_SECURITY_STORAGE_FAULT_WRITE_N)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+#else
+static esp_err_t _device_link_security_storage_fault(void)
+{
+    return ESP_OK;
+}
+#endif
+
 static void _device_link_security_close_session_locked(void);
 
 static esp_err_t _device_link_security_parse_handshake(
@@ -1351,6 +1372,26 @@ esp_err_t device_link_security_save_auth_record(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    const esp_err_t fault = _device_link_security_storage_fault();
+
+    if (fault != ESP_OK)
+    {
+        return fault;
+    }
+#if CONFIG_DEVICE_LINK_SECURITY_STORAGE_FAULT_TEST
+#if defined(CONFIG_DEVICE_LINK_SECURITY_STORAGE_CORRUPT_WRITE) && \
+    CONFIG_DEVICE_LINK_SECURITY_STORAGE_CORRUPT_WRITE
+    {
+        /* Land a structurally corrupted blob so the on-device load path
+         * exercises the fail-closed invalid-record branch (F-5). */
+        device_link_security_auth_record_t corrupt = *record;
+
+        corrupt.magic ^= UINT32_C(0x5a5a5a5a);
+        return nv_storage_set_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
+                                   &corrupt, sizeof(corrupt));
+    }
+#endif
+#endif
     return nv_storage_set_blob(DEVICE_LINK_SECURITY_AUTH_STORAGE_KEY,
                                record, sizeof(*record));
 }
@@ -1401,6 +1442,12 @@ static const uint8_t s_revoke_marker[1] = {1U};
 
 esp_err_t device_link_security_begin_revoke(void)
 {
+    const esp_err_t fault = _device_link_security_storage_fault();
+
+    if (fault != ESP_OK)
+    {
+        return fault;
+    }
     return nv_storage_set_blob(DEVICE_LINK_SECURITY_REVOKE_STORAGE_KEY,
                                s_revoke_marker, sizeof(s_revoke_marker));
 }
