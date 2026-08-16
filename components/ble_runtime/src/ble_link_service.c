@@ -1418,11 +1418,11 @@ static void _ble_link_service_encode_manifest(uint8_t *out, size_t *pos)
 {
     /* protocol_version/profile_version {major=2}. */
     static const uint8_t version[] = {0x08, 0x02};
-    /* security {sc_only, key=16, max_bonds=1, protocomm 2, patch 1,
+    /* security {sc_only, key=32, max_bonds=1, protocomm 2, patch 1,
      *          local_confirmation, application_credential} */
     static const uint8_t security[] =
     {
-        0x08, 0x01, 0x10, 0x10, 0x18, 0x01, 0x20, 0x02,
+        0x08, 0x01, 0x10, 0x20, 0x18, 0x01, 0x20, 0x02,
         0x28, 0x01, 0x30, 0x01, 0x38, 0x01,
     };
     /* framing {framing_version=1, header_bytes=8, preferred_att_mtu=498,
@@ -2791,7 +2791,9 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
     }
     device_link_tlv_writer_init(&writer, security, sizeof(security));
     (void)device_link_tlv_put_bool(&writer, 1U, true);
-    (void)device_link_tlv_put_uint(&writer, 2U, 16U);
+    /* AES-256-GCM session key: the first 32 bytes of the 64-byte SRP
+     * session-key digest (core v2 security.md). */
+    (void)device_link_tlv_put_uint(&writer, 2U, 32U);
     (void)device_link_tlv_put_uint(&writer, 3U, 1U);
     (void)device_link_tlv_put_uint(&writer, 4U, 2U);
     (void)device_link_tlv_put_uint(&writer, 5U,

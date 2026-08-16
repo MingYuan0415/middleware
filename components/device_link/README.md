@@ -34,7 +34,7 @@ The immutable contract pin is recorded in `contract.lock`; it contains the
 Device Link contract commit, profile, schema format, and normalized schema
 digest. It intentionally has no `protoc` or code-generator version because
 the application wire is handwritten Typed-TLV.
-expectedContractCommit=b82612f9c7c1e87c2aa2580302318db59207a855
+expectedContractCommit=3d6ff36fa80e68c6bc12ad02f7afdc9e24687cd0
 The only protobuf-c types in the middleware are the official ESP-IDF
 Protocomm Security 2 messages in `device_link_security`.
 

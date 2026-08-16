@@ -967,11 +967,11 @@ static void test_manifest_response_bytes(void)
         0x12, 0x02, 0x08, 0x01,
         0x1a, 0x0d, 0x08, 0x01, 0x10, 0x08, 0x18, 0xf2,
         0x03, 0x20, 0x80, 0x20, 0x28, 0x80, 0x08,
-        0x22, 0x0e, 0x08, 0x01, 0x10, 0x10, 0x18, 0x01,
+        0x22, 0x0e, 0x08, 0x01, 0x10, 0x20, 0x18, 0x01,
         0x20, 0x02, 0x28, 0x01, 0x30, 0x01, 0x38, 0x01,
     };
     /* actual: 0a020801 12020801 1a0d0801100818f203208020288008
-     *          220e0801101018012002280130013801 2802 */
+     *          220e0801102018012002280130013801 2802 */
 
     ble_link_codec_response_t response;
 
@@ -992,6 +992,10 @@ static void test_typed_tlv_manifest_request(void)
     };
     device_link_wire_header_t header;
     device_link_status_t status;
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    bool security_seen = false;
 
     _reset();
     _feed_single_channel(request, sizeof(request),
@@ -1011,6 +1015,41 @@ static void test_typed_tlv_manifest_request(void)
                      DEVICE_LINK_RESPONSE_STATUS_BYTES);
     TEST_ASSERT_TRUE(s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
                                 DEVICE_LINK_RESPONSE_STATUS_BYTES] != 0U);
+    /* The SecurityRequirements message advertises the pinned session
+     * cipher: AES-256-GCM with a 32-byte key (core v2 security.md). */
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                          &reader,
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
+                                      DEVICE_LINK_RESPONSE_STATUS_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES -
+                          DEVICE_LINK_RESPONSE_STATUS_BYTES));
+    while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
+            ESP_OK && has_field)
+    {
+        if (field.id == 4U)
+        {
+            device_link_tlv_reader_t nested;
+            device_link_tlv_field_t nested_field;
+            bool nested_has = false;
+
+            security_seen = true;
+            TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                                  &nested, field.value.bytes.data,
+                                  field.value.bytes.len));
+            while (device_link_tlv_reader_next(
+                        &nested, &nested_field, &nested_has) == ESP_OK &&
+                    nested_has)
+            {
+                if (nested_field.id == 2U)
+                {
+                    TEST_ASSERT_EQUAL(32U,
+                                      nested_field.value.unsigned_value);
+                    break;
+                }
+            }
+        }
+    }
+    TEST_ASSERT_TRUE(security_seen);
 }
 
 static void test_typed_tlv_snapshot_has_fixed_link_state(void)

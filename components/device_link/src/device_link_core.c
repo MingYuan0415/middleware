@@ -91,7 +91,7 @@ static const device_link_tlv_field_rule_t s_security_fields[] =
     },
     {
         .id = 2U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
-        .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 16U
+        .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 32U
     },
     {
         .id = 3U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,

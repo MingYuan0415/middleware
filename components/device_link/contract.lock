@@ -1,5 +1,5 @@
 lock_format=1
-contract_commit=b82612f9c7c1e87c2aa2580302318db59207a855
+contract_commit=3d6ff36fa80e68c6bc12ad02f7afdc9e24687cd0
 profile=device-link/v2
 schema_format=typed-tlv/1
-schema_digest=d568b6415979c6a29815841b53adca0e89e613ccdfbaea2096773c1c06798398
+schema_digest=e2cefd8e5db4cb5faf6dbe46f26e76d19384ed05ac92af54f7c48983bdb7bf2c
