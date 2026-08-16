@@ -925,37 +925,48 @@ static void _test_long_term_verifier(void)
            ESP_ERR_NOT_FOUND);
     assert(device_link_security_is_authenticated() == false);
     /* A corrupt or schema-mismatched record (e.g. left by an older
-     * firmware) must not block startup: the startup loader erases it and
-     * reports unbound, while load_auth_record keeps reporting the damage
-     * for recovery paths. */
+     * firmware) fails closed (F-5, core v2 operations.md): the startup
+     * loader reports ESP_ERR_INVALID_STATE and preserves the record, and
+     * load_auth_record keeps reporting the damage for recovery paths.
+     * No silent normalization into "unbound" is allowed. */
     static const uint8_t legacy_blob[sizeof(record)] = {0x00, 0x11, 0x22};
 
     assert(nv_storage_set_blob(TEST_AUTH_KEY, legacy_blob,
                                sizeof(legacy_blob)) == ESP_OK);
     assert(device_link_security_load_long_term_verifier() ==
-           ESP_ERR_NOT_FOUND);
+           ESP_ERR_INVALID_STATE);
     assert(device_link_security_load_auth_record(&record) ==
-           ESP_ERR_NOT_FOUND);
+           ESP_ERR_INVALID_STATE);
     assert(device_link_security_is_authenticated() == false);
-    /* Erase failure (storage fault) must not flip startup into a different
-     * class: the loader still reports unbound, and the next startup retries
-     * the erase until the corrupt slot is cleared. */
-    assert(nv_storage_set_blob(TEST_AUTH_KEY, legacy_blob,
-                               sizeof(legacy_blob)) == ESP_OK);
-    nv_storage_fake_fail_next_erase(ESP_FAIL);
+    /* The damaged record survives the failed load: a second startup stays
+     * fail-closed and only an explicit erase clears the slot. */
+    assert(nv_storage_fake_blob_len() == sizeof(legacy_blob));
     assert(device_link_security_load_long_term_verifier() ==
-           ESP_ERR_NOT_FOUND);
+           ESP_ERR_INVALID_STATE);
     assert(device_link_security_is_authenticated() == false);
-    /* A power cut between the erase and the next boot leaves the corrupt
-     * record or no record; both must still start unbound. */
+    /* An explicit erase failure (storage fault) must not fake success:
+     * the record stays damaged and the next startup still fails closed. */
+    nv_storage_fake_fail_next_erase(ESP_FAIL);
+    assert(device_link_security_erase_auth_record() == ESP_FAIL);
+    assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_INVALID_STATE);
+    assert(device_link_security_is_authenticated() == false);
+    /* A power cut leaves the damaged record intact; startup still fails
+     * closed instead of silently unbinding the device. */
     nv_storage_fake_power_cycle();
     assert(device_link_security_load_long_term_verifier() ==
+           ESP_ERR_INVALID_STATE);
+    assert(device_link_security_load_auth_record(&record) ==
+           ESP_ERR_INVALID_STATE);
+    assert(device_link_security_is_authenticated() == false);
+    /* Recovery matrix: an explicit factory-style erase clears the damage
+     * and the slot accepts a fresh bind with a working long-term
+     * verifier. */
+    assert(device_link_security_erase_auth_record() == ESP_OK);
+    assert(device_link_security_load_long_term_verifier() ==
            ESP_ERR_NOT_FOUND);
     assert(device_link_security_load_auth_record(&record) ==
            ESP_ERR_NOT_FOUND);
-    assert(device_link_security_is_authenticated() == false);
-    /* Recovery matrix: after normalization the slot accepts a fresh bind
-     * and the long-term verifier loads again. */
     assert(device_link_security_derive_long_term_verifier(
                password, sizeof(password),
                record.salt, record.verifier) == ESP_OK);

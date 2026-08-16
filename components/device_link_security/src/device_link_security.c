@@ -1510,17 +1510,41 @@ esp_err_t device_link_security_load_long_term_verifier(void)
 
     if (load_result == ESP_ERR_INVALID_STATE)
     {
-        /* A present but corrupt or schema-mismatched record (for example
-         * written by an older firmware revision) can never authenticate a
-         * session. Clear it and treat the device as unbound: startup stays
-         * available and a fresh bind overwrites the slot. The recovery
-         * path keeps its STORAGE/INTERNAL distinction via load_auth_record,
-         * so only this startup-oriented loader normalizes the damage. */
-        LOG_W("auth record invalid; erasing and continuing as unbound");
-        (void)device_link_security_erase_auth_record();
+        /* F-5 fail-closed policy (core v2 operations.md): a present but
+         * corrupt or schema-mismatched record maps to INTERNAL and must
+         * never be normalized into "unbound" by silent erasure. The
+         * record is preserved in NVS; the in-memory long-term verifier is
+         * released so no session can authenticate against damaged
+         * material. Only an explicit factory reset / revoke journal may
+         * delete the record. */
+        LOG_E("auth record malformed; long-term verifier disabled");
+        const bool rebuild =
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM ||
+            s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_NONE;
+
+        if (s_security.selected_kind ==
+                DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM)
+        {
+            _device_link_security_teardown_sec();
+        }
+        _device_link_security_free_long_term();
+        if (rebuild)
+        {
+            s_security.selected_kind = DEVICE_LINK_SECURITY_VERIFIER_NONE;
+            if (s_security.pb_salt != NULL || s_security.pb_verifier != NULL)
+            {
+                s_security.selected_kind =
+                    DEVICE_LINK_SECURITY_VERIFIER_PUBLIC;
+            }
+            const esp_err_t result = _device_link_security_rebuild();
+
+            _device_link_security_unlock();
+            return result == ESP_OK ? ESP_ERR_INVALID_STATE : result;
+        }
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
-    if (load_result == ESP_ERR_NOT_FOUND ||
-            load_result == ESP_ERR_INVALID_STATE)
+    if (load_result == ESP_ERR_NOT_FOUND)
     {
         const bool rebuild =
             s_security.selected_kind == DEVICE_LINK_SECURITY_VERIFIER_LONG_TERM ||

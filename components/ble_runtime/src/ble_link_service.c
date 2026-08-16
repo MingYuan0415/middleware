@@ -2328,6 +2328,38 @@ static device_link_status_t _ble_link_service_authorize_commit(
         _ble_link_service_unlock();
         goto commit_exit;
     }
+    {
+        device_link_security_auth_record_t existing;
+
+        memset(&existing, 0, sizeof(existing));
+        const esp_err_t existing_result =
+            device_link_security_load_auth_record(&existing);
+
+        _ble_link_service_zeroize(&existing, sizeof(existing));
+        if (existing_result == ESP_ERR_INVALID_STATE)
+        {
+            /* F-5 fail-closed: a malformed durable record maps to
+             * INTERNAL and must never be silently overwritten by a fresh
+             * bind. Only an explicit factory reset / revoke journal may
+             * delete it. */
+            s_service.close_after_encrypt.active = true;
+            s_service.close_after_encrypt.generation =
+                connection_generation;
+            commit_error = DEVICE_LINK_STATUS_INTERNAL;
+            _ble_link_service_unlock();
+            goto commit_exit;
+        }
+        if (existing_result != ESP_OK &&
+                existing_result != ESP_ERR_NOT_FOUND)
+        {
+            s_service.close_after_encrypt.active = true;
+            s_service.close_after_encrypt.generation =
+                connection_generation;
+            commit_error = DEVICE_LINK_STATUS_STORAGE;
+            _ble_link_service_unlock();
+            goto commit_exit;
+        }
+    }
     memcpy(record.credential_id, local_credential,
            DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES);
     memcpy(record.device_auth_id, local_device_auth_id,

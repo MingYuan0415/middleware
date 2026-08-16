@@ -1772,6 +1772,62 @@ static void test_authorize_commit_wrong_credential(void)
     TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
 }
 
+static void test_authorize_commit_malformed_record_fails_closed(void)
+{
+    /* F-5 fail-closed (core v2 operations.md): a present but malformed
+     * durable auth record rejects the commit probe with INTERNAL and is
+     * never silently overwritten by a fresh bind. Only an explicit
+     * factory reset / revoke journal may erase it. */
+    ble_link_codec_envelope_t envelope;
+    ble_link_codec_response_t response;
+    device_link_security_auth_record_t record;
+    uint8_t commit[64];
+
+    _reset();
+    s_pending_captured = false;
+    _set_facts(true, true, true);
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const size_t first_commit_len = _build_commit_body(
+                                        commit, sizeof(commit), 5U);
+
+    /* First commit: CONFIRMATION_REQUIRED (the durable probe runs only
+     * after local confirmation). */
+    _clear_capture();
+    _feed_single_channel(commit, first_commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    const uint64_t token = ble_link_service_confirmation_token();
+
+    TEST_ASSERT_TRUE(token != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(token, true));
+    /* Plant a malformed durable record (bad magic/schema) between the
+     * confirmation and the commit so the durable probe must see it. */
+    memset(&record, 0, sizeof(record));
+    TEST_ASSERT_EQUAL(ESP_OK, nv_storage_set_blob(
+                          "dls.auth", &record, sizeof(record)));
+    const size_t commit_len = _build_commit_body(commit, sizeof(commit), 6U);
+
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &response));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_INTERNAL, response.error);
+    TEST_ASSERT_EQUAL(BLE_LINK_CODEC_RESPONSE_NONE, response.body);
+    /* The malformed record survives: no silent overwrite. */
+    memset(&record, 0xa5, sizeof(record));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      device_link_security_load_auth_record(&record));
+}
+
 static void test_authorize_commit_unknown_transaction_not_found(void)
 {
     /* A Commit for an unknown transaction (no Prepare, or a retired one)
@@ -3723,6 +3779,7 @@ static void test_handshaking_teardown_requires_current_identity(void)
 int main(void)
 {
     test_authorize_commit_wrong_credential();
+    test_authorize_commit_malformed_record_fails_closed();
     test_authorize_commit_unknown_transaction_not_found();
     test_authorize_commit_truncated_rejected();
     test_get_authorization_recovery();
