@@ -38,6 +38,9 @@ add_custom_command(
         "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/wire.json"
         "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/framing.json"
         "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/authorization.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/error_responses.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2/golden.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/domains/wifi/v1/operation_results.json"
     VERBATIM)
 add_custom_target(contract_fixtures_inc DEPENDS "${CONTRACT_FIXTURE_INC}")
 

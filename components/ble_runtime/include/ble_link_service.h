@@ -15,11 +15,19 @@
 #include "device_link_router.h"
 
 #ifdef UNIT_TEST_HOST
-    /** @brief Test-only seam: force the authorize deadline value. */
-    void ble_link_service_test_set_auth_deadline_ticks(uint32_t ticks);
-    /** @brief Test-only seam: copy one operation-table record by id. */
-    esp_err_t ble_link_service_test_copy_operation(
-        uint64_t operation_id, device_link_operation_t *operation);
+/** @brief Test-only seam: force the authorize deadline value. */
+void ble_link_service_test_set_auth_deadline_ticks(uint32_t ticks);
+/** @brief Test-only seam: copy one operation-table record by id. */
+esp_err_t ble_link_service_test_copy_operation(
+    uint64_t operation_id, device_link_operation_t *operation);
+/** @brief Test-only seam: encode one OperationStatus body for the
+ * registered-domain result-declaration rules (contract fixture
+ * goldens). */
+device_link_status_t ble_link_service_test_encode_operation(
+    uint64_t operation_id, uint8_t domain_id, uint8_t method_id,
+    device_link_operation_state_t state, device_link_status_t status,
+    const uint8_t *result, size_t result_len,
+    uint8_t *response, size_t capacity, size_t *response_len);
 #endif
 
 #ifdef __cplusplus

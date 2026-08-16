@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "ble_link_reassembler.h"
+#include "ble_link_service.h"
 #include "ble_link_state.h"
 #include "device_link_core.h"
 #include "device_link_protocol.h"
@@ -15,6 +16,56 @@
 /* Generated from contracts/provisioning fixtures (see
  * contract_fixtures_generate.py). */
 #include "contract_fixtures.inc"
+
+/* ---------------------------------------------------------------------------
+ * Fixture disposition registry (contracts/provisioning/fixtures).
+ *
+ * Consumed byte-for-byte (generator + CTest):
+ *   core/v2/wire.json                  link_state, app headers, direction
+ *                                      cases, statuses, link_errors,
+ *                                      advertising, channel_methods
+ *   core/v2/framing.json               fragments and sequences
+ *   core/v2/authorization.json         authorize request/response bodies
+ *   core/v2/error_responses.json       non-OK empty-body rule, 23 cases
+ *   core/v2/golden.json                operation-query (schema decode)
+ *                                      and pending-operation (encoder
+ *                                      byte-compare)
+ *   domains/wifi/v1/invalid.json       adapter cross-field rejection
+ *   domains/wifi/v1/golden.json        canonical SetCredentialsRequest
+ *                                      admitted end to end
+ *   domains/wifi/v1/operation_results.json
+ *                                      OperationStatus bodies and
+ *                                      WifiStatus payloads (Empty included)
+ *
+ * Equivalently covered (host behavior tests, not mechanically consumed):
+ *   core/v2/methods.json               channel matrix is consumed; the
+ *                                      per-method full bodies are exercised
+ *                                      by the snapshot/authorization host
+ *                                      tests, not byte-compared
+ *   core/v2/operations.json            operation lifecycle, retention and
+ *                                      cancel semantics (ble_link_service
+ *                                      operation tests)
+ *   core/v2/replay.json                replay identity and epoch restart
+ *                                      (response cache / dispatcher tests)
+ *   core/v2/security_adapter.json      verifier states, transitions and
+ *                                      timeouts (device_link_security tests)
+ *   core/v2/qr.json                    QR canonical generation and field
+ *                                      bounds (device_link_service tests);
+ *                                      the 14 invalid payload cases are not
+ *                                      enumerated one by one
+ *   core/v2/semantic.json              invariants asserted across the host
+ *                                      suites, not checked against the JSON
+ *   domains/wifi/v1/semantic.json      same, Wi-Fi domain invariants
+ *   core/v2/golden.json                snapshot-with-fixed-link-state and
+ *                                      compact-operation-summary goldens
+ *                                      are covered by the snapshot host
+ *                                      tests, not byte-compared
+ *
+ * Not applicable on the device:
+ *   core/v2/semantic/                  (empty reference-codec workspace)
+ *
+ * Gap-free by construction: every fixture file above is registered.
+ * ------------------------------------------------------------------------- */
 
 static uint8_t s_slot_buffer[128];
 static ble_link_reassembler_t s_slot;
@@ -382,6 +433,307 @@ static void _test_authorization_schemas(void)
            sizeof(vectors) / sizeof(vectors[0]));
 }
 
+static esp_err_t _fixture_output(
+    const uint8_t *value, size_t len, ble_link_service_tx_channel_t channel,
+    bool is_last, uint32_t flow_id, void *arg)
+{
+    (void)value;
+    (void)len;
+    (void)channel;
+    (void)is_last;
+    (void)flow_id;
+    (void)arg;
+    return ESP_OK;
+}
+
+static device_link_status_t _fixture_handler(
+    const device_link_request_context_t *context, const uint8_t *request,
+    size_t request_len, uint8_t *response, size_t response_capacity,
+    size_t *response_len, void *arg)
+{
+    (void)context;
+    (void)request;
+    (void)request_len;
+    (void)response;
+    (void)response_capacity;
+    (void)response_len;
+    (void)arg;
+    /* Never invoked: only the descriptor registration and the
+     * OperationStatus encoder gate are exercised here. */
+    return DEVICE_LINK_STATUS_UNAVAILABLE;
+}
+
+static void _test_error_responses(void)
+{
+    /* error_responses.json rule: non-OK responses carry empty bodies.
+     * Each case freezes the request header, the status bytes, and the
+     * empty body; the header echo must reproduce the request header and
+     * the status bytes must encode the frozen LinkError value. */
+    for (size_t i = 0U; i < s_err_count; ++i)
+    {
+        device_link_wire_header_t header;
+        uint8_t echo[DEVICE_LINK_WIRE_HEADER_BYTES];
+        uint8_t status_bytes[DEVICE_LINK_RESPONSE_STATUS_BYTES];
+
+        assert(device_link_wire_decode_header(
+                   s_err_hdr[i], s_err_hdr_len[i], &header) == ESP_OK);
+        assert(header.domain_id == s_err_domain[i]);
+        assert(header.domain_major == s_err_major[i]);
+        assert(header.method_id == s_err_method[i]);
+        assert(device_link_wire_encode_header(&header, echo) == ESP_OK);
+        assert(memcmp(echo, s_err_hdr[i], s_err_hdr_len[i]) == 0);
+        assert(device_link_wire_encode_status(
+                   (device_link_status_t)s_err_status_value[i],
+                   status_bytes) == ESP_OK);
+        assert(s_err_status_len[i] == DEVICE_LINK_RESPONSE_STATUS_BYTES);
+        assert(memcmp(status_bytes, s_err_status[i],
+                      DEVICE_LINK_RESPONSE_STATUS_BYTES) == 0);
+        /* The rule itself: every non-OK response body is empty. */
+        assert(s_err_body_len[i] == 0U);
+    }
+    printf("error_responses: %zu non-OK empty-body cases validated\n",
+           s_err_count);
+}
+
+static void _test_operation_results(void)
+{
+    /* operation_results.json: OperationStatus bodies are frozen per
+     * (operation id, state, error, result payload). The encoder gate
+     * derives the result declaration from the registered domain
+     * descriptor: start_scan declares core.v2.Empty (no payload field)
+     * while the other methods declare wifi.v1.WifiStatus. */
+    static const device_link_tlv_schema_t s_empty_result_schema =
+    {
+        .fields = NULL,
+        .field_count = 0U,
+        .maximum_encoded_bytes = 0U,
+    };
+    static const device_link_tlv_field_rule_t s_result_fields[] =
+    {
+        {
+            .id = 1U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 8U,
+        },
+    };
+    static const device_link_tlv_schema_t s_status_result_schema =
+    {
+        .fields = s_result_fields,
+        .field_count = 1U,
+        .maximum_encoded_bytes = 64U,
+    };
+    static const device_link_method_descriptor_t s_wifi_methods[] =
+    {
+        {
+            .method_id = 2U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_SCAN,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_empty_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+        {
+            .method_id = 4U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 160U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_status_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+        {
+            .method_id = 5U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_status_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+        {
+            .method_id = 6U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_status_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+        {
+            .method_id = 7U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_status_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+        {
+            .method_id = 8U,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .maximum_request_bytes = 8U,
+            .maximum_response_bytes = 16U,
+            .request_schema = &s_empty_result_schema,
+            .response_schema = &s_empty_result_schema,
+            .operation_result_schema = &s_status_result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _fixture_handler,
+        },
+    };
+    static const device_link_domain_descriptor_t s_wifi_domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U,
+        .minor = 0U,
+        .methods = s_wifi_methods,
+        .method_count = 6U,
+    };
+
+    /* Register the Wi-Fi descriptor set before init so the encoder gate
+     * sees the frozen result declarations. */
+    assert(ble_link_service_set_domain_descriptors(
+               &s_wifi_domain, 1U) == ESP_OK);
+    ble_link_service_init(1U, _fixture_output, NULL, NULL, 32U);
+
+    for (size_t i = 0U; i < s_op_count; ++i)
+    {
+        uint8_t encoded[3072];
+        size_t encoded_len = 0U;
+
+        assert(ble_link_service_test_encode_operation(
+                   s_op_id[i], DEVICE_LINK_DOMAIN_WIFI, s_op_method[i],
+                   (device_link_operation_state_t)s_op_state[i],
+                   (device_link_status_t)s_op_error[i],
+                   s_op_result[i], s_op_result_len[i],
+                   encoded, sizeof(encoded), &encoded_len) ==
+               DEVICE_LINK_STATUS_OK);
+        assert(encoded_len == s_op_body_len[i]);
+        assert(memcmp(encoded, s_op_body[i], encoded_len) == 0);
+    }
+    printf("operation_results: %zu OperationStatus bodies validated\n",
+           s_op_count);
+}
+
+static void _test_authorize_prepare_response_schema_boundaries(void)
+{
+    /* Core v2 security.md freezes expires_in_ms in [1, 120000] and
+     * permission ids as nonzero. The schema boundary is the wire-level
+     * enforcement: a zero value for either field must be rejected. */
+    const device_link_tlv_schema_t *schema =
+        device_link_core_test_response_schema(3U);
+    static const uint8_t id16[16] =
+    {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    };
+
+    assert(schema != NULL);
+    for (uint64_t expires = 0U; expires <= 1U; ++expires)
+    {
+        uint8_t message[256];
+        device_link_tlv_writer_t writer;
+        size_t len = 0U;
+
+        device_link_tlv_writer_init(&writer, message, sizeof(message));
+        assert(device_link_tlv_put_fixed64(&writer, 1U, 1U) == ESP_OK);
+        assert(device_link_tlv_put_bytes(&writer, 2U, id16, sizeof(id16)) ==
+               ESP_OK);
+        assert(device_link_tlv_put_bytes(&writer, 3U, id16, sizeof(id16)) ==
+               ESP_OK);
+        assert(device_link_tlv_put_uint(&writer, 4U, expires) == ESP_OK);
+        assert(device_link_tlv_put_uint(&writer, 5U, 1U) == ESP_OK);
+        assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+        if (expires == 0U)
+        {
+            assert(device_link_tlv_validate_message(
+                       message, len, schema) != ESP_OK);
+        }
+        else
+        {
+            assert(device_link_tlv_validate_message(
+                       message, len, schema) == ESP_OK);
+        }
+    }
+    for (uint64_t permission = 0U; permission <= 1U; ++permission)
+    {
+        uint8_t message[256];
+        device_link_tlv_writer_t writer;
+        size_t len = 0U;
+
+        device_link_tlv_writer_init(&writer, message, sizeof(message));
+        assert(device_link_tlv_put_fixed64(&writer, 1U, 1U) == ESP_OK);
+        assert(device_link_tlv_put_bytes(&writer, 2U, id16, sizeof(id16)) ==
+               ESP_OK);
+        assert(device_link_tlv_put_bytes(&writer, 3U, id16, sizeof(id16)) ==
+               ESP_OK);
+        assert(device_link_tlv_put_uint(&writer, 4U, 1U) == ESP_OK);
+        assert(device_link_tlv_put_uint(&writer, 5U, permission) == ESP_OK);
+        assert(device_link_tlv_writer_finish(&writer, &len) == ESP_OK);
+        if (permission == 0U)
+        {
+            assert(device_link_tlv_validate_message(
+                       message, len, schema) != ESP_OK);
+        }
+        else
+        {
+            assert(device_link_tlv_validate_message(
+                       message, len, schema) == ESP_OK);
+        }
+    }
+    puts("authorize_prepare_response: expires/permission boundaries "
+         "validated");
+}
+
+static void _test_golden_messages(void)
+{
+    /* core/v2 golden.json (device-applicable entries): the OperationRequest
+     * golden must pass the GetOperation request schema, and the
+     * OperationStatus golden must be reproduced byte for byte by the
+     * encoder gate. */
+    const device_link_tlv_schema_t *operation_schema =
+        device_link_core_test_request_schema(6U);
+    uint8_t encoded[3072];
+    size_t encoded_len = 0U;
+
+    assert(operation_schema != NULL);
+    assert(device_link_tlv_validate_message(
+               s_golden_query, s_golden_query_len, operation_schema) ==
+           ESP_OK);
+    assert(ble_link_service_test_encode_operation(
+               s_golden_pending_id, s_golden_pending_domain,
+               s_golden_pending_method,
+               (device_link_operation_state_t)s_golden_pending_state,
+               (device_link_status_t)s_golden_pending_error,
+               NULL, 0U, encoded, sizeof(encoded), &encoded_len) ==
+           DEVICE_LINK_STATUS_OK);
+    assert(encoded_len == s_golden_pending_len);
+    assert(memcmp(encoded, s_golden_pending, encoded_len) == 0);
+    puts("golden messages: operation-query and pending-operation "
+         "validated");
+}
+
 int main(void)
 {
     _test_link_state_vectors();
@@ -393,6 +745,10 @@ int main(void)
     _test_channel_methods_matrix();
     _test_framing_vectors();
     _test_authorization_schemas();
+    _test_error_responses();
+    _test_operation_results();
+    _test_authorize_prepare_response_schema_boundaries();
+    _test_golden_messages();
     puts("contract_fixtures: all fixture vectors passed");
     return 0;
 }

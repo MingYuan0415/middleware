@@ -4043,6 +4043,33 @@ esp_err_t ble_link_service_test_copy_operation(
     _ble_link_service_unlock();
     return result;
 }
+
+device_link_status_t ble_link_service_test_encode_operation(
+    uint64_t operation_id, uint8_t domain_id, uint8_t method_id,
+    device_link_operation_state_t state, device_link_status_t status,
+    const uint8_t *result, size_t result_len,
+    uint8_t *response, size_t capacity, size_t *response_len)
+{
+    device_link_operation_t operation;
+
+    memset(&operation, 0, sizeof(operation));
+    operation.id = operation_id;
+    operation.domain_id = domain_id;
+    operation.method_id = method_id;
+    operation.state = state;
+    operation.status = status;
+    if (result_len > sizeof(operation.result))
+    {
+        return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+    }
+    if (result_len != 0U && result != NULL)
+    {
+        memcpy(operation.result, result, result_len);
+    }
+    operation.result_len = result_len;
+    return _ble_link_service_v2_encode_operation(
+               &operation, response, capacity, response_len);
+}
 #endif
 
 esp_err_t ble_link_service_set_domain_descriptors(

@@ -717,6 +717,18 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        /* First-line cross-field rules (wifi-v1.md, invalid.json): the
+         * wire security value is the enum + 1, so 1 is OPEN, 2 is
+         * PERSONAL and 3 is UNSUPPORTED. OPEN requires an empty
+         * password, PERSONAL requires a nonempty password (the schema
+         * bounds it to 64 bytes), and UNSUPPORTED is rejected. The
+         * manager's own profile validation stays as the second line of
+         * defense. */
+        if (security == 3U || (security == 1U && password_len != 0U) ||
+                (security == 2U && password_len == 0U))
+        {
+            return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+        }
         const connectivity_manager_credentials_t credentials =
         {
             .ssid = ssid,

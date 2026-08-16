@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Generate C vectors from the Device Link contract fixtures.
 
-Consumes contracts/provisioning/fixtures/core/v2/{wire,framing,
-authorization}.json and emits contract_fixtures.inc for the host test
-test_contract_fixtures.c. The generated file is a build artifact; the
-fixture checkout is the source of truth.
+Kind "core" (default) consumes
+contracts/provisioning/fixtures/core/v2/{wire,framing,authorization,
+error_responses}.json plus fixtures/domains/wifi/v1/operation_results.json
+and emits contract_fixtures.inc for the host test
+test_contract_fixtures.c. Kind "wifi" consumes
+fixtures/domains/wifi/v1/{invalid,operation_results}.json and emits
+contract_fixtures_wifi.inc for the device_link_service host test. The
+generated file is a build artifact; the fixture checkout is the source
+of truth.
 """
 
 from __future__ import annotations
@@ -13,9 +18,45 @@ import argparse
 import json
 from pathlib import Path
 
+STATUS_VALUES = {
+    "OK": 1,
+    "MALFORMED_FRAME": 2,
+    "UNSUPPORTED_VERSION": 3,
+    "UNSUPPORTED_OPERATION": 4,
+    "UNSUPPORTED_CAPABILITY": 5,
+    "UNAUTHENTICATED": 6,
+    "PERMISSION_DENIED": 7,
+    "CONFIRMATION_REQUIRED": 8,
+    "INVALID_ARGUMENT": 9,
+    "BUSY": 10,
+    "NOT_FOUND": 11,
+    "RESOURCE_EXHAUSTED": 12,
+    "CONFLICT": 13,
+    "UNAVAILABLE": 14,
+    "STORAGE": 15,
+    "INTERNAL": 16,
+}
+
+STATE_VALUES = {
+    "PENDING": 1,
+    "RUNNING": 2,
+    "SUCCEEDED": 3,
+    "FAILED": 4,
+    "CANCELED": 5,
+}
+
+INVALID_KINDS = {
+    "non-minimal-auto-connect": 1,
+    "open-with-password": 2,
+    "personal-with-empty-password": 3,
+    "unsupported-credential-security": 4,
+}
+
 
 def _c_bytes(hex_text: str) -> str:
     raw = bytes.fromhex(hex_text)
+    if not raw:
+        return "{0}"
     chunks = ", ".join(f"0x{b:02x}" for b in raw)
     return f"{{{chunks}}}"
 
@@ -215,7 +256,288 @@ def generate(fixture_dir: Path, out_path: Path) -> None:
         out.write(f"static const bool s_auth_{name}_is_response = "
                   f"{'true' if is_response else 'false'};\n")
 
+    # --- error_responses.json: non-OK responses with empty bodies. ---
+    out.write("\n/* error_responses.json cases. */\n")
+    error_responses = json.loads(
+        (fixture_dir / "error_responses.json").read_text(encoding="utf-8"))
+    for index, case in enumerate(error_responses["cases"]):
+        out.write(f"static const uint8_t s_err_hdr_{index}[] = "
+                  f"{_c_bytes(case['header_hex'])};\n")
+        out.write(f"static const size_t s_err_hdr_{index}_len = "
+                  f"{len(bytes.fromhex(case['header_hex']))};\n")
+        out.write(f"static const uint8_t s_err_status_{index}[] = "
+                  f"{_c_bytes(case['status_hex'])};\n")
+        out.write(f"static const size_t s_err_status_{index}_len = "
+                  f"{len(bytes.fromhex(case['status_hex']))};\n")
+        out.write(f"static const int s_err_status_{index}_value = "
+                  f"{STATUS_VALUES[case['status']]};\n")
+        out.write(f"static const uint8_t s_err_domain_{index} = "
+                  f"{case['domain_id']};\n")
+        out.write(f"static const uint8_t s_err_major_{index} = "
+                  f"{case['domain_major']};\n")
+        out.write(f"static const uint8_t s_err_method_{index} = "
+                  f"{case['method_id']};\n")
+        out.write(f"static const size_t s_err_body_{index}_len = "
+                  f"{len(bytes.fromhex(case['body_hex']))};\n")
+    out.write(f"static const size_t s_err_count = "
+              f"{len(error_responses['cases'])};\n")
+    out.write("static const uint8_t *const s_err_hdr[] = {" +
+              ", ".join(f"s_err_hdr_{i}"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const size_t s_err_hdr_len[] = {" +
+              ", ".join(f"s_err_hdr_{i}_len"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const uint8_t *const s_err_status[] = {" +
+              ", ".join(f"s_err_status_{i}"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const size_t s_err_status_len[] = {" +
+              ", ".join(f"s_err_status_{i}_len"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const int s_err_status_value[] = {" +
+              ", ".join(f"s_err_status_{i}_value"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const uint8_t s_err_domain[] = {" +
+              ", ".join(f"s_err_domain_{i}"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const uint8_t s_err_major[] = {" +
+              ", ".join(f"s_err_major_{i}"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const uint8_t s_err_method[] = {" +
+              ", ".join(f"s_err_method_{i}"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+    out.write("static const size_t s_err_body_len[] = {" +
+              ", ".join(f"s_err_body_{i}_len"
+                        for i in range(len(error_responses["cases"]))) +
+              "};\n")
+
+    # --- operation_results.json: OperationStatus body goldens. ---
+    out.write("\n/* wifi.v1 operation_results.json bodies. */\n")
+    op_results = json.loads(
+        (_wifi_fixture_dir(fixture_dir) / "operation_results.json")
+        .read_text(encoding="utf-8"))
+    op_cases = op_results["cases"] + op_results["error_cases"]
+    for index, case in enumerate(op_cases):
+        out.write(f"static const uint8_t s_op_body_{index}[] = "
+                  f"{_c_bytes(case['body_hex'])};\n")
+        out.write(f"static const size_t s_op_body_{index}_len = "
+                  f"{len(bytes.fromhex(case['body_hex']))};\n")
+        out.write(f"static const uint8_t s_op_result_{index}[] = "
+                  f"{_c_bytes(case['result_payload_hex'])};\n")
+        out.write(f"static const size_t s_op_result_{index}_len = "
+                  f"{len(bytes.fromhex(case['result_payload_hex']))};\n")
+        out.write(f"static const uint64_t s_op_id_{index} = "
+                  f"{case['operation_id']}ULL;\n")
+        out.write(f"static const uint8_t s_op_method_{index} = "
+                  f"{case['method_id']};\n")
+        out.write(f"static const int s_op_state_{index} = "
+                  f"{STATE_VALUES[case['state']]};\n")
+        out.write(f"static const int s_op_error_{index} = "
+                  f"{STATUS_VALUES[case['error']]};\n")
+    out.write(f"static const size_t s_op_count = {len(op_cases)};\n")
+    out.write("static const uint8_t *const s_op_body[] = {" +
+              ", ".join(f"s_op_body_{i}" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const size_t s_op_body_len[] = {" +
+              ", ".join(f"s_op_body_{i}_len" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const uint8_t *const s_op_result[] = {" +
+              ", ".join(f"s_op_result_{i}" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const size_t s_op_result_len[] = {" +
+              ", ".join(f"s_op_result_{i}_len"
+                        for i in range(len(op_cases))) + "};\n")
+    out.write("static const uint64_t s_op_id[] = {" +
+              ", ".join(f"s_op_id_{i}" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const uint8_t s_op_method[] = {" +
+              ", ".join(f"s_op_method_{i}" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const int s_op_state[] = {" +
+              ", ".join(f"s_op_state_{i}" for i in range(len(op_cases))) +
+              "};\n")
+    out.write("static const int s_op_error[] = {" +
+              ", ".join(f"s_op_error_{i}" for i in range(len(op_cases))) +
+              "};\n")
+
+    # --- golden.json: the device-applicable canonical messages. ---
+    out.write("\n/* core/v2 golden.json (device-applicable goldens). */\n")
+    goldens = json.loads(
+        (fixture_dir / "golden.json").read_text(encoding="utf-8"))
+    query = next(g for g in goldens if g["id"] == "operation-query")
+    pending = next(g for g in goldens if g["id"] == "pending-operation")
+    out.write(f"static const uint8_t s_golden_query[] = "
+              f"{_c_bytes(query['canonical_hex'])};\n")
+    out.write(f"static const size_t s_golden_query_len = "
+              f"{len(bytes.fromhex(query['canonical_hex']))};\n")
+    out.write(f"static const uint8_t s_golden_pending[] = "
+              f"{_c_bytes(pending['canonical_hex'])};\n")
+    out.write(f"static const size_t s_golden_pending_len = "
+              f"{len(bytes.fromhex(pending['canonical_hex']))};\n")
+    out.write(f"static const uint64_t s_golden_pending_id = "
+              f"{pending['value']['operation_id']}ULL;\n")
+    out.write(f"static const uint8_t s_golden_pending_domain = "
+              f"{pending['value']['domain_id']};\n")
+    out.write(f"static const uint8_t s_golden_pending_method = "
+              f"{pending['value']['method_id']};\n")
+    out.write(f"static const int s_golden_pending_state = "
+              f"{STATE_VALUES[pending['value']['state']]};\n")
+    out.write(f"static const int s_golden_pending_error = "
+              f"{STATUS_VALUES[pending['value']['error']]};\n")
+
     out.write("\n#endif /* CONTRACT_FIXTURES_INC */\n")
+    out.close()
+
+
+def _wifi_fixture_dir(fixture_dir: Path) -> Path:
+    """Derive the Wi-Fi v1 fixture dir from the core/v2 dir."""
+    return fixture_dir.parent.parent / "domains" / "wifi" / "v1"
+
+
+def generate_wifi(fixture_dir: Path, out_path: Path) -> None:
+    """Emit wifi.v1 invalid.json and operation_results.json vectors."""
+    wifi_dir = _wifi_fixture_dir(fixture_dir)
+    invalid = json.loads((wifi_dir / "invalid.json").read_text(
+        encoding="utf-8"))
+    op_results = json.loads((wifi_dir / "operation_results.json").read_text(
+        encoding="utf-8"))
+
+    out = out_path.open("w", encoding="utf-8")
+    out.write("/* Generated from contracts/provisioning fixtures; do not "
+              "edit. */\n")
+    out.write("#ifndef CONTRACT_FIXTURES_WIFI_INC\n"
+              "#define CONTRACT_FIXTURES_WIFI_INC\n")
+
+    out.write("\n/* wifi.v1 invalid.json wire vectors. */\n")
+    for index, case in enumerate(invalid):
+        raw = bytes.fromhex(case["wire_hex"])
+        out.write(f"static const uint8_t s_wifi_invalid_{index}[] = "
+                  f"{_c_bytes(case['wire_hex'])};\n")
+        out.write(f"static const size_t s_wifi_invalid_{index}_len = "
+                  f"{len(raw)};\n")
+        out.write(f"static const int s_wifi_invalid_{index}_kind = "
+                  f"{INVALID_KINDS[case['id']]};\n")
+    out.write(f"static const size_t s_wifi_invalid_count = "
+              f"{len(invalid)};\n")
+    out.write("static const uint8_t *const s_wifi_invalid[] = {" +
+              ", ".join(f"s_wifi_invalid_{i}"
+                        for i in range(len(invalid))) + "};\n")
+    out.write("static const size_t s_wifi_invalid_len[] = {" +
+              ", ".join(f"s_wifi_invalid_{i}_len"
+                        for i in range(len(invalid))) + "};\n")
+    out.write("static const int s_wifi_invalid_kind[] = {" +
+              ", ".join(f"s_wifi_invalid_{i}_kind"
+                        for i in range(len(invalid))) + "};\n")
+
+    out.write("\n/* wifi.v1 operation_results.json result payloads. */\n")
+    for index, case in enumerate(op_results["cases"] + op_results["error_cases"]):
+        raw = bytes.fromhex(case["result_payload_hex"])
+        out.write(f"static const uint8_t s_wifi_result_{index}[] = "
+                  f"{_c_bytes(case['result_payload_hex'])};\n")
+        out.write(f"static const size_t s_wifi_result_{index}_len = "
+                  f"{len(raw)};\n")
+        out.write(f"static const uint8_t s_wifi_result_{index}_method = "
+                  f"{case['method_id']};\n")
+        out.write(f"static const int s_wifi_result_{index}_state = "
+                  f"{STATE_VALUES[case['state']]};\n")
+        out.write(f"static const int s_wifi_result_{index}_error = "
+                  f"{STATUS_VALUES[case['error']]};\n")
+        value = case.get("result_value") or {}
+        out.write(f"static const uint64_t s_wifi_result_{index}_generation = "
+                  f"{value.get('generation', 0)};\n")
+        out.write(f"static const int s_wifi_result_{index}_wifi_state = "
+                  f"{5 if value.get('state') == 'CONNECTED' else 1};\n")
+        out.write(f"static const int s_wifi_result_{index}_failure = "
+                  f"0;\n")
+        ssid = bytes.fromhex(value.get("ssid", ""))
+        out.write(f"static const uint8_t s_wifi_result_{index}_ssid[] = "
+                  f"{_c_bytes(value.get('ssid', ''))};\n")
+        out.write(f"static const size_t s_wifi_result_{index}_ssid_len = "
+                  f"{len(ssid)};\n")
+        out.write(f"static const bool s_wifi_result_{index}_has_ipv4 = "
+                  f"{'true' if value.get('has_ipv4') else 'false'};\n")
+        out.write(f"static const bool s_wifi_result_{index}_saved_profile = "
+                  f"{'true' if value.get('saved_profile') else 'false'};\n")
+        out.write(f"static const bool s_wifi_result_{index}_persisted = "
+                  f"{'true' if value.get('profile_persisted') else 'false'};\n")
+        out.write(f"static const bool s_wifi_result_{index}_auto_connect = "
+                  f"{'true' if value.get('auto_connect') else 'false'};\n")
+        out.write(f"static const bool s_wifi_result_{index}_manual_hold = "
+                  f"{'true' if value.get('manual_hold') else 'false'};\n")
+        out.write(f"static const uint64_t s_wifi_result_{index}_revision = "
+                  f"{value.get('profile_revision', 0)};\n")
+        out.write(f"static const uint64_t s_wifi_result_{index}_sync_id = "
+                  f"{value.get('applied_client_sync_id', 0)};\n")
+    out.write(f"static const size_t s_wifi_result_count = "
+              f"{len(op_results['cases']) + len(op_results['error_cases'])};\n")
+    result_count = len(op_results["cases"]) + len(op_results["error_cases"])
+    out.write("static const uint8_t *const s_wifi_result[] = {" +
+              ", ".join(f"s_wifi_result_{i}"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const size_t s_wifi_result_len[] = {" +
+              ", ".join(f"s_wifi_result_{i}_len"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const uint8_t s_wifi_result_method[] = {" +
+              ", ".join(f"s_wifi_result_{i}_method"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const int s_wifi_result_state[] = {" +
+              ", ".join(f"s_wifi_result_{i}_state"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const int s_wifi_result_error[] = {" +
+              ", ".join(f"s_wifi_result_{i}_error"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const uint64_t s_wifi_result_generation[] = {" +
+              ", ".join(f"s_wifi_result_{i}_generation"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const int s_wifi_result_wifi_state[] = {" +
+              ", ".join(f"s_wifi_result_{i}_wifi_state"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const uint8_t *const s_wifi_result_ssid[] = {" +
+              ", ".join(f"s_wifi_result_{i}_ssid"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const size_t s_wifi_result_ssid_len[] = {" +
+              ", ".join(f"s_wifi_result_{i}_ssid_len"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const bool s_wifi_result_has_ipv4[] = {" +
+              ", ".join(f"s_wifi_result_{i}_has_ipv4"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const bool s_wifi_result_saved_profile[] = {" +
+              ", ".join(f"s_wifi_result_{i}_saved_profile"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const bool s_wifi_result_persisted[] = {" +
+              ", ".join(f"s_wifi_result_{i}_persisted"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const bool s_wifi_result_auto_connect[] = {" +
+              ", ".join(f"s_wifi_result_{i}_auto_connect"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const bool s_wifi_result_manual_hold[] = {" +
+              ", ".join(f"s_wifi_result_{i}_manual_hold"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const uint64_t s_wifi_result_revision[] = {" +
+              ", ".join(f"s_wifi_result_{i}_revision"
+                        for i in range(result_count)) + "};\n")
+    out.write("static const uint64_t s_wifi_result_sync_id[] = {" +
+              ", ".join(f"s_wifi_result_{i}_sync_id"
+                        for i in range(result_count)) + "};\n")
+
+    # --- wifi.v1 golden.json: the canonical SetCredentialsRequest. ---
+    out.write("\n/* wifi.v1 golden.json. */\n")
+    wifi_goldens = json.loads(
+        (wifi_dir / "golden.json").read_text(encoding="utf-8"))
+    wifi_golden = wifi_goldens[0]
+    out.write(f"static const uint8_t s_wifi_golden[] = "
+              f"{_c_bytes(wifi_golden['canonical_hex'])};\n")
+    out.write(f"static const size_t s_wifi_golden_len = "
+              f"{len(bytes.fromhex(wifi_golden['canonical_hex']))};\n")
+
+    out.write("\n#endif /* CONTRACT_FIXTURES_WIFI_INC */\n")
     out.close()
 
 
@@ -223,8 +545,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--kind", choices=["core", "wifi"], default="core")
     args = parser.parse_args()
-    generate(args.fixtures, args.out)
+    if args.kind == "wifi":
+        generate_wifi(args.fixtures, args.out)
+    else:
+        generate(args.fixtures, args.out)
     print(f"generated {args.out}")
 
 

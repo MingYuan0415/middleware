@@ -321,12 +321,14 @@ static const device_link_tlv_field_rule_t s_auth_prepare_response_fields[] =
     },
     {
         .id = 4U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
-        .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 120000U
+        .flags = DEVICE_LINK_TLV_RULE_REQUIRED,
+        .minimum_unsigned = 1U, .maximum_unsigned = 120000U
     },
     {
         .id = 5U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
         .flags = DEVICE_LINK_TLV_RULE_REQUIRED | DEVICE_LINK_TLV_RULE_REPEATED,
-        .maximum_count = 16U, .maximum_unsigned = UINT16_MAX
+        .minimum_unsigned = 1U, .maximum_count = 16U,
+        .maximum_unsigned = UINT16_MAX
     },
 };
 static const device_link_tlv_schema_t s_auth_prepare_response_schema =

@@ -239,7 +239,9 @@ static void test_credentials_are_delegated_without_echo(void)
                                      (const uint8_t *)"AP1", 3U) == ESP_OK);
     assert(device_link_tlv_put_bytes(&nested_writer, 2U,
                                      (const uint8_t *)"p", 1U) == ESP_OK);
-    assert(device_link_tlv_put_uint(&nested_writer, 3U, 1U) == ESP_OK);
+    /* PERSONAL with a nonempty password: the contract-valid shape for a
+     * delegated credential write (OPEN requires an empty password). */
+    assert(device_link_tlv_put_uint(&nested_writer, 3U, 2U) == ESP_OK);
     assert(device_link_tlv_writer_finish(&nested_writer, &nested_len) ==
            ESP_OK);
     device_link_tlv_writer_init(&writer, request, sizeof(request));
@@ -273,6 +275,29 @@ static void test_credentials_are_delegated_without_echo(void)
            DEVICE_LINK_STATUS_OK);
     assert(response_len != 0U);
     assert(!contains_byte(response, response_len, (uint8_t)'p'));
+
+    /* OPEN with an empty password is the other contract-valid shape. */
+    device_link_tlv_writer_init(&nested_writer, nested, sizeof(nested));
+    assert(device_link_tlv_put_bytes(&nested_writer, 1U,
+                                     (const uint8_t *)"AP1", 3U) == ESP_OK);
+    assert(device_link_tlv_put_bytes(&nested_writer, 2U,
+                                     (const uint8_t *)"", 0U) == ESP_OK);
+    assert(device_link_tlv_put_uint(&nested_writer, 3U, 1U) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&nested_writer, &nested_len) ==
+           ESP_OK);
+    device_link_tlv_writer_init(&writer, request, sizeof(request));
+    assert(device_link_tlv_put_bytes(&writer, 1U, nested, nested_len) ==
+           ESP_OK);
+    assert(device_link_tlv_put_fixed64(&writer, 2U,
+                                       UINT64_C(0x0203040506070809)) == ESP_OK);
+    assert(device_link_tlv_put_bool(&writer, 3U, false) == ESP_OK);
+    assert(device_link_tlv_writer_finish(&writer, &request_len) == ESP_OK);
+    response_len = 0U;
+    assert(descriptor->methods[3].handler(&context, request, request_len,
+                                          response, sizeof(response),
+                                          &response_len,
+                                          descriptor->methods[3].handler_arg) ==
+           DEVICE_LINK_STATUS_OK);
 }
 
 static void test_unauthorized_calls_are_rejected(void)

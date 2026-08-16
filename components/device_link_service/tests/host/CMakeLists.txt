@@ -160,3 +160,59 @@ target_compile_options(test_device_link_wifi_adapter PRIVATE
     -UNDEBUG)
 add_test(NAME device_link_wifi_adapter COMMAND test_device_link_wifi_adapter)
 set_tests_properties(device_link_wifi_adapter PROPERTIES TIMEOUT 10)
+
+# Contract fixture vectors for the Wi-Fi domain (wifi.v1 invalid.json and
+# operation_results.json): generated from the pinned contract checkout and
+# consumed by test_contract_fixtures_wifi.c.
+set(CONTRACT_WIFI_FIXTURE_INC
+    "${CMAKE_CURRENT_BINARY_DIR}/contract_fixtures_wifi.inc")
+add_custom_command(
+    OUTPUT "${CONTRACT_WIFI_FIXTURE_INC}"
+    COMMAND ${Python3_EXECUTABLE}
+        "${PROJECT_ROOT}/layers/middleware/components/ble_runtime/tests/host/contract_fixtures_generate.py"
+        --fixtures "${PROJECT_ROOT}/contracts/provisioning/fixtures/core/v2"
+        --kind wifi
+        --out "${CONTRACT_WIFI_FIXTURE_INC}"
+    DEPENDS
+        "${PROJECT_ROOT}/layers/middleware/components/ble_runtime/tests/host/contract_fixtures_generate.py"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/domains/wifi/v1/invalid.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/domains/wifi/v1/golden.json"
+        "${PROJECT_ROOT}/contracts/provisioning/fixtures/domains/wifi/v1/operation_results.json"
+    VERBATIM)
+add_custom_target(contract_wifi_fixtures_inc
+                  DEPENDS "${CONTRACT_WIFI_FIXTURE_INC}")
+
+add_executable(test_contract_fixtures_wifi
+               test_contract_fixtures_wifi.c
+               fakes/connectivity_manager.c
+               fakes/event_bus.c
+               fakes/ble_link_service_fake.c
+               "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${DEVICE_LINK_WIRE}/src/device_link_tlv.c")
+target_compile_features(test_contract_fixtures_wifi PRIVATE c_std_11)
+target_compile_definitions(test_contract_fixtures_wifi PRIVATE
+    _POSIX_C_SOURCE=200809L
+    UNIT_TEST_HOST)
+target_include_directories(test_contract_fixtures_wifi PRIVATE
+                           "${CMAKE_CURRENT_BINARY_DIR}"
+                           "${CMAKE_CURRENT_LIST_DIR}/fakes"
+                           "${BLE_RUNTIME}/tests/host/fakes"
+                           "${COMPONENT}/include"
+                           "${BLE_RUNTIME}/include"
+                           "${DEVICE_LINK_SECURITY}/include"
+                           "${DEVICE_LINK_WIRE}/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+                           "${HOST_CONNECTIVITY}/include"
+                           "${PROJECT_ROOT}/tests/host"
+                          )
+target_compile_options(test_contract_fixtures_wifi PRIVATE
+    -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
+    -Wall
+    -Wextra
+    -Werror
+    -Wpedantic
+    -UNDEBUG)
+add_dependencies(test_contract_fixtures_wifi contract_wifi_fixtures_inc)
+add_test(NAME contract_fixtures_wifi COMMAND test_contract_fixtures_wifi)
+set_tests_properties(contract_fixtures_wifi PROPERTIES TIMEOUT 10)
