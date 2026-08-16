@@ -134,6 +134,9 @@ static int _ble_link_gatt_access(
 static ble_gatt_registry_characteristic_t s_characteristics[5] =
 {
     {
+        /* Contract admission split (core v2 gatt.md): the 16-byte value is
+         * publicly readable while Notify is reserved for authorized
+         * sessions. */
         .uuid = s_link_state_uuid,
         .properties = BLE_GATT_REGISTRY_PROP_READ |
         BLE_GATT_REGISTRY_PROP_NOTIFY,

@@ -873,7 +873,11 @@ static esp_err_t _device_link_service_open_window_locked(void)
                               DEVICE_LINK_SERVICE_QR_SHORT_NAME,
                               DEVICE_LINK_SERVICE_QR_SERVICE_UUID,
                               discriminator_b64, pop_b64,
-                              (unsigned long)s_service.config.window_ms);
+                              /* The profile freezes qr.expires_in_ms at
+                               * 120000 and the device must honor the full
+                               * window (core v2 security.md). */
+                              (unsigned long)
+                              DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS);
 
     if (qr_length <= 0 || (size_t)qr_length >= sizeof(qr))
     {
@@ -2237,8 +2241,12 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (config->window_ms == 0U ||
-            config->window_ms > DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS)
+    /* The pairing window is the QR lifetime: the profile freezes
+     * qr.expires_in_ms at 120000 and the device must honor the full
+     * advertised window (core v2 security.md). A shorter window would
+     * publish a QR whose expiry the device cannot keep, so any other value
+     * fails closed. */
+    if (config->window_ms != DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS)
     {
         return ESP_ERR_INVALID_ARG;
     }

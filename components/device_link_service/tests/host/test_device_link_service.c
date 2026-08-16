@@ -44,7 +44,7 @@
 #include "nv_storage.h"
 #include "event_bus.h"
 
-#define TEST_WINDOW_MS 200U
+#define TEST_WINDOW_MS 120000U
 #define TEST_FAST_INTERVAL_MS 100U
 #define TEST_SLOW_INTERVAL_MS 700U
 #define TEST_FAST_WINDOW_MS 30000U
@@ -1600,6 +1600,12 @@ static void _test_bad_configuration(void)
     s_config.task_priority = 4U;
     s_config.window_ms = 0U;
     assert(device_link_service_init(&s_config) == ESP_ERR_INVALID_ARG);
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    /* The window is the frozen QR lifetime: any deviation fails closed. */
+    s_config.window_ms = TEST_WINDOW_MS - 1U;
+    assert(device_link_service_init(&s_config) == ESP_ERR_INVALID_ARG);
 }
 
 static void _test_start_failure_rolls_back(void)
@@ -1997,7 +2003,7 @@ static void _test_suspend_multiple_pending_and_cancel(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2034,7 +2040,7 @@ static void _test_suspend_waits_forever_cancelled_by_resume(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2073,7 +2079,7 @@ static void _test_concurrent_deinit_before_command_admission(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2173,7 +2179,7 @@ static void _test_suspend_cancel_then_fail_again(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2225,7 +2231,7 @@ static void _test_suspend_outstanding_cap_enforced(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2271,7 +2277,7 @@ static void _test_suspend_blocked_by_failed_close(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2393,7 +2399,9 @@ static void _test_window_lifecycle(void)
     char *expires = strstr(qr, "\"expires_in_ms\":");
 
     assert(expires != NULL);
-    assert(strstr(expires, "200") != NULL);
+    /* The profile freezes qr.expires_in_ms at 120000, independent of any
+     * window configuration. */
+    assert(strstr(expires, "120000") != NULL);
     assert((ble_link_session_get_state_flags() &
             BLE_LINK_STATE_FLAG_BINDABLE) != 0U);
     assert(device_link_service_is_busy());
@@ -2713,7 +2721,7 @@ static void _test_remaining_time_publishes_periodically(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2753,7 +2761,7 @@ static void _test_open_and_close_fault_recovery(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
@@ -2811,7 +2819,7 @@ static void _test_open_cleanup_gate_retry(void)
     memset(&s_config, 0, sizeof(s_config));
     s_config.runtime_port = &s_test_port;
     s_config.task_priority = 4U;
-    s_config.window_ms = 60000U;
+    s_config.window_ms = TEST_WINDOW_MS;
     assert(device_link_service_init(&s_config) == ESP_OK);
     _adv_converge();
     assert(_wait_for(_status_available, 500U));
