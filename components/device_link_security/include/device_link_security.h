@@ -28,6 +28,14 @@ extern "C" {
 #define DEVICE_LINK_SECURITY_PUBLIC_SRP_SERVICE_UUID \
     "2c77e48c-c510-4230-8d05-63d036dc038b"
 
+/* Public-discovery password derivation (fixtures/core/v2/security.json):
+ *   input  = UTF-8(label) || 0x00 || UUID_BYTES || 0x02 || instance_id[3]
+ *   password = BASE64URL_NO_PADDING(SHA-256(input))
+ * The instance identifier is the raw three advertisement-order bytes, not
+ * a numeric encoding: the frozen KAT instance "123456" is the byte triple
+ * 0x12 0x34 0x56 and derives "L_FahHWW-ZZHIURRoXgvSRBo1n1iTem9WrD4rysV1Tc".
+ */
+
 #ifdef UNIT_TEST_HOST
 /**
  * @brief Test-only seam: derive the public SRP password for an
