@@ -303,9 +303,102 @@ static void _test_operations(void)
     assert(extra == 5U);
 }
 
+static void _test_wrong_channel(void)
+{
+    /* A registered method on the wrong characteristic is a framing
+     * violation: the core v2 semantic matrix fixes wrong_channel ->
+     * MALFORMED_FRAME, and the handler must never run. */
+    handler_state_t handler = {.value = 0x42U};
+    const device_link_method_descriptor_t methods[] =
+    {
+        {
+            .method_id = 4U,
+            .channel = DEVICE_LINK_CHANNEL_CONTROL,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .maximum_request_bytes = 2U,
+            .maximum_response_bytes = 2U,
+            .request_schema = &s_value_schema,
+            .response_schema = &s_value_schema,
+            .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
+                DEVICE_LINK_STATUS_OK),
+            .handler = _handler,
+            .handler_arg = &handler,
+        },
+    };
+    const device_link_domain_descriptor_t domains[] =
+    {
+        {
+            .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+            .major = 1U,
+            .methods = methods,
+            .method_count = 1U,
+        },
+    };
+    uint8_t replay_response[DEVICE_LINK_REPLAY_SLOTS][64];
+    device_link_call_replay_t replay[DEVICE_LINK_REPLAY_SLOTS];
+    memset(replay, 0, sizeof(replay));
+    for (size_t i = 0U; i < DEVICE_LINK_REPLAY_SLOTS; ++i)
+    {
+        replay[i].response = replay_response[i];
+        replay[i].response_capacity = sizeof(replay_response[i]);
+    }
+    device_link_router_t router;
+    const uint64_t boot_id = UINT64_C(0x0102030405060708);
+    const uint16_t permissions[] = {DEVICE_LINK_PERMISSION_WIFI_WRITE};
+    device_link_request_context_t facts =
+    {
+        .channel = DEVICE_LINK_CHANNEL_SESSION,
+        .admission = DEVICE_LINK_ADMISSION_AUTHORIZED,
+        .security_authenticated = true,
+        .authorized = true,
+        .permissions = permissions,
+        .permission_count = 1U,
+    };
+    uint8_t request[64];
+    uint8_t response[64];
+    size_t response_len = 0U;
+
+    assert(device_link_router_init(
+               &router, boot_id, domains, 1U, replay,
+               DEVICE_LINK_REPLAY_SLOTS,
+               _digest, NULL) == ESP_OK);
+    const size_t request_len = _make_request(
+                                   1U, boot_id, handler.value,
+                                   request, sizeof(request));
+
+    assert(device_link_router_process(
+               &router, &facts, request, request_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(_response_status(response, response_len) ==
+           DEVICE_LINK_STATUS_MALFORMED_FRAME);
+    assert(response_len == DEVICE_LINK_WIRE_HEADER_BYTES + 2U);
+    assert(handler.calls == 0U);
+
+    /* The same request with the same call id is an exact replay and is
+     * answered from the cache (never re-dispatched); a new call id on the
+     * declared channel dispatches normally. */
+    assert(device_link_router_process(
+               &router, &facts, request, request_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(_response_status(response, response_len) ==
+           DEVICE_LINK_STATUS_MALFORMED_FRAME);
+    assert(handler.calls == 0U);
+    facts.channel = DEVICE_LINK_CHANNEL_CONTROL;
+    const size_t retry_len = _make_request(
+                                 2U, boot_id, handler.value,
+                                 request, sizeof(request));
+
+    assert(device_link_router_process(
+               &router, &facts, request, retry_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(_response_status(response, response_len) == DEVICE_LINK_STATUS_OK);
+    assert(handler.calls == 1U);
+}
+
 int main(void)
 {
     _test_router();
+    _test_wrong_channel();
     _test_operations();
     puts("device_link router/operation tests passed");
     return 0;

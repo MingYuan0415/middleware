@@ -356,15 +356,21 @@ static device_link_status_t _admit_method(
     {
         return DEVICE_LINK_STATUS_UNAUTHENTICATED;
     }
+    /* A registered method arriving on the wrong characteristic is a
+     * framing violation, not an unsupported method: the core v2 semantic
+     * matrix fixes wrong_channel -> MALFORMED_FRAME. */
     if (facts->channel != method->channel)
     {
-        return DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION;
+        return DEVICE_LINK_STATUS_MALFORMED_FRAME;
     }
+    /* Defensive consistency with the wire decoder: a recovery bit on any
+     * other method is rejected at header decode and never reaches the
+     * router, so this branch is unreachable in practice. */
     if (header->recovery_query &&
             !(header->domain_id == DEVICE_LINK_DOMAIN_CORE &&
               (header->method_id == 5U || header->method_id == 6U)))
     {
-        return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+        return DEVICE_LINK_STATUS_MALFORMED_FRAME;
     }
     if (facts->authorized)
     {

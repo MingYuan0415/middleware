@@ -16,6 +16,7 @@
 #include "esp_random.h"
 
 #include "device_link_security.h"
+#include "device_link_operation.h"
 #include "device_link_protocol.h"
 #include "device_link_wire.h"
 #include "device_link_tlv.h"
@@ -1069,6 +1070,170 @@ static void test_typed_tlv_snapshot_has_fixed_link_state(void)
     TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
                           &reader, &field, &has_field));
     TEST_ASSERT_TRUE(!has_field);
+}
+
+static void test_v2_snapshot_includes_operation_summaries(void)
+{
+    /* Core v2: GetLinkSnapshot carries compact operation summaries (field
+     * 3) for live operation-table records, and never a result payload. */
+    static const uint8_t request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x02U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+    };
+    device_link_wire_header_t header;
+    device_link_status_t status;
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    uint64_t operation_id = 0U;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x1000U,
+                          NULL, NULL, &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
+                          0x1000U, DEVICE_LINK_OPERATION_RUNNING,
+                          DEVICE_LINK_STATUS_OK, NULL, 0U));
+    _feed_single_channel(request, sizeof(request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                          s_outbound, s_outbound_len, &header));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                          &status));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, status);
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                          &reader,
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
+                                      DEVICE_LINK_RESPONSE_STATUS_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES -
+                          DEVICE_LINK_RESPONSE_STATUS_BYTES));
+    /* Field 1: event sequence; field 2: fixed link_state. */
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                          &reader, &field, &has_field));
+    TEST_ASSERT_TRUE(has_field);
+    TEST_ASSERT_EQUAL(1U, field.id);
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                          &reader, &field, &has_field));
+    TEST_ASSERT_TRUE(has_field);
+    TEST_ASSERT_EQUAL(2U, field.id);
+    TEST_ASSERT_EQUAL(16U, field.value.bytes.len);
+    /* Field 3: one OperationSummary for the live record. */
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                          &reader, &field, &has_field));
+    TEST_ASSERT_TRUE(has_field);
+    TEST_ASSERT_EQUAL(3U, field.id);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_TLV_LENGTH, field.wire_type);
+    {
+        device_link_tlv_reader_t nested;
+        device_link_tlv_field_t nfield;
+        bool nhas = false;
+
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init_nested(
+                              &nested, &reader, &field));
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(nhas);
+        TEST_ASSERT_EQUAL(1U, nfield.id);
+        TEST_ASSERT_EQUAL(DEVICE_LINK_TLV_FIXED64, nfield.wire_type);
+        TEST_ASSERT_EQUAL(operation_id, nfield.value.fixed64_value);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(nhas);
+        TEST_ASSERT_EQUAL(2U, nfield.id);
+        TEST_ASSERT_EQUAL(DEVICE_LINK_DOMAIN_WIFI,
+                          nfield.value.unsigned_value);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(nhas);
+        TEST_ASSERT_EQUAL(3U, nfield.id);
+        TEST_ASSERT_EQUAL(4U, nfield.value.unsigned_value);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(nhas);
+        TEST_ASSERT_EQUAL(4U, nfield.id);
+        TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_RUNNING,
+                          nfield.value.unsigned_value);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(nhas);
+        TEST_ASSERT_EQUAL(5U, nfield.id);
+        TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK,
+                          nfield.value.unsigned_value);
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                              &nested, &nfield, &nhas));
+        TEST_ASSERT_TRUE(!nhas);
+    }
+    /* No further top-level fields: summaries never carry a result
+     * payload. */
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_next(
+                          &reader, &field, &has_field));
+    TEST_ASSERT_TRUE(!has_field);
+}
+
+static void _commit_auth_record(void);
+
+static void test_v2_get_authorization_without_recovery_malformed(void)
+{
+    /* GetAuthorization is recovery-only: a request without the recovery
+     * bit misuses the header (MALFORMED_FRAME, a global error with an
+     * empty body); a recovery request with a malformed body stays
+     * INVALID_ARGUMENT (schema bounds are rejected by the router). */
+    static const uint8_t no_recovery[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x05U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x06U, 0x10U, 0x00U,
+        0x10U, 0x11U, 0x12U, 0x13U, 0x14U, 0x15U, 0x16U, 0x17U,
+        0x18U, 0x19U, 0x1aU, 0x1bU, 0x1cU, 0x1dU, 0x1eU, 0x1fU,
+    };
+    static const uint8_t recovery_bad_body[] =
+    {
+        0x15U, 0x00U, 0x02U, 0x05U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x06U, 0x02U, 0x00U, 0x10U, 0x11U,
+    };
+    device_link_wire_header_t header;
+    device_link_status_t status;
+
+    _reset();
+    nv_storage_fake_reset();
+    _commit_auth_record();
+    _feed_single_channel(no_recovery, sizeof(no_recovery),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                          s_outbound, s_outbound_len, &header));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                          &status));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_MALFORMED_FRAME, status);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_WIRE_HEADER_BYTES +
+                      DEVICE_LINK_RESPONSE_STATUS_BYTES, s_outbound_len);
+
+    _reset();
+    nv_storage_fake_reset();
+    _commit_auth_record();
+    _feed_single_channel(recovery_bad_body, sizeof(recovery_bad_body),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_header(
+                          s_outbound, s_outbound_len, &header));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                          &status));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_INVALID_ARGUMENT, status);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_WIRE_HEADER_BYTES +
+                      DEVICE_LINK_RESPONSE_STATUS_BYTES, s_outbound_len);
 }
 
 static void test_snapshot_request(void)
@@ -3004,14 +3169,22 @@ static void test_get_authorization_requires_recovery_flag(void)
     nv_storage_fake_reset();
 }
 
-static void test_prepare_refetch_same_transaction(void)
+static void test_prepare_retires_previous_transaction(void)
 {
+    /* Core v2 semantic invariant #31: a new Prepare retires the previous
+     * pending transaction -- txn id, credential id, application password,
+     * confirmation token, and any pending Commit matching it are all
+     * invalidated. A Commit for the retired transaction is NOT_FOUND. */
     ble_link_codec_envelope_t envelope;
     ble_link_codec_response_t first;
     ble_link_codec_response_t second;
+    uint8_t first_txn[8];
+    uint8_t first_credential[16];
+    uint8_t commit[64];
 
     _reset();
     esp_random_fake_reset(0x5eed5eedU);
+    s_pending_captured = false;
     _feed_single_channel(s_prepare_request, sizeof(s_prepare_request),
                          BLE_LINK_SERVICE_RX_SESSION);
     _reassemble_captured();
@@ -3021,9 +3194,13 @@ static void test_prepare_refetch_same_transaction(void)
                           envelope.body_data, envelope.body_len,
                           &first));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, first.error);
+    /* Remember the first transaction material. */
+    TEST_ASSERT_TRUE(first.body_len >= 27U);
+    memcpy(first_txn, &first.body_data[1], 8U);
+    memcpy(first_credential, &first.body_data[11], 16U);
 
-    /* A second prepare with a fresh request id returns the same material:
-     * txn id, credential id, and application password. */
+    /* A second prepare with a fresh request id retires the first
+     * transaction and returns fresh material. */
     static const uint8_t prepare2[] =
     {
         0x08, 0x02, 0x19, 0x08, 0x07, 0x06, 0x05, 0x04,
@@ -3042,9 +3219,30 @@ static void test_prepare_refetch_same_transaction(void)
                           envelope.body_data, envelope.body_len,
                           &second));
     TEST_ASSERT_EQUAL(BLE_LINK_ERROR_OK, second.error);
-    TEST_ASSERT_EQUAL(first.body_len, second.body_len);
-    TEST_ASSERT_EQUAL(0, memcmp(first.body_data, second.body_data,
-                                first.body_len));
+    TEST_ASSERT_TRUE(second.body_len >= 27U);
+    TEST_ASSERT_TRUE(memcmp(first_txn, &second.body_data[1], 8U) != 0);
+    TEST_ASSERT_TRUE(memcmp(first_credential,
+                            &second.body_data[11], 16U) != 0);
+
+    /* A Commit matching the retired transaction is NOT_FOUND and the
+     * retired credential never grants. */
+    memcpy(s_pending_txn, first_txn, sizeof(s_pending_txn));
+    memcpy(s_pending_credential, first_credential,
+           sizeof(s_pending_credential));
+    s_pending_captured = true;
+    memset(s_capture, 0, sizeof(s_capture));
+    s_capture_count = 0U;
+    const size_t commit_len = _build_commit_body(commit, sizeof(commit), 5U);
+
+    _feed_single_channel(commit, commit_len,
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_envelope(
+                          s_outbound, s_outbound_len, &envelope));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_codec_decode_response(
+                          envelope.body_data, envelope.body_len,
+                          &second));
+    TEST_ASSERT_EQUAL(BLE_LINK_ERROR_NOT_FOUND, second.error);
 }
 
 static void test_authorize_expiry_clears_transaction(void)
@@ -3530,7 +3728,9 @@ int main(void)
     test_get_authorization_recovery();
     test_real_security2_rehandshake_commit_replay_and_recovery();
     test_get_authorization_requires_recovery_flag();
-    test_prepare_refetch_same_transaction();
+    test_prepare_retires_previous_transaction();
+    test_v2_snapshot_includes_operation_summaries();
+    test_v2_get_authorization_without_recovery_malformed();
     test_authorize_expiry_clears_transaction();
     test_response_flow_identity_and_deferred_busy();
     test_stale_response_flow_is_ignored();

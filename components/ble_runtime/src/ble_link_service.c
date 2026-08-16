@@ -49,6 +49,8 @@
 #define BLE_LINK_SERVICE_RETRY_BASE_MS 100U
 #define BLE_LINK_SERVICE_RETRY_MAX_MS 1000U
 #define BLE_LINK_SERVICE_MAX_DOMAINS 4U
+/* OperationSummary (core v2) freezes maximum_encoded_bytes at 128. */
+#define BLE_LINK_SERVICE_OPERATION_SUMMARY_MAX_BYTES 128U
 
 typedef enum ble_link_service_cleanup_action
 {
@@ -299,6 +301,7 @@ static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work);
 static esp_err_t _ble_link_service_publish_link_state_locked(
     const ble_link_service_facts_t *facts,
     const ble_link_state_snapshot_t *link_state);
+static uint64_t _ble_link_service_v2_now_ms(void);
 
 static ble_link_service_t s_service;
 static ble_link_ingress_t s_ingress;
@@ -1947,7 +1950,8 @@ static device_link_status_t _ble_link_service_authorize_prepare(
     }
     _ble_link_service_lock();
     bool txn_active =
-        s_service.auth_txn.phase != BLE_LINK_AUTH_PHASE_IDLE;
+        s_service.auth_txn.phase != BLE_LINK_AUTH_PHASE_IDLE &&
+        s_service.auth_txn.phase != BLE_LINK_AUTH_PHASE_COMMITTED;
     const bool txn_expired = _ble_link_service_auth_txn_expired();
 
     if (txn_expired)
@@ -1955,10 +1959,15 @@ static device_link_status_t _ble_link_service_authorize_prepare(
         _ble_link_service_clear_auth_txn();
         txn_active = false;
     }
-    if (txn_active)
+    else if (txn_active)
     {
-        _ble_link_service_unlock();
-        return DEVICE_LINK_STATUS_BUSY;
+        /* A new Prepare retires the previous pending transaction: its
+         * transaction ID, credential ID, application password,
+         * confirmation token, and any pending Commit matching it are all
+         * invalidated (core v2 security contract). The durable committed
+         * record is untouched: COMMITTED is not a pending transaction. */
+        _ble_link_service_clear_auth_txn();
+        txn_active = false;
     }
     bool operation_token_unavailable = false;
 
@@ -2418,6 +2427,18 @@ static device_link_status_t _ble_link_service_authorize_commit(
            sizeof(s_service.committed_replay.credential_id));
     memcpy(s_service.committed_replay.device_auth_id, local_device_auth_id,
            sizeof(s_service.committed_replay.device_auth_id));
+    /* The durable boundary is crossed: the transaction secrets are no
+     * longer needed (the long-term verifier was derived, the response is
+     * encoded from the persisted record, and committed_replay carries its
+     * own identity copies). Clear the RAM copies now so "cleared on
+     * success" holds; the txn identity fields stay for replay matching. */
+    _ble_link_service_zeroize(&s_service.auth_txn.application_password,
+                              sizeof(s_service.auth_txn.application_password));
+    _ble_link_service_zeroize(&s_service.auth_txn.credential_id,
+                              sizeof(s_service.auth_txn.credential_id));
+    _ble_link_service_zeroize(&s_service.auth_txn.device_auth_id,
+                              sizeof(s_service.auth_txn.device_auth_id));
+    s_service.auth_txn.confirmation_token = 0U;
     /* The bootstrap response is still encrypted under the bootstrap
      * session; the long-term verifier switch is deferred until the
      * protected response has been handed to the transport (consumed in
@@ -2826,6 +2847,48 @@ static device_link_status_t _ble_link_service_v2_encode_snapshot(
                                       ble_link_events_baseline());
     (void)_ble_link_service_v2_put_nested(&writer, 2U, link_state,
                                           link_state_len);
+    /* Operation summaries: the snapshot carries only the compact summary
+     * (id, domain, method, state, error), never a result payload. The
+     * table is swept first so expired terminal records are excluded, and
+     * the whole iteration runs under the service mutex so the bridge
+     * writer (connectivity publisher context) cannot interleave. */
+    _ble_link_service_lock();
+    device_link_operation_sweep(&s_service.v2_operations,
+                                _ble_link_service_v2_now_ms());
+    for (size_t i = 0U; i < DEVICE_LINK_MAX_OPERATIONS; ++i)
+    {
+        const device_link_operation_t *operation =
+            &s_service.v2_operations.slots[i];
+        uint8_t summary[BLE_LINK_SERVICE_OPERATION_SUMMARY_MAX_BYTES];
+        size_t summary_len = 0U;
+        device_link_tlv_writer_t summary_writer;
+
+        if (operation->id == 0U)
+        {
+            continue;
+        }
+        device_link_tlv_writer_init(&summary_writer, summary,
+                                    sizeof(summary));
+        if (device_link_tlv_put_fixed64(&summary_writer, 1U,
+                                        operation->id) != ESP_OK ||
+                device_link_tlv_put_uint(&summary_writer, 2U,
+                                         operation->domain_id) != ESP_OK ||
+                device_link_tlv_put_uint(&summary_writer, 3U,
+                                         operation->method_id) != ESP_OK ||
+                device_link_tlv_put_uint(&summary_writer, 4U,
+                                         operation->state) != ESP_OK ||
+                device_link_tlv_put_uint(&summary_writer, 5U,
+                                         operation->status) != ESP_OK ||
+                device_link_tlv_writer_finish(&summary_writer,
+                                              &summary_len) != ESP_OK ||
+                device_link_tlv_put_bytes(&writer, 3U, summary,
+                                          summary_len) != ESP_OK)
+        {
+            _ble_link_service_unlock();
+            return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
+        }
+    }
+    _ble_link_service_unlock();
     if (device_link_tlv_writer_finish(&writer, response_len) != ESP_OK)
     {
         return DEVICE_LINK_STATUS_RESOURCE_EXHAUSTED;
@@ -3315,8 +3378,14 @@ static device_link_status_t _ble_link_service_v2_method(
     {
         uint8_t credential_id[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES] = {0};
 
-        if (!context->header.recovery_query ||
-                !_ble_link_service_v2_parse_credential_id(
+        /* GetAuthorization is recovery-only: a request without the
+         * recovery bit misuses the header (MALFORMED_FRAME, a global
+         * error), while a malformed body stays INVALID_ARGUMENT. */
+        if (!context->header.recovery_query)
+        {
+            return DEVICE_LINK_STATUS_MALFORMED_FRAME;
+        }
+        if (!_ble_link_service_v2_parse_credential_id(
                     request, request_len, credential_id))
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
