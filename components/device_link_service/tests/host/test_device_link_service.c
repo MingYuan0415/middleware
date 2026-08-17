@@ -39,6 +39,7 @@
 #include "ble_tx_scheduler.h"
 #include "connectivity_manager.h"
 #include "device_link_service.h"
+#include "device_link_wifi_adapter.h"
 #include "device_link_security.h"
 #include "device_link_security_auth.h"
 #include "nv_storage.h"
@@ -1621,6 +1622,29 @@ static void _test_start_failure_rolls_back(void)
     assert(device_link_service_init(&s_config) == ESP_ERR_INVALID_ARG);
     assert(host_freertos_live_queues() == 0U);
     assert(host_freertos_live_tasks() == 0U);
+}
+
+static void _test_wifi_descriptor_failure_blocks_runtime_start(void)
+{
+    _reset_host();
+    nv_storage_fake_reset();
+    memset(&s_config, 0, sizeof(s_config));
+    s_config.runtime_port = &s_test_port;
+    s_config.task_priority = 4U;
+    s_config.window_ms = TEST_WINDOW_MS;
+    device_link_wifi_adapter_test_set_descriptor_result(ESP_FAIL);
+
+    assert(device_link_service_init(&s_config) == ESP_FAIL);
+    assert(!s_port_started);
+    assert(!s_adv_started);
+    assert(host_freertos_live_queues() == 0U);
+    assert(host_freertos_live_tasks() == 0U);
+    assert(device_link_service_deinit(DEVICE_LINK_SERVICE_WAIT_FOREVER) ==
+           ESP_OK);
+
+    device_link_wifi_adapter_test_set_descriptor_result(ESP_OK);
+    _init_service();
+    _deinit_service();
 }
 
 static void _test_rollback_port_init_failure(void)
@@ -3604,6 +3628,7 @@ int main(void)
 {
     _test_bad_configuration();
     _test_start_failure_rolls_back();
+    _test_wifi_descriptor_failure_blocks_runtime_start();
     _test_rollback_port_init_failure();
     _test_rollback_runtime_never_initialized();
     _test_rollback_lease_failure_retryable();

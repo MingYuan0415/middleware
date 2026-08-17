@@ -43,6 +43,7 @@ typedef struct device_link_operation
     const device_link_tlv_schema_t *result_schema;
     uint8_t result[DEVICE_LINK_OPERATION_RESULT_BYTES];
     size_t result_len;
+    bool reserved;
     bool cancel_requested;
     device_link_operation_cancel_t cancel;
     void *cancel_arg;
@@ -76,6 +77,23 @@ esp_err_t device_link_operation_start_with_schema(
     const device_link_tlv_schema_t *result_schema,
     device_link_operation_cancel_t cancel, void *cancel_arg,
     uint64_t *operation_id);
+
+/** @brief Reserve a PENDING slot before submitting owner work. */
+esp_err_t device_link_operation_reserve(
+    device_link_operation_table_t *table, uint64_t now_ms,
+    uint8_t domain_id, uint8_t method_id,
+    const device_link_tlv_schema_t *result_schema,
+    uint64_t *operation_id);
+
+/** @brief Bind an owner and cancellation callback to a reserved slot. */
+esp_err_t device_link_operation_commit(
+    device_link_operation_table_t *table, uint64_t operation_id,
+    uint64_t owner_id, device_link_operation_cancel_t cancel,
+    void *cancel_arg);
+
+/** @brief Wipe and release a reservation whose owner submission failed. */
+esp_err_t device_link_operation_abort(
+    device_link_operation_table_t *table, uint64_t operation_id);
 
 esp_err_t device_link_operation_update(
     device_link_operation_table_t *table, uint64_t now_ms,

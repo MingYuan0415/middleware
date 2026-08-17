@@ -79,6 +79,9 @@ typedef struct device_link_domain_descriptor
     uint8_t minor;
     const device_link_method_descriptor_t *methods;
     size_t method_count;
+    /** Stable, sorted capability ids required before using this domain. */
+    const uint8_t *capability_prerequisite_ids;
+    size_t capability_prerequisite_count;
 } device_link_domain_descriptor_t;
 
 typedef struct device_link_call_replay

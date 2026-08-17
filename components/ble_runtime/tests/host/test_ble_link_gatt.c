@@ -464,9 +464,9 @@ static void test_link_state_read(void)
     TEST_ASSERT_EQUAL(0, characteristic->access_cb(
                           7U, link_state_handle, &context, NULL));
     TEST_ASSERT_TRUE(len > 0U);
-    /* protocol_major=2, protocol_minor=0. */
+    /* Core 2.1, profile 2.0. */
     TEST_ASSERT_EQUAL(0x02U, value[0]);
-    TEST_ASSERT_EQUAL(0x00U, value[1]);
+    TEST_ASSERT_EQUAL(0x01U, value[1]);
     TEST_ASSERT_EQUAL(0x02U, value[2]);
     TEST_ASSERT_EQUAL(0x00U, value[3]);
     TEST_ASSERT_EQUAL(BLE_LINK_STATE_MAX_ENCODED_BYTES, len);

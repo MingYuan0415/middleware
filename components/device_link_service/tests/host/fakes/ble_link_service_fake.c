@@ -6,13 +6,14 @@
 
 static uint64_t s_next_operation_id = 1U;
 static unsigned s_update_count = 0U;
-static unsigned s_defer_count = 0U;
 static uint64_t s_last_owner_id = 0U;
 static device_link_operation_state_t s_last_state;
 static device_link_status_t s_last_status;
 static size_t s_last_result_len = 0U;
 static bool s_in_flight = false;
 static esp_err_t s_start_result = ESP_OK;
+static bool s_reservation_active = false;
+static uint64_t s_reservation_id = 0U;
 
 esp_err_t ble_link_service_async_operation_start(
     uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
@@ -35,6 +36,57 @@ esp_err_t ble_link_service_async_operation_start(
     return ESP_OK;
 }
 
+esp_err_t ble_link_service_async_operation_reserve(
+    uint8_t domain_id, uint8_t method_id, uint64_t *out_operation_id)
+{
+    (void)domain_id;
+    (void)method_id;
+    if (out_operation_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_reservation_active)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_start_result != ESP_OK)
+    {
+        return s_start_result;
+    }
+    s_reservation_id = s_next_operation_id++;
+    s_reservation_active = true;
+    *out_operation_id = s_reservation_id;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_async_operation_commit(
+    uint64_t operation_id, uint64_t owner_id,
+    device_link_operation_cancel_t cancel, void *cancel_arg)
+{
+    (void)cancel;
+    (void)cancel_arg;
+    if (!s_reservation_active || operation_id != s_reservation_id ||
+            owner_id == 0U)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_last_owner_id = owner_id;
+    s_reservation_active = false;
+    s_reservation_id = 0U;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_async_operation_abort(uint64_t operation_id)
+{
+    if (!s_reservation_active || operation_id != s_reservation_id)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_reservation_active = false;
+    s_reservation_id = 0U;
+    return ESP_OK;
+}
+
 esp_err_t ble_link_service_async_operation_update(
     uint64_t owner_id, device_link_operation_state_t state,
     device_link_status_t status, const uint8_t *result, size_t result_len)
@@ -52,19 +104,6 @@ esp_err_t ble_link_service_async_operation_update(
     return ESP_OK;
 }
 
-esp_err_t ble_link_service_async_operation_defer_update(
-    uint64_t owner_id, device_link_operation_state_t state,
-    device_link_status_t status, const uint8_t *result, size_t result_len)
-{
-    (void)owner_id;
-    (void)state;
-    (void)status;
-    (void)result;
-    (void)result_len;
-    s_defer_count++;
-    return ESP_OK;
-}
-
 bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
 {
     (void)domain_id;
@@ -75,11 +114,12 @@ bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
 void ble_link_service_fake_reset(void)
 {
     s_update_count = 0U;
-    s_defer_count = 0U;
     s_last_owner_id = 0U;
     s_last_result_len = 0U;
     s_in_flight = false;
     s_start_result = ESP_OK;
+    s_reservation_active = false;
+    s_reservation_id = 0U;
 }
 
 void ble_link_service_fake_set_in_flight(bool in_flight)
@@ -90,11 +130,6 @@ void ble_link_service_fake_set_in_flight(bool in_flight)
 void ble_link_service_fake_set_start_result(esp_err_t result)
 {
     s_start_result = result;
-}
-
-unsigned ble_link_service_fake_defer_count(void)
-{
-    return s_defer_count;
 }
 
 unsigned ble_link_service_fake_update_count(void)

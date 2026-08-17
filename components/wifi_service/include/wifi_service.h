@@ -34,6 +34,15 @@ typedef uint64_t wifi_service_session_id_t;
 /** @brief Nonzero generation identifying one admitted operation. */
 typedef uint64_t wifi_service_operation_id_t;
 
+/** @brief Linearized outcome of a lower-layer cancellation request. */
+typedef enum
+{
+    WIFI_SERVICE_CANCEL_ACCEPTED = 0,
+    WIFI_SERVICE_CANCEL_TERMINAL_ALREADY_CLAIMED,
+    WIFI_SERVICE_CANCEL_NOT_FOUND,
+    WIFI_SERVICE_CANCEL_FAILURE,
+} wifi_service_cancel_disposition_t;
+
 /** @brief Public connection state reported in status snapshots. */
 typedef enum
 {
@@ -257,12 +266,16 @@ esp_err_t wifi_service_request_disconnect(
  *
  * @param session_id identifies the operation's session.
  * @param operation_id identifies the operation to cancel.
+ * @param out_disposition receives the outcome linearized under the service
+ *                        state lock.
  *
- * @return ESP_OK when marked for cancellation; ESP_ERR_NOT_FOUND when stale;
- *         otherwise an ESP-IDF error.
+ * @return ESP_OK when a disposition was produced; otherwise an argument or
+ *         lifecycle error with WIFI_SERVICE_CANCEL_FAILURE.
  */
 esp_err_t wifi_service_cancel(wifi_service_session_id_t session_id,
-                              wifi_service_operation_id_t operation_id);
+                              wifi_service_operation_id_t operation_id,
+                              wifi_service_cancel_disposition_t
+                              *out_disposition);
 
 /**
  * @brief Read the cached connection snapshot without accessing the driver.

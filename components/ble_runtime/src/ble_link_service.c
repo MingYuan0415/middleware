@@ -44,15 +44,9 @@
 #define BLE_LINK_SERVICE_AUTH_ID_BYTES DEVICE_LINK_SECURITY_AUTH_ID_BYTES
 #define BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES \
     DEVICE_LINK_SECURITY_AUTH_CREDENTIAL_BYTES
-#define BLE_LINK_SERVICE_PROTOCOMM_PATCH_VERSION 1U
 #define BLE_LINK_SERVICE_CLEANUP_OBLIGATIONS 4U
 #define BLE_LINK_SERVICE_RETRY_BASE_MS 100U
 #define BLE_LINK_SERVICE_RETRY_MAX_MS 1000U
-/* A completion bridge event may arrive after the manager admitted the
- * operation but before the Core v2 table admission ran (SMP publisher
- * context). Terminal completions are retained for this window and merged
- * by the next async_operation_start for the same owner id. */
-#define BLE_LINK_SERVICE_DEFERRED_COMPLETION_TTL_MS 1000U
 #define BLE_LINK_SERVICE_MAX_DOMAINS 4U
 /* OperationSummary (core v2) freezes maximum_encoded_bytes at 128. */
 #define BLE_LINK_SERVICE_OPERATION_SUMMARY_MAX_BYTES 128U
@@ -204,16 +198,8 @@ typedef struct ble_link_service
     size_t v2_domain_count;
     device_link_router_t v2_router;
     device_link_operation_table_t v2_operations;
-    struct
-    {
-        bool active;
-        uint64_t owner_id;
-        uint64_t deadline_ms;
-        device_link_operation_state_t state;
-        device_link_status_t status;
-        uint8_t result[DEVICE_LINK_OPERATION_RESULT_BYTES];
-        size_t result_len;
-    } deferred_completion;
+    bool v2_reservation_active;
+    uint64_t v2_reservation_id;
     device_link_call_replay_t v2_replay[DEVICE_LINK_REPLAY_SLOTS];
     uint8_t v2_replay_response[DEVICE_LINK_REPLAY_SLOTS]
     [BLE_LINK_SERVICE_MAX_CONTROL_MESSAGE_BYTES];
@@ -314,9 +300,11 @@ static esp_err_t _ble_link_service_accept_locked(
     const uint8_t *value, size_t len,
     ble_link_work_t **out_work);
 static esp_err_t _ble_link_service_execute_locked(ble_link_work_t *work);
+#ifdef UNIT_TEST_HOST
 static esp_err_t _ble_link_service_publish_link_state_locked(
     const ble_link_service_facts_t *facts,
     const ble_link_state_snapshot_t *link_state);
+#endif
 static uint64_t _ble_link_service_v2_now_ms(void);
 
 static ble_link_service_t s_service;
@@ -950,6 +938,8 @@ void ble_link_service_abort_transactions(void)
     s_service.completion.is_last = false;
     s_service.deferred_busy.active = false;
     _ble_link_service_clear_delayed_cmd0();
+    _ble_link_service_clear_auth_txn();
+    _ble_link_service_reset_v2_replay();
     _ble_link_service_stream_free();
     s_service.queued_handshake.work = NULL;
     _ble_link_service_unlock();
@@ -1018,6 +1008,7 @@ static void _ble_link_service_abort_session(uint32_t generation)
     s_service.lt_switch.active = false;
     s_service.close_after_encrypt.active = false;
     _ble_link_service_clear_auth_txn();
+    _ble_link_service_reset_v2_replay();
     _ble_link_service_stream_free();
 #ifdef UNIT_TEST_HOST
     ble_link_dispatcher_clear_session();
@@ -2092,6 +2083,7 @@ static uint32_t _ble_link_service_handle_authorize_prepare(
 }
 #endif
 
+#ifdef UNIT_TEST_HOST
 /**
  * @brief Parse an AuthorizeCommitRequest body with strict bounds.
  *
@@ -2170,6 +2162,7 @@ static bool _ble_link_service_parse_authorize_commit(
     *out_credential_len = credential_len;
     return true;
 }
+#endif
 
 static device_link_status_t _ble_link_service_authorize_commit(
     uint32_t connection_generation, uint32_t security_epoch, uint64_t txn_id,
@@ -2596,6 +2589,7 @@ static uint32_t _ble_link_service_handle_authorize_commit(
 }
 #endif
 
+#ifdef UNIT_TEST_HOST
 /**
  * @brief Parse a GetAuthorizationRequest body with strict bounds.
  *
@@ -2645,6 +2639,7 @@ static bool _ble_link_service_parse_get_authorization(
     }
     return saw_credential;
 }
+#endif
 
 static device_link_status_t _ble_link_service_get_authorization(
     const uint8_t credential_id[BLE_LINK_SERVICE_AUTH_CREDENTIAL_BYTES])
@@ -2804,17 +2799,25 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
         return DEVICE_LINK_STATUS_INTERNAL;
     }
     device_link_tlv_writer_init(&writer, security, sizeof(security));
-    (void)device_link_tlv_put_bool(&writer, 1U, true);
+    (void)device_link_tlv_put_bool(
+        &writer, 1U, DEVICE_LINK_SECURITY_SECURE_CONNECTIONS_ONLY);
     /* AES-256-GCM session key: the first 32 bytes of the 64-byte SRP
      * session-key digest (core v2 security.md). */
-    (void)device_link_tlv_put_uint(&writer, 2U, 32U);
-    (void)device_link_tlv_put_uint(&writer, 3U, 1U);
-    (void)device_link_tlv_put_uint(&writer, 4U, 2U);
+    (void)device_link_tlv_put_uint(
+        &writer, 2U, DEVICE_LINK_SECURITY_ENCRYPTION_KEY_BYTES);
+    (void)device_link_tlv_put_uint(
+        &writer, 3U, DEVICE_LINK_SECURITY_MAXIMUM_BONDS);
+    (void)device_link_tlv_put_uint(
+        &writer, 4U, DEVICE_LINK_SECURITY_PROTOCOMM_VERSION);
     (void)device_link_tlv_put_uint(&writer, 5U,
-                                   BLE_LINK_SERVICE_PROTOCOMM_PATCH_VERSION);
-    (void)device_link_tlv_put_bool(&writer, 6U, true);
-    (void)device_link_tlv_put_bool(&writer, 7U, true);
-    (void)device_link_tlv_put_bool(&writer, 8U, true);
+                                   DEVICE_LINK_SECURITY_PROTOCOMM_PATCH_VERSION);
+    (void)device_link_tlv_put_bool(
+        &writer, 6U, DEVICE_LINK_SECURITY_LOCAL_CONFIRMATION_FOR_GRANTS);
+    (void)device_link_tlv_put_bool(
+        &writer, 7U, DEVICE_LINK_SECURITY_QR_BOOTSTRAP_USES_POP);
+    (void)device_link_tlv_put_bool(
+        &writer, 8U,
+        DEVICE_LINK_SECURITY_PUBLIC_BOOTSTRAP_USES_SC_CONFIRMATION);
     if (device_link_tlv_writer_finish(&writer, &security_len) != ESP_OK)
     {
         return DEVICE_LINK_STATUS_INTERNAL;
@@ -2868,6 +2871,16 @@ static device_link_status_t _ble_link_service_v2_encode_manifest(
                                               &method_len) != ESP_OK ||
                     device_link_tlv_put_bytes(
                         &domain_writer, 4U, method, method_len) != ESP_OK)
+            {
+                return DEVICE_LINK_STATUS_INTERNAL;
+            }
+        }
+        for (size_t p = 0U;
+                p < domain->capability_prerequisite_count; ++p)
+        {
+            if (device_link_tlv_put_uint(
+                        &domain_writer, 5U,
+                        domain->capability_prerequisite_ids[p]) != ESP_OK)
             {
                 return DEVICE_LINK_STATUS_INTERNAL;
             }
@@ -3841,58 +3854,6 @@ uint64_t ble_link_service_confirmation_token(void)
     return token;
 }
 
-static void _ble_link_service_sweep_deferred_completion_locked(
-    uint64_t now_ms)
-{
-    if (!s_service.deferred_completion.active)
-    {
-        return;
-    }
-    if ((int32_t)(now_ms - s_service.deferred_completion.deadline_ms) < 0)
-    {
-        return;
-    }
-    _ble_link_service_zeroize(
-        s_service.deferred_completion.result,
-        sizeof(s_service.deferred_completion.result));
-    s_service.deferred_completion.active = false;
-    s_service.deferred_completion.owner_id = 0U;
-    s_service.deferred_completion.deadline_ms = 0U;
-    s_service.deferred_completion.result_len = 0U;
-}
-
-static bool _ble_link_service_deferred_completion_params_valid(
-    device_link_operation_state_t state, device_link_status_t status,
-    const uint8_t *result, size_t result_len)
-{
-    if (state < DEVICE_LINK_OPERATION_PENDING ||
-            state > DEVICE_LINK_OPERATION_CANCELED ||
-            status < DEVICE_LINK_STATUS_OK ||
-            status > DEVICE_LINK_STATUS_INTERNAL ||
-            (result == NULL && result_len != 0U) ||
-            result_len > DEVICE_LINK_OPERATION_RESULT_BYTES)
-    {
-        return false;
-    }
-    /* Mirror device_link_operation_update(): in-flight records report OK,
-     * SUCCEEDED reports OK, FAILED requires a non-OK error, and non-success
-     * terminal records never carry a result payload. */
-    const bool in_flight = state == DEVICE_LINK_OPERATION_PENDING ||
-                           state == DEVICE_LINK_OPERATION_RUNNING;
-    const bool non_success_terminal =
-        state == DEVICE_LINK_OPERATION_FAILED ||
-        state == DEVICE_LINK_OPERATION_CANCELED;
-
-    return !in_flight &&
-           !((state == DEVICE_LINK_OPERATION_SUCCEEDED &&
-              status != DEVICE_LINK_STATUS_OK) ||
-             (state == DEVICE_LINK_OPERATION_FAILED &&
-              status == DEVICE_LINK_STATUS_OK) ||
-             (state == DEVICE_LINK_OPERATION_CANCELED &&
-              status != DEVICE_LINK_STATUS_OK) ||
-             (non_success_terminal && result_len != 0U));
-}
-
 esp_err_t ble_link_service_async_operation_start(
     uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
     device_link_operation_cancel_t cancel, void *cancel_arg,
@@ -3918,57 +3879,90 @@ esp_err_t ble_link_service_async_operation_start(
         return ESP_ERR_INVALID_ARG;
     }
 
-    _ble_link_service_sweep_deferred_completion_locked(now_ms);
     const esp_err_t result = device_link_operation_start_with_schema(
                                  &s_service.v2_operations, now_ms,
                                  domain_id, method_id, owner_id,
                                  descriptor->operation_result_schema,
                                  cancel, cancel_arg, out_operation_id);
 
+    _ble_link_service_unlock();
+    return result;
+}
+
+esp_err_t ble_link_service_async_operation_reserve(
+    uint8_t domain_id, uint8_t method_id, uint64_t *out_operation_id)
+{
+    if (out_operation_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_operation_id = 0U;
+    _ble_link_service_lock();
+    if (!s_service.v2_ready || s_service.v2_reservation_active)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    const device_link_method_descriptor_t *descriptor =
+        _ble_link_service_v2_operation_descriptor(domain_id, method_id);
+
+    if (descriptor == NULL || descriptor->operation_result_schema == NULL)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t result = device_link_operation_reserve(
+                                 &s_service.v2_operations,
+                                 _ble_link_service_v2_now_ms(), domain_id,
+                                 method_id, descriptor->operation_result_schema,
+                                 out_operation_id);
+
     if (result != ESP_OK)
     {
         _ble_link_service_unlock();
         return result;
     }
-    if (s_service.deferred_completion.active &&
-            s_service.deferred_completion.owner_id == owner_id)
+    s_service.v2_reservation_active = true;
+    s_service.v2_reservation_id = *out_operation_id;
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_async_operation_commit(
+    uint64_t operation_id, uint64_t owner_id,
+    device_link_operation_cancel_t cancel, void *cancel_arg)
+{
+    if (!s_service.v2_reservation_active ||
+            s_service.v2_reservation_id != operation_id)
     {
-        /* A completion bridge event for this manager operation arrived
-         * before the table admission ran. Merge it now: the freshly
-         * admitted PENDING record receives the retained terminal state
-         * instead of leaking as a never-completing slot. The deferred
-         * payload was validated when it was stored, so this update can
-         * only fail on an internal invariant violation. */
-        const esp_err_t merge_result = device_link_operation_update(
-                                           &s_service.v2_operations, now_ms,
-                                           *out_operation_id,
-                                           s_service.deferred_completion.state,
-                                           s_service.deferred_completion.status,
-                                           s_service.deferred_completion.result,
-                                           s_service.deferred_completion.result_len);
-        _ble_link_service_zeroize(
-            s_service.deferred_completion.result,
-            sizeof(s_service.deferred_completion.result));
-        s_service.deferred_completion.active = false;
-        s_service.deferred_completion.owner_id = 0U;
-        s_service.deferred_completion.deadline_ms = 0U;
-        s_service.deferred_completion.result_len = 0U;
-        if (merge_result != ESP_OK)
-        {
-            /* Admission already succeeded. A malformed retained terminal
-             * must not leave the freshly allocated record PENDING; expose a
-             * terminal internal failure so the caller can still observe and
-             * retire the operation deterministically. */
-            const esp_err_t failure_result = device_link_operation_update(
-                                                 &s_service.v2_operations,
-                                                 now_ms, *out_operation_id,
-                                                 DEVICE_LINK_OPERATION_FAILED,
-                                                 DEVICE_LINK_STATUS_INTERNAL,
-                                                 NULL, 0U);
-            _ble_link_service_unlock();
-            return failure_result == ESP_OK ? ESP_OK : merge_result;
-        }
+        return ESP_ERR_INVALID_STATE;
     }
+    esp_err_t result = device_link_operation_commit(
+                           &s_service.v2_operations, operation_id, owner_id,
+                           cancel, cancel_arg);
+
+    if (result != ESP_OK)
+    {
+        (void)device_link_operation_abort(
+            &s_service.v2_operations, operation_id);
+    }
+    s_service.v2_reservation_active = false;
+    s_service.v2_reservation_id = 0U;
+    _ble_link_service_unlock();
+    return result;
+}
+
+esp_err_t ble_link_service_async_operation_abort(uint64_t operation_id)
+{
+    if (!s_service.v2_reservation_active ||
+            s_service.v2_reservation_id != operation_id)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = device_link_operation_abort(
+                                 &s_service.v2_operations, operation_id);
+
+    s_service.v2_reservation_active = false;
+    s_service.v2_reservation_id = 0U;
     _ble_link_service_unlock();
     return result;
 }
@@ -3985,7 +3979,6 @@ esp_err_t ble_link_service_async_operation_update(
     const uint64_t now_ms = _ble_link_service_v2_now_ms();
     device_link_operation_t operation;
 
-    _ble_link_service_sweep_deferred_completion_locked(now_ms);
     const esp_err_t find_result = device_link_operation_find_by_owner(
                                       &s_service.v2_operations, owner_id,
                                       &operation);
@@ -4002,69 +3995,6 @@ esp_err_t ble_link_service_async_operation_update(
 
     _ble_link_service_unlock();
     return result_status;
-}
-
-esp_err_t ble_link_service_async_operation_defer_update(
-    uint64_t owner_id, device_link_operation_state_t state,
-    device_link_status_t status, const uint8_t *result, size_t result_len)
-{
-    if (owner_id == 0U ||
-            !_ble_link_service_deferred_completion_params_valid(
-                state, status, result, result_len))
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    _ble_link_service_lock();
-    if (!s_service.v2_ready)
-    {
-        _ble_link_service_unlock();
-        return ESP_ERR_INVALID_STATE;
-    }
-    const uint64_t now_ms = _ble_link_service_v2_now_ms();
-
-    _ble_link_service_sweep_deferred_completion_locked(now_ms);
-    device_link_operation_t operation;
-    const esp_err_t find_result = device_link_operation_find_by_owner(
-                                      &s_service.v2_operations, owner_id,
-                                      &operation);
-
-    if (find_result == ESP_OK)
-    {
-        /* The table admission landed between the caller's failed update
-         * and this deferral: apply the terminal directly. */
-        const esp_err_t result_status = device_link_operation_update(
-                                            &s_service.v2_operations,
-                                            now_ms, operation.id, state,
-                                            status, result, result_len);
-
-        _ble_link_service_unlock();
-        return result_status;
-    }
-    if (s_service.deferred_completion.active)
-    {
-        /* One manager operation id is unique per boot, so a second
-         * terminal for a still-unmatched owner can only be a superseded
-         * snapshot; keep the newest and never leak the old payload. */
-        _ble_link_service_zeroize(
-            s_service.deferred_completion.result,
-            sizeof(s_service.deferred_completion.result));
-    }
-    s_service.deferred_completion.active = true;
-    s_service.deferred_completion.owner_id = owner_id;
-    s_service.deferred_completion.deadline_ms =
-        now_ms + BLE_LINK_SERVICE_DEFERRED_COMPLETION_TTL_MS;
-    s_service.deferred_completion.state = state;
-    s_service.deferred_completion.status = status;
-    s_service.deferred_completion.result_len = result_len;
-    _ble_link_service_zeroize(
-        s_service.deferred_completion.result,
-        sizeof(s_service.deferred_completion.result));
-    if (result_len != 0U)
-    {
-        memcpy(s_service.deferred_completion.result, result, result_len);
-    }
-    _ble_link_service_unlock();
-    return ESP_OK;
 }
 
 bool ble_link_service_async_operation_in_flight(uint8_t domain_id)

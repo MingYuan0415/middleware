@@ -34,20 +34,22 @@
 
 static void test_golden_public_link_state(void)
 {
-    /* Frozen fixture: protocol_major=2, profile_major=2, protocol/profile
-     * minor=0, boot_id=72623859790382856, state_flags=0xaa
+    /* Frozen fixture: Core 2.1, profile 2.0,
+     * boot_id=72623859790382856, state_flags=0xaa
      * (BOUND|BLUETOOTH_ENABLED|AUTHENTICATED|ERROR, a combination that
      * satisfies the v2 cross-flag implications). */
     static const uint8_t expected[] =
     {
-        0x02, 0x00, 0x02, 0x00, 0xaa, 0x00, 0x00, 0x00,
+        0x02, 0x01, 0x02, 0x00, 0xaa, 0x00, 0x00, 0x00,
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
     };
     ble_link_state_t state;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 72623859790382856ULL;
     state.state_flags = BLE_LINK_STATE_FLAG_BOUND |
                         BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED |
@@ -69,15 +71,17 @@ static void test_fixed_width_defaults(void)
     size_t out_len = 0U;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_state_encode(
                           &state, out, sizeof(out), &out_len));
     /* All fields are present, including zero versions and flags. */
     static const uint8_t expected[] =
     {
-        0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
 
@@ -92,8 +96,10 @@ static void test_max_encoded_size_within_contract(void)
     size_t out_len = 0U;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 0xffffffffffffffffULL;
     /* Every defined flag in a combination that satisfies the v2 cross-flag
      * implications (BOUND with AUTHENTICATED/AUTHORIZED, no BINDABLE). */
@@ -120,16 +126,20 @@ static void test_invalid_states_rejected(void)
                           &state, out, sizeof(out),
                           &out_len));
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     state.protocol_major = 128U;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
                           &state, out, sizeof(out),
                           &out_len));
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     state.state_flags = 0x100U;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
@@ -140,27 +150,31 @@ static void test_invalid_states_rejected(void)
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
                           &state, out, sizeof(out),
                           &out_len));
-    /* Non-zero minors are frozen at 0. */
+    /* Any minor other than the frozen Core/Profile values is rejected. */
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR + 1U;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
-    state.protocol_minor = 1U;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
                           &state, out, sizeof(out),
                           &out_len));
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR + 1U;
     state.boot_id = 42U;
-    state.profile_minor = 1U;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
                           &state, out, sizeof(out),
                           &out_len));
     /* AUTHENTICATED implies BOUND. */
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     state.state_flags = BLE_LINK_STATE_FLAG_AUTHENTICATED;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
@@ -193,8 +207,10 @@ static void test_small_buffer_rejected(void)
     size_t out_len = 0U;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_link_state_encode(
                           &state, small, sizeof(small),
@@ -207,8 +223,10 @@ static void test_fixed_size(void)
     size_t out_len = 0U;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = 42U;
     uint8_t out[BLE_LINK_STATE_MAX_ENCODED_BYTES];
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_state_encode(

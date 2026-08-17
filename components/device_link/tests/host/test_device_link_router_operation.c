@@ -14,6 +14,10 @@ typedef struct handler_state
 {
     unsigned calls;
     uint8_t value;
+    const uint8_t *replay_probe;
+    size_t replay_probe_size;
+    bool require_replay_scrubbed;
+    bool replay_scrub_observed;
 } handler_state_t;
 
 static const device_link_tlv_field_rule_t s_value_rule =
@@ -56,6 +60,15 @@ static device_link_status_t _handler(
     handler_state_t *state = arg;
 
     assert(context->header.domain_id == DEVICE_LINK_DOMAIN_WIFI);
+    if (state->require_replay_scrubbed)
+    {
+        for (size_t i = 0U; i < state->replay_probe_size; ++i)
+        {
+            assert(state->replay_probe[i] == 0U);
+        }
+        state->replay_scrub_observed = true;
+        state->require_replay_scrubbed = false;
+    }
     state->calls++;
     if (request_len != 2U || request[0] != 0x04U ||
             request[1] != state->value || response_capacity < 2U)
@@ -99,6 +112,74 @@ static device_link_status_t _response_status(
                response_len - DEVICE_LINK_WIRE_HEADER_BYTES,
                &status) == ESP_OK);
     return status;
+}
+
+static void _test_capability_prerequisites(void)
+{
+    handler_state_t handler = {.value = 0x31U};
+    const device_link_method_descriptor_t method =
+    {
+        .method_id = 4U,
+        .channel = DEVICE_LINK_CHANNEL_CONTROL,
+        .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+        .maximum_request_bytes = 2U,
+        .maximum_response_bytes = 2U,
+        .request_schema = &s_value_schema,
+        .response_schema = &s_value_schema,
+        .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
+            DEVICE_LINK_STATUS_OK),
+        .allowed_statuses_mask = DEVICE_LINK_STATUS_MASK(
+            DEVICE_LINK_STATUS_OK),
+        .handler = _handler,
+        .handler_arg = &handler,
+    };
+    static const uint8_t valid[] = {1U, 127U};
+    static const uint8_t too_many[] = {1U, 2U, 3U, 4U, 5U};
+    static const uint8_t zero[] = {0U};
+    static const uint8_t too_large[] = {128U};
+    static const uint8_t duplicate[] = {1U, 1U};
+    static const uint8_t unsorted[] = {2U, 1U};
+    device_link_domain_descriptor_t domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U,
+        .methods = &method,
+        .method_count = 1U,
+        .capability_prerequisite_ids = valid,
+        .capability_prerequisite_count = 2U,
+    };
+
+    assert(device_link_domain_descriptors_validate(&domain, 1U) == ESP_OK);
+    domain.capability_prerequisite_count = 0U;
+    assert(device_link_domain_descriptors_validate(&domain, 1U) ==
+           ESP_ERR_INVALID_ARG);
+    domain.capability_prerequisite_ids = NULL;
+    assert(device_link_domain_descriptors_validate(&domain, 1U) == ESP_OK);
+    domain.capability_prerequisite_ids = valid;
+    domain.capability_prerequisite_count = 5U;
+    assert(device_link_domain_descriptors_validate(&domain, 1U) ==
+           ESP_ERR_INVALID_ARG);
+
+    const uint8_t *invalid_sets[] =
+    {
+        zero,
+        too_large,
+        duplicate,
+        unsorted,
+    };
+    const size_t invalid_counts[] = {1U, 1U, 2U, 2U};
+
+    for (size_t i = 0U;
+            i < sizeof(invalid_sets) / sizeof(invalid_sets[0]); ++i)
+    {
+        domain.capability_prerequisite_ids = invalid_sets[i];
+        domain.capability_prerequisite_count = invalid_counts[i];
+        assert(device_link_domain_descriptors_validate(&domain, 1U) ==
+               ESP_ERR_INVALID_ARG);
+    }
+    domain.capability_prerequisite_ids = too_many;
+    domain.capability_prerequisite_count = 4U;
+    assert(device_link_domain_descriptors_validate(&domain, 1U) == ESP_OK);
 }
 
 static void _test_router(void)
@@ -191,6 +272,25 @@ static void _test_router(void)
     assert(memcmp(response, first_response, first_len) == 0);
     assert(handler.calls == 1U);
 
+    /* A distinct request in the same Security2 epoch wipes the entire old
+     * response slot before its handler is entered. */
+    memset(replay_response[0], 0xa5, sizeof(replay_response[0]));
+    handler.replay_probe = replay_response[0];
+    handler.replay_probe_size = sizeof(replay_response[0]);
+    handler.require_replay_scrubbed = true;
+    request_len = _make_request(
+                      2U, boot_id, handler.value,
+                      request, sizeof(request));
+    assert(device_link_router_process(
+               &router, &facts, request, request_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(handler.calls == 2U);
+    assert(handler.replay_scrub_observed);
+
+    request_len = _make_request(
+                      1U, boot_id, handler.value,
+                      request, sizeof(request));
+
     device_link_router_replay_reset(&router);
     assert(router.next_replay_slot == 0U);
     for (size_t i = 0U; i < DEVICE_LINK_REPLAY_SLOTS; ++i)
@@ -206,7 +306,7 @@ static void _test_router(void)
                &router, &facts, request, request_len,
                response, sizeof(response), &response_len) == ESP_OK);
     assert(_response_status(response, response_len) == DEVICE_LINK_STATUS_OK);
-    assert(handler.calls == 2U);
+    assert(handler.calls == 3U);
 
     request[DEVICE_LINK_WIRE_HEADER_BYTES + 1U]++;
     assert(device_link_router_process(
@@ -214,7 +314,7 @@ static void _test_router(void)
                response, sizeof(response), &response_len) == ESP_OK);
     assert(_response_status(response, response_len) ==
            DEVICE_LINK_STATUS_CONFLICT);
-    assert(handler.calls == 2U);
+    assert(handler.calls == 3U);
 
     request_len = _make_request(
                       2U, boot_id, handler.value,
@@ -226,7 +326,7 @@ static void _test_router(void)
                response, sizeof(response), &response_len) == ESP_OK);
     assert(_response_status(response, response_len) ==
            DEVICE_LINK_STATUS_PERMISSION_DENIED);
-    assert(handler.calls == 2U);
+    assert(handler.calls == 3U);
 
     request_len = _make_request(
                       4U, boot_id, handler.value,
@@ -391,6 +491,14 @@ static esp_err_t _cancel_owner(uint64_t owner_id, void *arg)
     return ESP_OK;
 }
 
+static esp_err_t _cancel_owner_failure(uint64_t owner_id, void *arg)
+{
+    uint64_t *seen = arg;
+
+    *seen = owner_id;
+    return ESP_FAIL;
+}
+
 typedef struct cancel_reentry
 {
     device_link_operation_table_t *table;
@@ -409,7 +517,7 @@ static esp_err_t _cancel_with_synchronous_completion(
                NULL, 0U);
 }
 
-static void _test_cancel_linearization(void)
+static void _test_terminal_claim_precedes_cancel_confirmation(void)
 {
     device_link_operation_table_t table;
     cancel_reentry_t reentry = {.table = &table};
@@ -426,8 +534,49 @@ static void _test_cancel_linearization(void)
     assert(device_link_operation_get(
                &table, 12U, reentry.operation_id, &operation) == ESP_OK);
     assert(operation->cancel_requested);
-    assert(operation->state == DEVICE_LINK_OPERATION_CANCELED);
+    assert(operation->state == DEVICE_LINK_OPERATION_SUCCEEDED);
     assert(operation->status == DEVICE_LINK_STATUS_OK);
+}
+
+static void _test_operation_reservation(void)
+{
+    device_link_operation_table_t table;
+    uint64_t operation_id = 0U;
+    uint64_t owner = 0U;
+    const device_link_operation_t *operation = NULL;
+
+    assert(device_link_operation_table_init(&table, 11U) == ESP_OK);
+    assert(device_link_operation_reserve(
+               &table, 1U, DEVICE_LINK_DOMAIN_WIFI, 4U,
+               &s_value_schema, &operation_id) == ESP_OK);
+    assert(device_link_operation_get(
+               &table, 1U, operation_id, &operation) == ESP_ERR_NOT_FOUND);
+    assert(device_link_operation_cancel(
+               &table, 1U, operation_id) == ESP_ERR_NOT_FOUND);
+    assert(device_link_operation_update(
+               &table, 1U, operation_id, DEVICE_LINK_OPERATION_RUNNING,
+               DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_ERR_INVALID_STATE);
+    assert(device_link_operation_commit(
+               &table, operation_id, 42U, _cancel_owner, &owner) == ESP_OK);
+    assert(device_link_operation_get(
+               &table, 1U, operation_id, &operation) == ESP_OK);
+    assert(operation->owner_id == 42U);
+    assert(!operation->reserved);
+
+    uint64_t aborted_id = 0U;
+
+    assert(device_link_operation_reserve(
+               &table, 2U, DEVICE_LINK_DOMAIN_WIFI, 4U,
+               &s_value_schema, &aborted_id) == ESP_OK);
+    memset(table.slots[1].result, 0xa5,
+           sizeof(table.slots[1].result));
+    assert(device_link_operation_abort(&table, aborted_id) == ESP_OK);
+    assert(device_link_operation_get(
+               &table, 2U, aborted_id, &operation) == ESP_ERR_NOT_FOUND);
+    for (size_t i = 0U; i < sizeof(table.slots[1]); ++i)
+    {
+        assert(((const uint8_t *)&table.slots[1])[i] == 0U);
+    }
 }
 
 static void _test_operations(void)
@@ -455,10 +604,11 @@ static void _test_operations(void)
         assert(start_result == ESP_OK);
         assert(ids[i] == i + 1U);
     }
-    uint64_t extra = 0U;
+    uint64_t extra = UINT64_MAX;
     assert(device_link_operation_start(
                &table, 10U, DEVICE_LINK_DOMAIN_WIFI, 4U, 999U,
                NULL, NULL, &extra) == ESP_ERR_NO_MEM);
+    assert(extra == 0U);
     memset(table.slots[0].result, 0xa5, sizeof(table.slots[0].result));
     assert(device_link_operation_update(
                &table, 20U, ids[0], DEVICE_LINK_OPERATION_RUNNING,
@@ -529,7 +679,7 @@ static void _test_operations(void)
     assert(operation->state == DEVICE_LINK_OPERATION_RUNNING);
     assert(operation->cancel_requested);
     assert(device_link_operation_update(
-               &table, 31U, ids[0], DEVICE_LINK_OPERATION_SUCCEEDED,
+               &table, 31U, ids[0], DEVICE_LINK_OPERATION_CANCELED,
                DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_OK);
     assert(device_link_operation_get(
                &table, 31U, ids[0], &operation) == ESP_OK);
@@ -544,6 +694,24 @@ static void _test_operations(void)
                DEVICE_LINK_DOMAIN_WIFI, 4U, 1000U,
                NULL, NULL, &extra) == ESP_OK);
     assert(extra == 5U);
+
+    device_link_operation_table_t cancel_failure_table;
+    uint64_t cancel_failure_id = 0U;
+
+    assert(device_link_operation_table_init(
+               &cancel_failure_table, 12U) == ESP_OK);
+    assert(device_link_operation_start(
+               &cancel_failure_table, 1U, DEVICE_LINK_DOMAIN_WIFI, 4U,
+               3000U, _cancel_owner_failure, &canceled_owner,
+               &cancel_failure_id) == ESP_OK);
+    assert(device_link_operation_cancel(
+               &cancel_failure_table, 2U, cancel_failure_id) == ESP_OK);
+    assert(device_link_operation_get(
+               &cancel_failure_table, 2U, cancel_failure_id,
+               &operation) == ESP_OK);
+    assert(operation->state == DEVICE_LINK_OPERATION_FAILED);
+    assert(operation->status == DEVICE_LINK_STATUS_UNAVAILABLE);
+    assert(operation->result_len == 0U);
 
     device_link_operation_table_t expiry_table;
     uint64_t expiry_id = 0U;
@@ -662,10 +830,12 @@ static void _test_wrong_channel(void)
 
 int main(void)
 {
+    _test_capability_prerequisites();
     _test_router();
     _test_wrong_channel();
     _test_operations();
-    _test_cancel_linearization();
+    _test_terminal_claim_precedes_cancel_confirmation();
+    _test_operation_reservation();
     _test_allowed_status_mask();
     _test_permission_list_rules();
     puts("device_link router/operation tests passed");

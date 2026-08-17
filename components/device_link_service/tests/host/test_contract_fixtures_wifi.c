@@ -37,6 +37,14 @@
  * fakes/ble_link_service_fake.c). */
 extern void ble_link_service_fake_reset(void);
 extern void connectivity_manager_fake_set_request_result(esp_err_t result);
+extern void event_bus_fake_publish(event_bus_msg_id_t msg_id,
+                                   uint32_t sub_type, const void *payload,
+                                   size_t payload_size);
+extern unsigned ble_link_service_fake_update_count(void);
+extern uint64_t ble_link_service_fake_last_owner(void);
+extern device_link_operation_state_t ble_link_service_fake_last_state(void);
+extern device_link_status_t ble_link_service_fake_last_status(void);
+extern size_t ble_link_service_fake_last_result_len(void);
 
 static device_link_status_t _call_method(
     uint8_t method_id, const uint8_t *request, size_t request_len)
@@ -147,6 +155,112 @@ static void _test_wifi_operation_result_payloads(void)
            s_wifi_result_count);
 }
 
+static void _set_terminal_failure(
+    int error, connectivity_manager_status_snapshot_t *snapshot)
+{
+    snapshot->last_error = ESP_FAIL;
+    switch ((device_link_status_t)error)
+    {
+    case DEVICE_LINK_STATUS_PERMISSION_DENIED:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION;
+        break;
+    case DEVICE_LINK_STATUS_NOT_FOUND:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+        snapshot->last_error = ESP_ERR_NOT_FOUND;
+        break;
+    case DEVICE_LINK_STATUS_CONFLICT:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+        snapshot->operation_conflict = true;
+        break;
+    case DEVICE_LINK_STATUS_UNAVAILABLE:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+        snapshot->last_error = ESP_ERR_TIMEOUT;
+        break;
+    case DEVICE_LINK_STATUS_STORAGE:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+        break;
+    case DEVICE_LINK_STATUS_INTERNAL:
+        snapshot->failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
+        break;
+    default:
+        assert(false);
+    }
+}
+
+static void _test_wifi_terminal_fixtures(void)
+{
+    unsigned expected_updates = 0U;
+
+    ble_link_service_fake_reset();
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    for (size_t i = 0U; i < s_wifi_result_count; ++i)
+    {
+        const device_link_operation_state_t expected_state =
+            (device_link_operation_state_t)s_wifi_result_state[i];
+        const device_link_status_t expected_error =
+            (device_link_status_t)s_wifi_result_error[i];
+
+        if (expected_state == DEVICE_LINK_OPERATION_SUCCEEDED)
+        {
+            assert(expected_error == DEVICE_LINK_STATUS_OK);
+            continue;
+        }
+        assert(s_wifi_result_len[i] == 0U);
+        assert(expected_state == DEVICE_LINK_OPERATION_FAILED ||
+               expected_state == DEVICE_LINK_OPERATION_CANCELED);
+        assert((expected_state == DEVICE_LINK_OPERATION_CANCELED) ==
+               (expected_error == DEVICE_LINK_STATUS_OK));
+
+        if (s_wifi_result_method[i] == WIFI_METHOD_START_SCAN)
+        {
+            connectivity_manager_scan_snapshot_t snapshot;
+
+            memset(&snapshot, 0, sizeof(snapshot));
+            snapshot.operation_id = (uint64_t)i + 1U;
+            snapshot.operation_canceled =
+                expected_state == DEVICE_LINK_OPERATION_CANCELED;
+            if (!snapshot.operation_canceled)
+            {
+                snapshot.last_error =
+                    expected_error == DEVICE_LINK_STATUS_UNAVAILABLE ?
+                    ESP_ERR_TIMEOUT : ESP_FAIL;
+            }
+            event_bus_fake_publish(
+                EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                &snapshot, sizeof(snapshot));
+        }
+        else
+        {
+            connectivity_manager_status_snapshot_t snapshot;
+
+            memset(&snapshot, 0, sizeof(snapshot));
+            snapshot.operation_id = (uint64_t)i + 1U;
+            snapshot.operation_complete = true;
+            snapshot.operation_canceled =
+                expected_state == DEVICE_LINK_OPERATION_CANCELED;
+            if (!snapshot.operation_canceled)
+            {
+                _set_terminal_failure(expected_error, &snapshot);
+            }
+            event_bus_fake_publish(
+                EVENT_BUS_ID(CONNECTIVITY_MANAGER_MSG),
+                CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                &snapshot, sizeof(snapshot));
+        }
+        expected_updates++;
+        assert(ble_link_service_fake_update_count() == expected_updates);
+        assert(ble_link_service_fake_last_owner() == (uint64_t)i + 1U);
+        assert(ble_link_service_fake_last_state() == expected_state);
+        assert(ble_link_service_fake_last_status() == expected_error);
+        assert(ble_link_service_fake_last_result_len() == 0U);
+    }
+    device_link_wifi_adapter_bridge_stop();
+    assert(expected_updates != 0U);
+    printf("wifi terminal fixtures: %u failure/cancel pairs validated\n",
+           expected_updates);
+}
+
 static void _test_wifi_golden_request(void)
 {
     /* wifi.v1 golden.json: the canonical SetCredentialsRequest (PERSONAL,
@@ -164,6 +278,7 @@ int main(void)
 {
     _test_invalid_wifi_credentials();
     _test_wifi_operation_result_payloads();
+    _test_wifi_terminal_fixtures();
     _test_wifi_golden_request();
     puts("contract_fixtures_wifi: all wifi fixture vectors passed");
     return 0;

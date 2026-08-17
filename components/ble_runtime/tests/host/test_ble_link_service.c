@@ -14,6 +14,7 @@
 #include "ble_link_reassembler.h"
 #include "ble_link_service.h"
 #include "ble_link_session.h"
+#include "ble_link_state.h"
 
 #include "esp_random.h"
 
@@ -1069,6 +1070,7 @@ static void test_typed_tlv_manifest_request(void)
     bool security_seen = false;
     bool protocol_seen = false;
     bool profile_seen = false;
+    uint32_t security_field_mask = 0U;
 
     _reset();
     _feed_single_channel(request, sizeof(request),
@@ -1125,8 +1127,8 @@ static void test_typed_tlv_manifest_request(void)
             }
             /* Field 1 is the protocol version, field 2 the independent
              * profile version: the encoder must never reuse the protocol
-             * buffer for the profile (both are 2.0 today, so the constant
-             * comparison pins the source, not just the value). */
+             * buffer for the profile. Core 2.1 and profile 2.0 deliberately
+             * differ, so this also catches accidental source reuse. */
             if (field.id == 1U)
             {
                 protocol_seen = true;
@@ -1154,18 +1156,159 @@ static void test_typed_tlv_manifest_request(void)
                         &nested, &nested_field, &nested_has) == ESP_OK &&
                     nested_has)
             {
-                if (nested_field.id == 2U)
+                uint64_t expected = 0U;
+
+                switch (nested_field.id)
                 {
-                    TEST_ASSERT_EQUAL(32U,
-                                      nested_field.value.unsigned_value);
+                case 1U:
+                    expected =
+                        DEVICE_LINK_SECURITY_SECURE_CONNECTIONS_ONLY;
                     break;
+                case 2U:
+                    expected = DEVICE_LINK_SECURITY_ENCRYPTION_KEY_BYTES;
+                    break;
+                case 3U:
+                    expected = DEVICE_LINK_SECURITY_MAXIMUM_BONDS;
+                    break;
+                case 4U:
+                    expected = DEVICE_LINK_SECURITY_PROTOCOMM_VERSION;
+                    break;
+                case 5U:
+                    expected =
+                        DEVICE_LINK_SECURITY_PROTOCOMM_PATCH_VERSION;
+                    break;
+                case 6U:
+                    expected =
+                        DEVICE_LINK_SECURITY_LOCAL_CONFIRMATION_FOR_GRANTS;
+                    break;
+                case 7U:
+                    expected = DEVICE_LINK_SECURITY_QR_BOOTSTRAP_USES_POP;
+                    break;
+                case 8U:
+                    expected =
+                        DEVICE_LINK_SECURITY_PUBLIC_BOOTSTRAP_USES_SC_CONFIRMATION;
+                    break;
+                default:
+                    TEST_ASSERT_TRUE(false);
                 }
+                TEST_ASSERT_EQUAL(expected,
+                                  nested_field.value.unsigned_value);
+                security_field_mask |= UINT32_C(1) << nested_field.id;
             }
         }
     }
     TEST_ASSERT_TRUE(security_seen);
+    TEST_ASSERT_EQUAL(UINT32_C(0x1fe), security_field_mask);
     TEST_ASSERT_TRUE(protocol_seen);
     TEST_ASSERT_TRUE(profile_seen);
+}
+
+static void test_typed_tlv_manifest_capability_prerequisites(void)
+{
+    static const uint8_t request[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x01U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+    };
+    static const device_link_tlv_schema_t empty_schema =
+    {
+        .fields = NULL,
+        .field_count = 0U,
+        .maximum_encoded_bytes = 0U,
+    };
+    static const device_link_method_descriptor_t method =
+    {
+        .method_id = 1U,
+        .channel = DEVICE_LINK_CHANNEL_SESSION,
+        .permission_id = DEVICE_LINK_PERMISSION_WIFI_READ,
+        .maximum_request_bytes = 0U,
+        .maximum_response_bytes = 0U,
+        .request_schema = &empty_schema,
+        .response_schema = &empty_schema,
+        .response_body_status_mask = DEVICE_LINK_STATUS_MASK(
+            DEVICE_LINK_STATUS_OK),
+        .allowed_statuses_mask = DEVICE_LINK_STATUS_MASK(
+            DEVICE_LINK_STATUS_OK),
+        .handler = _empty_scan_handler,
+    };
+    static const uint8_t prerequisites[] = {1U, 127U};
+    static const device_link_domain_descriptor_t domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U,
+        .minor = 0U,
+        .methods = &method,
+        .method_count = 1U,
+        .capability_prerequisite_ids = prerequisites,
+        .capability_prerequisite_count = 2U,
+    };
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    bool wifi_seen = false;
+
+    _clear_capture();
+    s_auto_confirm = true;
+    s_next_frame_id = 1U;
+    ble_link_service_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_set_domain_descriptors(
+                          &domain, 1U));
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
+    ble_link_events_init();
+    _establish_session();
+    _set_facts(true, true, true);
+    (void)device_link_security_init(&s_sec_config);
+    _feed_single_channel(request, sizeof(request),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                          &reader,
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
+                                      DEVICE_LINK_RESPONSE_STATUS_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES -
+                          DEVICE_LINK_RESPONSE_STATUS_BYTES));
+    while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
+            ESP_OK && has_field)
+    {
+        if (field.id != 5U)
+        {
+            continue;
+        }
+        device_link_tlv_reader_t nested;
+        device_link_tlv_field_t nested_field;
+        bool nested_has = false;
+        uint64_t domain_id = UINT64_MAX;
+        uint64_t capability_ids[4] = {0U};
+        size_t capability_count = 0U;
+
+        TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                              &nested, field.value.bytes.data,
+                              field.value.bytes.len));
+        while (device_link_tlv_reader_next(
+                    &nested, &nested_field, &nested_has) == ESP_OK &&
+                nested_has)
+        {
+            if (nested_field.id == 1U)
+            {
+                domain_id = nested_field.value.unsigned_value;
+            }
+            else if (nested_field.id == 5U)
+            {
+                TEST_ASSERT_TRUE(capability_count < 4U);
+                capability_ids[capability_count++] =
+                    nested_field.value.unsigned_value;
+            }
+        }
+        if (domain_id == DEVICE_LINK_DOMAIN_WIFI)
+        {
+            TEST_ASSERT_EQUAL(2U, capability_count);
+            TEST_ASSERT_EQUAL(1U, capability_ids[0]);
+            TEST_ASSERT_EQUAL(127U, capability_ids[1]);
+            wifi_seen = true;
+        }
+    }
+    TEST_ASSERT_TRUE(wifi_seen);
 }
 
 static void test_typed_tlv_snapshot_has_fixed_link_state(void)
@@ -1406,112 +1549,66 @@ static void test_v2_snapshot_includes_operation_summaries(void)
     TEST_ASSERT_TRUE(!has_field);
 }
 
-static void test_async_defer_completion_merges_on_admission(void)
+static void test_async_reservation_commits_owner_atomically(void)
 {
-    /* A completion bridge event may beat the Core v2 table admission on
-     * SMP. The deferred terminal is retained briefly and merged into the
-     * freshly admitted record, so the slot reaches a terminal state
-     * instead of leaking as an eternal PENDING record. */
     static const uint8_t result_payload[] = {0x04U, 0x2aU};
     uint64_t operation_id = 0U;
     device_link_operation_t record;
 
     _reset();
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_reserve(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U,
+                          &operation_id));
+    TEST_ASSERT_TRUE(operation_id != 0U);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_test_copy_operation(
+                          operation_id, &record));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_commit(
+                          operation_id, 0x2000U, NULL, NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                          operation_id, &record));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
+    TEST_ASSERT_EQUAL(0x2000U, record.owner_id);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
                           0x2000U, DEVICE_LINK_OPERATION_SUCCEEDED,
                           DEVICE_LINK_STATUS_OK, result_payload,
                           sizeof(result_payload)));
-    TEST_ASSERT_TRUE(!ble_link_service_async_operation_in_flight(
-                         DEVICE_LINK_DOMAIN_WIFI));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2000U, NULL, NULL,
-                          &operation_id));
-    TEST_ASSERT_TRUE(operation_id != 0U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
                           operation_id, &record));
     TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_SUCCEEDED, record.state);
-    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, record.status);
     TEST_ASSERT_EQUAL(sizeof(result_payload), record.result_len);
-    TEST_ASSERT_EQUAL(0, memcmp(record.result, result_payload,
-                                sizeof(result_payload)));
-
-    /* A second admission for a different owner must not consume the
-     * already-merged terminal. */
-    uint64_t fresh_id = 0U;
-
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2001U, NULL, NULL,
-                          &fresh_id));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
-                          fresh_id, &record));
-    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
 }
 
-static void test_async_defer_schema_mismatch_fails_terminal(void)
+static void test_async_reservation_abort_releases_slot(void)
 {
-    /* The bridge validates terminal shape before admission, while the
-     * operation table validates the method-specific result schema. If a
-     * retained payload violates that schema, admission still owns a valid
-     * operation id and must publish FAILED/INTERNAL instead of leaving it
-     * permanently PENDING. */
-    static const uint8_t malformed_payload[] = {0x08U, 0x2aU};
     uint64_t operation_id = 0U;
+    uint64_t next_operation_id = 0U;
     device_link_operation_t record;
 
     _reset();
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
-                          0x2100U, DEVICE_LINK_OPERATION_SUCCEEDED,
-                          DEVICE_LINK_STATUS_OK, malformed_payload,
-                          sizeof(malformed_payload)));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2100U, NULL, NULL,
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_reserve(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U,
                           &operation_id));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_async_operation_reserve(
+                          DEVICE_LINK_DOMAIN_INVALID, 4U,
+                          &next_operation_id));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_async_operation_abort(operation_id));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
+                      ble_link_service_test_copy_operation(
                           operation_id, &record));
-    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_FAILED, record.state);
-    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_INTERNAL, record.status);
-    TEST_ASSERT_EQUAL(0U, record.result_len);
-}
-
-static void test_async_defer_completion_expires(void)
-{
-    uint64_t operation_id = 0U;
-    device_link_operation_t record;
-
-    _reset();
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
-                          0x3000U, DEVICE_LINK_OPERATION_SUCCEEDED,
-                          DEVICE_LINK_STATUS_OK, NULL, 0U));
-    /* The deferred window is 1000 ms; a later admission starts PENDING.
-     * The host FreeRTOS shim caps vTaskDelay at 1 ms, so sleep against the
-     * real monotonic clock that backs xTaskGetTickCount(). */
-    const struct timespec sleep_1100ms = { .tv_sec = 1, .tv_nsec = 100000000L };
-
-    TEST_ASSERT_EQUAL(0, nanosleep(&sleep_1100ms, NULL));
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x3000U, NULL, NULL,
-                          &operation_id));
-    TEST_ASSERT_TRUE(operation_id != 0U);
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
-                          operation_id, &record));
-    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
-}
-
-static void test_async_defer_completion_rejects_invalid(void)
-{
-    _reset();
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      ble_link_service_async_operation_defer_update(
-                          0x3100U, DEVICE_LINK_OPERATION_FAILED,
-                          DEVICE_LINK_STATUS_OK, NULL, 0U));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      ble_link_service_async_operation_defer_update(
-                          0x3100U, DEVICE_LINK_OPERATION_SUCCEEDED,
-                          DEVICE_LINK_STATUS_OK, NULL, 1U));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      ble_link_service_async_operation_defer_update(
-                          0x3100U, DEVICE_LINK_OPERATION_CANCELED,
-                          DEVICE_LINK_STATUS_STORAGE, NULL, 0U));
+                      ble_link_service_async_operation_reserve(
+                          DEVICE_LINK_DOMAIN_INVALID, 4U,
+                          &next_operation_id));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_reserve(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U,
+                          &next_operation_id));
+    TEST_ASSERT_TRUE(next_operation_id != operation_id);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_service_async_operation_abort(
+                          next_operation_id));
 }
 
 typedef struct operation_race_thread_arg
@@ -2263,6 +2360,94 @@ static void test_authorize_prepare_rejects_unregistered_permissions(void)
                               &status));
         TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_OK, status);
     }
+}
+
+static void test_authorize_prepare_sensitive_replay_lifetime(void)
+{
+    static const uint8_t prepare[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x03U,
+        0x01U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x04U, 0x01U,
+    };
+    static const uint8_t manifest[] =
+    {
+        0x14U, 0x00U, 0x02U, 0x01U,
+        0x02U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+    };
+    uint8_t first_response[512];
+    size_t first_response_len = 0U;
+    device_link_tlv_reader_t reader;
+    device_link_tlv_field_t field;
+    bool has_field = false;
+    bool password_seen = false;
+
+    _reset();
+    esp_random_fake_reset(0x5eed5eedU);
+    _feed_single_channel(prepare, sizeof(prepare),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_TRUE(s_outbound_len <= sizeof(first_response));
+    memcpy(first_response, s_outbound, s_outbound_len);
+    first_response_len = s_outbound_len;
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_reader_init(
+                          &reader,
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES +
+                                      DEVICE_LINK_RESPONSE_STATUS_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES -
+                          DEVICE_LINK_RESPONSE_STATUS_BYTES));
+    while (device_link_tlv_reader_next(&reader, &field, &has_field) ==
+            ESP_OK && has_field)
+    {
+        if (field.id == 3U)
+        {
+            TEST_ASSERT_EQUAL(DEVICE_LINK_TLV_LENGTH, field.wire_type);
+            TEST_ASSERT_EQUAL(16U, field.value.bytes.len);
+            password_seen = true;
+        }
+    }
+    TEST_ASSERT_TRUE(password_seen);
+    TEST_ASSERT_TRUE((ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_TRANSITIONING) != 0U);
+
+    _clear_capture();
+    _feed_single_channel(prepare, sizeof(prepare),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_EQUAL(first_response_len, s_outbound_len);
+    TEST_ASSERT_EQUAL(0, memcmp(first_response, s_outbound,
+                                first_response_len));
+
+    _clear_capture();
+    _feed_single_channel(manifest, sizeof(manifest),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    _clear_capture();
+    _feed_single_channel(prepare, sizeof(prepare),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    device_link_status_t status = DEVICE_LINK_STATUS_OK;
+
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_wire_decode_status(
+                          &s_outbound[DEVICE_LINK_WIRE_HEADER_BYTES],
+                          s_outbound_len - DEVICE_LINK_WIRE_HEADER_BYTES,
+                          &status));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_CONFLICT, status);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_WIRE_HEADER_BYTES +
+                      DEVICE_LINK_RESPONSE_STATUS_BYTES, s_outbound_len);
+
+    ble_link_service_abort_transactions();
+    TEST_ASSERT_TRUE((ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_TRANSITIONING) == 0U);
+    _clear_capture();
+    _feed_single_channel(prepare, sizeof(prepare),
+                         BLE_LINK_SERVICE_RX_SESSION);
+    _reassemble_captured();
+    TEST_ASSERT_TRUE(s_outbound_len == first_response_len);
+    TEST_ASSERT_TRUE(memcmp(first_response, s_outbound,
+                            first_response_len) != 0);
 }
 
 static void test_authorize_flow(void)
@@ -4421,10 +4606,8 @@ int main(void)
     test_get_authorization_requires_recovery_flag();
     test_prepare_retires_previous_transaction();
     test_v2_snapshot_includes_operation_summaries();
-    test_async_defer_completion_merges_on_admission();
-    test_async_defer_schema_mismatch_fails_terminal();
-    test_async_defer_completion_expires();
-    test_async_defer_completion_rejects_invalid();
+    test_async_reservation_commits_owner_atomically();
+    test_async_reservation_abort_releases_slot();
     test_operation_table_reads_are_synchronized();
     test_v2_get_authorization_without_recovery_malformed();
     test_authorize_expiry_clears_transaction();
@@ -4435,6 +4618,7 @@ int main(void)
     test_manifest_request();
     test_manifest_response_bytes();
     test_typed_tlv_manifest_request();
+    test_typed_tlv_manifest_capability_prerequisites();
     test_typed_tlv_snapshot_has_fixed_link_state();
     test_operation_declared_empty_result_never_encoded();
     test_v2_get_operation_large_result_emits_fully();
@@ -4461,6 +4645,7 @@ int main(void)
     test_one_transaction_at_a_time();
     test_authorize_prepare_produces_transaction();
     test_authorize_prepare_rejects_unregistered_permissions();
+    test_authorize_prepare_sensitive_replay_lifetime();
     test_session_channel_reassembly();
     test_low_mtu_multi_fragment();
     test_idle_timeout_clears_state();

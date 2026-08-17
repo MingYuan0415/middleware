@@ -97,9 +97,26 @@ esp_err_t device_link_domain_descriptors_validate(
         if (domain->domain_id == DEVICE_LINK_DOMAIN_INVALID ||
                 domain->major == 0U || domain->methods == NULL ||
                 domain->method_count == 0U ||
+                domain->capability_prerequisite_count > 4U ||
+                ((domain->capability_prerequisite_ids == NULL) !=
+                 (domain->capability_prerequisite_count == 0U)) ||
                 (i > 0U && domains[i - 1U].domain_id >= domain->domain_id))
         {
             return ESP_ERR_INVALID_ARG;
+        }
+        for (size_t j = 0U;
+                j < domain->capability_prerequisite_count; ++j)
+        {
+            const uint8_t capability_id =
+                domain->capability_prerequisite_ids[j];
+
+            if (capability_id == 0U || capability_id > 127U ||
+                    (j > 0U &&
+                     domain->capability_prerequisite_ids[j - 1U] >=
+                     capability_id))
+            {
+                return ESP_ERR_INVALID_ARG;
+            }
         }
         for (size_t j = 0U; j < domain->method_count; ++j)
         {
@@ -489,6 +506,12 @@ esp_err_t device_link_router_process(
     {
         return result;
     }
+    /* A distinct request retires the previous response for this Security2
+     * epoch before any handler observes or produces sensitive material.
+     * Exact retransmission remains available only until this point. */
+    const size_t slot_index = _select_replay_slot(router, facts);
+
+    device_link_call_replay_reset(&router->replay[slot_index]);
     const size_t channel_limit =
         facts->channel == DEVICE_LINK_CHANNEL_SESSION ?
         DEVICE_LINK_MAX_SESSION_MESSAGE_BYTES :
@@ -545,8 +568,6 @@ esp_err_t device_link_router_process(
     {
         const size_t prefix = DEVICE_LINK_WIRE_HEADER_BYTES +
                               DEVICE_LINK_RESPONSE_STATUS_BYTES;
-        const size_t slot_index = _select_replay_slot(router, facts);
-
         if (response_capacity < prefix ||
                 router->replay[slot_index].response_capacity < prefix)
         {
@@ -636,7 +657,6 @@ esp_err_t device_link_router_process(
     {
         return result;
     }
-    const size_t slot_index = _select_replay_slot(router, facts);
     device_link_call_replay_t *replay = &router->replay[slot_index];
     if (*response_len > replay->response_capacity)
     {

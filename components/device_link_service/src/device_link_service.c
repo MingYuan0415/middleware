@@ -1873,14 +1873,14 @@ static esp_err_t _device_link_service_acquire_slow_lease(void);
  * The compile-time capability gate is the only publish decision: a product
  * that has not completed the Wi-Fi on-device matrix keeps the domain out
  * of the Manifest (fail closed). Registration is idempotent for the boot; a
- * failed registration is logged and leaves the Manifest without the Wi-Fi
- * domain rather than failing the runtime start.
+ * failed registration blocks runtime startup so an advertised product can
+ * never silently publish a Core-only Manifest.
  */
-static void _device_link_service_register_wifi_domain(void)
+static esp_err_t _device_link_service_register_wifi_domain(void)
 {
     if (s_service.wifi_domain_registered)
     {
-        return;
+        return ESP_OK;
     }
     /* Explicit capability gate: the Wi-Fi domain is published only when
      * the product enables it. Connectivity readiness is deliberately NOT a
@@ -1888,7 +1888,7 @@ static void _device_link_service_register_wifi_domain(void)
      * domain stays static for the boot. */
 #if !CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
     LOG_I("wifi domain not advertised (capability gate closed)");
-    return;
+    return ESP_OK;
 #endif
     const device_link_domain_descriptor_t *descriptor = NULL;
     esp_err_t result = device_link_wifi_adapter_get_descriptor(&descriptor);
@@ -1899,11 +1899,12 @@ static void _device_link_service_register_wifi_domain(void)
     }
     if (result != ESP_OK)
     {
-        LOG_W("wifi domain registration failed result=%d", result);
-        return;
+        LOG_E("wifi domain registration failed result=%d", result);
+        return result;
     }
     s_service.wifi_domain_registered = true;
     LOG_I("wifi domain registered");
+    return ESP_OK;
 }
 
 static esp_err_t _device_link_service_runtime_start(void)
@@ -1914,10 +1915,15 @@ static esp_err_t _device_link_service_runtime_start(void)
     }
     /* The Wi-Fi domain must be frozen into the router before the GATT
      * service initializes the link service (boot_id is still zero). */
-    _device_link_service_register_wifi_domain();
+    esp_err_t result = _device_link_service_register_wifi_domain();
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     memset(&s_service.runtime_config, 0, sizeof(s_service.runtime_config));
     s_service.runtime_config.port = s_service.config.runtime_port;
-    esp_err_t result = ble_runtime_init(&s_service.runtime_config);
+    result = ble_runtime_init(&s_service.runtime_config);
 
     s_service.runtime_initialized = result == ESP_OK;
     if (result != ESP_OK)
@@ -2330,7 +2336,7 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         /* The Wi-Fi domain must be frozen into the router before the GATT
          * service initializes the link service (boot_id is still zero).
          * Startup and the runtime_start path share this registration. */
-        _device_link_service_register_wifi_domain();
+        result = _device_link_service_register_wifi_domain();
     }
     if (result == ESP_OK && s_service.bluetooth_enabled)
     {

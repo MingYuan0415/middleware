@@ -38,6 +38,7 @@ esp_err_t device_link_operation_find_by_owner(
         const device_link_operation_t *operation = &table->slots[i];
 
         if (operation->id != 0U && operation->owner_id == owner_id &&
+                !operation->reserved &&
                 !_terminal(operation->state))
         {
             *out = *operation;
@@ -99,9 +100,46 @@ esp_err_t device_link_operation_start_with_schema(
     device_link_operation_cancel_t cancel, void *cancel_arg,
     uint64_t *operation_id)
 {
+    if (operation_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *operation_id = 0U;
+    if (owner_id == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = device_link_operation_reserve(
+                           table, now_ms, domain_id, method_id,
+                           result_schema, operation_id);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    result = device_link_operation_commit(
+                 table, *operation_id, owner_id, cancel, cancel_arg);
+    if (result != ESP_OK)
+    {
+        (void)device_link_operation_abort(table, *operation_id);
+        *operation_id = 0U;
+    }
+    return result;
+}
+
+esp_err_t device_link_operation_reserve(
+    device_link_operation_table_t *table, uint64_t now_ms,
+    uint8_t domain_id, uint8_t method_id,
+    const device_link_tlv_schema_t *result_schema,
+    uint64_t *operation_id)
+{
+    if (operation_id == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *operation_id = 0U;
     if (table == NULL || table->boot_id == 0U ||
-            domain_id == DEVICE_LINK_DOMAIN_INVALID || method_id == 0U ||
-            owner_id == 0U || operation_id == NULL)
+            domain_id == DEVICE_LINK_DOMAIN_INVALID || method_id == 0U)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -122,15 +160,60 @@ esp_err_t device_link_operation_start_with_schema(
     }
     memset(slot, 0, sizeof(*slot));
     slot->id = table->next_id++;
-    slot->owner_id = owner_id;
     slot->domain_id = domain_id;
     slot->method_id = method_id;
     slot->state = DEVICE_LINK_OPERATION_PENDING;
     slot->status = DEVICE_LINK_STATUS_OK;
     slot->result_schema = result_schema;
-    slot->cancel = cancel;
-    slot->cancel_arg = cancel_arg;
+    slot->reserved = true;
     *operation_id = slot->id;
+    return ESP_OK;
+}
+
+esp_err_t device_link_operation_commit(
+    device_link_operation_table_t *table, uint64_t operation_id,
+    uint64_t owner_id, device_link_operation_cancel_t cancel,
+    void *cancel_arg)
+{
+    if (table == NULL || operation_id == 0U || owner_id == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    device_link_operation_t *operation = _find(table, operation_id);
+
+    if (operation == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!operation->reserved)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    operation->owner_id = owner_id;
+    operation->cancel = cancel;
+    operation->cancel_arg = cancel_arg;
+    operation->reserved = false;
+    return ESP_OK;
+}
+
+esp_err_t device_link_operation_abort(
+    device_link_operation_table_t *table, uint64_t operation_id)
+{
+    if (table == NULL || operation_id == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    device_link_operation_t *operation = _find(table, operation_id);
+
+    if (operation == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!operation->reserved)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memset(operation, 0, sizeof(*operation));
     return ESP_OK;
 }
 
@@ -177,20 +260,11 @@ esp_err_t device_link_operation_update(
     {
         return ESP_ERR_NOT_FOUND;
     }
-    if (_terminal(operation->state) ||
+    if (operation->reserved || _terminal(operation->state) ||
             (operation->state == DEVICE_LINK_OPERATION_RUNNING &&
              state == DEVICE_LINK_OPERATION_PENDING))
     {
         return ESP_ERR_INVALID_STATE;
-    }
-    if (operation->cancel_requested && _terminal(state) &&
-            !(state == DEVICE_LINK_OPERATION_FAILED &&
-              status == DEVICE_LINK_STATUS_UNAVAILABLE))
-    {
-        state = DEVICE_LINK_OPERATION_CANCELED;
-        status = DEVICE_LINK_STATUS_OK;
-        result = NULL;
-        result_len = 0U;
     }
     if (state == DEVICE_LINK_OPERATION_SUCCEEDED)
     {
@@ -233,7 +307,7 @@ esp_err_t device_link_operation_get(
     device_link_operation_sweep(table, now_ms);
     device_link_operation_t *found = _find(table, operation_id);
 
-    if (found == NULL)
+    if (found == NULL || found->reserved)
     {
         return ESP_ERR_NOT_FOUND;
     }
@@ -253,6 +327,10 @@ esp_err_t device_link_operation_cancel(
     device_link_operation_t *operation = _find(table, operation_id);
 
     if (operation == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (operation->reserved)
     {
         return ESP_ERR_NOT_FOUND;
     }
@@ -278,8 +356,11 @@ esp_err_t device_link_operation_cancel(
 
     if (result != ESP_OK)
     {
-        operation->cancel_requested = false;
-        return result;
+        operation->state = DEVICE_LINK_OPERATION_FAILED;
+        operation->status = DEVICE_LINK_STATUS_UNAVAILABLE;
+        operation->terminal_at_ms = now_ms;
+        operation->result_len = 0U;
+        memset(operation->result, 0, sizeof(operation->result));
     }
     return ESP_OK;
 }

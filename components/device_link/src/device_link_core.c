@@ -176,10 +176,17 @@ static const device_link_tlv_field_rule_t s_domain_descriptor_fields[] =
         .flags = DEVICE_LINK_TLV_RULE_REPEATED | DEVICE_LINK_TLV_RULE_MESSAGE,
         .maximum_count = 12U, .nested = &s_method_descriptor_schema
     },
+    {
+        .id = 5U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+        .flags = DEVICE_LINK_TLV_RULE_REPEATED |
+        DEVICE_LINK_TLV_RULE_UNIQUE | DEVICE_LINK_TLV_RULE_SORTED,
+        .maximum_count = 4U, .minimum_unsigned = 1U,
+        .maximum_unsigned = 127U
+    },
 };
 static const device_link_tlv_schema_t s_domain_descriptor_schema =
 {
-    .fields = s_domain_descriptor_fields, .field_count = 4U,
+    .fields = s_domain_descriptor_fields, .field_count = 5U,
     .maximum_encoded_bytes = 768U,
 };
 

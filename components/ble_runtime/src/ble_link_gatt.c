@@ -312,8 +312,10 @@ static int _ble_link_gatt_read_link_state(
     ble_link_service_facts_t facts;
 
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     if (_ble_link_gatt_service_facts(&facts) != ESP_OK)
     {
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
@@ -593,8 +595,10 @@ esp_err_t ble_link_gatt_refresh_link_state(void)
     }
     config = s_gatt.config;
     memset(&state, 0, sizeof(state));
-    state.protocol_major = 2U;
-    state.profile_major = 2U;
+    state.protocol_major = BLE_LINK_STATE_PROTOCOL_MAJOR;
+    state.protocol_minor = BLE_LINK_STATE_PROTOCOL_MINOR;
+    state.profile_major = BLE_LINK_STATE_PROFILE_MAJOR;
+    state.profile_minor = BLE_LINK_STATE_PROFILE_MINOR;
     state.boot_id = facts.active_boot_id;
     state.state_flags = ble_link_session_get_state_flags();
     if (ble_link_state_encode(&state, value, sizeof(value), &len) != ESP_OK)

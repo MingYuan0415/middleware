@@ -764,32 +764,43 @@ exit:
 }
 
 esp_err_t wifi_service_cancel(wifi_service_session_id_t session_id,
-                              wifi_service_operation_id_t operation_id)
+                              wifi_service_operation_id_t operation_id,
+                              wifi_service_cancel_disposition_t
+                              *out_disposition)
 {
-    esp_err_t result = ESP_ERR_INVALID_ARG;
+    esp_err_t result = ESP_OK;
     bool state_owned = false;
-    if (session_id == 0 || operation_id == 0 ||
-            atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
+    if (out_disposition == NULL)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    *out_disposition = WIFI_SERVICE_CANCEL_FAILURE;
+    if (session_id == 0 || operation_id == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (atomic_load(&g_wifi_service.core_state) != WIFI_CORE_READY)
+    {
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     state_owned = true;
     if (g_wifi_service.claimed_session == session_id &&
             g_wifi_service.claimed_operation == operation_id)
     {
-        result = ESP_ERR_NOT_FOUND;
+        *out_disposition =
+            WIFI_SERVICE_CANCEL_TERMINAL_ALREADY_CLAIMED;
         goto exit;
     }
     if (g_wifi_service.current_session != session_id ||
             g_wifi_service.current_operation != operation_id)
     {
-        result = ESP_ERR_NOT_FOUND;
+        *out_disposition = WIFI_SERVICE_CANCEL_NOT_FOUND;
         goto exit;
     }
     g_wifi_service.cancel_session = session_id;
     g_wifi_service.cancel_operation = operation_id;
-    result = ESP_OK;
+    *out_disposition = WIFI_SERVICE_CANCEL_ACCEPTED;
 
 exit:
     if (state_owned)

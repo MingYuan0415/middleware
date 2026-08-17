@@ -587,29 +587,35 @@ static esp_err_t _wifi_operation_cancel(uint64_t owner_id, void *arg)
  * operation identity.
  */
 static device_link_status_t _admit_async_operation(
-    uint8_t method_id, esp_err_t manager_result,
+    uint8_t method_id, uint64_t table_operation_id, esp_err_t manager_result,
     connectivity_manager_operation_id_t manager_operation_id,
     uint8_t *response, size_t response_capacity, size_t *response_len)
 {
     if (manager_result != ESP_OK)
     {
+        const esp_err_t abort_result =
+            ble_link_service_async_operation_abort(table_operation_id);
+
+        if (abort_result != ESP_OK)
+        {
+            LOG_E("operation reservation abort failed result=%d",
+                  abort_result);
+            return DEVICE_LINK_STATUS_INTERNAL;
+        }
         return _encode_operation(method_id, manager_result, 0U, response,
                                  response_capacity, response_len);
     }
-    uint64_t table_operation_id = 0U;
-    const esp_err_t admit_result = ble_link_service_async_operation_start(
-                                       DEVICE_LINK_DOMAIN_WIFI, method_id,
+    const esp_err_t admit_result = ble_link_service_async_operation_commit(
+                                       table_operation_id,
                                        (uint64_t)manager_operation_id,
-                                       _wifi_operation_cancel, NULL,
-                                       &table_operation_id);
+                                       _wifi_operation_cancel, NULL);
 
     if (admit_result != ESP_OK)
     {
-        /* The manager admitted the work but the Core table is full or
-         * unavailable: cancel the manager side and report exhaustion. */
+        /* Commit failure is an internal invariant after a successful
+         * reservation. The commit path has already aborted and unlocked. */
         (void)connectivity_manager_cancel(manager_operation_id);
-        return _encode_operation(method_id, ESP_ERR_NO_MEM, 0U, response,
-                                 response_capacity, response_len);
+        return DEVICE_LINK_STATUS_INTERNAL;
     }
     return _encode_operation(method_id, ESP_OK, table_operation_id,
                              response, response_capacity, response_len);
@@ -673,8 +679,19 @@ static device_link_status_t _wifi_handler(
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
         (void)force_refresh;
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_request_scan(&operation_id);
-        return _admit_async_operation(method, result, operation_id,
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id,
                                       response, response_capacity,
                                       response_len);
     }
@@ -886,9 +903,20 @@ static device_link_status_t _wifi_handler(
             .password_length = password_len,
             .security = manager_security,
         };
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_request_sync_profile(
                      &credentials, sync_id, auto_connect, &operation_id);
-        return _admit_async_operation(method, result, operation_id,
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id,
                                       response, response_capacity,
                                       response_len);
     }
@@ -898,7 +926,20 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_request_disconnect(&operation_id);
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id, response,
+                                      response_capacity, response_len);
     }
     else if (method == WIFI_METHOD_RECONNECT_SAVED)
     {
@@ -906,7 +947,20 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_request_reconnect_saved(&operation_id);
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id, response,
+                                      response_capacity, response_len);
     }
     else if (method == WIFI_METHOD_FORGET_SAVED)
     {
@@ -914,7 +968,20 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_request_forget(&operation_id);
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id, response,
+                                      response_capacity, response_len);
     }
     else if (method == WIFI_METHOD_SET_AUTO_CONNECT)
     {
@@ -924,15 +991,26 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
+        uint64_t table_operation_id = 0U;
+        const esp_err_t reserve_result =
+            ble_link_service_async_operation_reserve(
+                DEVICE_LINK_DOMAIN_WIFI, method, &table_operation_id);
+
+        if (reserve_result != ESP_OK)
+        {
+            return _encode_operation(method, reserve_result, 0U, response,
+                                     response_capacity, response_len);
+        }
         result = connectivity_manager_set_auto_connect(enabled, &operation_id);
+        return _admit_async_operation(method, table_operation_id, result,
+                                      operation_id, response,
+                                      response_capacity, response_len);
     }
     else
     {
         return DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION;
     }
-    return _admit_async_operation(method, result, operation_id,
-                                  response, response_capacity,
-                                  response_len);
+    return DEVICE_LINK_STATUS_UNSUPPORTED_OPERATION;
 }
 
 static const device_link_method_descriptor_t s_methods[] =
@@ -1068,6 +1146,15 @@ static const device_link_domain_descriptor_t s_descriptor =
     .method_count = sizeof(s_methods) / sizeof(s_methods[0]),
 };
 
+#ifdef UNIT_TEST_HOST
+static esp_err_t s_descriptor_result = ESP_OK;
+
+void device_link_wifi_adapter_test_set_descriptor_result(esp_err_t result)
+{
+    s_descriptor_result = result;
+}
+#endif
+
 esp_err_t device_link_wifi_adapter_get_descriptor(
     const device_link_domain_descriptor_t **descriptor)
 {
@@ -1075,6 +1162,13 @@ esp_err_t device_link_wifi_adapter_get_descriptor(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    *descriptor = NULL;
+#ifdef UNIT_TEST_HOST
+    if (s_descriptor_result != ESP_OK)
+    {
+        return s_descriptor_result;
+    }
+#endif
     *descriptor = &s_descriptor;
     return ESP_OK;
 }
@@ -1192,21 +1286,7 @@ static void _bridge_update_status(
                                         snapshot->operation_id, state, status,
                                         result, result_len);
 
-    if (update_result == ESP_ERR_NOT_FOUND)
-    {
-        /* The manager terminal arrived before the Core v2 table admission:
-         * retain it briefly; async_operation_start merges it into the
-         * freshly admitted record. */
-        const esp_err_t defer_result =
-            ble_link_service_async_operation_defer_update(
-                snapshot->operation_id, state, status, result, result_len);
-
-        if (defer_result != ESP_OK)
-        {
-            LOG_W("operation bridge defer failed result=%d", defer_result);
-        }
-    }
-    else if (update_result != ESP_OK)
+    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
     {
         LOG_W("operation bridge update failed result=%d", update_result);
     }
@@ -1228,18 +1308,7 @@ static void _bridge_update_scan(
                                         snapshot->operation_id, state, status,
                                         NULL, 0U);
 
-    if (update_result == ESP_ERR_NOT_FOUND)
-    {
-        const esp_err_t defer_result =
-            ble_link_service_async_operation_defer_update(
-                snapshot->operation_id, state, status, NULL, 0U);
-
-        if (defer_result != ESP_OK)
-        {
-            LOG_W("scan bridge defer failed result=%d", defer_result);
-        }
-    }
-    else if (update_result != ESP_OK)
+    if (update_result != ESP_OK && update_result != ESP_ERR_NOT_FOUND)
     {
         LOG_W("scan bridge update failed result=%d", update_result);
     }

@@ -161,8 +161,8 @@ ctest --test-dir /tmp/mt-device-link-service --output-on-failure
 三套 sanitizer 选项均接受 `address` 或 `thread`。`ble_runtime` 套件还执行固定
 ESP-IDF v6.0.2 内部假设检查；失败时必须审查 NimBLE pairing/store/host-event 时序。
 该基线的 Security2 失败输出不会清零，普通检查确认适配假设但保留生产安全 blocker；发布
-检查设置 `DEVICE_LINK_REQUIRE_SECURITY_RELEASE=1`，在候选 IDF 通过 ownership、清零和完整
-BLE matrix 前必须失败。
+流程调用 `cmake --build <ble-runtime-build> --target device_link_security_release`，该目标设置
+严格 release gate，在候选 IDF 通过 ownership、清零和完整 BLE matrix 前必须失败。
 
 运行恢复出厂 journal 的持久化、故障注入和断电恢复套件：
 

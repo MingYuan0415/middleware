@@ -3,6 +3,7 @@
 #include "mt_log.h"
 
 #include "connectivity_manager.h"
+#include "connectivity_manager_digest.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -35,8 +36,10 @@
 #define CONNECTIVITY_MANAGER_POLL_MS        20U
 #define CONNECTIVITY_MANAGER_PROFILE_KEY    "wifi_profile"
 #define CONNECTIVITY_MANAGER_PROFILE_MAGIC  UINT32_C(0x57465031)
-#define CONNECTIVITY_MANAGER_PROFILE_VERSION UINT16_C(2)
-#define CONNECTIVITY_MANAGER_LEGACY_PROFILE_VERSION UINT16_C(1)
+#define CONNECTIVITY_MANAGER_PROFILE_VERSION UINT16_C(3)
+#define CONNECTIVITY_MANAGER_PROFILE_V2_VERSION UINT16_C(2)
+#define CONNECTIVITY_MANAGER_PROFILE_V1_VERSION UINT16_C(1)
+#define CONNECTIVITY_MANAGER_SYNC_DIGEST_BYTES 32U
 #define CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY \
     (CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH + 2U)
 #define CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY \
@@ -108,9 +111,12 @@ typedef struct manager_profile
     uint8_t trailing_reserved[3];
     uint64_t profile_revision;
     uint64_t last_client_sync_id;
+    uint8_t last_sync_identity[CONNECTIVITY_MANAGER_SYNC_DIGEST_BYTES];
+    uint8_t sync_window_valid;
+    uint8_t sync_reserved[7];
 } manager_profile_t;
 
-typedef struct manager_legacy_profile
+typedef struct manager_profile_v2
 {
     uint32_t magic;
     uint16_t version;
@@ -122,7 +128,23 @@ typedef struct manager_legacy_profile
     uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES];
     uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
     uint8_t trailing_reserved[3];
-} manager_legacy_profile_t;
+    uint64_t profile_revision;
+    uint64_t last_client_sync_id;
+} manager_profile_v2_t;
+
+typedef struct manager_profile_v1
+{
+    uint32_t magic;
+    uint16_t version;
+    uint8_t security;
+    uint8_t auto_connect;
+    uint8_t ssid_length;
+    uint8_t password_length;
+    uint8_t reserved[2];
+    uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES];
+    uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
+    uint8_t trailing_reserved[3];
+} manager_profile_v1_t;
 
 typedef struct manager_command
 {
@@ -172,6 +194,7 @@ typedef struct manager_worker
     bool active_sync;
     bool active_sync_auto_connect;
     connectivity_manager_client_sync_id_t active_client_sync_id;
+    uint8_t active_sync_identity[CONNECTIVITY_MANAGER_SYNC_DIGEST_BYTES];
     bool radio_initialized;
     bool suspended;
     bool retry_pending;
@@ -240,9 +263,11 @@ _Static_assert(CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES ==
                WIFI_SERVICE_PASSWORD_MAX_BYTES, "password limits must match");
 _Static_assert(CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS ==
                WIFI_SERVICE_MAX_SCAN_RECORDS, "scan limits must match");
-_Static_assert(sizeof(manager_profile_t) == 128U,
+_Static_assert(sizeof(manager_profile_t) == 168U,
+               "Wi-Fi profile v3 record size changed");
+_Static_assert(sizeof(manager_profile_v2_t) == 128U,
                "Wi-Fi profile v2 record size changed");
-_Static_assert(sizeof(manager_legacy_profile_t) == 112U,
+_Static_assert(sizeof(manager_profile_v1_t) == 112U,
                "Wi-Fi profile v1 record size changed");
 _Static_assert(sizeof(connectivity_manager_status_snapshot_t) <=
                EVENT_BUS_MAX_UI_PAYLOAD_SIZE, "status snapshot too large");
@@ -514,45 +539,98 @@ static bool _manager_credentials_policy_valid(
     return wifi_service_credentials_valid(&credentials);
 }
 
+static bool _manager_profile_payload_valid(
+    uint8_t security, uint8_t auto_connect, uint8_t ssid_length,
+    uint8_t password_length, const uint8_t reserved[2],
+    const uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES],
+    const uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U],
+    const uint8_t trailing_reserved[3])
+{
+    if (auto_connect > 1U ||
+            ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
+            password_length >
+            CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES ||
+            security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
+            !_manager_bytes_are_zero(reserved, 2U) ||
+            !_manager_bytes_are_zero(trailing_reserved, 3U) ||
+            !_manager_credentials_policy_valid(
+                (const char *)ssid, ssid_length,
+                (const char *)password, password_length,
+                (connectivity_manager_security_t)security))
+    {
+        return false;
+    }
+    return _manager_bytes_are_zero(ssid + ssid_length,
+                                   CONNECTIVITY_MANAGER_SSID_MAX_BYTES -
+                                   ssid_length) &&
+           _manager_bytes_are_zero(
+               password + password_length,
+               CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U -
+               password_length);
+}
+
 static bool _manager_profile_valid(const manager_profile_t *profile)
 {
     if (profile->magic != CONNECTIVITY_MANAGER_PROFILE_MAGIC ||
             profile->version != CONNECTIVITY_MANAGER_PROFILE_VERSION ||
-            profile->auto_connect > 1U ||
-            profile->ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
-            profile->password_length >
-            CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES ||
             profile->profile_revision == 0U ||
-            profile->security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
-            !_manager_bytes_are_zero(profile->reserved,
-                                     sizeof(profile->reserved)) ||
-            !_manager_bytes_are_zero(profile->trailing_reserved,
-                                     sizeof(profile->trailing_reserved)) ||
-            !_manager_credentials_policy_valid(
-                (const char *)profile->ssid, profile->ssid_length,
-                (const char *)profile->password, profile->password_length,
-                (connectivity_manager_security_t)profile->security))
+            profile->sync_window_valid > 1U ||
+            !_manager_bytes_are_zero(profile->sync_reserved,
+                                     sizeof(profile->sync_reserved)) ||
+            !_manager_profile_payload_valid(
+                profile->security, profile->auto_connect,
+                profile->ssid_length, profile->password_length,
+                profile->reserved, profile->ssid, profile->password,
+                profile->trailing_reserved))
     {
         return false;
     }
-    return _manager_bytes_are_zero(profile->ssid + profile->ssid_length,
-                                   sizeof(profile->ssid) -
-                                   profile->ssid_length) &&
-           _manager_bytes_are_zero(
-               profile->password + profile->password_length,
-               sizeof(profile->password) - profile->password_length);
+    const bool digest_zero = _manager_bytes_are_zero(
+                                 profile->last_sync_identity,
+                                 sizeof(profile->last_sync_identity));
+
+    return profile->sync_window_valid != 0U ?
+           profile->last_client_sync_id != 0U && !digest_zero :
+           profile->last_client_sync_id == 0U && digest_zero;
 }
 
-static bool _manager_profile_credentials_equal(
-    const manager_profile_t *left, const manager_profile_t *right)
+static bool _manager_profile_v2_valid(const manager_profile_v2_t *profile)
 {
-    return left != NULL && right != NULL &&
-           left->security == right->security &&
-           left->ssid_length == right->ssid_length &&
-           left->password_length == right->password_length &&
-           memcmp(left->ssid, right->ssid, sizeof(left->ssid)) == 0 &&
-           memcmp(left->password, right->password,
-                  sizeof(left->password)) == 0;
+    return profile->magic == CONNECTIVITY_MANAGER_PROFILE_MAGIC &&
+           profile->version == CONNECTIVITY_MANAGER_PROFILE_V2_VERSION &&
+           profile->profile_revision != 0U &&
+           _manager_profile_payload_valid(
+               profile->security, profile->auto_connect,
+               profile->ssid_length, profile->password_length,
+               profile->reserved, profile->ssid, profile->password,
+               profile->trailing_reserved);
+}
+
+static bool _manager_profile_v1_valid(const manager_profile_v1_t *profile)
+{
+    return profile->magic == CONNECTIVITY_MANAGER_PROFILE_MAGIC &&
+           profile->version == CONNECTIVITY_MANAGER_PROFILE_V1_VERSION &&
+           _manager_profile_payload_valid(
+               profile->security, profile->auto_connect,
+               profile->ssid_length, profile->password_length,
+               profile->reserved, profile->ssid, profile->password,
+               profile->trailing_reserved);
+}
+
+static void _manager_profile_copy_payload(
+    manager_profile_t *destination, uint8_t security, uint8_t auto_connect,
+    uint8_t ssid_length, uint8_t password_length,
+    const uint8_t ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES],
+    const uint8_t password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U])
+{
+    destination->magic = CONNECTIVITY_MANAGER_PROFILE_MAGIC;
+    destination->version = CONNECTIVITY_MANAGER_PROFILE_VERSION;
+    destination->security = security;
+    destination->auto_connect = auto_connect;
+    destination->ssid_length = ssid_length;
+    destination->password_length = password_length;
+    memcpy(destination->ssid, ssid, sizeof(destination->ssid));
+    memcpy(destination->password, password, sizeof(destination->password));
 }
 
 static esp_err_t _manager_profile_load(manager_worker_t *worker)
@@ -569,53 +647,60 @@ static esp_err_t _manager_profile_load(manager_worker_t *worker)
         _manager_secure_zero(raw, sizeof(raw));
         return ESP_OK;
     }
+    if (result == ESP_ERR_INVALID_SIZE
+#ifdef ESP_ERR_NVS_INVALID_LENGTH
+            || result == ESP_ERR_NVS_INVALID_LENGTH
+#endif
+       )
+    {
+        _manager_secure_zero(raw, sizeof(raw));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (result != ESP_OK)
     {
         _manager_secure_zero(raw, sizeof(raw));
         return result;
     }
-    if (size == sizeof(manager_legacy_profile_t))
+    bool migration_required = false;
+
+    if (size == sizeof(manager_profile_v1_t))
     {
-        manager_legacy_profile_t legacy;
+        manager_profile_v1_t legacy;
+
         memcpy(&legacy, raw, sizeof(legacy));
-        if (legacy.magic != CONNECTIVITY_MANAGER_PROFILE_MAGIC ||
-                legacy.version != CONNECTIVITY_MANAGER_LEGACY_PROFILE_VERSION ||
-                legacy.auto_connect > 1U || legacy.ssid_length == 0U ||
-                legacy.ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
-                legacy.security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
-                !_manager_bytes_are_zero(legacy.reserved,
-                                         sizeof(legacy.reserved)) ||
-                !_manager_bytes_are_zero(legacy.trailing_reserved,
-                                         sizeof(legacy.trailing_reserved)))
+        if (!_manager_profile_v1_valid(&legacy))
         {
             _manager_secure_zero(&legacy, sizeof(legacy));
             _manager_secure_zero(raw, sizeof(raw));
             return ESP_ERR_INVALID_RESPONSE;
         }
-        profile.magic = legacy.magic;
-        profile.version = CONNECTIVITY_MANAGER_PROFILE_VERSION;
-        profile.security = legacy.security;
-        profile.auto_connect = legacy.auto_connect;
-        profile.ssid_length = legacy.ssid_length;
-        profile.password_length = legacy.password_length;
-        memcpy(profile.ssid, legacy.ssid, sizeof(profile.ssid));
-        memcpy(profile.password, legacy.password, sizeof(profile.password));
+        _manager_profile_copy_payload(
+            &profile, legacy.security, legacy.auto_connect,
+            legacy.ssid_length, legacy.password_length,
+            legacy.ssid, legacy.password);
         profile.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
-        profile.last_client_sync_id = 0U;
         _manager_secure_zero(&legacy, sizeof(legacy));
-        if (!_manager_profile_valid(&profile))
+        migration_required = true;
+    }
+    else if (size == sizeof(manager_profile_v2_t))
+    {
+        manager_profile_v2_t legacy;
+
+        memcpy(&legacy, raw, sizeof(legacy));
+        if (!_manager_profile_v2_valid(&legacy))
         {
+            _manager_secure_zero(&legacy, sizeof(legacy));
             _manager_secure_zero(&profile, sizeof(profile));
             _manager_secure_zero(raw, sizeof(raw));
             return ESP_ERR_INVALID_RESPONSE;
         }
-        result = _manager_profile_store(&profile);
-        if (result != ESP_OK)
-        {
-            _manager_secure_zero(&profile, sizeof(profile));
-            _manager_secure_zero(raw, sizeof(raw));
-            return result;
-        }
+        _manager_profile_copy_payload(
+            &profile, legacy.security, legacy.auto_connect,
+            legacy.ssid_length, legacy.password_length,
+            legacy.ssid, legacy.password);
+        profile.profile_revision = legacy.profile_revision;
+        _manager_secure_zero(&legacy, sizeof(legacy));
+        migration_required = true;
     }
     else if (size == sizeof(profile))
     {
@@ -632,6 +717,16 @@ static esp_err_t _manager_profile_load(manager_worker_t *worker)
         _manager_secure_zero(raw, sizeof(raw));
         return ESP_ERR_INVALID_RESPONSE;
     }
+    if (migration_required)
+    {
+        result = _manager_profile_store(&profile);
+        if (result != ESP_OK)
+        {
+            _manager_secure_zero(&profile, sizeof(profile));
+            _manager_secure_zero(raw, sizeof(raw));
+            return result;
+        }
+    }
     worker->profile = profile;
     worker->profile_valid = true;
     _manager_secure_zero(&profile, sizeof(profile));
@@ -641,8 +736,59 @@ static esp_err_t _manager_profile_load(manager_worker_t *worker)
 
 static esp_err_t _manager_profile_store(const manager_profile_t *profile)
 {
+    if (profile == NULL || !_manager_profile_valid(profile))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     return nv_storage_set_blob(CONNECTIVITY_MANAGER_PROFILE_KEY, profile,
                                sizeof(*profile));
+}
+
+static esp_err_t _manager_profile_sync_identity(
+    const manager_profile_t *profile, bool auto_connect,
+    uint8_t digest[CONNECTIVITY_MANAGER_SYNC_DIGEST_BYTES])
+{
+    static const uint8_t domain[] =
+        "device-link.wifi.v1.set-credentials";
+    uint8_t canonical[sizeof(domain) + 5U +
+                      CONNECTIVITY_MANAGER_SSID_MAX_BYTES +
+                      CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES];
+    size_t offset = 0U;
+
+    if (profile == NULL || digest == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t wire_security = 0U;
+
+    switch ((connectivity_manager_security_t)profile->security)
+    {
+    case CONNECTIVITY_MANAGER_SECURITY_OPEN:
+        wire_security = 1U;
+        break;
+    case CONNECTIVITY_MANAGER_SECURITY_PERSONAL:
+        wire_security = 2U;
+        break;
+    case CONNECTIVITY_MANAGER_SECURITY_UNSUPPORTED:
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(&canonical[offset], domain, sizeof(domain));
+    offset += sizeof(domain);
+    canonical[offset++] = 1U;
+    canonical[offset++] = wire_security;
+    canonical[offset++] = auto_connect ? 1U : 0U;
+    canonical[offset++] = profile->ssid_length;
+    memcpy(&canonical[offset], profile->ssid, profile->ssid_length);
+    offset += profile->ssid_length;
+    canonical[offset++] = profile->password_length;
+    memcpy(&canonical[offset], profile->password, profile->password_length);
+    offset += profile->password_length;
+    const esp_err_t result = connectivity_manager_digest_sha256(
+                                 canonical, offset, digest);
+
+    _manager_secure_zero(canonical, sizeof(canonical));
+    return result;
 }
 
 static void _manager_cache_status_snapshot(
@@ -956,7 +1102,8 @@ static void _manager_set_target_status(manager_worker_t *worker)
                                       worker->profile.profile_revision :
                                       CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
     worker->status.applied_client_sync_id = worker->profile_valid ?
-                                            worker->profile.last_client_sync_id : 0U;
+                                            (worker->profile.sync_window_valid != 0U ?
+                                                worker->profile.last_client_sync_id : 0U) : 0U;
     if (worker->target_valid)
     {
         const manager_profile_t *target = worker->target_persisted ?
@@ -998,6 +1145,8 @@ static void _manager_clear_active_operation(manager_worker_t *worker)
     worker->active_sync = false;
     worker->active_sync_auto_connect = false;
     worker->active_client_sync_id = 0U;
+    _manager_secure_zero(worker->active_sync_identity,
+                         sizeof(worker->active_sync_identity));
 }
 
 static void _manager_complete_status_operation(
@@ -1095,20 +1244,28 @@ static manager_defer_result_t _manager_defer_foreground(
     {
         return MANAGER_DEFER_QUEUED;
     }
+    wifi_service_cancel_disposition_t disposition =
+        WIFI_SERVICE_CANCEL_FAILURE;
     const esp_err_t result = wifi_service_cancel(
                                  worker->session_id,
-                                 worker->service_operation_id);
-    if (result != ESP_OK)
+                                 worker->service_operation_id,
+                                 &disposition);
+    if (result != ESP_OK || disposition == WIFI_SERVICE_CANCEL_NOT_FOUND ||
+            disposition == WIFI_SERVICE_CANCEL_FAILURE)
     {
+        const esp_err_t terminal_result = result == ESP_OK ?
+                                          ESP_ERR_NOT_FOUND : result;
+
         _manager_publish_command_terminal(
-            worker, &worker->pending_command, result,
+            worker, &worker->pending_command, terminal_result,
             CONNECTIVITY_MANAGER_FAILURE_INTERNAL);
         _manager_secure_zero(&worker->pending_command,
                              sizeof(worker->pending_command));
         worker->pending_command_valid = false;
         return MANAGER_DEFER_REJECTED;
     }
-    worker->active_cancel_requested = true;
+    worker->active_cancel_requested =
+        disposition == WIFI_SERVICE_CANCEL_ACCEPTED;
     return MANAGER_DEFER_QUEUED;
 }
 
@@ -1327,18 +1484,39 @@ static void _manager_handle_connected(manager_worker_t *worker,
                              1U;
         saved.last_client_sync_id = worker->active_sync ?
                                     worker->active_client_sync_id : 0U;
-        if (saved.profile_revision == 0U)
+        saved.sync_window_valid = worker->active_sync ? 1U : 0U;
+        memset(saved.last_sync_identity, 0,
+               sizeof(saved.last_sync_identity));
+        if (worker->active_sync)
         {
-            saved.profile_revision = worker->profile_valid &&
-                                     worker->profile.profile_revision < UINT64_MAX ?
+            memcpy(saved.last_sync_identity,
+                   worker->active_sync_identity,
+                   sizeof(saved.last_sync_identity));
+        }
+        esp_err_t result = ESP_OK;
+        connectivity_manager_failure_t persistence_failure =
+            CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+
+        if (saved.profile_revision == 0U && worker->profile_valid &&
+                worker->profile.profile_revision == UINT64_MAX)
+        {
+            result = ESP_ERR_INVALID_STATE;
+            persistence_failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
+        }
+        else if (saved.profile_revision == 0U)
+        {
+            saved.profile_revision = worker->profile_valid ?
                                      worker->profile.profile_revision + 1U :
                                      CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
-            if (saved.profile_revision == 0U)
+        }
+        if (result == ESP_OK)
+        {
+            result = _manager_profile_store(&saved);
+            if (result == ESP_ERR_INVALID_ARG)
             {
-                saved.profile_revision = UINT64_MAX;
+                persistence_failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
             }
         }
-        esp_err_t result = _manager_profile_store(&saved);
         if (result == ESP_OK)
         {
             _manager_secure_zero(&worker->profile, sizeof(worker->profile));
@@ -1348,7 +1526,7 @@ static void _manager_handle_connected(manager_worker_t *worker,
         }
         else
         {
-            worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+            worker->status.failure = persistence_failure;
             worker->status.last_error = result;
             _manager_set_ephemeral_link(worker, &saved);
         }
@@ -1493,11 +1671,37 @@ static void _manager_poll_status(manager_worker_t *worker)
     {
         const bool canceled = worker->active_cancel_requested &&
                               status.operation_canceled;
-        const esp_err_t result = canceled ? ESP_ERR_NOT_FINISHED :
-                                 status.last_error;
-        const connectivity_manager_failure_t failure = canceled ?
+        esp_err_t result = canceled ? ESP_ERR_NOT_FINISHED :
+                           status.last_error;
+        connectivity_manager_failure_t failure = canceled ?
             CONNECTIVITY_MANAGER_FAILURE_NONE :
             _manager_map_failure(status.failure);
+
+        if (result == ESP_OK &&
+                worker->active_command == MANAGER_COMMAND_FORGET)
+        {
+            result = nv_storage_erase_key(CONNECTIVITY_MANAGER_PROFILE_KEY);
+            if (result == ESP_ERR_NVS_NOT_FOUND)
+            {
+                result = ESP_OK;
+            }
+            if (result == ESP_OK)
+            {
+                _manager_secure_zero(&worker->profile,
+                                     sizeof(worker->profile));
+                _manager_secure_zero(&worker->target,
+                                     sizeof(worker->target));
+                worker->profile_valid = false;
+                worker->target_valid = false;
+                worker->target_candidate = false;
+                worker->target_persisted = false;
+                worker->target_reconnectable = false;
+            }
+            else
+            {
+                failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+            }
+        }
         worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.ipv4_address = 0U;
         _manager_set_target_status(worker);
@@ -1636,6 +1840,8 @@ static void _manager_command_connect(manager_worker_t *worker,
     worker->active_sync = false;
     worker->active_sync_auto_connect = true;
     worker->active_client_sync_id = 0U;
+    _manager_secure_zero(worker->active_sync_identity,
+                         sizeof(worker->active_sync_identity));
     worker->retry_count = 0U;
     worker->status.manual_hold = false;
     (void)_manager_start_connect(worker, command->operation_id,
@@ -1651,25 +1857,41 @@ static void _manager_command_sync_profile(
     {
         return;
     }
-    if (worker->profile_valid && worker->profile.last_client_sync_id ==
-            command->client_sync_id)
+    uint8_t identity[CONNECTIVITY_MANAGER_SYNC_DIGEST_BYTES];
+    esp_err_t identity_result = _manager_profile_sync_identity(
+                                    &command->credentials,
+                                    command->sync_auto_connect, identity);
+
+    if (identity_result != ESP_OK)
     {
-        if (!_manager_profile_credentials_equal(
-                    &worker->profile, &command->credentials) ||
-                worker->profile.auto_connect !=
-                (command->sync_auto_connect ? 1U : 0U))
+        worker->status.last_error = identity_result;
+        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
+        _manager_publish_status_terminal(
+            worker, command->operation_id, identity_result,
+            CONNECTIVITY_MANAGER_FAILURE_INTERNAL);
+        _manager_secure_zero(identity, sizeof(identity));
+        return;
+    }
+    if (worker->profile_valid &&
+            worker->profile.sync_window_valid != 0U &&
+            worker->profile.last_client_sync_id == command->client_sync_id)
+    {
+        if (memcmp(worker->profile.last_sync_identity, identity,
+                   sizeof(identity)) != 0)
         {
             worker->status.last_error = ESP_ERR_INVALID_STATE;
             worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
             _manager_publish_status_terminal(
                 worker, command->operation_id, ESP_ERR_INVALID_STATE,
                 CONNECTIVITY_MANAGER_FAILURE_CONFLICT);
+            _manager_secure_zero(identity, sizeof(identity));
             return;
         }
         _manager_set_target_status(worker);
         _manager_publish_status_terminal(
             worker, command->operation_id, ESP_OK,
             CONNECTIVITY_MANAGER_FAILURE_NONE);
+        _manager_secure_zero(identity, sizeof(identity));
         return;
     }
     worker->retry_pending = false;
@@ -1683,6 +1905,9 @@ static void _manager_command_sync_profile(
     worker->active_sync = true;
     worker->active_sync_auto_connect = command->sync_auto_connect;
     worker->active_client_sync_id = command->client_sync_id;
+    memcpy(worker->active_sync_identity, identity,
+           sizeof(worker->active_sync_identity));
+    _manager_secure_zero(identity, sizeof(identity));
     worker->status.manual_hold = false;
     (void)_manager_start_connect(worker, command->operation_id,
                                  MANAGER_COMMAND_SYNC_PROFILE);
@@ -1797,27 +2022,6 @@ static void _manager_command_forget(manager_worker_t *worker,
         return;
     }
 
-    esp_err_t result = nv_storage_erase_key(CONNECTIVITY_MANAGER_PROFILE_KEY);
-    if (result == ESP_ERR_NVS_NOT_FOUND)
-    {
-        result = ESP_OK;
-    }
-    if (result != ESP_OK)
-    {
-        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
-        worker->status.last_error = result;
-        _manager_publish_status_terminal(
-            worker, command->operation_id, result,
-            CONNECTIVITY_MANAGER_FAILURE_STORAGE);
-        return;
-    }
-    _manager_secure_zero(&worker->profile, sizeof(worker->profile));
-    _manager_secure_zero(&worker->target, sizeof(worker->target));
-    worker->profile_valid = false;
-    worker->target_valid = false;
-    worker->target_candidate = false;
-    worker->target_persisted = false;
-    worker->target_reconnectable = false;
     _manager_command_disconnect(worker, command);
 }
 
@@ -1834,8 +2038,29 @@ static void _manager_command_set_auto(manager_worker_t *worker,
         return;
     }
     manager_profile_t changed = worker->profile;
-    changed.auto_connect = command->enabled ? 1U : 0U;
-    esp_err_t result = _manager_profile_store(&changed);
+    const uint8_t requested = command->enabled ? 1U : 0U;
+    const bool policy_changed = changed.auto_connect != requested;
+    esp_err_t result = ESP_OK;
+    connectivity_manager_failure_t failure =
+        CONNECTIVITY_MANAGER_FAILURE_NONE;
+
+    if (policy_changed && changed.profile_revision == UINT64_MAX)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        failure = CONNECTIVITY_MANAGER_FAILURE_INTERNAL;
+    }
+    else if (policy_changed)
+    {
+        changed.auto_connect = requested;
+        changed.profile_revision++;
+        result = _manager_profile_store(&changed);
+        if (result != ESP_OK)
+        {
+            failure = result == ESP_ERR_INVALID_ARG ?
+                      CONNECTIVITY_MANAGER_FAILURE_INTERNAL :
+                      CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+        }
+    }
     if (result == ESP_OK)
     {
         worker->profile = changed;
@@ -1847,18 +2072,22 @@ static void _manager_command_set_auto(manager_worker_t *worker,
         else
         {
             worker->resume_auto_after_scan = false;
-            if (worker->active_command == MANAGER_COMMAND_AUTO &&
-                    wifi_service_cancel(worker->session_id,
-                                        worker->service_operation_id) == ESP_OK)
+            if (worker->active_command == MANAGER_COMMAND_AUTO)
             {
-                worker->active_cancel_requested = true;
+                wifi_service_cancel_disposition_t disposition =
+                    WIFI_SERVICE_CANCEL_FAILURE;
+                const esp_err_t cancel_result = wifi_service_cancel(
+                                                    worker->session_id,
+                                                    worker->service_operation_id,
+                                                    &disposition);
+
+                worker->active_cancel_requested = cancel_result == ESP_OK &&
+                                                  disposition == WIFI_SERVICE_CANCEL_ACCEPTED;
             }
         }
     }
     worker->status.last_error = result;
-    worker->status.failure = result == ESP_OK ?
-                             CONNECTIVITY_MANAGER_FAILURE_NONE :
-                             CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+    worker->status.failure = failure;
     _manager_set_target_status(worker);
     _manager_publish_status_terminal(
         worker, command->operation_id, result, worker->status.failure);
@@ -1936,17 +2165,27 @@ static void _manager_command_cancel(manager_worker_t *worker,
         _manager_complete_cancel_failure(worker, ESP_ERR_INVALID_STATE);
         return;
     }
+    wifi_service_cancel_disposition_t disposition =
+        WIFI_SERVICE_CANCEL_FAILURE;
     const esp_err_t cancel_result = wifi_service_cancel(
                                         worker->session_id,
-                                        worker->service_operation_id);
+                                        worker->service_operation_id,
+                                        &disposition);
 
-    if (cancel_result != ESP_OK)
+    if (cancel_result != ESP_OK ||
+            disposition == WIFI_SERVICE_CANCEL_NOT_FOUND ||
+            disposition == WIFI_SERVICE_CANCEL_FAILURE)
     {
-        _manager_complete_cancel_failure(worker, cancel_result);
+        _manager_complete_cancel_failure(
+            worker, cancel_result == ESP_OK ?
+            ESP_ERR_NOT_FOUND : cancel_result);
         return;
     }
-    worker->active_cancel_requested = true;
-    _manager_clear_candidate(worker);
+    if (disposition == WIFI_SERVICE_CANCEL_ACCEPTED)
+    {
+        worker->active_cancel_requested = true;
+        _manager_clear_candidate(worker);
+    }
 }
 
 static void _manager_run_pending(manager_worker_t *worker)
@@ -2038,7 +2277,9 @@ static esp_err_t _manager_worker_init(manager_worker_t *worker)
     esp_err_t storage_result = _manager_profile_load(worker);
     if (storage_result != ESP_OK)
     {
-        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+        worker->status.failure = storage_result == ESP_ERR_INVALID_RESPONSE ?
+                                 CONNECTIVITY_MANAGER_FAILURE_INTERNAL :
+                                 CONNECTIVITY_MANAGER_FAILURE_STORAGE;
         worker->status.last_error = storage_result;
     }
     esp_err_t radio_result = _manager_radio_start(worker);

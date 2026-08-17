@@ -22,6 +22,11 @@ extern "C" {
 esp_err_t device_link_wifi_adapter_get_descriptor(
     const device_link_domain_descriptor_t **descriptor);
 
+#ifdef UNIT_TEST_HOST
+/** @brief Override descriptor lookup for fail-closed startup tests. */
+void device_link_wifi_adapter_test_set_descriptor_result(esp_err_t result);
+#endif
+
 /**
  * @brief Start the asynchronous operation completion bridge.
  *

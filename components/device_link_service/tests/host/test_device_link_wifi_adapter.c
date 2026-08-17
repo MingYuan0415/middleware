@@ -32,7 +32,6 @@ extern void event_bus_fake_publish(event_bus_msg_id_t msg_id,
 extern void ble_link_service_fake_reset(void);
 extern void ble_link_service_fake_set_in_flight(bool in_flight);
 extern void ble_link_service_fake_set_start_result(esp_err_t result);
-extern unsigned ble_link_service_fake_defer_count(void);
 extern unsigned ble_link_service_fake_update_count(void);
 extern uint64_t ble_link_service_fake_last_owner(void);
 extern device_link_operation_state_t ble_link_service_fake_last_state(void);

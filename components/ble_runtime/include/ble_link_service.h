@@ -160,6 +160,24 @@ esp_err_t ble_link_service_async_operation_start(
     uint64_t *out_operation_id);
 
 /**
+ * @brief Reserve a Core operation slot and hold the service lock.
+ *
+ * The caller must immediately submit owner work and pair a successful call
+ * with commit or abort on the same task. Holding the lock makes an SMP
+ * terminal callback wait until the owner identity is committed.
+ */
+esp_err_t ble_link_service_async_operation_reserve(
+    uint8_t domain_id, uint8_t method_id, uint64_t *out_operation_id);
+
+/** @brief Commit owner identity and release a reserved service transaction. */
+esp_err_t ble_link_service_async_operation_commit(
+    uint64_t operation_id, uint64_t owner_id,
+    device_link_operation_cancel_t cancel, void *cancel_arg);
+
+/** @brief Abort a reserved slot and release the service transaction. */
+esp_err_t ble_link_service_async_operation_abort(uint64_t operation_id);
+
+/**
  * @brief Update the live operation owned by @p owner_id.
  *
  * The completion bridge calls this when the adapter's lower layer reports
@@ -177,32 +195,6 @@ esp_err_t ble_link_service_async_operation_start(
  *         ESP_ERR_INVALID_ARG for a semantics violation.
  */
 esp_err_t ble_link_service_async_operation_update(
-    uint64_t owner_id, device_link_operation_state_t state,
-    device_link_status_t status, const uint8_t *result, size_t result_len);
-
-/**
- * @brief Apply a terminal completion, or retain it briefly when the table
- * admission has not run yet.
- *
- * The completion bridge calls this when
- * ble_link_service_async_operation_update() reports ESP_ERR_NOT_FOUND:
- * on SMP the adapter's lower layer may already have published its terminal
- * event while the admission of the Core v2 table record is still in
- * flight. The terminal is retained for
- * BLE_LINK_SERVICE_DEFERRED_COMPLETION_TTL_MS and is merged by the next
- * ble_link_service_async_operation_start() whose owner_id matches. If the
- * admission landed between the two calls, the terminal is applied directly.
- *
- * @param[in] owner_id Adapter-owned operation identity.
- * @param[in] state    Terminal state.
- * @param[in] status   LinkError status.
- * @param[in] result   Result payload (may be NULL when result_len is 0).
- * @param[in] result_len Payload length.
- * @return ESP_OK when applied now or retained, ESP_ERR_INVALID_ARG for a
- *         semantics violation, ESP_ERR_INVALID_STATE when the v2 table is
- *         unavailable.
- */
-esp_err_t ble_link_service_async_operation_defer_update(
     uint64_t owner_id, device_link_operation_state_t state,
     device_link_status_t status, const uint8_t *result, size_t result_len);
 

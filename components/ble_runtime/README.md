@@ -172,8 +172,8 @@ store、connection 和 host-event 源码假设；脚本失败必须触发人工�
 指针，也不在释放前清零；项目适配层因此把依赖失败输出视为非所有权值，并只向上返回
 `NULL/0`。本地可用的 v6.1-beta1 标签仍保留相同行为，且其 NimBLE 子模块对象不在当前
 checkout 中，无法完成既有 BLE assumption matrix。因此生产安全验收保持 blocked；发布
-检查可设置 `DEVICE_LINK_REQUIRE_SECURITY_RELEASE=1` 将该阻塞转为脚本失败。不得仅凭版本
-号升级解除阻塞，候选版本必须同时通过输出 ownership、失败清零和完整 BLE matrix。
+流程必须构建 `device_link_security_release` 目标，将该阻塞转为确定失败。不得仅凭版本号
+升级解除阻塞，候选版本必须同时通过输出 ownership、失败清零和完整 BLE matrix。
 
 ## 宿主测试
 
