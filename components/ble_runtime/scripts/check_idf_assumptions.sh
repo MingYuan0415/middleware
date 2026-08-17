@@ -42,6 +42,22 @@ check_contains()
 
 NIMBLE="components/bt/host/nimble/nimble"
 NIMBLE_HOST="$NIMBLE/nimble/host"
+SECURITY2="components/protocomm/src/security/security2.c"
+
+check_source \
+    "$SECURITY2" \
+    "6bee47b928ca33315908ddf5c7208eadf9ae774c3e8dd949ea64007429c8d550"
+
+# v6.0.2 frees a failed GCM allocation without clearing or zeroizing the
+# output. The project adapter treats an error output as dependency-owned and
+# exposes only NULL/0 to its callers. Any source change requires a fresh
+# ownership and zeroization audit before production security acceptance.
+check_contains \
+    "$SECURITY2" \
+    "psa_aead_decrypt failed with status=%d"
+check_contains \
+    "$SECURITY2" \
+    "free(*outbuf);"
 
 check_source \
     "$NIMBLE_HOST/include/host/ble_gatt.h" \
@@ -173,4 +189,9 @@ check_contains \
     "$NIMBLE_HOST/store/config/src/ble_store_config.c" \
     "ble_addr_cmp(&rpa_rec->peer_addr, &key->peer_rpa_addr)"
 
-echo "ESP-IDF BLE runtime assumptions verified"
+echo "ESP-IDF BLE runtime and Security2 baseline assumptions verified"
+if [ "${DEVICE_LINK_REQUIRE_SECURITY_RELEASE:-0}" = "1" ]; then
+    echo "Device Link production security acceptance is blocked: ESP-IDF v6.0.2 does not clear or zeroize failed Security2 outputs" >&2
+    exit 1
+fi
+echo "Device Link production security acceptance remains blocked"

@@ -984,14 +984,17 @@ esp_err_t device_link_security_handshake_ex(
     uint8_t **output, size_t *output_len,
     device_link_security_handshake_result_t *handshake_result)
 {
-    if (input == NULL || output == NULL || output_len == NULL ||
-            handshake_result == NULL)
+    if (output == NULL || output_len == NULL || handshake_result == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
     *output = NULL;
     *output_len = 0U;
     memset(handshake_result, 0, sizeof(*handshake_result));
+    if (input == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     device_link_security_handshake_stage_t request_stage;
     esp_err_t result = _device_link_security_parse_handshake(
                            input, input_len, false, &request_stage);
@@ -1144,7 +1147,13 @@ esp_err_t device_link_security_unprotect(
     const uint8_t *input, size_t input_len,
     uint8_t **output, size_t *output_len)
 {
-    if (input == NULL || output == NULL || output_len == NULL)
+    if (output == NULL || output_len == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *output = NULL;
+    *output_len = 0U;
+    if (input == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1183,11 +1192,20 @@ esp_err_t device_link_security_unprotect(
 
     if (result != ESP_OK)
     {
-        free(plain);
+        /* ESP-IDF v6.0.2 frees a failed decrypt allocation without
+         * clearing its output pointer. The failure output is therefore
+         * non-owning and must never be inspected or freed here. */
         /* Malformed ciphertext or a failed tag closes the session. */
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
         return result;
+    }
+    if (plain == NULL || plain_len <= 0)
+    {
+        free(plain);
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_RESPONSE;
     }
     /* The request callback runs without the adapter lock: it may invoke
      * adapter operations (protect, close_session, verifier transitions)
@@ -1260,10 +1278,18 @@ esp_err_t device_link_security_unprotect(
         plain_response, plain_response_len, release_cb, release_arg);
     if (result != ESP_OK)
     {
-        free(cipher);
+        /* As with decrypt, v6.0.2 owns and frees an allocation once its
+         * encrypt callback reports failure. */
         _device_link_security_close_session_locked();
         _device_link_security_unlock();
         return result;
+    }
+    if (cipher == NULL || cipher_len <= 0)
+    {
+        free(cipher);
+        _device_link_security_close_session_locked();
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_RESPONSE;
     }
     *output = cipher;
     *output_len = (size_t)cipher_len;
@@ -1275,12 +1301,16 @@ esp_err_t device_link_security_protect(
     const uint8_t *plain, size_t plain_len,
     uint8_t **cipher, size_t *cipher_len)
 {
-    if (plain == NULL || cipher == NULL || cipher_len == NULL)
+    if (cipher == NULL || cipher_len == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
     *cipher = NULL;
     *cipher_len = 0U;
+    if (plain == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     _device_link_security_lock();
     if (!s_security.initialized || !s_security.session_open ||
             !s_security.authenticated || s_security.sec_inst == NULL ||
@@ -1298,10 +1328,16 @@ esp_err_t device_link_security_protect(
 
     if (result != ESP_OK)
     {
-        free(*cipher);
         *cipher = NULL;
         _device_link_security_unlock();
         return result;
+    }
+    if (*cipher == NULL || out_len <= 0)
+    {
+        free(*cipher);
+        *cipher = NULL;
+        _device_link_security_unlock();
+        return ESP_ERR_INVALID_RESPONSE;
     }
     *cipher_len = (size_t)out_len;
     _device_link_security_unlock();

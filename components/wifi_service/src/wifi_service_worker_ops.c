@@ -364,6 +364,8 @@ static void _wifi_service_context_set_operation(
     wifi_service_session_id_t session_id,
     wifi_service_operation_id_t operation_id)
 {
+    context->status.operation_canceled = false;
+    context->scan.operation_canceled = false;
     context->operation_kind = kind;
     context->operation_session = session_id;
     context->operation_id = operation_id;
@@ -693,7 +695,6 @@ static void _wifi_service_cancel_scan(wifi_worker_context_t *context,
     esp_err_t abort_result = wifi_service_port_scan_abort();
     context->scan_active = false;
     context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
-    context->scan.last_error = abort_result == ESP_OK ? reason : abort_result;
     esp_err_t restart_result = wifi_service_worker_restart_radio(context);
     bool radio_restarted = restart_result == ESP_OK;
     if (wifi_service_port_scan_is_owned())
@@ -710,6 +711,12 @@ static void _wifi_service_cancel_scan(wifi_worker_context_t *context,
     {
         restart_result = ESP_OK;
     }
+    const esp_err_t cancel_result = abort_result != ESP_OK ? abort_result :
+                                    restart_result;
+
+    context->scan.operation_canceled = cancel_result == ESP_OK;
+    context->scan.last_error = cancel_result == ESP_OK ? reason :
+                               cancel_result;
     const bool reconnect_after_completion = reconnect && radio_restarted &&
                                             restart_result == ESP_OK &&
                                             context->status.desired_connected &&
@@ -752,6 +759,8 @@ static void _wifi_service_cancel_connect(wifi_worker_context_t *context,
         context->status.session_id = context->operation_session;
         context->status.operation_id = context->operation_id;
         context->status.last_error = reason;
+        context->status.operation_canceled =
+            reason == ESP_ERR_INVALID_STATE;
         context->status.ipv4_address = 0;
         wifi_service_worker_complete_operation(context);
         wifi_service_worker_publish_status(context);
@@ -770,6 +779,8 @@ static void _wifi_service_cancel_connect(wifi_worker_context_t *context,
         _wifi_service_set_status_idle(
             context, result == ESP_OK ? reason : result,
             context->operation_session, context->operation_id);
+        context->status.operation_canceled =
+            result == ESP_OK && reason == ESP_ERR_INVALID_STATE;
     }
     wifi_service_worker_complete_operation(context);
     if (context->status.available)
@@ -818,6 +829,7 @@ static void _wifi_service_reject_item(wifi_worker_context_t *context,
         context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
         context->scan.last_error = canceled ? ESP_ERR_INVALID_STATE :
                                    ESP_ERR_NOT_FOUND;
+        context->scan.operation_canceled = canceled;
         _wifi_service_operation_complete(item->session_id, item->operation_id);
         wifi_service_worker_publish_scan(context);
     }
@@ -828,6 +840,7 @@ static void _wifi_service_reject_item(wifi_worker_context_t *context,
         context->status.operation_id = item->operation_id;
         context->status.last_error = canceled ? ESP_ERR_INVALID_STATE :
                                      ESP_ERR_NOT_FOUND;
+        context->status.operation_canceled = canceled;
         _wifi_service_operation_complete(item->session_id, item->operation_id);
         wifi_service_worker_publish_status(context);
     }
@@ -836,6 +849,7 @@ static void _wifi_service_reject_item(wifi_worker_context_t *context,
 static void _wifi_service_begin_scan(wifi_worker_context_t *context,
                                      const wifi_queue_item_t *item)
 {
+    context->scan.operation_canceled = false;
     context->pre_scan_state = context->status.state;
     context->scan.session_id = item->session_id;
     context->scan.operation_id = item->operation_id;
@@ -869,6 +883,7 @@ static void _wifi_service_begin_scan(wifi_worker_context_t *context,
 static void _wifi_service_begin_connect(wifi_worker_context_t *context,
                                         const wifi_queue_item_t *item)
 {
+    context->status.operation_canceled = false;
     wifi_service_port_credentials_t credentials;
     memset(&credentials, 0, sizeof(credentials));
     if (!_wifi_service_take_slot(item, &credentials))
@@ -919,6 +934,7 @@ exit:
 static void _wifi_service_begin_disconnect(wifi_worker_context_t *context,
         const wifi_queue_item_t *item)
 {
+    context->status.operation_canceled = false;
     _wifi_service_context_set_operation(context, WIFI_OPERATION_DISCONNECT,
                                         item->session_id,
                                         item->operation_id);
@@ -930,6 +946,8 @@ static void _wifi_service_begin_disconnect(wifi_worker_context_t *context,
     {
         context->status.last_error = claim == WIFI_TERMINAL_CANCELED ?
                                      ESP_ERR_INVALID_STATE : ESP_ERR_NOT_FOUND;
+        context->status.operation_canceled =
+            claim == WIFI_TERMINAL_CANCELED;
         wifi_service_worker_complete_operation(context);
         wifi_service_worker_publish_status(context);
         return;

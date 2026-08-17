@@ -95,6 +95,19 @@ typedef struct wifi_service_credentials
     wifi_service_security_t security;   /**< Requested security mode. */
 } wifi_service_credentials_t;
 
+/**
+ * @brief Validate the frozen Device Link Wi-Fi v1 credential policy.
+ *
+ * SSIDs are 1..32 bytes without NUL. OPEN requires an empty password.
+ * PERSONAL accepts an 8..63 byte NUL-free passphrase or exactly 64 ASCII
+ * hexadecimal characters; the latter remains an ASCII PSK for ESP-IDF.
+ *
+ * @param[in] credentials Borrowed credential bytes.
+ * @return true when the complete cross-field policy is satisfied.
+ */
+bool wifi_service_credentials_valid(
+    const wifi_service_credentials_t *credentials);
+
 /** @brief One bounded scan result copied from the Wi-Fi driver. */
 typedef struct wifi_service_scan_record
 {
@@ -118,6 +131,7 @@ typedef struct wifi_service_status_snapshot
     uint8_t retry_count;                       /**< Completed retry attempts. */
     bool available;                            /**< Radio service is usable. */
     bool desired_connected;                    /**< Reconnect policy is active. */
+    bool operation_canceled;                   /**< Lower layer confirmed cancel. */
     char ssid[WIFI_SERVICE_SSID_MAX_BYTES + 1U]; /**< Target SSID. */
 } wifi_service_status_snapshot_t;
 
@@ -131,6 +145,7 @@ typedef struct wifi_service_scan_snapshot
     int32_t last_error;                       /**< Last ESP-IDF error value. */
     uint8_t record_count;                     /**< Number of valid records. */
     bool truncated;                           /**< Driver returned more records. */
+    bool operation_canceled;                  /**< Lower layer confirmed cancel. */
     wifi_service_scan_record_t records[WIFI_SERVICE_MAX_SCAN_RECORDS];
 } wifi_service_scan_snapshot_t;
 

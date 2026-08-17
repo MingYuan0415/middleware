@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/wifi_service.c"
+        "src/wifi_service_credentials.c"
         "src/wifi_service_worker.c"
         "src/wifi_service_worker_ops.c"
         "src/wifi_service_idf_port.c"

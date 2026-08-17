@@ -656,34 +656,6 @@ esp_err_t wifi_service_request_disconnect(
                                       out_operation_id);
 }
 
-static bool _wifi_service_credentials_valid(
-    const wifi_service_credentials_t *credentials)
-{
-    if (credentials == NULL || credentials->ssid == NULL ||
-            credentials->ssid_length == 0 ||
-            credentials->ssid_length > WIFI_SERVICE_SSID_MAX_BYTES ||
-            memchr(credentials->ssid, '\0', credentials->ssid_length) != NULL)
-    {
-        return false;
-    }
-    bool valid;
-    if (credentials->security == WIFI_SERVICE_SECURITY_OPEN)
-    {
-        valid = credentials->password_length == 0;
-    }
-    else
-    {
-        valid = credentials->security == WIFI_SERVICE_SECURITY_PERSONAL &&
-                credentials->password != NULL &&
-                credentials->password_length >= 1 &&
-                credentials->password_length <=
-                WIFI_SERVICE_PASSWORD_MAX_BYTES &&
-                memchr(credentials->password, '\0',
-                       credentials->password_length) == NULL;
-    }
-    return valid;
-}
-
 static wifi_credential_slot_t *_wifi_service_reserve_credentials_locked(
     const wifi_service_credentials_t *credentials, uint8_t *slot_index)
 {
@@ -750,7 +722,7 @@ esp_err_t wifi_service_request_connect(
     wifi_credential_slot_t *slot = NULL;
     uint8_t slot_index = 0;
     if (session_id == 0 || out_operation_id == NULL ||
-            !_wifi_service_credentials_valid(credentials))
+            !wifi_service_credentials_valid(credentials))
     {
         return ESP_ERR_INVALID_ARG;
     }

@@ -126,6 +126,9 @@ bool device_link_router_is_sealed(const device_link_router_t *router);
 
 void device_link_call_replay_reset(device_link_call_replay_t *replay);
 
+/** @brief Invalidate and wipe every replay slot owned by a router. */
+void device_link_router_replay_reset(device_link_router_t *router);
+
 esp_err_t device_link_router_process(
     device_link_router_t *router,
     const device_link_request_context_t *facts,

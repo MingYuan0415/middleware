@@ -888,12 +888,20 @@ esp_err_t wifi_service_port_set_credentials(
 {
     esp_err_t result = ESP_ERR_INVALID_ARG;
     wifi_config_t config;
-    if (credentials == NULL || !s_state.wifi_initialized ||
-            credentials->ssid_length == 0 ||
-            credentials->ssid_length > WIFI_SERVICE_SSID_MAX_BYTES ||
-            credentials->password_length > WIFI_SERVICE_PASSWORD_MAX_BYTES ||
-            (credentials->security != WIFI_SERVICE_SECURITY_OPEN &&
-             credentials->security != WIFI_SERVICE_SECURITY_PERSONAL))
+    if (credentials == NULL || !s_state.wifi_initialized)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const wifi_service_credentials_t policy =
+    {
+        .ssid = (const char *)credentials->ssid,
+        .ssid_length = credentials->ssid_length,
+        .password = (const char *)credentials->password,
+        .password_length = credentials->password_length,
+        .security = credentials->security,
+    };
+
+    if (!wifi_service_credentials_valid(&policy))
     {
         return ESP_ERR_INVALID_ARG;
     }

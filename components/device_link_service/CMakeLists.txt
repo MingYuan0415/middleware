@@ -10,6 +10,7 @@ idf_component_register(
         connectivity_manager
         event_bus
         nv_storage
+        wifi_service
     PRIV_REQUIRES
         esp_hw_support
         freertos

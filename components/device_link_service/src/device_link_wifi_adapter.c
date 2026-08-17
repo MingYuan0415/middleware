@@ -10,6 +10,7 @@
 #include "device_link_wifi_adapter.h"
 #include "event_bus.h"
 #include "mt_log.h"
+#include "wifi_service.h"
 
 #define WIFI_METHOD_GET_STATUS 1U
 #define WIFI_METHOD_START_SCAN 2U
@@ -273,6 +274,131 @@ static const device_link_tlv_schema_t s_operation_accepted_schema =
     .maximum_encoded_bytes = 16U,
 };
 
+static bool _wire_security_from_manager(
+    connectivity_manager_security_t security, uint64_t *wire)
+{
+    if (wire == NULL)
+    {
+        return false;
+    }
+    switch (security)
+    {
+    case CONNECTIVITY_MANAGER_SECURITY_OPEN:
+        *wire = 1U;
+        return true;
+    case CONNECTIVITY_MANAGER_SECURITY_PERSONAL:
+        *wire = 2U;
+        return true;
+    case CONNECTIVITY_MANAGER_SECURITY_UNSUPPORTED:
+        *wire = 3U;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool _manager_security_from_wire(
+    uint64_t wire, connectivity_manager_security_t *security)
+{
+    if (security == NULL)
+    {
+        return false;
+    }
+    switch (wire)
+    {
+    case 1U:
+        *security = CONNECTIVITY_MANAGER_SECURITY_OPEN;
+        return true;
+    case 2U:
+        *security = CONNECTIVITY_MANAGER_SECURITY_PERSONAL;
+        return true;
+    case 3U:
+        *security = CONNECTIVITY_MANAGER_SECURITY_UNSUPPORTED;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool _wire_state(connectivity_manager_state_t state, uint64_t *wire)
+{
+    if (wire == NULL)
+    {
+        return false;
+    }
+    switch (state)
+    {
+    case CONNECTIVITY_MANAGER_STATE_OFFLINE:
+        *wire = 1U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_IDLE:
+        *wire = 2U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_SCANNING:
+        *wire = 3U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_CONNECTING:
+        *wire = 4U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_WAITING_IP:
+        *wire = 5U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_IP_READY:
+        *wire = 6U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_RETRY_WAIT:
+        *wire = 7U;
+        return true;
+    case CONNECTIVITY_MANAGER_STATE_SUSPENDED:
+        *wire = 8U;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool _wire_failure(connectivity_manager_failure_t failure,
+                          uint64_t *wire)
+{
+    if (wire == NULL)
+    {
+        return false;
+    }
+    switch (failure)
+    {
+    case CONNECTIVITY_MANAGER_FAILURE_NONE:
+        *wire = 1U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_AUTHENTICATION:
+        *wire = 2U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_AP_NOT_FOUND:
+        *wire = 3U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_ASSOCIATION_TIMEOUT:
+        *wire = 4U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_DHCP_TIMEOUT:
+        *wire = 5U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_LINK_LOST:
+        *wire = 6U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE:
+        *wire = 7U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_STORAGE:
+        *wire = 8U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_INTERNAL:
+        *wire = 9U;
+        return true;
+    case CONNECTIVITY_MANAGER_FAILURE_CONFLICT:
+    default:
+        return false;
+    }
+}
+
 static device_link_status_t _map_result(esp_err_t result)
 {
     if (result == ESP_OK)
@@ -400,18 +526,20 @@ static device_link_status_t _encode_status(
     uint8_t *response, size_t capacity, size_t *response_len)
 {
     device_link_tlv_writer_t writer;
+    uint64_t wire_state = 0U;
+    uint64_t wire_failure = 0U;
 
     if (status == NULL || response == NULL || response_len == NULL ||
-            status->generation == 0U || status->profile_revision == 0U)
+            status->generation == 0U || status->profile_revision == 0U ||
+            !_wire_state(status->state, &wire_state) ||
+            !_wire_failure(status->failure, &wire_failure))
     {
         return DEVICE_LINK_STATUS_INTERNAL;
     }
     device_link_tlv_writer_init(&writer, response, capacity);
     if (device_link_tlv_put_fixed64(&writer, 1U, status->generation) != ESP_OK ||
-            device_link_tlv_put_uint(&writer, 2U,
-                                     (uint64_t)status->state + 1U) != ESP_OK ||
-            device_link_tlv_put_uint(&writer, 3U,
-                                     (uint64_t)status->failure + 1U) != ESP_OK ||
+            device_link_tlv_put_uint(&writer, 2U, wire_state) != ESP_OK ||
+            device_link_tlv_put_uint(&writer, 3U, wire_failure) != ESP_OK ||
             (status->ssid[0] != '\0' && device_link_tlv_put_bytes(
                  &writer, 4U, (const uint8_t *)status->ssid,
                  strlen(status->ssid)) != ESP_OK) ||
@@ -622,6 +750,13 @@ static device_link_status_t _wifi_handler(
             uint8_t network[64];
             device_link_tlv_writer_t nested;
             size_t network_len = 0U;
+            uint64_t wire_security = 0U;
+
+            if (!_wire_security_from_manager(scan.records[i].security,
+                                             &wire_security))
+            {
+                return DEVICE_LINK_STATUS_INTERNAL;
+            }
 
             device_link_tlv_writer_init(&nested, network, sizeof(network));
             if (device_link_tlv_put_bytes(&nested, 1U,
@@ -632,7 +767,7 @@ static device_link_status_t _wifi_handler(
                     device_link_tlv_put_uint(&nested, 3U,
                                              scan.records[i].channel) != ESP_OK ||
                     device_link_tlv_put_uint(&nested, 4U,
-                                             (uint64_t)scan.records[i].security + 1U) != ESP_OK ||
+                                             wire_security) != ESP_OK ||
                     device_link_tlv_put_bool(&nested, 5U,
                                              scan.records[i].saved) != ESP_OK ||
                     device_link_tlv_writer_finish(&nested, &network_len) !=
@@ -694,6 +829,7 @@ static device_link_status_t _wifi_handler(
         size_t ssid_len = 0U;
         size_t password_len = 0U;
         uint64_t security = 0U;
+        connectivity_manager_security_t manager_security;
 
         if (!_read_message(nested_data, nested_len, &s_credentials_schema,
                            &nested))
@@ -722,15 +858,23 @@ static device_link_status_t _wifi_handler(
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
-        /* First-line cross-field rules (wifi-v1.md, invalid.json): the
-         * wire security value is the enum + 1, so 1 is OPEN, 2 is
-         * PERSONAL and 3 is UNSUPPORTED. OPEN requires an empty
-         * password, PERSONAL requires a nonempty password (the schema
-         * bounds it to 64 bytes), and UNSUPPORTED is rejected. The
-         * manager's own profile validation stays as the second line of
-         * defense. */
-        if (security == 3U || (security == 1U && password_len != 0U) ||
-                (security == 2U && password_len == 0U))
+        if (!_manager_security_from_wire(security, &manager_security) ||
+                manager_security == CONNECTIVITY_MANAGER_SECURITY_UNSUPPORTED)
+        {
+            return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
+        }
+        const wifi_service_credentials_t policy =
+        {
+            .ssid = ssid,
+            .ssid_length = ssid_len,
+            .password = password,
+            .password_length = password_len,
+            .security = manager_security == CONNECTIVITY_MANAGER_SECURITY_OPEN ?
+            WIFI_SERVICE_SECURITY_OPEN :
+            WIFI_SERVICE_SECURITY_PERSONAL,
+        };
+
+        if (!wifi_service_credentials_valid(&policy))
         {
             return DEVICE_LINK_STATUS_INVALID_ARGUMENT;
         }
@@ -740,7 +884,7 @@ static device_link_status_t _wifi_handler(
             .ssid_length = ssid_len,
             .password = password,
             .password_length = password_len,
-            .security = (connectivity_manager_security_t)(security - 1U),
+            .security = manager_security,
         };
         result = connectivity_manager_request_sync_profile(
                      &credentials, sync_id, auto_connect, &operation_id);
@@ -1012,7 +1156,17 @@ static void _bridge_update_status(
     device_link_status_t status = _bridge_map_failure(snapshot->failure);
     device_link_operation_state_t state = DEVICE_LINK_OPERATION_FAILED;
 
-    if (snapshot->last_error == ESP_OK)
+    if (snapshot->operation_canceled)
+    {
+        state = DEVICE_LINK_OPERATION_CANCELED;
+        status = DEVICE_LINK_STATUS_OK;
+    }
+    else if (snapshot->operation_conflict)
+    {
+        state = DEVICE_LINK_OPERATION_FAILED;
+        status = DEVICE_LINK_STATUS_CONFLICT;
+    }
+    else if (snapshot->last_error == ESP_OK)
     {
         state = DEVICE_LINK_OPERATION_SUCCEEDED;
         status = DEVICE_LINK_STATUS_OK;
@@ -1063,11 +1217,13 @@ static void _bridge_update_scan(
 {
     /* start_scan declares core.v2.Empty: a SUCCEEDED record carries no
      * result payload; scan pages are read via GetScanResults. */
-    device_link_status_t status =
-        _map_result((esp_err_t)snapshot->last_error);
-    const device_link_operation_state_t state =
-        status == DEVICE_LINK_STATUS_OK ?
-        DEVICE_LINK_OPERATION_SUCCEEDED : DEVICE_LINK_OPERATION_FAILED;
+    device_link_status_t status = snapshot->operation_canceled ?
+                                  DEVICE_LINK_STATUS_OK :
+                                  _map_result((esp_err_t)snapshot->last_error);
+    const device_link_operation_state_t state = snapshot->operation_canceled ?
+        DEVICE_LINK_OPERATION_CANCELED :
+        (status == DEVICE_LINK_STATUS_OK ?
+         DEVICE_LINK_OPERATION_SUCCEEDED : DEVICE_LINK_OPERATION_FAILED);
     const esp_err_t update_result = ble_link_service_async_operation_update(
                                         snapshot->operation_id, state, status,
                                         NULL, 0U);

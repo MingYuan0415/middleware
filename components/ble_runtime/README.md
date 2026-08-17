@@ -168,6 +168,13 @@ gate/ADV hold 并物理关 gate，临时 STOP/HCI 失败不会留下无 tracking
 时闭窗主动重启 pairing。`scripts/check_idf_assumptions.sh` 锁定对应 GATT、GAP、ATT、SM、
 store、connection 和 host-event 源码假设；脚本失败必须触发人工时序审查。
 
+同一脚本也锁定 Security2 源码。v6.0.2 的 GCM encrypt/decrypt 失败路径会释放输出但不清空
+指针，也不在释放前清零；项目适配层因此把依赖失败输出视为非所有权值，并只向上返回
+`NULL/0`。本地可用的 v6.1-beta1 标签仍保留相同行为，且其 NimBLE 子模块对象不在当前
+checkout 中，无法完成既有 BLE assumption matrix。因此生产安全验收保持 blocked；发布
+检查可设置 `DEVICE_LINK_REQUIRE_SECURITY_RELEASE=1` 将该阻塞转为脚本失败。不得仅凭版本
+号升级解除阻塞，候选版本必须同时通过输出 ownership、失败清零和完整 BLE matrix。
+
 ## 宿主测试
 
 测试需要导出 ESP-IDF v6.0.2 的 `IDF_PATH`，以直接编译该版本的

@@ -75,6 +75,7 @@ static void _wifi_service_finish_suspended_scan(
     context->scan_active = false;
     context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
     context->scan.last_error = result;
+    context->scan.operation_canceled = result == ESP_OK;
     bool publish_restored_status = false;
     if (restore_status &&
             context->status.state == WIFI_SERVICE_STATE_SCANNING)

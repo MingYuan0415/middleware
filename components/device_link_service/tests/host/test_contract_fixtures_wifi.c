@@ -29,6 +29,9 @@
 #define WIFI_INVALID_OPEN_WITH_PASSWORD 2
 #define WIFI_INVALID_PERSONAL_EMPTY_PASSWORD 3
 #define WIFI_INVALID_UNSUPPORTED_SECURITY 4
+#define WIFI_INVALID_SSID_NUL 5
+#define WIFI_INVALID_PERSONAL_SHORT 6
+#define WIFI_INVALID_PERSONAL_NON_HEX_PSK 7
 
 /* Test-only fake hooks (fakes/connectivity_manager.c, fakes/event_bus.c,
  * fakes/ble_link_service_fake.c). */
@@ -66,9 +69,9 @@ static void _test_invalid_wifi_credentials(void)
 {
     /* wifi.v1 invalid.json: the adapter is the first line of defense for
      * the cross-field credential rules. OPEN requires an empty password,
-     * PERSONAL requires a nonempty password, UNSUPPORTED is rejected,
-     * and a non-minimal varint encoding is rejected by the schema
-     * decoder. All four map to INVALID_ARGUMENT. */
+     * PERSONAL requires an 8..63-byte passphrase or 64 ASCII hex PSK,
+     * SSIDs and secrets reject NUL, UNSUPPORTED is rejected, and a
+     * non-minimal varint is rejected by the schema decoder. */
     for (size_t i = 0U; i < s_wifi_invalid_count; ++i)
     {
         if (s_wifi_invalid_kind[i] == WIFI_INVALID_NON_MINIMAL_AUTO_CONNECT)

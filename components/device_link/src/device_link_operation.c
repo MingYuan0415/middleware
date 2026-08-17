@@ -87,6 +87,18 @@ esp_err_t device_link_operation_start(
     device_link_operation_cancel_t cancel, void *cancel_arg,
     uint64_t *operation_id)
 {
+    return device_link_operation_start_with_schema(
+               table, now_ms, domain_id, method_id, owner_id, NULL,
+               cancel, cancel_arg, operation_id);
+}
+
+esp_err_t device_link_operation_start_with_schema(
+    device_link_operation_table_t *table, uint64_t now_ms,
+    uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
+    const device_link_tlv_schema_t *result_schema,
+    device_link_operation_cancel_t cancel, void *cancel_arg,
+    uint64_t *operation_id)
+{
     if (table == NULL || table->boot_id == 0U ||
             domain_id == DEVICE_LINK_DOMAIN_INVALID || method_id == 0U ||
             owner_id == 0U || operation_id == NULL)
@@ -115,6 +127,7 @@ esp_err_t device_link_operation_start(
     slot->method_id = method_id;
     slot->state = DEVICE_LINK_OPERATION_PENDING;
     slot->status = DEVICE_LINK_STATUS_OK;
+    slot->result_schema = result_schema;
     slot->cancel = cancel;
     slot->cancel_arg = cancel_arg;
     *operation_id = slot->id;
@@ -137,9 +150,9 @@ esp_err_t device_link_operation_update(
         return ESP_ERR_INVALID_ARG;
     }
     /* Frozen operation-state semantics (core v2 OperationStatus): in-flight
-     * states report OK, SUCCEEDED reports OK and may carry the declared
-     * result payload, FAILED requires a non-OK error, and non-success
-     * terminal records never carry a result payload. */
+     * states report OK without payload, SUCCEEDED carries exactly its
+     * declared result (or zero bytes for Empty), and non-success terminal
+     * records never carry a result payload. */
     const bool in_flight = state == DEVICE_LINK_OPERATION_PENDING ||
                            state == DEVICE_LINK_OPERATION_RUNNING;
     const bool non_success_terminal =
@@ -149,8 +162,11 @@ esp_err_t device_link_operation_update(
     if ((in_flight && status != DEVICE_LINK_STATUS_OK) ||
             (state == DEVICE_LINK_OPERATION_SUCCEEDED &&
              status != DEVICE_LINK_STATUS_OK) ||
+            (in_flight && result_len != 0U) ||
             (state == DEVICE_LINK_OPERATION_FAILED &&
              status == DEVICE_LINK_STATUS_OK) ||
+            (state == DEVICE_LINK_OPERATION_CANCELED &&
+             status != DEVICE_LINK_STATUS_OK) ||
             (non_success_terminal && result_len != 0U))
     {
         return ESP_ERR_INVALID_ARG;
@@ -167,9 +183,33 @@ esp_err_t device_link_operation_update(
     {
         return ESP_ERR_INVALID_STATE;
     }
+    if (operation->cancel_requested && _terminal(state) &&
+            !(state == DEVICE_LINK_OPERATION_FAILED &&
+              status == DEVICE_LINK_STATUS_UNAVAILABLE))
+    {
+        state = DEVICE_LINK_OPERATION_CANCELED;
+        status = DEVICE_LINK_STATUS_OK;
+        result = NULL;
+        result_len = 0U;
+    }
+    if (state == DEVICE_LINK_OPERATION_SUCCEEDED)
+    {
+        const bool empty_result = operation->result_schema == NULL ||
+                                  operation->result_schema->field_count == 0U;
+
+        if ((empty_result && result_len != 0U) ||
+                (!empty_result &&
+                 (result_len == 0U ||
+                  device_link_tlv_validate_message(
+                      result, result_len, operation->result_schema) != ESP_OK)))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
     operation->state = state;
     operation->status = status;
     operation->result_len = result_len;
+    memset(operation->result, 0, sizeof(operation->result));
     if (result_len != 0U)
     {
         memcpy(operation->result, result, result_len);
@@ -209,6 +249,7 @@ esp_err_t device_link_operation_cancel(
     {
         return ESP_ERR_INVALID_ARG;
     }
+    device_link_operation_sweep(table, now_ms);
     device_link_operation_t *operation = _find(table, operation_id);
 
     if (operation == NULL)
@@ -219,18 +260,26 @@ esp_err_t device_link_operation_cancel(
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (operation->cancel != NULL)
+    if (operation->cancel_requested)
     {
-        const esp_err_t result = operation->cancel(
-                                     operation->owner_id,
-                                     operation->cancel_arg);
-
-        if (result != ESP_OK)
-        {
-            return result;
-        }
+        return ESP_OK;
     }
-    return device_link_operation_update(
-               table, now_ms, operation_id, DEVICE_LINK_OPERATION_CANCELED,
-               DEVICE_LINK_STATUS_OK, NULL, 0U);
+    if (operation->cancel == NULL)
+    {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* Register intent before entering the lower layer. A synchronous
+     * completion callback can re-enter the service while cancel() runs;
+     * it must observe that cancellation won the serialization order. */
+    operation->cancel_requested = true;
+    const esp_err_t result = operation->cancel(
+                                 operation->owner_id,
+                                 operation->cancel_arg);
+
+    if (result != ESP_OK)
+    {
+        operation->cancel_requested = false;
+        return result;
+    }
+    return ESP_OK;
 }

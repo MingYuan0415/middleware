@@ -257,8 +257,9 @@ device_link_security_verifier_kind_t device_link_security_selected_verifier(void
  *
  * @param[in] input SessionData bytes.
  * @param[in] input_len Input length.
- * @param[out] output Allocated SessionData response.
- * @param[out] output_len Response length.
+ * @param[out] output Allocated SessionData response on success; NULL on
+ *                    failure.
+ * @param[out] output_len Response length on success; zero on failure.
  * @return ESP_OK, or a Protocomm error (the session is closed on failure).
  */
 esp_err_t device_link_security_handshake(
@@ -276,8 +277,9 @@ esp_err_t device_link_security_handshake(
  *
  * @param[in] input Serialized SessionData request.
  * @param[in] input_len Request length.
- * @param[out] output Allocated serialized SessionData response.
- * @param[out] output_len Response length.
+ * @param[out] output Allocated serialized response on success; NULL on
+ *                    failure.
+ * @param[out] output_len Response length on success; zero on failure.
  * @param[out] handshake_result Parsed stage and authentication result.
  * @return ESP_OK, or an error with the current session closed.
  */
@@ -304,8 +306,9 @@ esp_err_t device_link_security_handshake_ex(
  *
  * @param[in] input Ciphertext.
  * @param[in] input_len Ciphertext length (must exceed the 16-byte tag).
- * @param[out] output Allocated ciphertext response.
- * @param[out] output_len Response length.
+ * @param[out] output Allocated ciphertext response on success; NULL on
+ *                    failure.
+ * @param[out] output_len Response length on success; zero on failure.
  * @return ESP_OK, ESP_ERR_INVALID_STATE when unauthenticated, or a
  *         Protocomm error (the session is closed on failure).
  */
@@ -324,8 +327,8 @@ esp_err_t device_link_security_unprotect(
  *
  * @param[in] plain Plaintext Envelope.
  * @param[in] plain_len Plaintext length.
- * @param[out] cipher Allocated ciphertext.
- * @param[out] cipher_len Ciphertext length.
+ * @param[out] cipher Allocated ciphertext on success; NULL on failure.
+ * @param[out] cipher_len Ciphertext length on success; zero on failure.
  * @return ESP_OK, ESP_ERR_INVALID_STATE when unauthenticated, or an
  *         encryption error.
  */

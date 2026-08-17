@@ -114,6 +114,8 @@ typedef struct connectivity_manager_status_snapshot
     bool auto_connect;                              /**< Persistent policy switch. */
     bool manual_hold;                               /**< Offline for this boot. */
     bool operation_complete;                        /**< Foreground terminal event. */
+    bool operation_canceled;                        /**< Owner confirmed cancellation. */
+    bool operation_conflict;                        /**< Sync identity conflict. */
     uint64_t profile_revision;                       /**< Durable profile revision. */
     connectivity_manager_client_sync_id_t
     applied_client_sync_id;                         /**< Last durable sync id. */
@@ -129,6 +131,7 @@ typedef struct connectivity_manager_scan_snapshot
     uint8_t record_count;                           /**< Valid records. */
     bool running;                                   /**< Scan is active. */
     bool truncated;                                 /**< Results were truncated. */
+    bool operation_canceled;                        /**< Owner confirmed cancellation. */
     connectivity_manager_scan_record_t
     records[CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS]; /**< Scan results. */
 } connectivity_manager_scan_snapshot_t;

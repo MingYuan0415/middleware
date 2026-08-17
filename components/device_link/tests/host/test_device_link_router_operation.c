@@ -191,13 +191,30 @@ static void _test_router(void)
     assert(memcmp(response, first_response, first_len) == 0);
     assert(handler.calls == 1U);
 
+    device_link_router_replay_reset(&router);
+    assert(router.next_replay_slot == 0U);
+    for (size_t i = 0U; i < DEVICE_LINK_REPLAY_SLOTS; ++i)
+    {
+        assert(!replay[i].active);
+        assert(replay[i].response_len == 0U);
+        for (size_t j = 0U; j < replay[i].response_capacity; ++j)
+        {
+            assert(replay[i].response[j] == 0U);
+        }
+    }
+    assert(device_link_router_process(
+               &router, &facts, request, request_len,
+               response, sizeof(response), &response_len) == ESP_OK);
+    assert(_response_status(response, response_len) == DEVICE_LINK_STATUS_OK);
+    assert(handler.calls == 2U);
+
     request[DEVICE_LINK_WIRE_HEADER_BYTES + 1U]++;
     assert(device_link_router_process(
                &router, &facts, request, request_len,
                response, sizeof(response), &response_len) == ESP_OK);
     assert(_response_status(response, response_len) ==
            DEVICE_LINK_STATUS_CONFLICT);
-    assert(handler.calls == 1U);
+    assert(handler.calls == 2U);
 
     request_len = _make_request(
                       2U, boot_id, handler.value,
@@ -209,7 +226,7 @@ static void _test_router(void)
                response, sizeof(response), &response_len) == ESP_OK);
     assert(_response_status(response, response_len) ==
            DEVICE_LINK_STATUS_PERMISSION_DENIED);
-    assert(handler.calls == 1U);
+    assert(handler.calls == 2U);
 
     request_len = _make_request(
                       4U, boot_id, handler.value,
@@ -374,6 +391,45 @@ static esp_err_t _cancel_owner(uint64_t owner_id, void *arg)
     return ESP_OK;
 }
 
+typedef struct cancel_reentry
+{
+    device_link_operation_table_t *table;
+    uint64_t operation_id;
+} cancel_reentry_t;
+
+static esp_err_t _cancel_with_synchronous_completion(
+    uint64_t owner_id, void *arg)
+{
+    cancel_reentry_t *reentry = arg;
+
+    assert(owner_id == 77U);
+    return device_link_operation_update(
+               reentry->table, 12U, reentry->operation_id,
+               DEVICE_LINK_OPERATION_SUCCEEDED, DEVICE_LINK_STATUS_OK,
+               NULL, 0U);
+}
+
+static void _test_cancel_linearization(void)
+{
+    device_link_operation_table_t table;
+    cancel_reentry_t reentry = {.table = &table};
+
+    assert(device_link_operation_table_init(&table, 10U) == ESP_OK);
+    assert(device_link_operation_start(
+               &table, 10U, DEVICE_LINK_DOMAIN_WIFI, 1U, 77U,
+               _cancel_with_synchronous_completion, &reentry,
+               &reentry.operation_id) == ESP_OK);
+    assert(device_link_operation_cancel(
+               &table, 11U, reentry.operation_id) == ESP_OK);
+    const device_link_operation_t *operation = NULL;
+
+    assert(device_link_operation_get(
+               &table, 12U, reentry.operation_id, &operation) == ESP_OK);
+    assert(operation->cancel_requested);
+    assert(operation->state == DEVICE_LINK_OPERATION_CANCELED);
+    assert(operation->status == DEVICE_LINK_STATUS_OK);
+}
+
 static void _test_operations(void)
 {
     device_link_operation_table_t table;
@@ -383,23 +439,39 @@ static void _test_operations(void)
     assert(device_link_operation_table_init(&table, 9U) == ESP_OK);
     for (size_t i = 0U; i < DEVICE_LINK_MAX_OPERATIONS; ++i)
     {
-        assert(device_link_operation_start(
-                   &table, 10U, DEVICE_LINK_DOMAIN_WIFI, 4U,
-                   i + 100U, _cancel_owner, &canceled_owner,
-                   &ids[i]) == ESP_OK);
+        const esp_err_t start_result = i == 2U ?
+                                       device_link_operation_start_with_schema(
+                                           &table, 10U,
+                                           DEVICE_LINK_DOMAIN_WIFI, 4U,
+                                           i + 100U, &s_value_schema,
+                                           _cancel_owner, &canceled_owner,
+                                           &ids[i]) :
+                                       device_link_operation_start(
+                                           &table, 10U,
+                                           DEVICE_LINK_DOMAIN_WIFI, 4U,
+                                           i + 100U, _cancel_owner,
+                                           &canceled_owner, &ids[i]);
+
+        assert(start_result == ESP_OK);
         assert(ids[i] == i + 1U);
     }
     uint64_t extra = 0U;
     assert(device_link_operation_start(
                &table, 10U, DEVICE_LINK_DOMAIN_WIFI, 4U, 999U,
                NULL, NULL, &extra) == ESP_ERR_NO_MEM);
+    memset(table.slots[0].result, 0xa5, sizeof(table.slots[0].result));
     assert(device_link_operation_update(
                &table, 20U, ids[0], DEVICE_LINK_OPERATION_RUNNING,
                DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_OK);
+    for (size_t i = 0U; i < sizeof(table.slots[0].result); ++i)
+    {
+        assert(table.slots[0].result[i] == 0U);
+    }
     /* Frozen operation-state semantics: in-flight states report OK,
      * FAILED requires a non-OK error, and non-success terminal records
      * never carry a result payload. */
-    static const uint8_t payload[4] = {1U, 2U, 3U, 4U};
+    static const uint8_t payload[2] = {0x04U, 0x2aU};
+    static const uint8_t malformed_payload[2] = {0x08U, 0x2aU};
 
     assert(device_link_operation_update(
                &table, 21U, ids[1], DEVICE_LINK_OPERATION_RUNNING,
@@ -412,12 +484,15 @@ static void _test_operations(void)
                DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_ERR_INVALID_ARG);
     assert(device_link_operation_update(
                &table, 21U, ids[1], DEVICE_LINK_OPERATION_FAILED,
-               DEVICE_LINK_STATUS_NOT_FOUND, payload,
-               sizeof(payload)) == ESP_ERR_INVALID_ARG);
+               DEVICE_LINK_STATUS_NOT_FOUND, malformed_payload,
+               sizeof(malformed_payload)) == ESP_ERR_INVALID_ARG);
     assert(device_link_operation_update(
                &table, 21U, ids[1], DEVICE_LINK_OPERATION_CANCELED,
                DEVICE_LINK_STATUS_OK, payload,
                sizeof(payload)) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[1], DEVICE_LINK_OPERATION_CANCELED,
+               DEVICE_LINK_STATUS_STORAGE, NULL, 0U) == ESP_ERR_INVALID_ARG);
     assert(device_link_operation_update(
                &table, 21U, ids[1], DEVICE_LINK_OPERATION_SUCCEEDED,
                DEVICE_LINK_STATUS_CONFLICT, NULL, 0U) == ESP_ERR_INVALID_ARG);
@@ -427,23 +502,62 @@ static void _test_operations(void)
                DEVICE_LINK_STATUS_STORAGE, NULL, 0U) == ESP_OK);
     assert(device_link_operation_update(
                &table, 21U, ids[2], DEVICE_LINK_OPERATION_SUCCEEDED,
+               DEVICE_LINK_STATUS_OK, malformed_payload,
+               sizeof(malformed_payload)) == ESP_ERR_INVALID_ARG);
+    assert(device_link_operation_update(
+               &table, 21U, ids[2], DEVICE_LINK_OPERATION_SUCCEEDED,
                DEVICE_LINK_STATUS_OK, payload, sizeof(payload)) == ESP_OK);
+    assert(device_link_operation_cancel(
+               &table, 22U, ids[2]) == ESP_ERR_INVALID_STATE);
+    assert(device_link_operation_cancel(
+               &table, 22U, ids[3]) == ESP_OK);
+    assert(device_link_operation_update(
+               &table, 23U, ids[3], DEVICE_LINK_OPERATION_FAILED,
+               DEVICE_LINK_STATUS_UNAVAILABLE, NULL, 0U) == ESP_OK);
+    const device_link_operation_t *operation = NULL;
+
+    assert(device_link_operation_get(
+               &table, 23U, ids[3], &operation) == ESP_OK);
+    assert(operation->state == DEVICE_LINK_OPERATION_FAILED);
+    assert(operation->status == DEVICE_LINK_STATUS_UNAVAILABLE);
     assert(device_link_operation_cancel(
                &table, 30U, ids[0]) == ESP_OK);
     assert(canceled_owner == 100U);
-    const device_link_operation_t *operation = NULL;
     assert(device_link_operation_get(
                &table, 30U, ids[0], &operation) == ESP_OK);
     assert(operation != NULL);
-    assert(operation->state == DEVICE_LINK_OPERATION_CANCELED);
+    assert(operation->state == DEVICE_LINK_OPERATION_RUNNING);
+    assert(operation->cancel_requested);
+    assert(device_link_operation_update(
+               &table, 31U, ids[0], DEVICE_LINK_OPERATION_SUCCEEDED,
+               DEVICE_LINK_STATUS_OK, NULL, 0U) == ESP_OK);
     assert(device_link_operation_get(
-               &table, 30U + DEVICE_LINK_OPERATION_RETENTION_MS,
+               &table, 31U, ids[0], &operation) == ESP_OK);
+    assert(operation->state == DEVICE_LINK_OPERATION_CANCELED);
+    assert(operation->status == DEVICE_LINK_STATUS_OK);
+    assert(operation->result_len == 0U);
+    assert(device_link_operation_get(
+               &table, 31U + DEVICE_LINK_OPERATION_RETENTION_MS,
                ids[0], &operation) == ESP_ERR_NOT_FOUND);
     assert(device_link_operation_start(
-               &table, 30U + DEVICE_LINK_OPERATION_RETENTION_MS,
+               &table, 31U + DEVICE_LINK_OPERATION_RETENTION_MS,
                DEVICE_LINK_DOMAIN_WIFI, 4U, 1000U,
                NULL, NULL, &extra) == ESP_OK);
     assert(extra == 5U);
+
+    device_link_operation_table_t expiry_table;
+    uint64_t expiry_id = 0U;
+    assert(device_link_operation_table_init(&expiry_table, 10U) == ESP_OK);
+    assert(device_link_operation_start(
+               &expiry_table, 1U, DEVICE_LINK_DOMAIN_WIFI, 2U, 2000U,
+               _cancel_owner, &canceled_owner, &expiry_id) == ESP_OK);
+    assert(device_link_operation_update(
+               &expiry_table, 2U, expiry_id,
+               DEVICE_LINK_OPERATION_SUCCEEDED, DEVICE_LINK_STATUS_OK,
+               NULL, 0U) == ESP_OK);
+    assert(device_link_operation_cancel(
+               &expiry_table, 2U + DEVICE_LINK_OPERATION_RETENTION_MS,
+               expiry_id) == ESP_ERR_NOT_FOUND);
 }
 
 static void _test_wrong_channel(void)
@@ -551,6 +665,7 @@ int main(void)
     _test_router();
     _test_wrong_channel();
     _test_operations();
+    _test_cancel_linearization();
     _test_allowed_status_mask();
     _test_permission_list_rules();
     puts("device_link router/operation tests passed");

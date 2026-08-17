@@ -17,6 +17,7 @@ set(BLE_RUNTIME "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(DEVICE_LINK_SECURITY "${PROJECT_ROOT}/layers/middleware/components/device_link_security")
 set(DEVICE_LINK_WIRE "${PROJECT_ROOT}/layers/middleware/components/device_link")
 set(EVENT_BUS "${PROJECT_ROOT}/layers/middleware/components/event_bus")
+set(WIFI_SERVICE "${PROJECT_ROOT}/layers/middleware/components/wifi_service")
 set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 set(IDF_BT "$ENV{IDF_PATH}/components/bt")
 set(PROTOCOMM_PROTO "$ENV{IDF_PATH}/components/protocomm/proto-c")
@@ -27,6 +28,7 @@ add_executable(test_device_link_service
                "${HOST_CONNECTIVITY}/freertos_host.c"
                "${COMPONENT}/src/device_link_service.c"
                "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${WIFI_SERVICE}/src/wifi_service_credentials.c"
                "${CMAKE_CURRENT_LIST_DIR}/fakes/connectivity_manager.c"
                "${BLE_RUNTIME}/src/ble_runtime.c"
                "${BLE_RUNTIME}/src/ble_adv_manager.c"
@@ -79,6 +81,7 @@ target_include_directories(test_device_link_service PRIVATE
                            "${BLE_RUNTIME}/include"
                            "${DEVICE_LINK_WIRE}/include"
                            "${EVENT_BUS}/include"
+                           "${WIFI_SERVICE}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
                            "${IDF_BT}/common/tinycrypt/include"
                           )
@@ -134,6 +137,7 @@ add_executable(test_device_link_wifi_adapter
                fakes/event_bus.c
                fakes/ble_link_service_fake.c
                "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${WIFI_SERVICE}/src/wifi_service_credentials.c"
                "${DEVICE_LINK_WIRE}/src/device_link_tlv.c")
 target_compile_features(test_device_link_wifi_adapter PRIVATE c_std_11)
 target_compile_definitions(test_device_link_wifi_adapter PRIVATE
@@ -148,6 +152,7 @@ target_include_directories(test_device_link_wifi_adapter PRIVATE
                            "${DEVICE_LINK_WIRE}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
                            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+                           "${WIFI_SERVICE}/include"
                            "${HOST_CONNECTIVITY}/include"
                            "${PROJECT_ROOT}/tests/host"
                           )
@@ -188,6 +193,7 @@ add_executable(test_contract_fixtures_wifi
                fakes/event_bus.c
                fakes/ble_link_service_fake.c
                "${COMPONENT}/src/device_link_wifi_adapter.c"
+               "${WIFI_SERVICE}/src/wifi_service_credentials.c"
                "${DEVICE_LINK_WIRE}/src/device_link_tlv.c")
 target_compile_features(test_contract_fixtures_wifi PRIVATE c_std_11)
 target_compile_definitions(test_contract_fixtures_wifi PRIVATE
@@ -203,6 +209,7 @@ target_include_directories(test_contract_fixtures_wifi PRIVATE
                            "${DEVICE_LINK_WIRE}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
                            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+                           "${WIFI_SERVICE}/include"
                            "${HOST_CONNECTIVITY}/include"
                            "${PROJECT_ROOT}/tests/host"
                           )

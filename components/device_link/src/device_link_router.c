@@ -107,6 +107,12 @@ esp_err_t device_link_domain_descriptors_validate(
                 &domain->methods[j];
 
             if (method->method_id == 0U || method->permission_id == 0U ||
+                    (method->flags & ~(DEVICE_LINK_METHOD_BOOTSTRAP |
+                                       DEVICE_LINK_METHOD_ASYNCHRONOUS)) != 0U ||
+                    (((method->flags & DEVICE_LINK_METHOD_BOOTSTRAP) != 0U) &&
+                     ((method->flags & DEVICE_LINK_METHOD_ASYNCHRONOUS) != 0U)) ||
+                    (((method->flags & DEVICE_LINK_METHOD_ASYNCHRONOUS) != 0U) !=
+                     (method->operation_result_schema != NULL)) ||
                     (method->channel != DEVICE_LINK_CHANNEL_SESSION &&
                      method->channel != DEVICE_LINK_CHANNEL_CONTROL) ||
                     method->handler == NULL ||
@@ -210,6 +216,19 @@ void device_link_call_replay_reset(device_link_call_replay_t *replay)
         _secure_zero(replay->response, replay->response_capacity);
     }
     replay->response_len = 0U;
+}
+
+void device_link_router_replay_reset(device_link_router_t *router)
+{
+    if (router == NULL || router->replay == NULL)
+    {
+        return;
+    }
+    for (size_t index = 0U; index < router->replay_count; ++index)
+    {
+        device_link_call_replay_reset(&router->replay[index]);
+    }
+    router->next_replay_slot = 0U;
 }
 
 static esp_err_t _emit_status_response(
@@ -623,13 +642,17 @@ esp_err_t device_link_router_process(
     {
         return ESP_ERR_NO_MEM;
     }
-    result = router->digest(request, request_len,
-                            replay->request_digest,
+    uint8_t request_digest[DEVICE_LINK_REPLAY_DIGEST_BYTES];
+    result = router->digest(request, request_len, request_digest,
                             router->digest_arg);
     if (result != ESP_OK)
     {
+        _secure_zero(request_digest, sizeof(request_digest));
         return result;
     }
+    device_link_call_replay_reset(replay);
+    memcpy(replay->request_digest, request_digest, sizeof(request_digest));
+    _secure_zero(request_digest, sizeof(request_digest));
     memcpy(replay->response, response, *response_len);
     replay->active = true;
     replay->request_len = request_len;

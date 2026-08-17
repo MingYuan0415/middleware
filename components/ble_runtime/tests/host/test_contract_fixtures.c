@@ -511,20 +511,73 @@ static void _test_operation_results(void)
     static const device_link_tlv_field_rule_t s_result_fields[] =
     {
         {
-            .id = 1U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .id = 1U, .wire_type = DEVICE_LINK_TLV_FIXED64,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_NONZERO,
+        },
+        {
+            .id = 2U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
             .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 8U,
+        },
+        {
+            .id = 3U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED, .maximum_unsigned = 9U,
+        },
+        {
+            .id = 4U, .wire_type = DEVICE_LINK_TLV_LENGTH,
+            .maximum_bytes = 32U,
+        },
+        {
+            .id = 5U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_BOOL,
+            .maximum_unsigned = 1U,
+        },
+        {
+            .id = 6U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_BOOL,
+            .maximum_unsigned = 1U,
+        },
+        {
+            .id = 7U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_BOOL,
+            .maximum_unsigned = 1U,
+        },
+        {
+            .id = 8U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_BOOL,
+            .maximum_unsigned = 1U,
+        },
+        {
+            .id = 9U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_BOOL,
+            .maximum_unsigned = 1U,
+        },
+        {
+            .id = 10U, .wire_type = DEVICE_LINK_TLV_FIXED64,
+            .flags = DEVICE_LINK_TLV_RULE_REQUIRED |
+            DEVICE_LINK_TLV_RULE_NONZERO,
+        },
+        {
+            .id = 11U, .wire_type = DEVICE_LINK_TLV_FIXED64,
+            .flags = DEVICE_LINK_TLV_RULE_NONZERO,
         },
     };
     static const device_link_tlv_schema_t s_status_result_schema =
     {
         .fields = s_result_fields,
-        .field_count = 1U,
-        .maximum_encoded_bytes = 64U,
+        .field_count = 11U,
+        .maximum_encoded_bytes = 256U,
     };
     static const device_link_method_descriptor_t s_wifi_methods[] =
     {
         {
             .method_id = 2U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_SCAN,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 0U,
@@ -542,6 +595,7 @@ static void _test_operation_results(void)
         },
         {
             .method_id = 4U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 160U,
@@ -559,6 +613,7 @@ static void _test_operation_results(void)
         },
         {
             .method_id = 5U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 0U,
@@ -576,6 +631,7 @@ static void _test_operation_results(void)
         },
         {
             .method_id = 6U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 0U,
@@ -593,6 +649,7 @@ static void _test_operation_results(void)
         },
         {
             .method_id = 7U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 0U,
@@ -610,6 +667,7 @@ static void _test_operation_results(void)
         },
         {
             .method_id = 8U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 8U,

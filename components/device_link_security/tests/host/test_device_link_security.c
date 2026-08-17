@@ -162,6 +162,8 @@ static char s_last_sec2_request[512];
 static size_t s_last_sec2_request_len;
 static uint32_t s_last_session_id;
 static bool s_fail_next_sec2;
+static bool s_fail_encrypt_after_free;
+static bool s_fail_decrypt_after_free;
 static unsigned s_authenticated_count;
 static bool s_authenticated_observed_state;
 static esp_err_t s_authenticated_result;
@@ -310,6 +312,12 @@ static esp_err_t _fake_sec2_encrypt(
     memset(cipher + input_length, 0x5a, FAKE_TAG_BYTES);
     *output = cipher;
     *output_length = input_length + (ssize_t)FAKE_TAG_BYTES;
+    if (s_fail_encrypt_after_free)
+    {
+        s_fail_encrypt_after_free = false;
+        free(cipher);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -333,6 +341,12 @@ static esp_err_t _fake_sec2_decrypt(
     memcpy(plain, input, (size_t)input_length - FAKE_TAG_BYTES);
     *output = plain;
     *output_length = input_length - (ssize_t)FAKE_TAG_BYTES;
+    if (s_fail_decrypt_after_free)
+    {
+        s_fail_decrypt_after_free = false;
+        free(plain);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -405,6 +419,8 @@ static void _reset_fakes(void)
     s_last_sec2_request_len = 0U;
     s_last_session_id = 0U;
     s_fail_next_sec2 = false;
+    s_fail_encrypt_after_free = false;
+    s_fail_decrypt_after_free = false;
     s_authenticated_count = 0U;
     s_authenticated_observed_state = false;
     s_authenticated_result = ESP_OK;
@@ -1154,6 +1170,52 @@ static void _test_protect_requires_authentication(void)
     device_link_security_deinit();
 }
 
+static void _test_dependency_failure_ownership(void)
+{
+    _reset_fakes();
+    assert(device_link_security_init(&s_lifecycle_config) == ESP_OK);
+    assert(device_link_security_open_bootstrap(
+               (const uint8_t *)TEST_POP, strlen(TEST_POP)) == ESP_OK);
+    _select_bootstrap();
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+
+    assert(device_link_security_handshake(
+               s_cmd0_wire, s_cmd0_wire_len, &out, &out_len) == ESP_OK);
+    free(out);
+    _complete_handshake();
+
+    uint8_t *cipher = (uint8_t *)(uintptr_t)1U;
+    size_t cipher_len = SIZE_MAX;
+
+    s_fail_encrypt_after_free = true;
+    assert(device_link_security_protect(
+               (const uint8_t *)"plain", 5U, &cipher, &cipher_len) ==
+           ESP_FAIL);
+    assert(cipher == NULL);
+    assert(cipher_len == 0U);
+
+    uint8_t protected_request[FAKE_TAG_BYTES + 1U] = {0};
+
+    out = (uint8_t *)(uintptr_t)1U;
+    out_len = SIZE_MAX;
+    s_fail_decrypt_after_free = true;
+    assert(device_link_security_unprotect(
+               protected_request, sizeof(protected_request),
+               &out, &out_len) == ESP_FAIL);
+    assert(out == NULL);
+    assert(out_len == 0U);
+    assert(!device_link_security_session_open());
+
+    out = (uint8_t *)(uintptr_t)1U;
+    out_len = SIZE_MAX;
+    assert(device_link_security_unprotect(
+               NULL, 0U, &out, &out_len) == ESP_ERR_INVALID_ARG);
+    assert(out == NULL);
+    assert(out_len == 0U);
+    device_link_security_deinit();
+}
+
 static void _test_revoke_journal(void)
 {
     nv_storage_fake_reset();
@@ -1408,6 +1470,7 @@ int main(void)
     _test_revoke_journal_fail_closed();
     _test_nv_commit_boundary();
     _test_protect_requires_authentication();
+    _test_dependency_failure_ownership();
     _test_bootstrap_lifecycle();
     _test_failed_handshake_closes_session();
     _test_cmd1_authentication_transition();

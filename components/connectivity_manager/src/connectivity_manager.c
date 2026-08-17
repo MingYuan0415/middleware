@@ -484,36 +484,58 @@ static void _manager_copy_ssid(char destination[], const uint8_t source[],
     }
 }
 
+static bool _manager_credentials_policy_valid(
+    const char *ssid, size_t ssid_length,
+    const char *password, size_t password_length,
+    connectivity_manager_security_t security)
+{
+    wifi_service_security_t wifi_security;
+
+    switch (security)
+    {
+    case CONNECTIVITY_MANAGER_SECURITY_OPEN:
+        wifi_security = WIFI_SERVICE_SECURITY_OPEN;
+        break;
+    case CONNECTIVITY_MANAGER_SECURITY_PERSONAL:
+        wifi_security = WIFI_SERVICE_SECURITY_PERSONAL;
+        break;
+    default:
+        return false;
+    }
+    const wifi_service_credentials_t credentials =
+    {
+        .ssid = ssid,
+        .ssid_length = ssid_length,
+        .password = password,
+        .password_length = password_length,
+        .security = wifi_security,
+    };
+
+    return wifi_service_credentials_valid(&credentials);
+}
+
 static bool _manager_profile_valid(const manager_profile_t *profile)
 {
     if (profile->magic != CONNECTIVITY_MANAGER_PROFILE_MAGIC ||
             profile->version != CONNECTIVITY_MANAGER_PROFILE_VERSION ||
-            profile->auto_connect > 1U || profile->ssid_length == 0U ||
+            profile->auto_connect > 1U ||
             profile->ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
+            profile->password_length >
+            CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES ||
             profile->profile_revision == 0U ||
             profile->security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL ||
             !_manager_bytes_are_zero(profile->reserved,
                                      sizeof(profile->reserved)) ||
             !_manager_bytes_are_zero(profile->trailing_reserved,
                                      sizeof(profile->trailing_reserved)) ||
-            memchr(profile->ssid, '\0', profile->ssid_length) != NULL)
+            !_manager_credentials_policy_valid(
+                (const char *)profile->ssid, profile->ssid_length,
+                (const char *)profile->password, profile->password_length,
+                (connectivity_manager_security_t)profile->security))
     {
         return false;
     }
-    if (profile->security == CONNECTIVITY_MANAGER_SECURITY_OPEN)
-    {
-        return profile->password_length == 0U &&
-               _manager_bytes_are_zero(profile->ssid + profile->ssid_length,
-                                       sizeof(profile->ssid) -
-                                       profile->ssid_length) &&
-               _manager_bytes_are_zero(profile->password,
-                                       sizeof(profile->password));
-    }
-    return profile->password_length >= 8U &&
-           profile->password_length <=
-           CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES &&
-           memchr(profile->password, '\0', profile->password_length) == NULL &&
-           _manager_bytes_are_zero(profile->ssid + profile->ssid_length,
+    return _manager_bytes_are_zero(profile->ssid + profile->ssid_length,
                                    sizeof(profile->ssid) -
                                    profile->ssid_length) &&
            _manager_bytes_are_zero(
@@ -580,8 +602,20 @@ static esp_err_t _manager_profile_load(manager_worker_t *worker)
         memcpy(profile.password, legacy.password, sizeof(profile.password));
         profile.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
         profile.last_client_sync_id = 0U;
-        (void)_manager_profile_store(&profile);
         _manager_secure_zero(&legacy, sizeof(legacy));
+        if (!_manager_profile_valid(&profile))
+        {
+            _manager_secure_zero(&profile, sizeof(profile));
+            _manager_secure_zero(raw, sizeof(raw));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        result = _manager_profile_store(&profile);
+        if (result != ESP_OK)
+        {
+            _manager_secure_zero(&profile, sizeof(profile));
+            _manager_secure_zero(raw, sizeof(raw));
+            return result;
+        }
     }
     else if (size == sizeof(profile))
     {
@@ -718,6 +752,8 @@ static void _manager_cache_status(manager_worker_t *worker)
     worker->status.operation_id =
         worker->operation_id != 0U ? worker->operation_id : 0U;
     worker->status.operation_complete = false;
+    worker->status.operation_canceled = false;
+    worker->status.operation_conflict = false;
     _manager_publish_status(worker, &worker->status,
                             EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
 }
@@ -734,8 +770,12 @@ static void _manager_publish_status_terminal(
     connectivity_manager_status_snapshot_t terminal = worker->status;
     terminal.operation_id = operation_id;
     terminal.operation_complete = true;
+    terminal.operation_canceled = result == ESP_ERR_NOT_FINISHED;
+    terminal.operation_conflict =
+        failure == CONNECTIVITY_MANAGER_FAILURE_CONFLICT;
     terminal.last_error = result;
-    terminal.failure = failure;
+    terminal.failure = terminal.operation_conflict ?
+                       CONNECTIVITY_MANAGER_FAILURE_NONE : failure;
     terminal.generation = _manager_next_generation();
     _manager_cache_status_snapshot(worker, &terminal);
     manager_terminal_event_t event =
@@ -761,6 +801,10 @@ static void _manager_publish_scan(
     const connectivity_manager_scan_snapshot_t *snapshot, uint32_t flags)
 {
     connectivity_manager_scan_snapshot_t published = *snapshot;
+    if (published.running)
+    {
+        published.operation_canceled = false;
+    }
     published.generation = _manager_next_generation();
     _manager_cache_scan_snapshot(worker, &published);
     const esp_err_t result = event_bus_publish(
@@ -778,6 +822,8 @@ static void _manager_cache_scan(manager_worker_t *worker)
     if (!worker->scan.running && worker->scan.operation_id != 0U)
     {
         connectivity_manager_scan_snapshot_t terminal = worker->scan;
+        terminal.operation_canceled =
+            terminal.last_error == ESP_ERR_NOT_FINISHED;
         terminal.generation = _manager_next_generation();
         _manager_cache_scan_snapshot(worker, &terminal);
         manager_terminal_event_t event =
@@ -815,6 +861,7 @@ static void _manager_publish_scan_terminal(
     memset(&terminal, 0, sizeof(terminal));
     terminal.operation_id = operation_id;
     terminal.last_error = result;
+    terminal.operation_canceled = result == ESP_ERR_NOT_FINISHED;
     terminal.generation = _manager_next_generation();
     _manager_cache_scan_snapshot(worker, &terminal);
     manager_terminal_event_t event =
@@ -1321,7 +1368,8 @@ static void _manager_handle_connected(manager_worker_t *worker,
 static void _manager_handle_connect_terminal(manager_worker_t *worker,
         const wifi_service_status_snapshot_t *status)
 {
-    const bool canceled = worker->active_cancel_requested;
+    const bool canceled = worker->active_cancel_requested &&
+                          status->operation_canceled;
     const bool candidate = worker->target_candidate;
     const connectivity_manager_failure_t failure = canceled ?
         CONNECTIVITY_MANAGER_FAILURE_NONE :
@@ -1443,7 +1491,8 @@ static void _manager_poll_status(manager_worker_t *worker)
              (status.state == WIFI_SERVICE_STATE_IDLE ||
               status.state == WIFI_SERVICE_STATE_OFFLINE))
     {
-        const bool canceled = worker->active_cancel_requested;
+        const bool canceled = worker->active_cancel_requested &&
+                              status.operation_canceled;
         const esp_err_t result = canceled ? ESP_ERR_NOT_FINISHED :
                                  status.last_error;
         const connectivity_manager_failure_t failure = canceled ?
@@ -1486,8 +1535,7 @@ static void _manager_poll_scan(manager_worker_t *worker)
         return;
     }
     worker->scan.operation_id = worker->operation_id;
-    worker->scan.last_error = worker->active_cancel_requested ||
-                              scan.state == WIFI_SERVICE_SCAN_CANCELED ?
+    worker->scan.last_error = scan.operation_canceled ?
                               ESP_ERR_NOT_FINISHED : scan.last_error;
     worker->scan.running = scan.state == WIFI_SERVICE_SCAN_RUNNING;
     worker->scan.truncated = scan.truncated;
@@ -1607,36 +1655,16 @@ static void _manager_command_sync_profile(
             command->client_sync_id)
     {
         if (!_manager_profile_credentials_equal(
-                    &worker->profile, &command->credentials))
+                    &worker->profile, &command->credentials) ||
+                worker->profile.auto_connect !=
+                (command->sync_auto_connect ? 1U : 0U))
         {
             worker->status.last_error = ESP_ERR_INVALID_STATE;
-            worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_CONFLICT;
+            worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
             _manager_publish_status_terminal(
                 worker, command->operation_id, ESP_ERR_INVALID_STATE,
                 CONNECTIVITY_MANAGER_FAILURE_CONFLICT);
             return;
-        }
-        if (worker->profile.auto_connect !=
-                (command->sync_auto_connect ? 1U : 0U))
-        {
-            manager_profile_t changed = worker->profile;
-            changed.auto_connect = command->sync_auto_connect ? 1U : 0U;
-            const esp_err_t store_result = _manager_profile_store(&changed);
-            if (store_result == ESP_OK)
-            {
-                worker->profile = changed;
-            }
-            _manager_secure_zero(&changed, sizeof(changed));
-            if (store_result != ESP_OK)
-            {
-                worker->status.last_error = store_result;
-                worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
-                _manager_set_target_status(worker);
-                _manager_publish_status_terminal(
-                    worker, command->operation_id, store_result,
-                    CONNECTIVITY_MANAGER_FAILURE_STORAGE);
-                return;
-            }
         }
         _manager_set_target_status(worker);
         _manager_publish_status_terminal(
@@ -1726,10 +1754,10 @@ static void _manager_command_reconnect(manager_worker_t *worker,
     if (!worker->profile_valid)
     {
         worker->status.last_error = ESP_ERR_NOT_FOUND;
-        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
         _manager_publish_status_terminal(
             worker, command->operation_id, ESP_ERR_NOT_FOUND,
-            CONNECTIVITY_MANAGER_FAILURE_STORAGE);
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
         return;
     }
     worker->retry_pending = false;
@@ -1757,6 +1785,15 @@ static void _manager_command_forget(manager_worker_t *worker,
     {
         _manager_set_target_status(worker);
         _manager_cache_status(worker);
+        return;
+    }
+    if (!worker->profile_valid)
+    {
+        worker->status.last_error = ESP_ERR_NOT_FOUND;
+        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+        _manager_publish_status_terminal(
+            worker, command->operation_id, ESP_ERR_NOT_FOUND,
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
         return;
     }
 
@@ -1790,10 +1827,10 @@ static void _manager_command_set_auto(manager_worker_t *worker,
     if (!worker->profile_valid)
     {
         worker->status.last_error = ESP_ERR_NOT_FOUND;
-        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_STORAGE;
+        worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
         _manager_publish_status_terminal(
             worker, command->operation_id, ESP_ERR_NOT_FOUND,
-            CONNECTIVITY_MANAGER_FAILURE_STORAGE);
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
         return;
     }
     manager_profile_t changed = worker->profile;
@@ -1841,6 +1878,25 @@ static void _manager_command_set_auto(manager_worker_t *worker,
     _manager_secure_zero(&changed, sizeof(changed));
 }
 
+static void _manager_complete_cancel_failure(manager_worker_t *worker,
+        esp_err_t result)
+{
+    const connectivity_manager_operation_id_t operation_id =
+        worker->operation_id;
+
+    if (worker->operation_kind == MANAGER_OPERATION_SCAN)
+    {
+        _manager_publish_scan_terminal(worker, operation_id, result);
+        _manager_clear_active_operation(worker);
+    }
+    else
+    {
+        _manager_complete_status_operation(
+            worker, result, CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE);
+    }
+    _manager_continue_policy(worker, false);
+}
+
 static void _manager_command_cancel(manager_worker_t *worker,
                                     const manager_command_t *command)
 {
@@ -1877,11 +1933,16 @@ static void _manager_command_cancel(manager_worker_t *worker,
     }
     if (worker->service_operation_id == 0U)
     {
+        _manager_complete_cancel_failure(worker, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (wifi_service_cancel(worker->session_id,
-                            worker->service_operation_id) != ESP_OK)
+    const esp_err_t cancel_result = wifi_service_cancel(
+                                        worker->session_id,
+                                        worker->service_operation_id);
+
+    if (cancel_result != ESP_OK)
     {
+        _manager_complete_cancel_failure(worker, cancel_result);
         return;
     }
     worker->active_cancel_requested = true;
@@ -2657,25 +2718,10 @@ esp_err_t connectivity_manager_request_scan(
 static bool _manager_credentials_valid(
     const connectivity_manager_credentials_t *credentials)
 {
-    if (credentials == NULL || credentials->ssid == NULL ||
-            credentials->ssid_length == 0U ||
-            credentials->ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES ||
-            memchr(credentials->ssid, '\0',
-                   credentials->ssid_length) != NULL ||
-            credentials->security > CONNECTIVITY_MANAGER_SECURITY_PERSONAL)
-    {
-        return false;
-    }
-    if (credentials->security == CONNECTIVITY_MANAGER_SECURITY_OPEN)
-    {
-        return credentials->password_length == 0U;
-    }
-    return credentials->password != NULL &&
-           credentials->password_length >= 1U &&
-           credentials->password_length <=
-           CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES &&
-           memchr(credentials->password, '\0',
-                  credentials->password_length) == NULL;
+    return credentials != NULL && _manager_credentials_policy_valid(
+               credentials->ssid, credentials->ssid_length,
+               credentials->password, credentials->password_length,
+               credentials->security);
 }
 
 esp_err_t connectivity_manager_request_connect(

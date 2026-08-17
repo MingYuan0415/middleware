@@ -50,6 +50,9 @@ INVALID_KINDS = {
     "open-with-password": 2,
     "personal-with-empty-password": 3,
     "unsupported-credential-security": 4,
+    "ssid-with-nul": 5,
+    "personal-passphrase-too-short": 6,
+    "personal-64-byte-non-hex": 7,
 }
 
 

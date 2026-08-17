@@ -45,6 +45,12 @@ static const device_link_security_config_t s_sec_config =
     .request_arg = NULL,
 };
 
+static device_link_status_t _empty_scan_handler(
+    const device_link_request_context_t *context,
+    const uint8_t *request, size_t request_len,
+    uint8_t *response, size_t response_capacity, size_t *response_len,
+    void *arg);
+
 #define TEST_ASSERT_TRUE(condition) \
     do \
     { \
@@ -1240,7 +1246,80 @@ static void test_v2_snapshot_includes_operation_summaries(void)
     bool has_field = false;
     uint64_t operation_id = 0U;
 
-    _reset();
+    static const device_link_tlv_schema_t empty_schema =
+    {
+        .fields = NULL,
+        .field_count = 0U,
+        .maximum_encoded_bytes = 0U,
+    };
+    static const device_link_tlv_field_rule_t result_rule =
+    {
+        .id = 1U,
+        .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+        .flags = DEVICE_LINK_TLV_RULE_REQUIRED,
+        .maximum_unsigned = UINT64_MAX,
+    };
+    static const device_link_tlv_schema_t result_schema =
+    {
+        .fields = &result_rule,
+        .field_count = 1U,
+        .maximum_encoded_bytes = 3U,
+    };
+    static const device_link_method_descriptor_t methods[] =
+    {
+        {
+            .method_id = 2U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_SCAN,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 0U,
+            .request_schema = &empty_schema,
+            .response_schema = &empty_schema,
+            .operation_result_schema = &empty_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _empty_scan_handler,
+        },
+        {
+            .method_id = 4U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
+            .channel = DEVICE_LINK_CHANNEL_SESSION,
+            .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
+            .maximum_request_bytes = 0U,
+            .maximum_response_bytes = 0U,
+            .request_schema = &empty_schema,
+            .response_schema = &empty_schema,
+            .operation_result_schema = &result_schema,
+            .response_body_status_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .allowed_statuses_mask =
+            DEVICE_LINK_STATUS_MASK(DEVICE_LINK_STATUS_OK),
+            .handler = _empty_scan_handler,
+        },
+    };
+    static const device_link_domain_descriptor_t domain =
+    {
+        .domain_id = DEVICE_LINK_DOMAIN_WIFI,
+        .major = 1U,
+        .minor = 0U,
+        .methods = methods,
+        .method_count = 2U,
+    };
+
+    _clear_capture();
+    s_auto_confirm = true;
+    s_next_frame_id = 1U;
+    ble_link_service_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_set_domain_descriptors(
+                          &domain, 1U));
+    ble_link_service_init(BOOT_ID, _capture, NULL, NULL, 32U);
+    ble_link_events_init();
+    _establish_session();
+    _set_facts(true, true, true);
+    (void)device_link_security_init(&s_sec_config);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
                           DEVICE_LINK_DOMAIN_WIFI, 4U, 0x1000U,
                           NULL, NULL, &operation_id));
@@ -1333,7 +1412,7 @@ static void test_async_defer_completion_merges_on_admission(void)
      * SMP. The deferred terminal is retained briefly and merged into the
      * freshly admitted record, so the slot reaches a terminal state
      * instead of leaking as an eternal PENDING record. */
-    static const uint8_t result_payload[] = {0xa5U, 0x5aU};
+    static const uint8_t result_payload[] = {0x04U, 0x2aU};
     uint64_t operation_id = 0U;
     device_link_operation_t record;
 
@@ -1345,7 +1424,7 @@ static void test_async_defer_completion_merges_on_admission(void)
     TEST_ASSERT_TRUE(!ble_link_service_async_operation_in_flight(
                          DEVICE_LINK_DOMAIN_WIFI));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x2000U, NULL, NULL,
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2000U, NULL, NULL,
                           &operation_id));
     TEST_ASSERT_TRUE(operation_id != 0U);
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
@@ -1361,11 +1440,37 @@ static void test_async_defer_completion_merges_on_admission(void)
     uint64_t fresh_id = 0U;
 
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
-                          DEVICE_LINK_DOMAIN_WIFI, 2U, 0x2001U, NULL, NULL,
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2001U, NULL, NULL,
                           &fresh_id));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
                           fresh_id, &record));
     TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_PENDING, record.state);
+}
+
+static void test_async_defer_schema_mismatch_fails_terminal(void)
+{
+    /* The bridge validates terminal shape before admission, while the
+     * operation table validates the method-specific result schema. If a
+     * retained payload violates that schema, admission still owns a valid
+     * operation id and must publish FAILED/INTERNAL instead of leaving it
+     * permanently PENDING. */
+    static const uint8_t malformed_payload[] = {0x08U, 0x2aU};
+    uint64_t operation_id = 0U;
+    device_link_operation_t record;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_defer_update(
+                          0x2100U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, malformed_payload,
+                          sizeof(malformed_payload)));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_start(
+                          DEVICE_LINK_DOMAIN_WIFI, 4U, 0x2100U, NULL, NULL,
+                          &operation_id));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_test_copy_operation(
+                          operation_id, &record));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_OPERATION_FAILED, record.state);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_STATUS_INTERNAL, record.status);
+    TEST_ASSERT_EQUAL(0U, record.result_len);
 }
 
 static void test_async_defer_completion_expires(void)
@@ -1403,6 +1508,10 @@ static void test_async_defer_completion_rejects_invalid(void)
                       ble_link_service_async_operation_defer_update(
                           0x3100U, DEVICE_LINK_OPERATION_SUCCEEDED,
                           DEVICE_LINK_STATUS_OK, NULL, 1U));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_link_service_async_operation_defer_update(
+                          0x3100U, DEVICE_LINK_OPERATION_CANCELED,
+                          DEVICE_LINK_STATUS_STORAGE, NULL, 0U));
 }
 
 typedef struct operation_race_thread_arg
@@ -1596,6 +1705,7 @@ static void test_operation_declared_empty_result_never_encoded(void)
     {
         {
             .method_id = 2U,
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_SCAN,
             .channel = DEVICE_LINK_CHANNEL_SESSION,
             .maximum_request_bytes = 0U,
@@ -1670,12 +1780,15 @@ static void test_operation_declared_empty_result_never_encoded(void)
                           DEVICE_LINK_DOMAIN_WIFI, 2U, 777U, NULL, NULL,
                           &operation_id));
     TEST_ASSERT_TRUE(operation_id != 0U);
-    /* A buggy bridge attaches a payload despite the Empty declaration;
-     * update() admits it defensively, the encoder must not expose it. */
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
+    /* A buggy bridge cannot attach a payload to an Empty declaration. */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_link_service_async_operation_update(
                           777U, DEVICE_LINK_OPERATION_SUCCEEDED,
                           DEVICE_LINK_STATUS_OK, bogus_payload,
                           sizeof(bogus_payload)));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
+                          777U, DEVICE_LINK_OPERATION_SUCCEEDED,
+                          DEVICE_LINK_STATUS_OK, NULL, 0U));
     uint8_t request[DEVICE_LINK_WIRE_HEADER_BYTES + 16U];
     device_link_wire_header_t header;
     device_link_tlv_writer_t writer;
@@ -1748,15 +1861,16 @@ static void test_v2_get_operation_large_result_emits_fully(void)
     static const device_link_tlv_field_rule_t s_test_result_fields[] =
     {
         {
-            .id = 1U, .wire_type = DEVICE_LINK_TLV_UNSIGNED,
+            .id = 1U, .wire_type = DEVICE_LINK_TLV_LENGTH,
             .flags = DEVICE_LINK_TLV_RULE_REQUIRED,
-            .maximum_unsigned = UINT8_MAX
+            .minimum_bytes = 2997U,
+            .maximum_bytes = 2997U,
         },
     };
     static const device_link_tlv_schema_t s_test_result_schema =
     {
         .fields = s_test_result_fields, .field_count = 1U,
-        .maximum_encoded_bytes = 16U,
+        .maximum_encoded_bytes = 3000U,
     };
     static const device_link_tlv_schema_t s_test_request_schema =
     {
@@ -1766,6 +1880,7 @@ static void test_v2_get_operation_large_result_emits_fully(void)
     {
         {
             .method_id = 4U, /* set_credentials: WifiStatus result */
+            .flags = DEVICE_LINK_METHOD_ASYNCHRONOUS,
             .permission_id = DEVICE_LINK_PERMISSION_WIFI_WRITE,
             .channel = DEVICE_LINK_CHANNEL_CONTROL,
             .maximum_request_bytes = 160U,
@@ -1795,6 +1910,7 @@ static void test_v2_get_operation_large_result_emits_fully(void)
         .methods = s_test_methods, .method_count = 1U,
     };
     static uint8_t result_payload[3000];
+    static uint8_t result_value[2997];
     uint64_t operation_id = 0U;
     device_link_wire_header_t header;
     device_link_status_t status;
@@ -1806,10 +1922,19 @@ static void test_v2_get_operation_large_result_emits_fully(void)
     device_link_tlv_writer_t writer;
     size_t body_len = 0U;
 
-    for (size_t i = 0U; i < sizeof(result_payload); ++i)
+    for (size_t i = 0U; i < sizeof(result_value); ++i)
     {
-        result_payload[i] = (uint8_t)(i * 31U + 7U);
+        result_value[i] = (uint8_t)(i * 31U + 7U);
     }
+    size_t result_len = 0U;
+
+    device_link_tlv_writer_init(
+        &writer, result_payload, sizeof(result_payload));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_put_bytes(
+                          &writer, 1U, result_value, sizeof(result_value)));
+    TEST_ASSERT_EQUAL(ESP_OK, device_link_tlv_writer_finish(
+                          &writer, &result_len));
+    TEST_ASSERT_EQUAL(sizeof(result_payload), result_len);
 
     /* Register the domain descriptor before init (boot id still zero),
      * exactly like the service does before the router seals. */
@@ -1855,7 +1980,7 @@ static void test_v2_get_operation_large_result_emits_fully(void)
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_async_operation_update(
                           0x4000U, DEVICE_LINK_OPERATION_SUCCEEDED,
                           DEVICE_LINK_STATUS_OK, result_payload,
-                          sizeof(result_payload)));
+                          result_len));
 
     memset(&header, 0, sizeof(header));
     header.kind = DEVICE_LINK_MESSAGE_REQUEST;
@@ -4297,6 +4422,7 @@ int main(void)
     test_prepare_retires_previous_transaction();
     test_v2_snapshot_includes_operation_summaries();
     test_async_defer_completion_merges_on_admission();
+    test_async_defer_schema_mismatch_fails_terminal();
     test_async_defer_completion_expires();
     test_async_defer_completion_rejects_invalid();
     test_operation_table_reads_are_synchronized();

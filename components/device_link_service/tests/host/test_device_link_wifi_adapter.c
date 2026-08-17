@@ -238,9 +238,9 @@ static void test_credentials_are_delegated_without_echo(void)
     assert(device_link_tlv_put_bytes(&nested_writer, 1U,
                                      (const uint8_t *)"AP1", 3U) == ESP_OK);
     assert(device_link_tlv_put_bytes(&nested_writer, 2U,
-                                     (const uint8_t *)"p", 1U) == ESP_OK);
-    /* PERSONAL with a nonempty password: the contract-valid shape for a
-     * delegated credential write (OPEN requires an empty password). */
+                                     (const uint8_t *)"password", 8U) == ESP_OK);
+    /* PERSONAL with a minimum-length passphrase: the contract-valid shape
+     * for a delegated credential write (OPEN requires an empty password). */
     assert(device_link_tlv_put_uint(&nested_writer, 3U, 2U) == ESP_OK);
     assert(device_link_tlv_writer_finish(&nested_writer, &nested_len) ==
            ESP_OK);

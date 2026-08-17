@@ -38,19 +38,30 @@ typedef struct ble_link_security_ops
         const uint8_t *input, size_t input_len,
         device_link_security_handshake_stage_t *stage);
 
-    /** @brief Process one handshake frame; response is allocated. */
+    /** @brief Process one handshake frame.
+     *
+     * On success the response is allocated for the caller. On failure the
+     * implementation returns a NULL output and zero length; dependency
+     * failure pointers never cross this adapter boundary.
+     */
     esp_err_t (*handshake)(
         const uint8_t *input, size_t input_len,
         uint8_t **output, size_t *output_len,
         device_link_security_handshake_result_t *handshake_result);
 
-    /** @brief Decrypt one protected Device Link v2 message; response
-     *  ciphertext is allocated. */
+    /** @brief Decrypt one protected Device Link v2 message.
+     *
+     * Response ciphertext is allocated on success. Failure returns a NULL
+     * output and zero length.
+     */
     esp_err_t (*unprotect)(const uint8_t *input, size_t input_len,
                            uint8_t **output, size_t *output_len);
 
-    /** @brief Protect one outbound Device Link v2 message; ciphertext is
-     *  allocated. */
+    /** @brief Protect one outbound Device Link v2 message.
+     *
+     * Ciphertext is allocated on success. Failure returns a NULL output and
+     * zero length.
+     */
     esp_err_t (*protect)(const uint8_t *plain, size_t plain_len,
                          uint8_t **cipher, size_t *cipher_len);
 

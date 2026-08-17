@@ -30,11 +30,11 @@ the protocol path. Sensitive buffers are cleared on completion, failure and
 disconnect.
 
 The component does not contain application protobuf schemas or generated C.
-The immutable contract pin is recorded in `contract.lock`; it contains the
+The immutable contract pin is recorded in `device-link-contract.lock`; it contains the
 Device Link contract commit, profile, schema format, and normalized schema
 digest. It intentionally has no `protoc` or code-generator version because
 the application wire is handwritten Typed-TLV.
-expectedContractCommit=88fe72ad45e8133a18e6e97e439e197f31a01d20
+expectedContractCommit=fa8b314c47df84d2cbfa257813086004e3db0d58
 The only protobuf-c types in the middleware are the official ESP-IDF
 Protocomm Security 2 messages in `device_link_security`.
 
