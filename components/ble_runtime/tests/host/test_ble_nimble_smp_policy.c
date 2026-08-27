@@ -55,10 +55,12 @@ static void test_cancel_injects_reject_when_pending(void)
 {
     TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_inject_required(
                          true, 1U));
+    TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_inject_required(
+                         true, 0U));
     TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_inject_required(
                           false, 1U));
     TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_inject_required(
-                          true, 0U));
+                          true, BLE_NIMBLE_SMP_CONN_HANDLE_NONE));
 }
 
 static void test_reply_keeps_pending_when_inject_fails(void)
@@ -74,12 +76,34 @@ static void test_restore_pending_requires_same_connection(void)
                           true, 1U, 1U, 7U, 7U));
     TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_restore_pending(
                          false, 1U, 1U, 7U, 7U));
+    TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_restore_pending(
+                         false, 1U, 1U, 0U, 0U));
     TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_restore_pending(
                           false, 1U, 2U, 7U, 7U));
     TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_restore_pending(
                           false, 1U, 1U, 7U, 0U));
     TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_restore_pending(
-                          false, 1U, 1U, 0U, 0U));
+                          false, 1U, 1U, BLE_NIMBLE_SMP_CONN_HANDLE_NONE,
+                          BLE_NIMBLE_SMP_CONN_HANDLE_NONE));
+}
+
+static void test_clear_committed_requires_original_offer(void)
+{
+    TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_clear_committed(
+                         true, 1U, 1U, 7U, 7U, false));
+    TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_clear_committed(
+                         true, 1U, 1U, 0U, 0U, false));
+    TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_clear_committed(
+                          false, 1U, 1U, 7U, 7U, false));
+    TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_clear_committed(
+                          true, 1U, 2U, 7U, 8U, true));
+    TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_clear_committed(
+                          true, 1U, 1U, 7U, 7U, true));
+    TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_clear_committed(
+                          true, 1U, 1U, 7U, 8U, false));
+    TEST_ASSERT_FALSE(ble_nimble_smp_numeric_comparison_clear_committed(
+                          true, 1U, 1U, BLE_NIMBLE_SMP_CONN_HANDLE_NONE,
+                          BLE_NIMBLE_SMP_CONN_HANDLE_NONE, false));
 }
 
 int main(void)
@@ -90,5 +114,6 @@ int main(void)
     test_cancel_injects_reject_when_pending();
     test_reply_keeps_pending_when_inject_fails();
     test_restore_pending_requires_same_connection();
+    test_clear_committed_requires_original_offer();
     return 0;
 }

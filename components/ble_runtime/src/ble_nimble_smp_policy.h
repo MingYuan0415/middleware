@@ -10,6 +10,7 @@ extern "C" {
 
 #define BLE_NIMBLE_SMP_PASSKEY_ACTION_NUMCMP 4U
 #define BLE_NIMBLE_SMP_PAIR_KEY_SIZE_MAX 16U
+#define BLE_NIMBLE_SMP_CONN_HANDLE_NONE 0xffffU
 
 typedef enum ble_nimble_smp_passkey_decision
 {
@@ -67,7 +68,7 @@ bool ble_nimble_smp_numeric_comparison_inject_required(
  * action.
  *
  * @param inject_result NimBLE `ble_sm_inject_io` return value.
- * @return true when the pending flag and connection handle may be cleared.
+ * @return true when `ble_sm_inject_io` consumed the pending action.
  */
 bool ble_nimble_smp_numeric_comparison_reply_committed(int inject_result);
 
@@ -92,6 +93,30 @@ bool ble_nimble_smp_numeric_comparison_restore_pending(
     uint32_t current_epoch,
     uint16_t begin_handle,
     uint16_t current_handle);
+
+/**
+ * @brief Decide whether a successful inject may clear the stored handle.
+ *
+ * Clear only when the inject consumed the original offer: the epoch and
+ * handle are unchanged and pending is still false. A newer offer or a
+ * cancel that advanced the epoch must keep its handle.
+ *
+ * @param inject_committed True when `ble_sm_inject_io` consumed the action.
+ * @param begin_epoch Epoch sampled when the reply cleared pending.
+ * @param current_epoch Epoch after inject returned.
+ * @param begin_handle Connection handle sampled with `begin_epoch`.
+ * @param current_handle Connection handle after inject returned.
+ * @param current_pending Pending flag after inject returned.
+ * @return true when the stored handle may be set to
+ *         `BLE_NIMBLE_SMP_CONN_HANDLE_NONE`.
+ */
+bool ble_nimble_smp_numeric_comparison_clear_committed(
+    bool inject_committed,
+    uint32_t begin_epoch,
+    uint32_t current_epoch,
+    uint16_t begin_handle,
+    uint16_t current_handle,
+    bool current_pending);
 
 #ifdef __cplusplus
 }

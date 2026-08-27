@@ -72,6 +72,8 @@ _Static_assert(BLE_SM_IOACT_NUMCMP == BLE_NIMBLE_SMP_PASSKEY_ACTION_NUMCMP,
                "NimBLE numeric-comparison action changed");
 _Static_assert(BLE_SM_PAIR_KEY_SZ_MAX == BLE_NIMBLE_SMP_PAIR_KEY_SIZE_MAX,
                "NimBLE max pairing key size changed");
+_Static_assert(BLE_HS_CONN_HANDLE_NONE == BLE_NIMBLE_SMP_CONN_HANDLE_NONE,
+               "NimBLE missing-connection handle changed");
 
 /* ESP-IDF v6.0.2 exposes this controller-privacy operation only through an
  * internal header. The fixed source and build mode are pinned by the runtime
@@ -4713,7 +4715,7 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
     }
 }
 
-static uint16_t s_passkey_conn_handle;
+static uint16_t s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
 static bool s_passkey_pending;
 static uint32_t s_passkey_epoch;
 static SemaphoreHandle_t s_passkey_lock;
@@ -4749,7 +4751,7 @@ void ble_nimble_port_numeric_comparison_cancel(void)
     conn_handle = s_passkey_conn_handle;
     pending = s_passkey_pending;
     s_passkey_pending = false;
-    s_passkey_conn_handle = 0U;
+    s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
     s_passkey_epoch++;
     _ble_nimble_port_passkey_unlock();
     if (!ble_nimble_smp_numeric_comparison_inject_required(
@@ -4808,9 +4810,11 @@ esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
     {
         s_passkey_pending = true;
     }
-    else if (committed)
+    else if (ble_nimble_smp_numeric_comparison_clear_committed(
+                 committed, epoch, s_passkey_epoch, conn_handle,
+                 s_passkey_conn_handle, s_passkey_pending))
     {
-        s_passkey_conn_handle = 0U;
+        s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
     }
     _ble_nimble_port_passkey_unlock();
     return committed ? ESP_OK : ESP_FAIL;
@@ -6309,7 +6313,7 @@ static esp_err_t _ble_nimble_port_init(void)
                              &s_passkey_lock_control);
     }
     s_passkey_pending = false;
-    s_passkey_conn_handle = 0U;
+    s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
     if (s_pairing_gate_ack == NULL || s_pairing_gate_lock == NULL ||
             s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL ||
             s_passkey_lock == NULL)
