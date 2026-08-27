@@ -126,6 +126,41 @@ static void test_scan_event_completes_operation(void)
     device_link_wifi_adapter_bridge_stop();
 }
 
+static void test_status_event_completes_save(void)
+{
+    device_link_v1_credentials_t credentials;
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&credentials, 0, sizeof(credentials));
+    memcpy(credentials.ssid, "cafe", 4U);
+    credentials.ssid_length = 4U;
+    memcpy(credentials.password, "password", 8U);
+    credentials.password_length = 8U;
+    credentials.security = DEVICE_LINK_V1_WIFI_PERSONAL;
+    memset(&status, 0, sizeof(status));
+    status.generation = 5U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.saved_profile = true;
+    status.profile_persisted = true;
+    status.operation_complete = true;
+    status.operation_id = 1U;
+    memcpy(status.ssid, "cafe", 4U);
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(
+               DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, &credentials, 9U,
+               NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 1U);
+    assert(ble_link_service_fake_last_complete_id() == 9U);
+    device_link_wifi_adapter_bridge_stop();
+}
+
 int main(void)
 {
     test_fill_info();
@@ -133,5 +168,6 @@ int main(void)
     test_submit_save_credentials();
     test_status_event_observes_snapshot();
     test_scan_event_completes_operation();
+    test_status_event_completes_save();
     return 0;
 }

@@ -215,6 +215,11 @@ static SemaphoreHandle_t s_cleanup_drain_lock;
  * every queued physical command. */
 static atomic_bool s_adv_host_ready = ATOMIC_VAR_INIT(false);
 
+static uint8_t _ble_nimble_port_sm_sec_lvl(bool open)
+{
+    return open ? 0U : 1U;
+}
+
 static void _ble_nimble_port_pairing_gate_event(
     struct ble_npl_event *event)
 {
@@ -227,7 +232,7 @@ static void _ble_nimble_port_pairing_gate_event(
         const bool open = ble_nimble_pairing_gate_effective_open(
                               &s_pairing_gate_state);
 
-        ble_hs_cfg.sm_sec_lvl = open ? 2 : 2;
+        ble_hs_cfg.sm_sec_lvl = _ble_nimble_port_sm_sec_lvl(open);
         atomic_store_explicit(&s_pairing_gate_applied_seq, sequence,
                               memory_order_release);
         if (s_pairing_gate_ack != NULL)
@@ -357,9 +362,9 @@ static esp_err_t _ble_nimble_port_apply_pairing_gate_context(void)
          * persistent NimBLE host queue. Apply directly to avoid waiting on an
          * event behind the current callback; queued older events still read
          * the latest effective state. */
-        ble_hs_cfg.sm_sec_lvl =
-            ble_nimble_pairing_gate_effective_open(&s_pairing_gate_state) ?
-            0 : 1;
+        ble_hs_cfg.sm_sec_lvl = _ble_nimble_port_sm_sec_lvl(
+                                    ble_nimble_pairing_gate_effective_open(
+                                        &s_pairing_gate_state));
         return ESP_OK;
     }
     return _ble_nimble_port_apply_pairing_gate_state();
@@ -1530,7 +1535,7 @@ static void _ble_nimble_port_timer_fail_closed(
                 ble_tx_scheduler_handle_indication_timeout(
                     identity->token) == ESP_OK)
         {
-            _ble_nimble_port_link_abort(identity);
+            (void)ble_link_service_abort_tx_if_current(identity);
             if (terminate_for_replacement)
             {
                 ble_link_operation_identity_t terminate = *identity;
@@ -2465,9 +2470,7 @@ static void _ble_nimble_port_tx_consumer(
         {
             if (event->indication)
             {
-                /* A response indication is transactional: ambiguity
-                 * retires only its flow and closes that Security 2 epoch. */
-                _ble_nimble_port_link_abort(&event->identity);
+                (void)ble_link_service_abort_tx_if_current(&event->identity);
             }
             else if (event->attr_handle ==
                      ble_link_gatt_link_state_handle())
@@ -2481,7 +2484,7 @@ static void _ble_nimble_port_tx_consumer(
         {
             if (event->indication)
             {
-                _ble_nimble_port_link_abort(&event->identity);
+                (void)ble_link_service_abort_tx_if_current(&event->identity);
             }
             else if (event->attr_handle ==
                      ble_link_gatt_link_state_handle())
@@ -2635,7 +2638,7 @@ static bool _ble_nimble_port_bond_store_verified(
 {
     if (_ble_nimble_port_storage_error_load() != ESP_OK ||
             desc == NULL || !desc->sec_state.encrypted ||
-            !desc->sec_state.bonded ||
+            !desc->sec_state.bonded || !desc->sec_state.authenticated ||
             !ble_nimble_peer_identity_valid(
                 desc->peer_id_addr.type, desc->peer_id_addr.val))
     {
@@ -2663,7 +2666,8 @@ static bool _ble_nimble_port_bond_store_verified(
      * and both identity keys, indexed by the normalized identity address. */
     if (!peer_sec.sc || !our_sec.sc || !peer_sec.ltk_present ||
             !our_sec.ltk_present || !peer_sec.irk_present ||
-            !our_sec.irk_present)
+            !our_sec.irk_present || !peer_sec.authenticated ||
+            !our_sec.authenticated)
     {
         return false;
     }
@@ -3402,6 +3406,7 @@ static esp_err_t _ble_nimble_port_bond_store_verified_identity(
     *out_verified = peer_sec.sc && our_sec.sc &&
                     peer_sec.ltk_present && our_sec.ltk_present &&
                     peer_sec.irk_present && our_sec.irk_present &&
+                    peer_sec.authenticated && our_sec.authenticated &&
                     peer_sec.key_size == 16 && our_sec.key_size == 16;
     return ESP_OK;
 }
@@ -4616,21 +4621,25 @@ static int _ble_nimble_port_store_status(
     {
         return -1;
     }
-    /* The host callback only registers immutable work. This write fails and
-     * pairing restarts on a fresh ACL after the owner invalidates and evicts. */
-    ble_gap_manager_snapshot_t snapshot;
-    const esp_err_t register_result =
-        (_ble_nimble_port_gap_snapshot(&snapshot) == ESP_OK &&
-         snapshot.connected) ?
-        _ble_nimble_port_register_remote_replacement(
-            snapshot.conn_handle) : ESP_ERR_INVALID_STATE;
-
-    if (register_result != ESP_OK)
     {
-        ESP_LOGW(TAG, "store overflow replacement rejected (%d)",
-                 register_result);
+        ble_addr_t residual[CONFIG_BT_NIMBLE_MAX_BONDS];
+        size_t residual_count = 0U;
+
+        if (_ble_nimble_port_collect_residuals(
+                    BLE_STORE_OBJ_TYPE_PEER_SEC, residual, &residual_count,
+                    CONFIG_BT_NIMBLE_MAX_BONDS) != ESP_OK)
+        {
+            return -1;
+        }
+        for (size_t i = 0U; i < residual_count; ++i)
+        {
+            if (_ble_nimble_port_unpair_peer(&residual[i]) != 0)
+            {
+                return -1;
+            }
+        }
+        return residual_count > 0U ? 0 : -1;
     }
-    return -1;
 }
 
 static bool _ble_nimble_port_store_object_is_bond(int object_type)
@@ -4647,11 +4656,18 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
 }
 
 static uint16_t s_passkey_conn_handle;
-static bool s_passkey_pending;
+static atomic_bool s_passkey_pending = ATOMIC_VAR_INIT(false);
+
+void ble_nimble_port_numeric_comparison_cancel(void)
+{
+    atomic_store_explicit(&s_passkey_pending, false, memory_order_release);
+    s_passkey_conn_handle = 0U;
+}
 
 esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
 {
-    if (!s_passkey_pending)
+    if (!atomic_exchange_explicit(&s_passkey_pending, false,
+                                  memory_order_acq_rel))
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -4663,12 +4679,10 @@ esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
     io.numcmp_accept = accept ? 1 : 0;
     const int result = ble_sm_inject_io(s_passkey_conn_handle, &io);
 
-    s_passkey_pending = false;
     s_passkey_conn_handle = 0U;
     return result == 0 ? ESP_OK : ESP_FAIL;
 #else
     (void)accept;
-    s_passkey_pending = false;
     s_passkey_conn_handle = 0U;
     return ESP_OK;
 #endif
@@ -4824,6 +4838,10 @@ static int _ble_nimble_port_gap_event(
               event->disconnect.conn.conn_handle,
               event->disconnect.reason, disconnect_current);
 
+        if (disconnect_current)
+        {
+            ble_nimble_port_numeric_comparison_cancel();
+        }
         if (disconnect_current &&
                 s_link_sec_conn == event->disconnect.conn.conn_handle)
         {
@@ -4985,40 +5003,31 @@ static int _ble_nimble_port_gap_event(
         }
         return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING:
-        /* An existing bond attempts to pair again: allowed only while a
-         * replacement window is open. The old authorization must be
-         * invalidated before the old bond is deleted (replacement
-         * ordering: invalidate first, delete second, so a crash leaves
-         * the device unbound but never dual-authorized). */
         if (!event->repeat_pairing.new_sc ||
                 !event->repeat_pairing.new_bonding ||
-                event->repeat_pairing.new_key_size != BLE_SM_PAIR_KEY_SZ_MAX)
+                event->repeat_pairing.new_key_size != BLE_SM_PAIR_KEY_SZ_MAX ||
+                !_ble_nimble_port_pairing_window_open())
         {
             return BLE_GAP_REPEAT_PAIRING_IGNORE;
         }
-        if (_ble_nimble_port_pairing_window_open())
         {
-            const esp_err_t register_result =
-                _ble_nimble_port_register_remote_replacement(
-                    event->repeat_pairing.conn_handle);
+            struct ble_gap_conn_desc desc;
 
-            if (register_result != ESP_OK)
+            if (ble_gap_conn_find(event->repeat_pairing.conn_handle,
+                                  &desc) != 0 ||
+                    _ble_nimble_port_unpair_peer(&desc.peer_id_addr) != 0)
             {
-                ESP_LOGW(TAG, "repeat pairing replacement rejected (%d)",
-                         register_result);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
             }
             ble_hs_cfg.sm_sc_only = 1;
-            /* The public unpair API removes the controller resolving-list
-             * entry but also terminates the ACL. Pairing must therefore be
-             * retried after the client reconnects. */
-            return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
-        return BLE_GAP_REPEAT_PAIRING_IGNORE;
     case BLE_GAP_EVENT_PASSKEY_ACTION:
         if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP)
         {
             s_passkey_conn_handle = event->passkey.conn_handle;
-            s_passkey_pending = true;
+            atomic_store_explicit(&s_passkey_pending, true,
+                                  memory_order_release);
             (void)ble_link_service_offer_numeric_comparison(
                 event->passkey.params.numcmp);
         }
@@ -5370,7 +5379,8 @@ static esp_err_t _ble_nimble_port_register_database(void)
                     ble_gatt_registry_admission_requires_encryption(
                         characteristic->write_admission))
             {
-                definition->flags |= BLE_GATT_CHR_F_WRITE_ENC;
+                definition->flags |= BLE_GATT_CHR_F_WRITE_ENC |
+                                     BLE_GATT_CHR_F_WRITE_AUTHEN;
             }
             if (characteristic->properties & BLE_GATT_REGISTRY_PROP_NOTIFY)
             {
@@ -5386,7 +5396,8 @@ static esp_err_t _ble_nimble_port_register_database(void)
                     ble_gatt_registry_admission_requires_encryption(
                         characteristic->tx_admission))
             {
-                definition->flags |= BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC;
+                definition->flags |= BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
+                                     BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN;
             }
         }
         characteristics[definition_cursor +
@@ -6178,7 +6189,7 @@ static esp_err_t _ble_nimble_port_init(void)
     ble_hs_cfg.sm_mitm = 1;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_sc_only = 1;
-    ble_hs_cfg.sm_sec_lvl = 2;
+    ble_hs_cfg.sm_sec_lvl = 1;
     /* Identity keys let the GAP reducer verify the peer's SC bond against
      * the NimBLE store before admitting the Device Link session. */
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |

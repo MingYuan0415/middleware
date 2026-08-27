@@ -96,9 +96,11 @@ esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
 bool ble_link_service_write_blocked(void);
 bool ble_link_service_response_in_flight(void);
 void ble_link_service_abort_transactions(void);
-void ble_link_service_on_connect(void);
+void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle);
 void ble_link_service_clear_session_state(void);
 esp_err_t ble_link_service_clear_session_state_if_current(
+    const ble_link_operation_identity_t *identity);
+esp_err_t ble_link_service_abort_tx_if_current(
     const ble_link_operation_identity_t *identity);
 
 esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept);

@@ -81,6 +81,9 @@ esp_err_t ble_nimble_port_revoke_binding(void);
 /** @brief Complete Numeric Comparison with the local Yes/No decision. */
 esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept);
 
+/** @brief Drop a pending Numeric Comparison without injecting a reply. */
+void ble_nimble_port_numeric_comparison_cancel(void);
+
 /**
  * @brief Request a local disconnect of the current ACL.
  *

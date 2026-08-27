@@ -214,7 +214,8 @@ esp_err_t ble_gatt_registry_get_service(
  * @brief Query whether an admission level requires link-layer encryption.
  *
  * The transport port translates this into static ATT security flags
- * (READ_ENC / WRITE_ENC / NOTIFY_INDICATE_ENC) so NimBLE rejects unencrypted
+ * (READ_ENC / WRITE_ENC / WRITE_AUTHEN / NOTIFY_INDICATE_ENC /
+ * NOTIFY_INDICATE_AUTHEN) so NimBLE rejects unencrypted or unauthenticated
  * access before the project callback runs. Application-level authorization is
  * enforced in access callbacks and the TX scheduler, never with NimBLE's
  * SMP authorization flag.

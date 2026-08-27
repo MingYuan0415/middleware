@@ -807,6 +807,11 @@ static void _device_link_service_cancel_pending_suspend_locked(void)
     s_suspend_pending_count = 0U;
 }
 
+static void _device_link_service_clear_link_session(void)
+{
+    ble_nimble_port_numeric_comparison_cancel();
+    ble_link_service_clear_session_state();
+}
 
 static esp_err_t _device_link_service_close_window_locked(void)
 {
@@ -889,7 +894,7 @@ static esp_err_t _device_link_service_close_window_locked(void)
     /* A closed window invalidates any prepared transaction, and the
      * committed long-term verifier is restored so a bound peer can
      * reconnect outside any window. */
-    ble_link_service_clear_session_state();
+    _device_link_service_clear_link_session();
     _device_link_service_open_public_verifier();
     if (result == ESP_OK)
     {
@@ -1130,13 +1135,22 @@ static void _device_link_service_handle_command(
         }
         break;
     case DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING:
-        s_service.snapshot.last_error = ble_link_service_confirm_binding(
-                                            command->confirmation_token,
-                                            command->accept_binding);
+        if (!ble_link_service_pending_confirmation() ||
+                command->confirmation_token == 0U ||
+                command->confirmation_token !=
+                ble_link_service_confirmation_token())
+        {
+            s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        s_service.snapshot.last_error =
+            ble_nimble_port_numeric_comparison_reply(
+                command->accept_binding);
         if (s_service.snapshot.last_error == ESP_OK)
         {
             s_service.snapshot.last_error =
-                ble_nimble_port_numeric_comparison_reply(
+                ble_link_service_confirm_binding(
+                    command->confirmation_token,
                     command->accept_binding);
         }
         _device_link_service_refresh_snapshot_locked();
@@ -1233,7 +1247,7 @@ static void _device_link_service_handle_command(
         /* A revoke request is a local security boundary even when a storage
          * step failed. Retire the live application session immediately. */
         (void)ble_link_session_set_authorization(false, 0U);
-        ble_link_service_clear_session_state();
+        _device_link_service_clear_link_session();
         s_service.snapshot.last_error = revoke_result;
         break;
     }
@@ -1509,7 +1523,7 @@ static void _device_link_service_worker(void *arg)
         }
         if (worker_result == ESP_OK && drain_started && !session_retired)
         {
-            ble_link_service_clear_session_state();
+            _device_link_service_clear_link_session();
             session_retired = true;
         }
         bool revoke_pending = false;
@@ -1645,14 +1659,10 @@ static esp_err_t _device_link_service_acquire_slow_lease(void);
  * The service worker remains alive across these calls; only the NimBLE-owned
  * runtime and its event registrations are replaced. */
 /**
- * @brief Register the Wi-Fi domain with the link service before the
- * router seals its startup descriptor set.
+ * @brief Register the v1 Wi-Fi owner with the link service.
  *
- * The compile-time capability gate is the only publish decision: a product
- * that has not completed the Wi-Fi on-device matrix keeps the domain out
- * of the Manifest (fail closed). Registration is idempotent for the boot; a
- * failed registration blocks runtime startup so an advertised product can
- * never silently publish a Core-only Manifest.
+ * Registration is idempotent for the boot. A failed registration blocks
+ * runtime startup so slot commands never sit ACCEPTED without an owner.
  */
 static esp_err_t _device_link_service_register_wifi_domain(void)
 {
@@ -1660,14 +1670,6 @@ static esp_err_t _device_link_service_register_wifi_domain(void)
     {
         return ESP_OK;
     }
-    /* Explicit capability gate: the Wi-Fi domain is published only when
-     * the product enables it. Connectivity readiness is deliberately NOT a
-     * publish decision: the manager starts after this service and the
-     * domain stays static for the boot. */
-#if !CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
-    LOG_I("wifi domain not advertised (capability gate closed)");
-    return ESP_OK;
-#endif
     const void *descriptor = NULL;
     esp_err_t result = device_link_wifi_adapter_get_descriptor(&descriptor);
 
@@ -1794,7 +1796,7 @@ static esp_err_t _device_link_service_runtime_stop(void)
     }
     ble_link_session_set_pairing_window(false);
     ble_link_service_set_pairing_window(false);
-    ble_link_service_clear_session_state();
+    _device_link_service_clear_link_session();
     if (s_service.client_connected)
     {
         result = ble_nimble_port_request_disconnect();
@@ -2188,22 +2190,13 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
          * public password, mirroring the runtime_start path. */
         _device_link_service_open_public_verifier();
     }
-#if CONFIG_DEVICE_LINK_SERVICE_WIFI_ADVERTISED
     if (result == ESP_OK)
     {
-        /* The completion bridge consumes connectivity manager terminal
-         * snapshots into the Core v2 operation table. It is deliberately
-         * independent of the BLE runtime and of the Bluetooth policy:
-         * a device that boots with the persisted Bluetooth-disabled policy
-         * and later enables the runtime must already have the bridge
-         * installed, otherwise the Wi-Fi domain registers while operation
-         * completions are never written back and table slots leak. The
-         * compile-time capability gate is the only subscription decision
-         * (matching the publish decision); with the gate closed there is
-         * no Wi-Fi domain and no operation record to complete. */
+        /* v1 Wi-Fi commands occupy the single operation slot. Install the
+         * completion bridge independently of the BLE runtime so a later
+         * Bluetooth-enable still completes SCAN/SET_CREDENTIALS. */
         result = device_link_wifi_adapter_bridge_start();
     }
-#endif
     if (result != ESP_OK)
     {
         return _device_link_service_rollback_init(result);

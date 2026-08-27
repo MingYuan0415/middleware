@@ -375,6 +375,18 @@ void device_link_v1_engine_confirm_tx(device_link_v1_engine_t *engine)
     engine->in_flight = DEVICE_LINK_V1_TX_NONE;
 }
 
+void device_link_v1_engine_abort_tx(device_link_v1_engine_t *engine)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            engine->in_flight == DEVICE_LINK_V1_TX_NONE)
+    {
+        return;
+    }
+    engine->pending_accepted = false;
+    engine->pending_ack = false;
+    engine->in_flight = DEVICE_LINK_V1_TX_NONE;
+}
+
 void device_link_v1_engine_disconnect(device_link_v1_engine_t *engine)
 {
     if (!_device_link_v1_engine_ready(engine) || !engine->connected)

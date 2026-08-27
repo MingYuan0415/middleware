@@ -16,18 +16,4 @@ config DEVICE_LINK_SERVICE_QUEUE_DEPTH
         commands. Commands are rare (window open/close, connect events),
         so a shallow queue is sufficient.
 
-config DEVICE_LINK_SERVICE_WIFI_ADVERTISED
-    bool "Advertise the Wi-Fi domain in the Device Link manifest"
-    default n
-    help
-        Explicit capability gate for publishing the Wi-Fi domain: the
-        domain descriptor is frozen into the startup router only when
-        this option is enabled. The compile-time gate is the only
-        publish decision; connectivity readiness deliberately plays no
-        role (the manager starts after this service and the domain
-        stays static for the boot). Keep disabled until the Wi-Fi
-        domain end-to-end matrix (write, reboot, storage failure,
-        recovery) passes on hardware; then flip it and the registry
-        advertised flag together.
-
 endmenu

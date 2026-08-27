@@ -430,7 +430,7 @@ void ble_link_gatt_set_connection(
         }
     }
     _ble_link_gatt_unlock();
-    ble_link_service_on_connect();
+    ble_link_service_on_connect(generation, conn_handle);
 }
 
 esp_err_t ble_link_gatt_update_identity(

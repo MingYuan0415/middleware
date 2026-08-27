@@ -36,6 +36,9 @@ typedef struct ble_link_service
     uint32_t tx_flow_id;
     bool pairing_window_open;
     bool confirmation_pending;
+    bool connection_valid;
+    uint32_t connection_generation;
+    uint16_t conn_handle;
     uint64_t confirmation_token;
     uint32_t passkey;
     uint64_t next_token;
@@ -82,6 +85,15 @@ static ble_link_work_t *_ble_link_service_alloc_work(void)
         }
     }
     return NULL;
+}
+
+static bool _ble_link_service_identity_is_current(
+    const ble_link_operation_identity_t *identity)
+{
+    return identity != NULL &&
+           s_service.connection_valid &&
+           identity->generation == s_service.connection_generation &&
+           identity->conn_handle == s_service.conn_handle;
 }
 
 static size_t _ble_link_service_encode_app_error(
@@ -146,32 +158,37 @@ static size_t _ble_link_service_handle_admitted(
     case DEVICE_LINK_V1_CONNECT:
     case DEVICE_LINK_V1_DISCONNECT:
     case DEVICE_LINK_V1_FORGET:
+        if (s_service.owner_ops.submit_operation == NULL)
+        {
+            device_link_v1_engine_arm_response(&s_service.engine,
+                                               request->request_id, false, false);
+            return device_link_v1_encode_response(
+                       request->opcode, request->request_id,
+                       DEVICE_LINK_V1_STATUS_INTERNAL, NULL, out, capacity);
+        }
         status = device_link_v1_engine_start(
                      &s_service.engine, (device_link_v1_operation_t)request->opcode,
                      request->request_id, &operation_id);
         if (status == DEVICE_LINK_V1_STATUS_ACCEPTED)
         {
-            if (s_service.owner_ops.submit_operation != NULL)
+            const device_link_v1_status_t submitted =
+                s_service.owner_ops.submit_operation(
+                    (device_link_v1_operation_t)request->opcode,
+                    request->opcode == DEVICE_LINK_V1_SET_CREDENTIALS ?
+                    &request->payload.credentials : NULL,
+                    operation_id, s_service.owner_arg);
+
+            if (submitted != DEVICE_LINK_V1_STATUS_ACCEPTED)
             {
-                const device_link_v1_status_t submitted =
-                    s_service.owner_ops.submit_operation(
-                        (device_link_v1_operation_t)request->opcode,
-                        request->opcode == DEVICE_LINK_V1_SET_CREDENTIALS ?
-                        &request->payload.credentials : NULL,
-                        operation_id, s_service.owner_arg);
+                const device_link_v1_snapshot_t *snapshot =
+                    device_link_v1_engine_snapshot(&s_service.engine);
 
-                if (submitted != DEVICE_LINK_V1_STATUS_ACCEPTED)
-                {
-                    const device_link_v1_snapshot_t *snapshot =
-                        device_link_v1_engine_snapshot(&s_service.engine);
-
-                    (void)device_link_v1_engine_complete(
-                        &s_service.engine, operation_id,
-                        DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL, NULL, 0U,
-                        snapshot);
-                }
+                (void)device_link_v1_engine_complete(
+                    &s_service.engine, operation_id,
+                    DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL, NULL, 0U,
+                    snapshot);
             }
-            accepted = status == DEVICE_LINK_V1_STATUS_ACCEPTED;
+            accepted = submitted == DEVICE_LINK_V1_STATUS_ACCEPTED;
         }
         device_link_v1_engine_arm_response(&s_service.engine,
                                            request->request_id, accepted, false);
@@ -228,7 +245,15 @@ static esp_err_t _ble_link_service_pump_locked(void)
     }
     memcpy(s_service.tx_value, value, length);
     s_service.tx_length = length;
-    return _ble_link_service_submit_tx(value, length);
+    {
+        const esp_err_t result = _ble_link_service_submit_tx(value, length);
+
+        if (result != ESP_OK)
+        {
+            device_link_v1_engine_abort_tx(&s_service.engine);
+        }
+        return result;
+    }
 }
 
 esp_err_t ble_link_service_set_domain_descriptors(
@@ -397,6 +422,7 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
     }
     if (length == 0U)
     {
+        device_link_v1_engine_abort_tx(&s_service.engine);
         _ble_link_service_unlock();
         return ESP_ERR_INVALID_SIZE;
     }
@@ -404,6 +430,10 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
     s_service.tx_length = length;
     const esp_err_t result = _ble_link_service_submit_tx(response, length);
 
+    if (result != ESP_OK)
+    {
+        device_link_v1_engine_abort_tx(&s_service.engine);
+    }
     _ble_link_service_unlock();
     return result;
 }
@@ -481,9 +511,12 @@ void ble_link_service_abort_transactions(void)
     _ble_link_service_unlock();
 }
 
-void ble_link_service_on_connect(void)
+void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle)
 {
     _ble_link_service_lock();
+    s_service.connection_generation = generation;
+    s_service.conn_handle = conn_handle;
+    s_service.connection_valid = generation != 0U;
     device_link_v1_engine_connect(&s_service.engine);
     _ble_link_service_unlock();
 }
@@ -492,6 +525,9 @@ void ble_link_service_clear_session_state(void)
 {
     _ble_link_service_lock();
     device_link_v1_engine_disconnect(&s_service.engine);
+    s_service.connection_valid = false;
+    s_service.connection_generation = 0U;
+    s_service.conn_handle = 0U;
     s_service.confirmation_pending = false;
     s_service.confirmation_token = 0U;
     s_service.passkey = 0U;
@@ -501,8 +537,28 @@ void ble_link_service_clear_session_state(void)
 esp_err_t ble_link_service_clear_session_state_if_current(
     const ble_link_operation_identity_t *identity)
 {
-    (void)identity;
+    _ble_link_service_lock();
+    if (!_ble_link_service_identity_is_current(identity))
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    _ble_link_service_unlock();
     ble_link_service_clear_session_state();
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_abort_tx_if_current(
+    const ble_link_operation_identity_t *identity)
+{
+    _ble_link_service_lock();
+    if (!_ble_link_service_identity_is_current(identity))
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    device_link_v1_engine_abort_tx(&s_service.engine);
+    _ble_link_service_unlock();
     return ESP_OK;
 }
 

@@ -243,6 +243,25 @@ static void _test_scan_payload_correlation(void)
     _ack_ok(&engine, 7U);
 }
 
+static void _test_abort_tx_keeps_record(void)
+{
+    device_link_v1_engine_t engine;
+    const device_link_v1_snapshot_t idle = _idle();
+    uint32_t operation_id = 0U;
+
+    device_link_v1_engine_init(&engine, &idle);
+    assert(device_link_v1_engine_start(
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    device_link_v1_engine_arm_response(&engine, 1U, true, false);
+    assert(device_link_v1_engine_write_blocked(&engine));
+    device_link_v1_engine_abort_tx(&engine);
+    assert(!device_link_v1_engine_write_blocked(&engine));
+    assert(device_link_v1_engine_slot_occupied(&engine));
+    assert(engine.connected);
+    assert(!engine.accepted_confirmed);
+}
+
 static void _test_connect_authentication(void)
 {
     device_link_v1_engine_t engine;
@@ -270,5 +289,6 @@ int main(void)
     _test_ordinary_coalesce_and_id_exhaustion();
     _test_scan_payload_correlation();
     _test_connect_authentication();
+    _test_abort_tx_keeps_record();
     return 0;
 }

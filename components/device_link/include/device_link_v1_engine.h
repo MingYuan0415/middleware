@@ -96,6 +96,13 @@ device_link_v1_tx_kind_t device_link_v1_engine_next_tx(
 /** @brief Confirm the in-flight indication. */
 void device_link_v1_engine_confirm_tx(device_link_v1_engine_t *engine);
 
+/**
+ * @brief Drop the in-flight indication without applying confirm side effects.
+ *
+ * Keeps the slot and connection so the client can recover with GET_OPERATION.
+ */
+void device_link_v1_engine_abort_tx(device_link_v1_engine_t *engine);
+
 /** @brief Apply BLE disconnect: keep the record, drop unconfirmed TX. */
 void device_link_v1_engine_disconnect(device_link_v1_engine_t *engine);
 
