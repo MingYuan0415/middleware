@@ -40,10 +40,10 @@ static void test_enc_change_before_identity_holds(void)
 
 static void test_unresolved_rpa_outside_window_fails_closed(void)
 {
-    /* A peer whose identity did NOT resolve at CONNECT and that is not
-     * inside a pairing window can never prove a prior bond: the had_bond
-     * fact is frozen (no re-query at identity time, or a fresh pairing
-     * would bypass a closed window). Fail closed: delete and terminate. */
+    /* A peer whose identity did NOT resolve at CONNECT, that is not inside
+     * a pairing window, and whose ACL has already started SMP cannot prove
+     * a prior bond: refreshing had_bond from the store would let this
+     * connection's pairing bypass a closed window. Fail closed. */
     ble_link_sec_state_t state;
 
     ble_link_sec_state_reset(&state);
@@ -55,7 +55,7 @@ static void test_unresolved_rpa_outside_window_fails_closed(void)
      * bond and no window is open: this can only be this connection's own
      * fresh pairing, which must not be admitted. */
     const uint32_t actions =
-        ble_link_sec_state_on_identity(&state, true, true);
+        ble_link_sec_state_on_identity(&state, true, true, false, false);
 
     assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) != 0U);
@@ -73,7 +73,7 @@ static void test_identity_before_enc_change_converges(void)
     assert(ble_link_sec_state_on_connect(&state, true, false, false, false, false) ==
            BLE_LINK_SEC_ACTION_NONE);
     uint32_t actions =
-        ble_link_sec_state_on_identity(&state, true, false);
+        ble_link_sec_state_on_identity(&state, true, false, false, false);
 
     assert(actions == BLE_LINK_SEC_ACTION_NONE);
     assert(!state.finalized);
@@ -101,7 +101,7 @@ static void test_connect_bond_snapshot_is_not_overwritten(void)
      * current pairing; the had_bond fact is not re-derived and the CONNECT
      * snapshot still admits the original bonded peer. */
     const uint32_t actions = ble_link_sec_state_on_identity(
-                                 &state, false, false);
+                                 &state, false, false, false, false);
 
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
@@ -124,7 +124,7 @@ static void test_new_peer_in_window_is_admitted(void)
 
     assert(actions == BLE_LINK_SEC_ACTION_NONE);
     assert(!state.finalized);
-    actions = ble_link_sec_state_on_identity(&state, true, true);
+    actions = ble_link_sec_state_on_identity(&state, true, true, false, false);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
     assert((actions & BLE_LINK_SEC_ACTION_SET_IDENTITY_KNOWN) != 0U);
@@ -255,6 +255,25 @@ static void test_final_encryption_snapshot_recovers_fresh_identity(void)
            BLE_LINK_SEC_ACTION_NONE);
 }
 
+static void test_late_identity_refresh_admits_existing_bond(void)
+{
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(
+               &state, false, false, false, false, false) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    assert(ble_link_sec_state_on_encrypted(
+               &state, true, true, true) == BLE_LINK_SEC_ACTION_NONE);
+    const uint32_t actions = ble_link_sec_state_on_identity(
+                                 &state, true, true, true, true);
+
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_TERMINATE) == 0U);
+    assert(ble_link_sec_state_peer_admitted(&state));
+}
+
 int main(void)
 {
     test_reset_clears_state();
@@ -269,6 +288,7 @@ int main(void)
     test_encryption_dropped_resets_decision();
     test_static_identity_known_at_connect();
     test_final_encryption_snapshot_recovers_fresh_identity();
+    test_late_identity_refresh_admits_existing_bond();
     puts("ble_link_sec_state: all tests passed");
     return 0;
 }

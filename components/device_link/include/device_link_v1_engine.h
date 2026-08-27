@@ -22,6 +22,7 @@ typedef struct device_link_v1_engine
     device_link_v1_snapshot_t ordinary_snapshot;
     device_link_v1_snapshot_t pre_snapshot;
     uint32_t next_operation_id;
+    uint32_t deadline_ms;
     uint8_t response_request_id;
     bool record_present;
     bool accepted_confirmed;
@@ -71,6 +72,10 @@ device_link_v1_status_t device_link_v1_engine_get_operation(
 /**
  * @brief Complete an ACTIVE operation with a terminal snapshot.
  *
+ * SCAN and SET_CREDENTIALS success rebuild the snapshot from the
+ * pre-operation state so UNCHANGED postconditions hold. A NONE failure
+ * that still cannot satisfy success postconditions becomes INTERNAL.
+ *
  * @return false when the id, phase, failure, or snapshot is illegal.
  */
 bool device_link_v1_engine_complete(
@@ -78,6 +83,35 @@ bool device_link_v1_engine_complete(
     device_link_v1_wifi_failure_t failure,
     const device_link_v1_network_t *networks, uint8_t count,
     const device_link_v1_snapshot_t *snapshot);
+
+/**
+ * @brief Drop an unconfirmed ACTIVE record without a terminal event.
+ *
+ * @return false when no unconfirmed ACTIVE record is present.
+ */
+bool device_link_v1_engine_rollback(device_link_v1_engine_t *engine);
+
+/**
+ * @brief Arm the finite ACTIVE-record deadline from @p now_ms.
+ */
+void device_link_v1_engine_arm_deadline(device_link_v1_engine_t *engine,
+                                        uint32_t now_ms, uint32_t timeout_ms);
+
+/**
+ * @brief Complete an ACTIVE record with TIMEOUT when the deadline is due.
+ *
+ * @return true when this call terminated the record.
+ */
+bool device_link_v1_engine_tick(device_link_v1_engine_t *engine,
+                                uint32_t now_ms);
+
+/**
+ * @brief Drop the in-flight indication as undeliverable.
+ *
+ * Ordinary events are discarded. A terminal event is omitted; the record
+ * remains for GET_OPERATION. A response is aborted without confirm.
+ */
+void device_link_v1_engine_reject_tx(device_link_v1_engine_t *engine);
 
 /** @brief Observe a new Wi-Fi snapshot and retain at most one ordinary event. */
 void device_link_v1_engine_observe_snapshot(

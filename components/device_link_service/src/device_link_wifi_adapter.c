@@ -1,5 +1,11 @@
 #include <string.h>
 
+#include "esp_err.h"
+#ifndef UNIT_TEST_HOST
+    #include "freertos/FreeRTOS.h"
+    #include "freertos/semphr.h"
+#endif
+
 #include "ble_link_service.h"
 #include "connectivity_manager.h"
 #include "device_link_wifi_adapter.h"
@@ -21,6 +27,30 @@ typedef struct device_link_wifi_bridge
 } device_link_wifi_bridge_t;
 
 static device_link_wifi_bridge_t s_bridge;
+#ifndef UNIT_TEST_HOST
+    static SemaphoreHandle_t s_bridge_lock;
+    static StaticSemaphore_t s_bridge_lock_control;
+#endif
+
+static void _device_link_wifi_lock(void)
+{
+#ifndef UNIT_TEST_HOST
+    if (s_bridge_lock != NULL)
+    {
+        (void)xSemaphoreTakeRecursive(s_bridge_lock, portMAX_DELAY);
+    }
+#endif
+}
+
+static void _device_link_wifi_unlock(void)
+{
+#ifndef UNIT_TEST_HOST
+    if (s_bridge_lock != NULL)
+    {
+        (void)xSemaphoreGiveRecursive(s_bridge_lock);
+    }
+#endif
+}
 
 static device_link_v1_wifi_failure_t _device_link_wifi_map_failure(
     connectivity_manager_failure_t failure)
@@ -122,35 +152,58 @@ static void _device_link_wifi_on_status(
 {
     device_link_v1_snapshot_t snapshot;
 
+    uint32_t ble_operation_id;
+    connectivity_manager_operation_id_t manager_operation_id;
+    device_link_v1_operation_t operation;
+
+    _device_link_wifi_lock();
     if (status->generation <= s_bridge.last_status_generation)
     {
+        _device_link_wifi_unlock();
         return;
     }
     s_bridge.last_status_generation = status->generation;
+    ble_operation_id = s_bridge.ble_operation_id;
+    manager_operation_id = s_bridge.manager_operation_id;
+    operation = s_bridge.operation;
+    _device_link_wifi_unlock();
     _device_link_wifi_map_snapshot(status, &snapshot);
     ble_link_service_observe_snapshot(&snapshot);
     if (!status->operation_complete ||
-            status->operation_id != s_bridge.manager_operation_id ||
-            s_bridge.ble_operation_id == 0U)
+            status->operation_id != manager_operation_id ||
+            ble_operation_id == 0U)
     {
         return;
     }
-    if (s_bridge.operation == DEVICE_LINK_V1_OPERATION_SCAN)
+    if (operation == DEVICE_LINK_V1_OPERATION_SCAN)
     {
         return;
     }
     device_link_v1_wifi_failure_t failure =
         _device_link_wifi_map_failure(status->failure);
 
-    if (s_bridge.operation == DEVICE_LINK_V1_OPERATION_CONNECT &&
-            failure == DEVICE_LINK_V1_WIFI_FAILURE_STORAGE)
+    if (status->operation_canceled ||
+            status->last_error == ESP_ERR_NOT_FINISHED)
+    {
+        failure = DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT;
+    }
+    else if (operation == DEVICE_LINK_V1_OPERATION_CONNECT &&
+             failure == DEVICE_LINK_V1_WIFI_FAILURE_STORAGE)
     {
         failure = DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL;
     }
-    (void)ble_link_service_complete_operation(
-        s_bridge.ble_operation_id, failure, NULL, 0U, &snapshot);
-    s_bridge.ble_operation_id = 0U;
-    s_bridge.manager_operation_id = 0U;
+    if (ble_link_service_complete_operation(
+                ble_operation_id, failure, NULL, 0U, &snapshot) != ESP_OK)
+    {
+        return;
+    }
+    _device_link_wifi_lock();
+    if (s_bridge.ble_operation_id == ble_operation_id)
+    {
+        s_bridge.ble_operation_id = 0U;
+        s_bridge.manager_operation_id = 0U;
+    }
+    _device_link_wifi_unlock();
 }
 
 static void _device_link_wifi_on_scan(
@@ -162,18 +215,26 @@ static void _device_link_wifi_on_scan(
     device_link_v1_snapshot_t snapshot;
     uint8_t count = 0U;
 
+    uint32_t ble_operation_id;
+    device_link_v1_wifi_failure_t failure;
+
+    _device_link_wifi_lock();
     if (scan->generation <= s_bridge.last_scan_generation ||
             s_bridge.operation != DEVICE_LINK_V1_OPERATION_SCAN ||
             scan->operation_id != s_bridge.manager_operation_id ||
             s_bridge.ble_operation_id == 0U)
     {
+        _device_link_wifi_unlock();
         return;
     }
     if (scan->running)
     {
+        _device_link_wifi_unlock();
         return;
     }
     s_bridge.last_scan_generation = scan->generation;
+    ble_operation_id = s_bridge.ble_operation_id;
+    _device_link_wifi_unlock();
     memset(source, 0, sizeof(source));
     for (uint8_t i = 0U; i < scan->record_count &&
             i < CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS; ++i)
@@ -193,13 +254,34 @@ static void _device_link_wifi_on_scan(
     memset(&status, 0, sizeof(status));
     (void)connectivity_manager_get_status(&status);
     _device_link_wifi_map_snapshot(&status, &snapshot);
-    (void)ble_link_service_complete_operation(
-        s_bridge.ble_operation_id,
-        scan->last_error == ESP_OK ? DEVICE_LINK_V1_WIFI_FAILURE_NONE :
-        DEVICE_LINK_V1_WIFI_FAILURE_RADIO,
-        networks, count, &snapshot);
-    s_bridge.ble_operation_id = 0U;
-    s_bridge.manager_operation_id = 0U;
+    if (scan->operation_canceled ||
+            scan->last_error == ESP_ERR_NOT_FINISHED ||
+            scan->last_error == ESP_ERR_TIMEOUT)
+    {
+        failure = DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT;
+        count = 0U;
+    }
+    else if (scan->last_error != ESP_OK)
+    {
+        failure = DEVICE_LINK_V1_WIFI_FAILURE_RADIO;
+        count = 0U;
+    }
+    else
+    {
+        failure = DEVICE_LINK_V1_WIFI_FAILURE_NONE;
+    }
+    if (ble_link_service_complete_operation(
+                ble_operation_id, failure, networks, count, &snapshot) != ESP_OK)
+    {
+        return;
+    }
+    _device_link_wifi_lock();
+    if (s_bridge.ble_operation_id == ble_operation_id)
+    {
+        s_bridge.ble_operation_id = 0U;
+        s_bridge.manager_operation_id = 0U;
+    }
+    _device_link_wifi_unlock();
 }
 
 static void _device_link_wifi_event(
@@ -286,9 +368,11 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
     {
         return DEVICE_LINK_V1_STATUS_INTERNAL;
     }
+    _device_link_wifi_lock();
     s_bridge.ble_operation_id = operation_id;
     s_bridge.manager_operation_id = manager_id;
     s_bridge.operation = operation;
+    _device_link_wifi_unlock();
     return DEVICE_LINK_V1_STATUS_ACCEPTED;
 }
 
@@ -320,6 +404,17 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
     {
         return ESP_OK;
     }
+#ifndef UNIT_TEST_HOST
+    if (s_bridge_lock == NULL)
+    {
+        s_bridge_lock = xSemaphoreCreateRecursiveMutexStatic(
+                            &s_bridge_lock_control);
+        if (s_bridge_lock == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+#endif
     ble_link_service_set_v1_ops(&ops, NULL);
     const esp_err_t result = event_bus_subscribe(
                                  CONNECTIVITY_MANAGER_MSG, EVENT_BUS_SUB_TYPE_ANY,
@@ -342,5 +437,7 @@ void device_link_wifi_adapter_bridge_stop(void)
     }
     (void)event_bus_unsubscribe(s_bridge.subscription);
     ble_link_service_set_v1_ops(NULL, NULL);
+    _device_link_wifi_lock();
     memset(&s_bridge, 0, sizeof(s_bridge));
+    _device_link_wifi_unlock();
 }

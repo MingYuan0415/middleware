@@ -12,6 +12,7 @@ static uint32_t s_last_complete_id;
 static device_link_v1_wifi_failure_t s_last_failure;
 static unsigned s_observe_count;
 static device_link_v1_snapshot_t s_last_snapshot;
+static esp_err_t s_complete_result = ESP_OK;
 
 void ble_link_service_fake_reset(void)
 {
@@ -22,6 +23,12 @@ void ble_link_service_fake_reset(void)
     s_last_failure = DEVICE_LINK_V1_WIFI_FAILURE_NONE;
     s_observe_count = 0U;
     memset(&s_last_snapshot, 0, sizeof(s_last_snapshot));
+    s_complete_result = ESP_OK;
+}
+
+void ble_link_service_fake_set_complete_result(esp_err_t result)
+{
+    s_complete_result = result;
 }
 
 unsigned ble_link_service_fake_complete_count(void)
@@ -84,5 +91,5 @@ esp_err_t ble_link_service_complete_operation(
     {
         s_last_snapshot = *snapshot;
     }
-    return ESP_OK;
+    return s_complete_result;
 }

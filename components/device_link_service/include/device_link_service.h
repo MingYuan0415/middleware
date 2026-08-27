@@ -73,6 +73,7 @@ typedef struct device_link_service_status
     uint8_t instance_id[3]; /**< Boot-scoped public discovery identifier. */
     bool active; /**< A binding window owns the bindable advertisement. */
     bool client_connected; /**< One BLE transport client is connected. */
+    bool bound; /**< A durable Device Link bond is present. */
     bool pending_confirmation; /**< A binding awaits local confirmation. */
     device_link_confirmation_token_t confirmation_token; /**< Exact
                                                           * transaction to

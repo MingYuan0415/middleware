@@ -92,6 +92,20 @@ void ble_link_service_set_worker_wake(
     ble_link_service_wake_fn_t wake, void *arg);
 void ble_link_service_wake_owner(void);
 esp_err_t ble_link_service_pump_tx(void);
+
+/**
+ * @brief Complete an ACTIVE record with TIMEOUT when its deadline is due.
+ *
+ * @param[in] now_ms Monotonic millisecond clock.
+ */
+void ble_link_service_tick(uint32_t now_ms);
+
+/**
+ * @brief Record the negotiated ATT MTU used to size indications.
+ *
+ * @param[in] att_mtu Negotiated ATT MTU, clamped to at least 23.
+ */
+void ble_link_service_set_att_mtu(uint16_t att_mtu);
 esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
 bool ble_link_service_write_blocked(void);
 bool ble_link_service_response_in_flight(void);

@@ -69,7 +69,8 @@ uint32_t ble_link_sec_state_on_connect(
 }
 
 uint32_t ble_link_sec_state_on_identity(
-    ble_link_sec_state_t *state, bool bonded, bool bond_verified)
+    ble_link_sec_state_t *state, bool bonded, bool bond_verified,
+    bool refresh_had_bond, bool had_bond)
 {
     uint32_t actions = BLE_LINK_SEC_ACTION_NONE;
 
@@ -78,11 +79,10 @@ uint32_t ble_link_sec_state_on_identity(
         return actions;
     }
     state->identity_ready = true;
-    /* The prior-bond fact is frozen at CONNECT (a snapshot of the store
-     * before this ACL's SMP procedure). Identity resolution may run after a
-     * new provisional key was written, so it must never be re-derived from
-     * the store here: a pairing created by THIS connection would otherwise
-     * look like a pre-existing bond and bypass a closed pairing window. */
+    if (refresh_had_bond && !state->had_bond)
+    {
+        state->had_bond = had_bond;
+    }
     state->bonded = state->bonded || bonded;
     state->bond_verified = state->bond_verified || bond_verified;
     if (!_ble_link_sec_state_finalize_locked(state))
@@ -179,7 +179,7 @@ uint32_t ble_link_sec_state_reconcile_snapshot(
     if (identity_ready)
     {
         actions |= ble_link_sec_state_on_identity(
-                       state, bonded, bond_verified);
+                       state, bonded, bond_verified, false, false);
     }
     actions |= ble_link_sec_state_on_encrypted(
                    state, encrypted, bonded, bond_verified);

@@ -607,6 +607,9 @@ static void _device_link_service_refresh_snapshot_locked(void)
         ble_link_service_confirmation_token();
     s_service.snapshot.numeric_comparison =
         ble_link_service_numeric_comparison_value();
+    s_service.snapshot.bound =
+        (ble_link_session_get_state_flags() &
+         BLE_LINK_STATE_FLAG_BOUND) != 0U;
     s_service.snapshot.client_connected = s_service.client_connected;
     s_service.snapshot.window_remaining_ms =
         s_service.window_open ?
@@ -670,6 +673,11 @@ static esp_err_t _device_link_service_open_window_locked(void)
          * window would overwrite its lease id and leave the old
          * advertisement live forever. Fail closed until the close
          * retried by the worker tick succeeds. */
+        return ESP_ERR_INVALID_STATE;
+    }
+    if ((ble_link_session_get_state_flags() &
+            BLE_LINK_STATE_FLAG_BOUND) != 0U)
+    {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_service.client_connected)
@@ -875,13 +883,19 @@ static esp_err_t _device_link_service_close_window_locked(void)
     s_service.window_open = false;
     s_service.window_open_pending = false;
     s_service.window_deadline = 0U;
-    if (s_service.client_connected)
+    const uint32_t session_flags = ble_link_session_get_state_flags();
+    const bool verified_bound =
+        ((session_flags & BLE_LINK_STATE_FLAG_BOUND) != 0U) &&
+        (((session_flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U) ||
+         ((session_flags & BLE_LINK_STATE_FLAG_AUTHORIZED) != 0U));
+    const bool drop_acl = s_service.client_connected &&
+                          (ble_link_service_pending_confirmation() ||
+                           !verified_bound);
+
+    if (drop_acl)
     {
-        /* Closing a pairing window is also an ACL boundary. This is
-         * independent of provisional-bond cleanup: an already-bound peer may
-         * be connected while the window expires. The port retains the exact
-         * generation termination obligation; only successful retention lets
-         * suspend/window-close acknowledgement advance. */
+        /* Closing a pairing window is an ACL boundary for pairing
+         * sessions. A verified bound peer may keep the connection. */
         const esp_err_t disconnect_result =
             ble_nimble_port_request_disconnect();
 
@@ -891,10 +905,13 @@ static esp_err_t _device_link_service_close_window_locked(void)
             return disconnect_result;
         }
     }
-    /* A closed window invalidates any prepared transaction, and the
-     * committed long-term verifier is restored so a bound peer can
-     * reconnect outside any window. */
-    _device_link_service_clear_link_session();
+    /* A closed window invalidates any prepared pairing transaction. A
+     * verified bound session is left intact so the peer can keep using
+     * the existing ACL outside the window. */
+    if (!verified_bound || ble_link_service_pending_confirmation())
+    {
+        _device_link_service_clear_link_session();
+    }
     _device_link_service_open_public_verifier();
     if (result == ESP_OK)
     {
@@ -1299,6 +1316,8 @@ static void _device_link_service_worker_tick(void)
      * callback. Continue it from this owner task so no GATT submit is
      * re-entered from NimBLE's completion stack. */
     (void)ble_link_service_pump_tx();
+    ble_link_service_tick(
+        (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
     if (ble_link_gatt_link_state_dirty())
     {
         (void)ble_link_gatt_refresh_link_state();

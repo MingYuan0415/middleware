@@ -26,6 +26,9 @@
 #ifndef BLE_ATT_ERR_INSUFFICIENT_AUTHEN
     #define BLE_ATT_ERR_INSUFFICIENT_AUTHEN 0x05
 #endif
+#ifndef BLE_ATT_ERR_INSUFFICIENT_RESOURCES
+    #define BLE_ATT_ERR_INSUFFICIENT_RESOURCES 0x11
+#endif
 
 static const uint8_t s_device_link_uuid[16] =
 {
@@ -259,7 +262,7 @@ static int _ble_link_gatt_access(
 
     if (result != ESP_OK || work == NULL)
     {
-        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        return BLE_ATT_ERR_INSUFFICIENT_RESOURCES;
     }
     if (work_submit != NULL)
     {
@@ -267,13 +270,13 @@ static int _ble_link_gatt_access(
         if (result != ESP_OK)
         {
             ble_link_service_release_work(work);
-            return 0x11;
+            return BLE_ATT_ERR_INSUFFICIENT_RESOURCES;
         }
         return 0;
     }
     result = ble_link_service_execute(work);
     ble_link_service_release_work(work);
-    return result == ESP_OK ? 0 : BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    return result == ESP_OK ? 0 : BLE_ATT_ERR_INSUFFICIENT_RESOURCES;
 }
 
 esp_err_t ble_link_gatt_init(const ble_link_gatt_config_t *config)
@@ -349,16 +352,12 @@ esp_err_t ble_link_gatt_restart(void)
         _ble_link_gatt_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    const uint64_t boot_id = s_gatt.config.boot_id;
-    const size_t queue_depth = (s_gatt.config.tx_queue_depth > 0U) ?
-                               s_gatt.config.tx_queue_depth : 32U;
-
     s_gatt.config.connection_generation = 0U;
     s_gatt.config.conn_handle = 0U;
     s_gatt.config.att_mtu = 23U;
     _ble_link_gatt_unlock();
-    ble_link_service_init(boot_id, _ble_link_gatt_output, NULL, NULL,
-                          queue_depth);
+    ble_link_service_reset();
+    ble_link_service_set_att_mtu(23U);
     return ESP_OK;
 }
 
@@ -462,6 +461,8 @@ void ble_link_gatt_on_reassembly_idle_generation(
 
 void ble_link_gatt_set_att_mtu(uint16_t mtu)
 {
+    uint16_t applied = 0U;
+
     _ble_link_gatt_lock();
     if (s_gatt.configured)
     {
@@ -470,8 +471,13 @@ void ble_link_gatt_set_att_mtu(uint16_t mtu)
             mtu = BLE_LINK_GATT_ATT_MTU_MAX;
         }
         s_gatt.config.att_mtu = (mtu >= 23U) ? mtu : 23U;
+        applied = s_gatt.config.att_mtu;
     }
     _ble_link_gatt_unlock();
+    if (applied != 0U)
+    {
+        ble_link_service_set_att_mtu(applied);
+    }
 }
 
 esp_err_t ble_link_gatt_get_att_mtu(uint32_t *out_mtu)

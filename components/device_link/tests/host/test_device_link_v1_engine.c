@@ -28,6 +28,13 @@ static device_link_v1_snapshot_t _home_connected(void)
     return snapshot;
 }
 
+static void _boot(device_link_v1_engine_t *engine,
+                  const device_link_v1_snapshot_t *snapshot)
+{
+    device_link_v1_engine_init(engine, snapshot);
+    device_link_v1_engine_connect(engine);
+}
+
 static void _confirm_response(device_link_v1_engine_t *engine)
 {
     assert(engine->in_flight == DEVICE_LINK_V1_TX_RESPONSE);
@@ -80,7 +87,7 @@ static void _test_connected_terminal_and_ack_order(void)
     device_link_v1_operation_record_t record;
     const device_link_v1_snapshot_t idle = _idle();
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_CONNECT, 1U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_get_operation(&engine,
@@ -117,7 +124,7 @@ static void _test_ack_omits_terminal(void)
     const device_link_v1_snapshot_t idle = _idle();
     device_link_v1_operation_record_t record;
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 71U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
@@ -137,7 +144,7 @@ static void _test_disconnect_keeps_record(void)
     device_link_v1_operation_record_t record;
     const device_link_v1_snapshot_t idle = _idle();
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 10U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
@@ -157,7 +164,7 @@ static void _test_unconfirmed_accepted_omits_terminal(void)
     device_link_v1_operation_record_t record;
     const device_link_v1_snapshot_t idle = _idle();
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     assert(device_link_v1_engine_start_with_id(
                &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, 20U) ==
            DEVICE_LINK_V1_STATUS_ACCEPTED);
@@ -180,7 +187,7 @@ static void _test_ordinary_coalesce_and_id_exhaustion(void)
     uint32_t operation_id = 0U;
 
     connecting.state = DEVICE_LINK_V1_WIFI_CONNECTING;
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     const device_link_v1_snapshot_t connected = _home_connected();
 
     device_link_v1_engine_observe_snapshot(&engine, &connecting);
@@ -192,7 +199,7 @@ static void _test_ordinary_coalesce_and_id_exhaustion(void)
     device_link_v1_engine_connect(&engine);
     assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, UINT32_MAX,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
@@ -228,7 +235,7 @@ static void _test_scan_payload_correlation(void)
     network.ssid_length = 4U;
     network.security = DEVICE_LINK_V1_WIFI_PERSONAL;
     network.rssi_dbm = -42;
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 7U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
@@ -249,7 +256,7 @@ static void _test_abort_tx_keeps_record(void)
     const device_link_v1_snapshot_t idle = _idle();
     uint32_t operation_id = 0U;
 
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     assert(device_link_v1_engine_start(
                &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
                &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
@@ -270,7 +277,7 @@ static void _test_connect_authentication(void)
 
     snapshot.state = DEVICE_LINK_V1_WIFI_ERROR;
     snapshot.failure = DEVICE_LINK_V1_WIFI_FAILURE_AUTHENTICATION;
-    device_link_v1_engine_init(&engine, &idle);
+    _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_CONNECT, 8U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
@@ -278,6 +285,154 @@ static void _test_connect_authentication(void)
                &snapshot));
     _emit_ordinary_then_terminal(&engine);
     _ack_ok(&engine, 8U);
+}
+
+static void _test_scan_rebuilds_unchanged_snapshot(void)
+{
+    device_link_v1_engine_t engine;
+    device_link_v1_snapshot_t scanning = _idle();
+    device_link_v1_operation_record_t record;
+    const device_link_v1_snapshot_t idle = _idle();
+
+    scanning.state = DEVICE_LINK_V1_WIFI_SCANNING;
+    _boot(&engine, &idle);
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 31U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_complete(
+               &engine, 31U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U,
+               &scanning));
+    assert(device_link_v1_engine_snapshot(&engine)->state ==
+           DEVICE_LINK_V1_WIFI_IDLE);
+    assert(device_link_v1_engine_get_operation(&engine,
+            &record) == DEVICE_LINK_V1_STATUS_OK);
+    assert(record.phase == DEVICE_LINK_V1_OPERATION_SUCCEEDED);
+    _ack_ok(&engine, 31U);
+}
+
+static void _test_set_credentials_keeps_prior_failure(void)
+{
+    device_link_v1_engine_t engine;
+    device_link_v1_snapshot_t error = _home_connected();
+    device_link_v1_snapshot_t saved = _idle();
+    device_link_v1_operation_record_t record;
+
+    error.state = DEVICE_LINK_V1_WIFI_ERROR;
+    error.failure = DEVICE_LINK_V1_WIFI_FAILURE_AUTHENTICATION;
+    saved.profile_ssid[0] = 'C';
+    saved.profile_ssid[1] = 'a';
+    saved.profile_ssid[2] = 'f';
+    saved.profile_ssid[3] = 'e';
+    saved.profile_ssid_length = 4U;
+    _boot(&engine, &error);
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, 32U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_complete(
+               &engine, 32U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U,
+               &saved));
+    assert(device_link_v1_engine_snapshot(&engine)->state ==
+           DEVICE_LINK_V1_WIFI_ERROR);
+    assert(device_link_v1_engine_snapshot(&engine)->failure ==
+           DEVICE_LINK_V1_WIFI_FAILURE_AUTHENTICATION);
+    assert(device_link_v1_engine_snapshot(&engine)->profile_ssid_length == 4U);
+    assert(device_link_v1_engine_get_operation(&engine,
+            &record) == DEVICE_LINK_V1_STATUS_OK);
+    assert(record.phase == DEVICE_LINK_V1_OPERATION_SUCCEEDED);
+    _ack_ok(&engine, 32U);
+}
+
+static void _test_connect_none_mismatch_becomes_internal(void)
+{
+    device_link_v1_engine_t engine;
+    device_link_v1_snapshot_t idle = _idle();
+    device_link_v1_operation_record_t record;
+
+    idle.profile_ssid[0] = 'H';
+    idle.profile_ssid_length = 1U;
+    _boot(&engine, &idle);
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_CONNECT, 33U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_complete(
+               &engine, 33U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U,
+               &idle));
+    assert(device_link_v1_engine_get_operation(&engine,
+            &record) == DEVICE_LINK_V1_STATUS_OK);
+    assert(record.phase == DEVICE_LINK_V1_OPERATION_FAILED);
+    assert(record.failure == DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL);
+    _ack_ok(&engine, 33U);
+}
+
+static void _test_rollback_unconfirmed_active(void)
+{
+    device_link_v1_engine_t engine;
+    const device_link_v1_snapshot_t idle = _idle();
+    uint32_t operation_id = 0U;
+
+    _boot(&engine, &idle);
+    assert(device_link_v1_engine_start(
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_rollback(&engine));
+    assert(!device_link_v1_engine_slot_occupied(&engine));
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 34U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(!device_link_v1_engine_rollback(&engine));
+    assert(device_link_v1_engine_slot_occupied(&engine));
+}
+
+static void _test_tick_completes_timeout(void)
+{
+    device_link_v1_engine_t engine;
+    device_link_v1_operation_record_t record;
+    const device_link_v1_snapshot_t idle = _idle();
+
+    _boot(&engine, &idle);
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 35U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    device_link_v1_engine_arm_deadline(&engine, 1000U, 50U);
+    assert(!device_link_v1_engine_tick(&engine, 1049U));
+    assert(device_link_v1_engine_tick(&engine, 1050U));
+    assert(device_link_v1_engine_get_operation(&engine,
+            &record) == DEVICE_LINK_V1_STATUS_OK);
+    assert(record.phase == DEVICE_LINK_V1_OPERATION_FAILED);
+    assert(record.failure == DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    _ack_ok(&engine, 35U);
+}
+
+static void _test_init_disconnected(void)
+{
+    device_link_v1_engine_t engine;
+    const device_link_v1_snapshot_t idle = _idle();
+    uint32_t operation_id = 0U;
+
+    device_link_v1_engine_init(&engine, &idle);
+    assert(!engine.connected);
+    assert(device_link_v1_engine_start(
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &operation_id) == DEVICE_LINK_V1_STATUS_INTERNAL);
+}
+
+static void _test_reject_tx_drops_ordinary_and_omits_terminal(void)
+{
+    device_link_v1_engine_t engine;
+    device_link_v1_snapshot_t connected = _home_connected();
+    const device_link_v1_snapshot_t idle = _idle();
+
+    _boot(&engine, &idle);
+    device_link_v1_engine_observe_snapshot(&engine, &connected);
+    assert(device_link_v1_engine_next_tx(&engine) ==
+           DEVICE_LINK_V1_TX_ORDINARY_STATUS);
+    device_link_v1_engine_reject_tx(&engine);
+    assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
+
+    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 36U,
+              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_complete(
+               &engine, 36U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U, &idle));
+    assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_TERMINAL);
+    device_link_v1_engine_reject_tx(&engine);
+    assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
+    assert(device_link_v1_engine_slot_occupied(&engine));
+    _ack_ok(&engine, 36U);
 }
 
 int main(void)
@@ -290,5 +445,12 @@ int main(void)
     _test_scan_payload_correlation();
     _test_connect_authentication();
     _test_abort_tx_keeps_record();
+    _test_scan_rebuilds_unchanged_snapshot();
+    _test_set_credentials_keeps_prior_failure();
+    _test_connect_none_mismatch_becomes_internal();
+    _test_rollback_unconfirmed_active();
+    _test_tick_completes_timeout();
+    _test_init_disconnected();
+    _test_reject_tx_drops_ordinary_and_omits_terminal();
     return 0;
 }

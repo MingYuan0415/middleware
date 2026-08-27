@@ -2,19 +2,20 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "ble_link_service.h"
+#include "ble_link_session.h"
 
 #define DBG_TAG "ble_link_service"
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"
 
-#define BLE_LINK_SERVICE_FLOW_ID 1U
-
 struct ble_link_work
 {
     bool used;
     uint16_t att_mtu;
+    uint32_t generation;
     bool encrypted;
     bool authenticated;
     uint8_t value[DEVICE_LINK_V1_MAX_ATT_VALUE_BYTES];
@@ -34,6 +35,8 @@ typedef struct ble_link_service
     uint8_t tx_value[DEVICE_LINK_V1_MAX_ATT_VALUE_BYTES];
     size_t tx_length;
     uint32_t tx_flow_id;
+    uint32_t next_flow_id;
+    uint16_t att_mtu;
     bool pairing_window_open;
     bool confirmation_pending;
     bool connection_valid;
@@ -125,11 +128,15 @@ static size_t _ble_link_service_handle_admitted(
     switch (request->opcode)
     {
     case DEVICE_LINK_V1_GET_INFO:
-        info.pairing_window_open = s_service.pairing_window_open;
+        info.pairing_window_open =
+            (ble_link_session_get_state_flags() &
+             BLE_LINK_STATE_FLAG_BINDABLE) != 0U;
         if (s_service.owner_ops.fill_info != NULL)
         {
             s_service.owner_ops.fill_info(&info, s_service.owner_arg);
-            info.pairing_window_open = s_service.pairing_window_open;
+            info.pairing_window_open =
+                (ble_link_session_get_state_flags() &
+                 BLE_LINK_STATE_FLAG_BINDABLE) != 0U;
         }
         return device_link_v1_encode_info_response(request->request_id, &info,
                 out, capacity);
@@ -180,15 +187,19 @@ static size_t _ble_link_service_handle_admitted(
 
             if (submitted != DEVICE_LINK_V1_STATUS_ACCEPTED)
             {
-                const device_link_v1_snapshot_t *snapshot =
-                    device_link_v1_engine_snapshot(&s_service.engine);
-
-                (void)device_link_v1_engine_complete(
-                    &s_service.engine, operation_id,
-                    DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL, NULL, 0U,
-                    snapshot);
+                (void)device_link_v1_engine_rollback(&s_service.engine);
+                status = (submitted == DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT) ?
+                         DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT :
+                         DEVICE_LINK_V1_STATUS_INTERNAL;
             }
-            accepted = submitted == DEVICE_LINK_V1_STATUS_ACCEPTED;
+            else
+            {
+                accepted = true;
+                device_link_v1_engine_arm_deadline(
+                    &s_service.engine,
+                    (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+                    DEVICE_LINK_V1_OPERATION_TIMEOUT_MS);
+            }
         }
         device_link_v1_engine_arm_response(&s_service.engine,
                                            request->request_id, accepted, false);
@@ -206,7 +217,16 @@ static esp_err_t _ble_link_service_submit_tx(const uint8_t *value, size_t length
     {
         return ESP_ERR_INVALID_STATE;
     }
-    s_service.tx_flow_id = BLE_LINK_SERVICE_FLOW_ID;
+    if (s_service.next_flow_id == 0U)
+    {
+        s_service.next_flow_id = 1U;
+    }
+    s_service.tx_flow_id = s_service.next_flow_id;
+    s_service.next_flow_id++;
+    if (s_service.next_flow_id == 0U)
+    {
+        s_service.next_flow_id = 1U;
+    }
     return s_service.output(value, length, BLE_LINK_SERVICE_TX_SESSION, true,
                             s_service.tx_flow_id, s_service.output_arg);
 }
@@ -238,9 +258,13 @@ static esp_err_t _ble_link_service_pump_locked(void)
     {
         return ESP_OK;
     }
-    if (length == 0U)
+    const uint16_t att_mtu = s_service.att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
+                             s_service.att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
+    const size_t max_value = (size_t)att_mtu - 3U;
+
+    if (length == 0U || length > max_value)
     {
-        device_link_v1_engine_confirm_tx(&s_service.engine);
+        device_link_v1_engine_reject_tx(&s_service.engine);
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(s_service.tx_value, value, length);
@@ -286,14 +310,25 @@ void ble_link_service_init(
     s_service.output = output;
     s_service.output_arg = arg;
     s_service.next_token = 1U;
+    s_service.next_flow_id = 1U;
+    s_service.att_mtu = DEVICE_LINK_V1_MINIMUM_ATT_MTU;
     device_link_v1_engine_init(&s_service.engine, &snapshot);
     _ble_link_service_unlock();
 }
 
 void ble_link_service_reset(void)
 {
-    ble_link_service_init(s_service.boot_id, s_service.output,
-                          s_service.output_arg, NULL, 0U);
+    _ble_link_service_lock();
+    device_link_v1_engine_disconnect(&s_service.engine);
+    s_service.connection_valid = false;
+    s_service.connection_generation = 0U;
+    s_service.conn_handle = 0U;
+    s_service.confirmation_pending = false;
+    s_service.confirmation_token = 0U;
+    s_service.passkey = 0U;
+    s_service.tx_flow_id = 0U;
+    s_service.tx_length = 0U;
+    _ble_link_service_unlock();
 }
 
 void ble_link_service_set_v1_ops(const ble_link_v1_owner_ops_t *ops, void *arg)
@@ -366,6 +401,11 @@ esp_err_t ble_link_service_accept(
         return ESP_ERR_NO_MEM;
     }
     work->att_mtu = (uint16_t)facts->preferred_att_mtu;
+    work->generation = facts->connection_generation;
+    if (facts->preferred_att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU)
+    {
+        s_service.att_mtu = (uint16_t)facts->preferred_att_mtu;
+    }
     work->encrypted = facts->encrypted;
     work->authenticated = facts->secure_connections_bond_verified ||
                           facts->session_authenticated;
@@ -388,6 +428,12 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
         return ESP_ERR_INVALID_ARG;
     }
     _ble_link_service_lock();
+    if (!s_service.connection_valid ||
+            work->generation != s_service.connection_generation)
+    {
+        _ble_link_service_unlock();
+        return ESP_OK;
+    }
     memset(&input, 0, sizeof(input));
     input.att_mtu = work->att_mtu;
     input.att_value_length = work->length;
@@ -470,6 +516,27 @@ esp_err_t ble_link_service_pump_tx(void)
 
     _ble_link_service_unlock();
     return result;
+}
+
+void ble_link_service_tick(uint32_t now_ms)
+{
+    _ble_link_service_lock();
+    const bool timed_out = device_link_v1_engine_tick(&s_service.engine,
+                           now_ms);
+
+    _ble_link_service_unlock();
+    if (timed_out)
+    {
+        _ble_link_service_wake();
+    }
+}
+
+void ble_link_service_set_att_mtu(uint16_t att_mtu)
+{
+    _ble_link_service_lock();
+    s_service.att_mtu = att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
+                        att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
+    _ble_link_service_unlock();
 }
 
 esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last)

@@ -3447,13 +3447,31 @@ static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
         result = ESP_FAIL;
         goto exit;
     }
-    bool matching_bond = count > 0;
+    bool matching_bond = false;
     ble_addr_t matching_peer = {0};
 
     (void)record_valid;
     if (count > 0)
     {
+        bool verified = false;
+
         matching_peer = peers[0];
+        result = _ble_nimble_port_bond_store_verified_identity(
+                     &peers[0], &verified);
+        if (result != ESP_OK)
+        {
+            goto exit;
+        }
+        if (verified)
+        {
+            matching_bond = true;
+        }
+        else if (_ble_nimble_port_unpair_peer(&peers[0]) != 0)
+        {
+            ESP_LOGW(TAG, "malformed bond deletion failed");
+            result = ESP_FAIL;
+            goto exit;
+        }
     }
     {
         /* Sweep residual bond records of every object type - even when a
@@ -4657,11 +4675,29 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
 
 static uint16_t s_passkey_conn_handle;
 static atomic_bool s_passkey_pending = ATOMIC_VAR_INIT(false);
+static atomic_bool s_acl_pairing_attempted = ATOMIC_VAR_INIT(false);
 
 void ble_nimble_port_numeric_comparison_cancel(void)
 {
-    atomic_store_explicit(&s_passkey_pending, false, memory_order_release);
+    const uint16_t conn_handle = s_passkey_conn_handle;
+    const bool pending = atomic_exchange_explicit(&s_passkey_pending, false,
+                         memory_order_acq_rel);
+
     s_passkey_conn_handle = 0U;
+#ifndef UNIT_TEST_HOST
+    if (pending && conn_handle != 0U)
+    {
+        struct ble_sm_io io;
+
+        memset(&io, 0, sizeof(io));
+        io.action = BLE_SM_IOACT_NUMCMP;
+        io.numcmp_accept = 0;
+        (void)ble_sm_inject_io(conn_handle, &io);
+    }
+#else
+    (void)pending;
+    (void)conn_handle;
+#endif
 }
 
 esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
@@ -4749,6 +4785,8 @@ static int _ble_nimble_port_gap_event(
 
             ble_hs_cfg.sm_sc_only = 1;
             ble_link_sec_state_reset(&s_link_sec_state);
+            atomic_store_explicit(&s_acl_pairing_attempted, false,
+                                  memory_order_release);
             s_link_sec_conn = event->connect.conn_handle;
             /* The controller supplies peer_id_addr when a stored IRK
              * resolves the OTA address. Any unresolved or non-identity
@@ -4983,15 +5021,15 @@ static int _ble_nimble_port_gap_event(
             {
                 ble_hs_cfg.sm_sc_only = 0;
             }
-            /* The had_bond fact is frozen at CONNECT: identity resolution
-             * may run after THIS connection's pairing persisted keys, so
-             * the store must not be re-queried here (a fresh pairing would
-             * otherwise look like a pre-existing bond and bypass a closed
-             * pairing window). */
+            const bool refresh_had_bond = !atomic_load_explicit(
+                                              &s_acl_pairing_attempted,
+                                              memory_order_acquire);
             const uint32_t actions = ble_link_sec_state_on_identity(
                                          &s_link_sec_state,
                                          desc.sec_state.bonded,
-                                         bond_verified);
+                                         bond_verified,
+                                         refresh_had_bond,
+                                         _ble_nimble_port_peer_has_bond(&desc));
 
             _ble_nimble_port_apply_sec_actions(
                 actions, event->identity_resolved.conn_handle);
@@ -5003,8 +5041,11 @@ static int _ble_nimble_port_gap_event(
         }
         return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING:
+        atomic_store_explicit(&s_acl_pairing_attempted, true,
+                              memory_order_release);
         if (!event->repeat_pairing.new_sc ||
                 !event->repeat_pairing.new_bonding ||
+                !event->repeat_pairing.new_authenticated ||
                 event->repeat_pairing.new_key_size != BLE_SM_PAIR_KEY_SZ_MAX ||
                 !_ble_nimble_port_pairing_window_open())
         {
@@ -5023,6 +5064,8 @@ static int _ble_nimble_port_gap_event(
             return BLE_GAP_REPEAT_PAIRING_RETRY;
         }
     case BLE_GAP_EVENT_PASSKEY_ACTION:
+        atomic_store_explicit(&s_acl_pairing_attempted, true,
+                              memory_order_release);
         if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP)
         {
             s_passkey_conn_handle = event->passkey.conn_handle;
@@ -5030,7 +5073,12 @@ static int _ble_nimble_port_gap_event(
                                   memory_order_release);
             (void)ble_link_service_offer_numeric_comparison(
                 event->passkey.params.numcmp);
+            return 0;
         }
+#ifndef UNIT_TEST_HOST
+        (void)ble_gap_terminate(event->passkey.conn_handle,
+                                BLE_ERR_CONN_TERM_LOCAL);
+#endif
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         port_event.type = BLE_PORT_EVENT_ADV_COMPLETE;

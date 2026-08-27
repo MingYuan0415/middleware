@@ -70,6 +70,7 @@ static void _device_link_v1_engine_clear_record(device_link_v1_engine_t *engine)
     engine->suppress_indications = false;
     engine->pending_accepted = false;
     engine->pending_ack = false;
+    engine->deadline_ms = 0U;
 }
 
 static device_link_v1_status_t _device_link_v1_engine_admit(
@@ -107,6 +108,7 @@ static device_link_v1_status_t _device_link_v1_engine_admit(
     engine->response_request_id = request_id;
     engine->pending_accepted = true;
     engine->pending_ack = false;
+    engine->deadline_ms = 0U;
     if (operation_id == UINT32_MAX)
     {
         engine->ids_exhausted = true;
@@ -128,7 +130,7 @@ void device_link_v1_engine_init(device_link_v1_engine_t *engine,
     }
     memset(engine, 0, sizeof(*engine));
     engine->next_operation_id = 1U;
-    engine->connected = true;
+    engine->connected = false;
     if (snapshot != NULL && device_link_v1_snapshot_valid(snapshot))
     {
         engine->current_snapshot = *snapshot;
@@ -230,25 +232,68 @@ bool device_link_v1_engine_complete(
     const device_link_v1_network_t *networks, uint8_t count,
     const device_link_v1_snapshot_t *snapshot)
 {
+    device_link_v1_snapshot_t applied;
+    device_link_v1_wifi_failure_t terminal_failure = failure;
+    const device_link_v1_operation_t operation =
+        engine != NULL ? engine->record.operation :
+        DEVICE_LINK_V1_OPERATION_SCAN;
+
     if (!_device_link_v1_engine_ready(engine) || snapshot == NULL ||
             !engine->record_present ||
             engine->record.operation_id != operation_id ||
             engine->record.phase != DEVICE_LINK_V1_OPERATION_ACTIVE ||
-            !device_link_v1_failure_allowed(engine->record.operation, failure) ||
-            !device_link_v1_snapshot_valid(snapshot) ||
+            !device_link_v1_failure_allowed(operation, failure) ||
             count > DEVICE_LINK_V1_MAX_SCAN_NETWORKS)
     {
         return false;
     }
-    if (failure == DEVICE_LINK_V1_WIFI_FAILURE_NONE &&
-            !_device_link_v1_engine_success_snapshot(
-                engine->record.operation, &engine->pre_snapshot, snapshot))
+    applied = *snapshot;
+    if (terminal_failure == DEVICE_LINK_V1_WIFI_FAILURE_NONE)
+    {
+        if (operation == DEVICE_LINK_V1_OPERATION_SCAN)
+        {
+            applied = engine->pre_snapshot;
+        }
+        else if (operation == DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS)
+        {
+            if (snapshot->profile_ssid_length > DEVICE_LINK_V1_MAX_SSID_BYTES)
+            {
+                return false;
+            }
+            applied = engine->pre_snapshot;
+            applied.profile_ssid_length = snapshot->profile_ssid_length;
+            memcpy(applied.profile_ssid, snapshot->profile_ssid,
+                   snapshot->profile_ssid_length);
+        }
+    }
+    if (!device_link_v1_snapshot_valid(&applied))
     {
         return false;
     }
-    if (engine->record.operation == DEVICE_LINK_V1_OPERATION_SCAN)
+    if (terminal_failure == DEVICE_LINK_V1_WIFI_FAILURE_NONE &&
+            !_device_link_v1_engine_success_snapshot(
+                operation, &engine->pre_snapshot, &applied))
     {
-        if (failure != DEVICE_LINK_V1_WIFI_FAILURE_NONE && count != 0U)
+        if (!device_link_v1_failure_allowed(
+                    operation, DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL))
+        {
+            return false;
+        }
+        terminal_failure = DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL;
+        applied = *snapshot;
+        if (!device_link_v1_snapshot_valid(&applied))
+        {
+            applied = engine->current_snapshot;
+        }
+        if (!device_link_v1_snapshot_valid(&applied))
+        {
+            return false;
+        }
+    }
+    if (operation == DEVICE_LINK_V1_OPERATION_SCAN)
+    {
+        if (terminal_failure != DEVICE_LINK_V1_WIFI_FAILURE_NONE &&
+                count != 0U)
         {
             return false;
         }
@@ -267,19 +312,90 @@ bool device_link_v1_engine_complete(
     {
         return false;
     }
-    engine->record.failure = failure;
-    engine->record.phase = (failure == DEVICE_LINK_V1_WIFI_FAILURE_NONE) ?
-                           DEVICE_LINK_V1_OPERATION_SUCCEEDED :
-                           DEVICE_LINK_V1_OPERATION_FAILED;
+    engine->record.failure = terminal_failure;
+    engine->record.phase =
+        (terminal_failure == DEVICE_LINK_V1_WIFI_FAILURE_NONE) ?
+        DEVICE_LINK_V1_OPERATION_SUCCEEDED :
+        DEVICE_LINK_V1_OPERATION_FAILED;
+    engine->deadline_ms = 0U;
     const bool snapshot_changed = !device_link_v1_snapshot_equal(
-                                      &engine->current_snapshot, snapshot);
+                                      &engine->current_snapshot, &applied);
 
-    engine->current_snapshot = *snapshot;
+    engine->current_snapshot = applied;
     if (engine->connected && (snapshot_changed || engine->ordinary_present))
     {
-        _device_link_v1_engine_retain_ordinary(engine, snapshot);
+        _device_link_v1_engine_retain_ordinary(engine, &applied);
     }
     return true;
+}
+
+bool device_link_v1_engine_rollback(device_link_v1_engine_t *engine)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            !engine->record_present ||
+            engine->record.phase != DEVICE_LINK_V1_OPERATION_ACTIVE ||
+            engine->accepted_confirmed)
+    {
+        return false;
+    }
+    _device_link_v1_engine_clear_record(engine);
+    return true;
+}
+
+void device_link_v1_engine_arm_deadline(device_link_v1_engine_t *engine,
+                                        uint32_t now_ms, uint32_t timeout_ms)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            !engine->record_present ||
+            engine->record.phase != DEVICE_LINK_V1_OPERATION_ACTIVE ||
+            timeout_ms == 0U)
+    {
+        return;
+    }
+    engine->deadline_ms = now_ms + timeout_ms;
+}
+
+bool device_link_v1_engine_tick(device_link_v1_engine_t *engine,
+                                uint32_t now_ms)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            !engine->record_present ||
+            engine->record.phase != DEVICE_LINK_V1_OPERATION_ACTIVE ||
+            engine->deadline_ms == 0U ||
+            (int32_t)(now_ms - engine->deadline_ms) < 0)
+    {
+        return false;
+    }
+    return device_link_v1_engine_complete(
+               engine, engine->record.operation_id,
+               DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT, NULL, 0U,
+               &engine->current_snapshot);
+}
+
+void device_link_v1_engine_reject_tx(device_link_v1_engine_t *engine)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            engine->in_flight == DEVICE_LINK_V1_TX_NONE)
+    {
+        return;
+    }
+    switch (engine->in_flight)
+    {
+    case DEVICE_LINK_V1_TX_RESPONSE:
+        engine->pending_accepted = false;
+        engine->pending_ack = false;
+        break;
+    case DEVICE_LINK_V1_TX_ORDINARY_STATUS:
+        engine->ordinary_present = false;
+        break;
+    case DEVICE_LINK_V1_TX_TERMINAL:
+        engine->terminal_omitted = true;
+        break;
+    case DEVICE_LINK_V1_TX_NONE:
+    default:
+        break;
+    }
+    engine->in_flight = DEVICE_LINK_V1_TX_NONE;
 }
 
 void device_link_v1_engine_observe_snapshot(

@@ -71,17 +71,20 @@ uint32_t ble_link_sec_state_on_connect(
  * @brief Feed an identity resolution event (IDENTITY_RESOLVED, or a
  * static identity known after connect).
  *
- * The had_bond fact captured at CONNECT is never overwritten here: identity
- * resolution may run after this connection's pairing persisted keys, and
- * re-deriving the prior-bond fact from the store would let a fresh pairing
- * bypass a closed pairing window.
+ * The had_bond fact captured at CONNECT is not overwritten unless
+ * @p refresh_had_bond is true. Refresh only when this ACL has not started
+ * SMP; otherwise a pairing created by this connection could look like a
+ * pre-existing bond and bypass a closed pairing window.
  *
  * @param[in] bonded Connection reports a stored bond.
  * @param[in] bond_verified Store bond material is valid.
+ * @param[in] refresh_had_bond True when this ACL has not attempted pairing.
+ * @param[in] had_bond Store currently holds a bond for the resolved identity.
  * @return Action mask.
  */
 uint32_t ble_link_sec_state_on_identity(
-    ble_link_sec_state_t *state, bool bonded, bool bond_verified);
+    ble_link_sec_state_t *state, bool bonded, bool bond_verified,
+    bool refresh_had_bond, bool had_bond);
 
 /**
  * @brief Feed an encryption change event.

@@ -43,6 +43,8 @@ static uint32_t s_submitted_id;
 static device_link_v1_operation_t s_submitted_op;
 static unsigned s_submit_calls;
 static esp_err_t s_output_result = ESP_OK;
+static device_link_v1_status_t s_submit_result = DEVICE_LINK_V1_STATUS_ACCEPTED;
+static uint32_t s_last_flow_id;
 
 static esp_err_t _output(const uint8_t *value, size_t len,
                          ble_link_service_tx_channel_t channel, bool is_last,
@@ -50,8 +52,8 @@ static esp_err_t _output(const uint8_t *value, size_t len,
 {
     (void)channel;
     (void)is_last;
-    (void)flow_id;
     (void)arg;
+    s_last_flow_id = flow_id;
     TEST_ASSERT_TRUE(len <= sizeof(s_tx));
     memcpy(s_tx, value, len);
     s_tx_len = len;
@@ -77,7 +79,7 @@ static device_link_v1_status_t _submit(
     s_submitted_op = operation;
     s_submitted_id = operation_id;
     s_submit_calls++;
-    return DEVICE_LINK_V1_STATUS_ACCEPTED;
+    return s_submit_result;
 }
 
 static ble_link_service_facts_t _facts(void)
@@ -113,6 +115,8 @@ static void _reset(void)
     s_submitted_op = 0;
     s_submit_calls = 0U;
     s_output_result = ESP_OK;
+    s_submit_result = DEVICE_LINK_V1_STATUS_ACCEPTED;
+    s_last_flow_id = 0U;
     ble_link_service_init(BOOT_ID, _output, NULL, NULL, 0U);
     ble_link_service_set_v1_ops(&ops, NULL);
     ble_link_service_set_pairing_window(true);
@@ -204,7 +208,8 @@ static void test_scan_without_owner_returns_internal(void)
     TEST_ASSERT_EQUAL(DEVICE_LINK_V1_SCAN | DEVICE_LINK_V1_RESPONSE_MASK,
                       s_tx[0]);
     TEST_ASSERT_EQUAL(DEVICE_LINK_V1_STATUS_INTERNAL, s_tx[2]);
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_response_completed(1U, true));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_response_completed(
+                          s_last_flow_id, true));
     TEST_ASSERT_TRUE(!ble_link_service_write_blocked());
     _execute_write(again, sizeof(again));
     TEST_ASSERT_EQUAL(DEVICE_LINK_V1_STATUS_INTERNAL, s_tx[2]);
@@ -250,6 +255,40 @@ static void test_abort_tx_rejects_stale_identity(void)
                           &current));
 }
 
+static void test_submit_failure_returns_internal_without_slot(void)
+{
+    const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+    const uint8_t query[] = { DEVICE_LINK_V1_GET_OPERATION, 0x03U };
+
+    _reset();
+    s_submit_result = DEVICE_LINK_V1_STATUS_INTERNAL;
+    _execute_write(scan, sizeof(scan));
+    TEST_ASSERT_TRUE(s_tx_len >= 3U);
+    TEST_ASSERT_EQUAL(DEVICE_LINK_V1_STATUS_INTERNAL, s_tx[2]);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_response_completed(
+                          s_last_flow_id, true));
+    s_submit_result = DEVICE_LINK_V1_STATUS_ACCEPTED;
+    _execute_write(query, sizeof(query));
+    TEST_ASSERT_EQUAL(DEVICE_LINK_V1_STATUS_NOT_FOUND, s_tx[2]);
+}
+
+static void test_stale_generation_is_dropped(void)
+{
+    const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+    ble_link_work_t *work = NULL;
+    const ble_link_service_facts_t facts = _facts();
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &facts, BLE_LINK_SERVICE_RX_SESSION, scan,
+                          sizeof(scan), &work));
+    ble_link_service_on_connect(2U, 7U);
+    s_tx_calls = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(work));
+    ble_link_service_release_work(work);
+    TEST_ASSERT_EQUAL(0U, s_tx_calls);
+}
+
 int main(void)
 {
     test_get_info_response();
@@ -258,5 +297,7 @@ int main(void)
     test_scan_without_owner_returns_internal();
     test_execute_output_failure_unblocks_writes();
     test_abort_tx_rejects_stale_identity();
+    test_submit_failure_returns_internal_without_slot();
+    test_stale_generation_is_dropped();
     return 0;
 }
