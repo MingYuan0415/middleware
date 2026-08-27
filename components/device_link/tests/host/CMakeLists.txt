@@ -13,19 +13,12 @@ find_program(DEVICE_LINK_SETARCH setarch)
 get_filename_component(PROJECT_ROOT
     "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/device_link")
-set(IDF_BT "$ENV{IDF_PATH}/components/bt")
 
-function(add_device_link_test target source)
+function(add_device_link_v1_test target source)
     add_executable(${target}
         ${source}
-        "${COMPONENT}/src/device_link_operation.c"
-        "${COMPONENT}/src/device_link_core.c"
-        "${COMPONENT}/src/device_link_digest.c"
-        "${COMPONENT}/src/device_link_router.c"
-        "${COMPONENT}/src/device_link_tlv.c"
-        "${COMPONENT}/src/device_link_wire.c"
-        "${IDF_BT}/common/tinycrypt/src/sha256.c"
-        "${IDF_BT}/common/tinycrypt/src/utils.c"
+        "${COMPONENT}/src/device_link_v1.c"
+        "${COMPONENT}/src/device_link_v1_engine.c"
     )
     target_compile_features(${target} PRIVATE c_std_11)
     target_compile_definitions(${target} PRIVATE
@@ -33,9 +26,7 @@ function(add_device_link_test target source)
         UNIT_TEST_HOST
     )
     target_include_directories(${target} PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/fakes"
         "${COMPONENT}/include"
-        "${IDF_BT}/common/tinycrypt/include"
     )
     target_compile_options(${target} PRIVATE
         -Wall
@@ -68,7 +59,6 @@ function(add_device_link_test target source)
         message(FATAL_ERROR
             "Unsupported DEVICE_LINK_SANITIZER=${DEVICE_LINK_SANITIZER}")
     endif()
-
     if(DEVICE_LINK_SANITIZER STREQUAL "thread" AND
             DEVICE_LINK_SETARCH AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
         add_test(NAME ${target} COMMAND
@@ -79,6 +69,5 @@ function(add_device_link_test target source)
     set_tests_properties(${target} PROPERTIES TIMEOUT 10)
 endfunction()
 
-add_device_link_test(test_device_link_wire_tlv test_device_link_wire_tlv.c)
-add_device_link_test(test_device_link_router_operation
-    test_device_link_router_operation.c)
+add_device_link_v1_test(test_device_link_v1 test_device_link_v1.c)
+add_device_link_v1_test(test_device_link_v1_engine test_device_link_v1_engine.c)

@@ -1,5 +1,8 @@
-lock_format=1
-contract_commit=b909e1444ba7f50a0697de51fe47ac0a82766466
-profile=device-link/v2
-schema_format=typed-tlv/1
-schema_digest=b0f749edf02d2061040440eb9a6bc733c7aa80ebd8bdb85c01d46acf36b5c18e
+lock_format=2
+contract_commit=ec245e4e1bbf85ef73b003132679227d6ef4591b
+profile=device-link/v1
+schema_format=fixed-binary/1
+schema_digest=2b6a39f2dc2bc9f846ee4ab79dc4fc0f15c0208c43dcfc08117ef1372e4bdda8
+release_state=freeze_candidate
+release_tag=none
+pin_state=working_tree_candidate

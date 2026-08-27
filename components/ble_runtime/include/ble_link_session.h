@@ -7,8 +7,29 @@
 
 #include "esp_err.h"
 
-#include "ble_link_dispatcher.h"
-#include "ble_link_state.h"
+#define BLE_LINK_ERROR_OK 1U
+#define BLE_LINK_ERROR_UNAUTHENTICATED 6U
+#define BLE_LINK_ERROR_PERMISSION_DENIED 7U
+#define BLE_LINK_ERROR_UNAVAILABLE 14U
+
+#define BLE_LINK_STATE_FLAG_BINDABLE UINT32_C(0x01)
+#define BLE_LINK_STATE_FLAG_BOUND UINT32_C(0x02)
+#define BLE_LINK_STATE_FLAG_PUBLIC_DISCOVERY UINT32_C(0x04)
+#define BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED UINT32_C(0x08)
+#define BLE_LINK_STATE_FLAG_TRANSITIONING UINT32_C(0x10)
+#define BLE_LINK_STATE_FLAG_AUTHENTICATED UINT32_C(0x20)
+#define BLE_LINK_STATE_FLAG_AUTHORIZED UINT32_C(0x40)
+#define BLE_LINK_STATE_FLAG_ERROR UINT32_C(0x80)
+
+typedef struct ble_link_dispatcher_facts
+{
+    uint64_t active_boot_id;
+    uint32_t connection_generation;
+    bool encrypted;
+    bool session_authenticated;
+    bool authorized;
+    bool recovery_query;
+} ble_link_dispatcher_facts_t;
 
 #ifdef UNIT_TEST_HOST
     /**

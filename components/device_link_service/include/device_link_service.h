@@ -14,7 +14,6 @@
 extern "C" {
 #endif
 
-#define DEVICE_LINK_SERVICE_QR_MAX_BYTES 256U
 #define DEVICE_LINK_SERVICE_WAIT_FOREVER UINT32_MAX
 
 EVENT_BUS_DECLARE_ID(DEVICE_LINK_SERVICE_MSG);
@@ -74,11 +73,11 @@ typedef struct device_link_service_status
     uint8_t instance_id[3]; /**< Boot-scoped public discovery identifier. */
     bool active; /**< A binding window owns the bindable advertisement. */
     bool client_connected; /**< One BLE transport client is connected. */
-    bool qr_ready; /**< QR bootstrap data may be copied. */
     bool pending_confirmation; /**< A binding awaits local confirmation. */
     device_link_confirmation_token_t confirmation_token; /**< Exact
                                                           * transaction to
                                                           * confirm. */
+    uint32_t numeric_comparison; /**< Six-digit passkey, or zero. */
 } device_link_service_status_t;
 
 typedef device_link_service_status_t device_link_service_snapshot_t;
@@ -135,11 +134,10 @@ esp_err_t device_link_service_release_startup_gate(void);
 esp_err_t device_link_service_deinit(uint32_t timeout_ms);
 
 /**
- * @brief Generate a fresh QR secret set and open the binding window.
+ * @brief Open the Numeric Comparison pairing window.
  *
- * The worker acquires a fast bindable advertisement lease carrying a fresh
- * 24-bit discriminator, opens the link session pairing window, and exposes
- * the QR payload through device_link_service_copy_qr().
+ * The worker acquires a fast bindable advertisement lease and opens the
+ * link session pairing window.
  *
  * @return ESP_OK when admitted, otherwise a lifecycle or queue error.
  */
@@ -222,17 +220,6 @@ esp_err_t device_link_service_resume(uint32_t timeout_ms);
  */
 esp_err_t device_link_service_get_status(
     device_link_service_status_t *status);
-
-/**
- * @brief Copy the active QR bootstrap JSON for display.
- * @param[out] output Receives the NUL-terminated QR JSON.
- * @param[in] capacity Output capacity in bytes.
- * @param[out] out_length Receives the JSON byte count excluding NUL.
- * @return ESP_OK on success; otherwise an argument, state, or size error.
- * @warning The caller must overwrite the output when the page is paused.
- */
-esp_err_t device_link_service_copy_qr(
-    char *output, size_t capacity, size_t *out_length);
 
 /**
  * @brief Report whether a binding window currently owns BLE.

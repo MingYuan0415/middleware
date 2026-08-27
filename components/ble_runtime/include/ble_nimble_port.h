@@ -78,6 +78,9 @@ esp_err_t ble_nimble_port_get_public_instance_id(uint8_t out_instance_id[3]);
  */
 esp_err_t ble_nimble_port_revoke_binding(void);
 
+/** @brief Complete Numeric Comparison with the local Yes/No decision. */
+esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept);
+
 /**
  * @brief Request a local disconnect of the current ACL.
  *

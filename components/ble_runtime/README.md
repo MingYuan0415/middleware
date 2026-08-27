@@ -4,7 +4,7 @@
 GAP、ADV、静态 GATT registry、Device Link framing/TX 和 host-store 协调均建立在这个
 生命周期上；只有 NimBLE adapter 可以调用 `nimble_port_*` 或修改 `ble_hs_cfg`。
 
-上层 `device_link_service` worker 是 ACL、Security 2 会话、授权事务和持久化清理的逻辑
+上层 `device_link_service` worker 是 ACL、Numeric Comparison 确认和持久化清理的逻辑
 owner。NimBLE callback、timer callback 和 GATT access callback 只产生带身份的事件或工作，
 不直接完成跨组件状态迁移。
 
@@ -19,9 +19,8 @@ adapter 自己创建 host task，因此 task 创建失败可见。`nimble_port_s
 fault，只能重启恢复。发生 terminal fault 时保留相关资源，避免失败 teardown 产生
 use-after-free；只有无 fault 的重试才释放资源。
 
-独立的 `ble_link_timer` owner 使用 4096B stack。它的 deadline sweep 可以同步退休
-Security 2 flow、推进 TX scheduler 并保留 provisional cleanup，因此不是只执行轻量 timer
-callback 的任务。
+独立的 `ble_link_timer` owner 使用 4096B stack。它的 deadline sweep 可以推进
+TX scheduler 并保留 provisional cleanup，因此不是只执行轻量 timer callback 的任务。
 
 clean deinit 先取得独立 shutdown pause，通过 NimBLE host barrier 关闭 pairing gate，随后
 持续推进 revoke、cleanup、terminal fence 和 accepted/rejected terminate。owner 仅在第一次
@@ -168,17 +167,9 @@ gate/ADV hold 并物理关 gate，临时 STOP/HCI 失败不会留下无 tracking
 时闭窗主动重启 pairing。`scripts/check_idf_assumptions.sh` 锁定对应 GATT、GAP、ATT、SM、
 store、connection 和 host-event 源码假设；脚本失败必须触发人工时序审查。
 
-同一脚本也锁定 Security2 源码。v6.0.2 的 GCM encrypt/decrypt 失败路径会释放输出但不清空
-指针，也不在释放前清零；项目适配层因此把依赖失败输出视为非所有权值，并只向上返回
-`NULL/0`。本地可用的 v6.1-beta1 标签仍保留相同行为，且其 NimBLE 子模块对象不在当前
-checkout 中，无法完成既有 BLE assumption matrix。因此生产安全验收保持 blocked；发布
-流程必须构建 `device_link_security_release` 目标，将该阻塞转为确定失败。不得仅凭版本号
-升级解除阻塞，候选版本必须同时通过输出 ownership、失败清零和完整 BLE matrix。
-
 ## 宿主测试
 
-测试需要导出 ESP-IDF v6.0.2 的 `IDF_PATH`，以直接编译该版本的
-`SessionData`/`Sec2Payload` protobuf-c 类型：
+测试需要导出 ESP-IDF v6.0.2 的 `IDF_PATH`：
 
 ```sh
 cmake -S tests/host -B /tmp/mt-ble-runtime -G Ninja \

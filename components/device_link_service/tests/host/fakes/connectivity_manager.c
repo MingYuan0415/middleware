@@ -22,10 +22,28 @@ static connectivity_manager_scan_snapshot_t s_scan =
 };
 static connectivity_manager_operation_id_t s_next_operation = 1U;
 static esp_err_t s_request_result = ESP_OK;
+static char s_saved_ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U];
+static char s_saved_password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
+static connectivity_manager_credentials_t s_last_saved;
 
 void connectivity_manager_fake_set_request_result(esp_err_t result)
 {
     s_request_result = result;
+}
+
+void connectivity_manager_fake_reset(void)
+{
+    s_next_operation = 1U;
+    s_request_result = ESP_OK;
+    memset(&s_last_saved, 0, sizeof(s_last_saved));
+    memset(s_saved_ssid, 0, sizeof(s_saved_ssid));
+    memset(s_saved_password, 0, sizeof(s_saved_password));
+}
+
+const connectivity_manager_credentials_t *connectivity_manager_fake_last_saved(
+    void)
+{
+    return s_last_saved.ssid == NULL ? NULL : &s_last_saved;
 }
 
 static esp_err_t _admit(connectivity_manager_operation_id_t *operation_id)
@@ -119,6 +137,36 @@ esp_err_t connectivity_manager_request_reconnect_saved(
 esp_err_t connectivity_manager_request_forget(
     connectivity_manager_operation_id_t *operation_id)
 {
+    return _admit(operation_id);
+}
+
+esp_err_t connectivity_manager_request_save_profile(
+    const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_operation_id_t *operation_id)
+{
+    if (credentials == NULL || credentials->ssid == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(s_saved_ssid, 0, sizeof(s_saved_ssid));
+    memset(s_saved_password, 0, sizeof(s_saved_password));
+    if (credentials->ssid_length > CONNECTIVITY_MANAGER_SSID_MAX_BYTES)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(s_saved_ssid, credentials->ssid, credentials->ssid_length);
+    if (credentials->password != NULL && credentials->password_length > 0U &&
+            credentials->password_length <=
+            CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES)
+    {
+        memcpy(s_saved_password, credentials->password,
+               credentials->password_length);
+    }
+    s_last_saved.ssid = s_saved_ssid;
+    s_last_saved.ssid_length = credentials->ssid_length;
+    s_last_saved.password = s_saved_password;
+    s_last_saved.password_length = credentials->password_length;
+    s_last_saved.security = credentials->security;
     return _admit(operation_id);
 }
 

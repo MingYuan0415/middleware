@@ -2,7 +2,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -24,8 +23,8 @@
 #include "ble_link_service.h"
 
 #include "ble_nimble_port.h"
-#include "device_link_security.h"
 #include "ble_runtime.h"
+
 #include "device_link_service.h"
 #include "device_link_wifi_adapter.h"
 #include "event_bus.h"
@@ -35,16 +34,9 @@
 #include "mt_log.h"
 
 #define DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES 3U
-#define DEVICE_LINK_SERVICE_POP_BYTES 16U
-#define DEVICE_LINK_SERVICE_QR_VERSION "link-v2"
-#define DEVICE_LINK_SERVICE_QR_SHORT_NAME "MT"
-#define DEVICE_LINK_SERVICE_QR_SERVICE_UUID \
-    "2c77e48c-c510-4230-8d05-63d036dc038b"
 #define DEVICE_LINK_SERVICE_RETRY_MS 100U
 #define DEVICE_LINK_SERVICE_REMAINING_PUBLISH_MS 1000U
-/* AuthorizePrepareResponse.expires_in_ms is frozen in [1, 120000] by the
- * core v2 contract; the binding window must stay inside that bound. */
-#define DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS 120000U
+#define DEVICE_LINK_SERVICE_WINDOW_MS 120000U
 #define DEVICE_LINK_SERVICE_BLUETOOTH_POLICY_KEY "dl_bt_policy"
 #define DEVICE_LINK_SERVICE_BLUETOOTH_POLICY_MAGIC UINT32_C(0x444c4254)
 #define DEVICE_LINK_SERVICE_BLUETOOTH_POLICY_VERSION 1U
@@ -135,10 +127,7 @@ typedef struct device_link_service
     bool window_open_pending; /**< Window deferred until the ACL is gone. */
     bool revoke_in_progress; /**< Journaled revoke awaiting completion. */
     bool suspended;
-    bool qr_ready;
     uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
-    uint8_t pop[DEVICE_LINK_SERVICE_POP_BYTES];
-    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
     TickType_t window_deadline;
     TickType_t last_remaining_publish;
 } device_link_service_t;
@@ -214,51 +203,10 @@ static void _device_link_service_zeroize(void *data, size_t size)
     }
 }
 
-static void _device_link_service_base64url(
-    const uint8_t *input, size_t input_length, char *output)
-{
-    static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    size_t input_index = 0U;
-    size_t output_index = 0U;
-
-    while (input_index + 3U <= input_length)
-    {
-        const uint32_t value = ((uint32_t)input[input_index] << 16) |
-                               ((uint32_t)input[input_index + 1U] << 8) |
-                               input[input_index + 2U];
-
-        output[output_index++] = alphabet[(value >> 18) & 0x3fU];
-        output[output_index++] = alphabet[(value >> 12) & 0x3fU];
-        output[output_index++] = alphabet[(value >> 6) & 0x3fU];
-        output[output_index++] = alphabet[value & 0x3fU];
-        input_index += 3U;
-    }
-    if (input_index + 1U == input_length)
-    {
-        const uint32_t value = (uint32_t)input[input_index] << 16;
-
-        output[output_index++] = alphabet[(value >> 18) & 0x3fU];
-        output[output_index++] = alphabet[(value >> 12) & 0x3fU];
-    }
-    else if (input_index + 2U == input_length)
-    {
-        const uint32_t value = ((uint32_t)input[input_index] << 16) |
-                               ((uint32_t)input[input_index + 1U] << 8);
-
-        output[output_index++] = alphabet[(value >> 18) & 0x3fU];
-        output[output_index++] = alphabet[(value >> 12) & 0x3fU];
-        output[output_index++] = alphabet[(value >> 6) & 0x3fU];
-    }
-    output[output_index] = '\0';
-}
-
 static void _device_link_service_zero_secrets(void)
 {
     _device_link_service_zeroize(s_service.discriminator,
                                  sizeof(s_service.discriminator));
-    _device_link_service_zeroize(s_service.pop, sizeof(s_service.pop));
-    _device_link_service_zeroize(s_service.qr, sizeof(s_service.qr));
 }
 
 static bool _device_link_service_policy_valid(
@@ -657,8 +605,9 @@ static void _device_link_service_refresh_snapshot_locked(void)
         ble_link_service_pending_confirmation();
     s_service.snapshot.confirmation_token =
         ble_link_service_confirmation_token();
+    s_service.snapshot.numeric_comparison =
+        ble_link_service_numeric_comparison_value();
     s_service.snapshot.client_connected = s_service.client_connected;
-    s_service.snapshot.qr_ready = s_service.qr_ready;
     s_service.snapshot.window_remaining_ms =
         s_service.window_open ?
         _device_link_service_remaining_ms(s_service.window_deadline) : 0U;
@@ -676,107 +625,15 @@ static void _device_link_service_wake_worker(void *arg)
     }
 }
 
-/**
- * @brief Install the Security 2 public-discovery verifier for the current
- * advertisement.
- *
- * The public password is derived from the boot-scoped instance id, so the
- * slot is (re)installed whenever public advertising becomes visible and
- * removed whenever it stops. A failure leaves the device fail-closed (no
- * public handshakes) and is logged rather than propagated: the missing
- * public endpoint must not take down the runtime.
- */
 static void _device_link_service_open_public_verifier(void)
 {
-    esp_err_t result;
-
-    if (s_service.config.runtime_port == NULL ||
-            s_service.config.runtime_port->get_public_instance_id == NULL)
-    {
-        result = device_link_security_close_public();
-    }
-    else
-    {
-        uint8_t instance_id[DEVICE_LINK_SECURITY_PUBLIC_INSTANCE_BYTES];
-        esp_err_t getter_result;
-
-        memset(instance_id, 0, sizeof(instance_id));
-        getter_result =
-            s_service.config.runtime_port->get_public_instance_id(
-                instance_id);
-        if (getter_result != ESP_OK ||
-                (instance_id[0] == 0U && instance_id[1] == 0U &&
-                 instance_id[2] == 0U))
-        {
-            /* A failed or empty instance id must never install a public
-             * verifier: the derivation input would be unknown and the
-             * endpoint would accept a wrong password. Fail closed. */
-            LOG_W("public instance id unavailable result=%d",
-                  getter_result);
-            result = device_link_security_close_public();
-        }
-        else
-        {
-            result = device_link_security_open_public(instance_id);
-        }
-    }
-    if (result != ESP_OK)
-    {
-        LOG_W("public verifier install failed result=%d", result);
-    }
 }
 
-/**
- * @brief Continue a journaled revoke that could not complete in one pass.
- *
- * Retries the durable steps (authorization erase, verifier reload, port
- * bond/CCCD deletion command) until the port accepts the deletion; the
- * journal written by begin_revoke preserves the obligation across crashes
- * and the worker tick re-enters this until completion.
- */
 static esp_err_t _device_link_service_continue_revoke(void)
 {
-    esp_err_t result = device_link_security_erase_auth_record();
+    const esp_err_t result = ble_nimble_port_revoke_binding();
 
-    if (result == ESP_ERR_NOT_FOUND)
-    {
-        result = ESP_OK;
-    }
-    if (result == ESP_OK && s_service.bluetooth_enabled)
-    {
-        const esp_err_t verifier_result =
-            device_link_security_load_long_term_verifier();
-
-        if (verifier_result != ESP_OK &&
-                verifier_result != ESP_ERR_NOT_FOUND)
-        {
-            result = verifier_result;
-        }
-    }
-    if (result == ESP_OK)
-    {
-        result = ble_nimble_port_revoke_binding();
-        if (result != ESP_OK)
-        {
-            result = ESP_ERR_INVALID_STATE;
-        }
-    }
-    if (result == ESP_OK)
-    {
-        /* The deletion command was accepted (or is already executing).
-         * The revoke is complete only once the journal marker is gone:
-         * the host-core owner clears it after the store is verified
-         * empty. The port de-duplicates concurrent REVOKE commands, so
-         * polling the journal here is safe. */
-        bool pending = false;
-
-        if (device_link_security_revoke_pending(&pending) != ESP_OK ||
-                pending)
-        {
-            result = ESP_ERR_INVALID_STATE;
-        }
-    }
-    return result;
+    return result == ESP_OK ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 static esp_err_t _device_link_service_close_window_locked(void);
@@ -835,58 +692,17 @@ static esp_err_t _device_link_service_open_window_locked(void)
         return ESP_OK;
     }
     uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
-    uint8_t pop[DEVICE_LINK_SERVICE_POP_BYTES];
-    char discriminator_b64[5];
-    char pop_b64[23];
-    char qr[DEVICE_LINK_SERVICE_QR_MAX_BYTES];
     ble_adv_lease_t lease;
     bool cleanup_started = false;
     esp_err_t result = ESP_OK;
 
     memset(&lease, 0, sizeof(lease));
     esp_fill_random(discriminator, sizeof(discriminator));
-    esp_fill_random(pop, sizeof(pop));
     if (discriminator[0] == 0U && discriminator[1] == 0U &&
             discriminator[2] == 0U)
     {
         discriminator[2] = 0x5aU;
     }
-    bool pop_nonzero = false;
-
-    for (size_t i = 0U; i < sizeof(pop); ++i)
-    {
-        pop_nonzero = pop_nonzero || pop[i] != 0U;
-    }
-    if (!pop_nonzero)
-    {
-        pop[sizeof(pop) - 1U] = 0x5aU;
-    }
-    _device_link_service_base64url(
-        discriminator, sizeof(discriminator), discriminator_b64);
-    _device_link_service_base64url(pop, sizeof(pop), pop_b64);
-    const int qr_length = snprintf(
-                              qr, sizeof(qr),
-                              "{\"ver\":\"%s\",\"name\":\"%s\","
-                              "\"service\":\"%s\",\"discriminator\":\"%s\","
-                              "\"pop\":\"%s\",\"expires_in_ms\":%lu}",
-                              DEVICE_LINK_SERVICE_QR_VERSION,
-                              DEVICE_LINK_SERVICE_QR_SHORT_NAME,
-                              DEVICE_LINK_SERVICE_QR_SERVICE_UUID,
-                              discriminator_b64, pop_b64,
-                              /* The profile freezes qr.expires_in_ms at
-                               * 120000 and the device must honor the full
-                               * window (core v2 security.md). */
-                              (unsigned long)
-                              DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS);
-
-    if (qr_length <= 0 || (size_t)qr_length >= sizeof(qr))
-    {
-        result = ESP_ERR_INVALID_SIZE;
-        goto exit;
-    }
-    /* Freeze the current slow advertisement before any bootstrap material
-     * becomes usable. The bindable lease is installed while paused, then
-     * the host gate is opened, and only the final unpause exposes it. */
     cleanup_started = true;
     result = ble_adv_manager_set_pause_reason(
                  BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, true);
@@ -894,25 +710,12 @@ static esp_err_t _device_link_service_open_window_locked(void)
     {
         goto exit;
     }
-    /* Arm the Security 2 bootstrap verifier before the window becomes
-     * visible, so a handshake can never race an armed window and no
-     * bindable advertisement outlives a failed verifier. The public
-     * discovery endpoint is removed first: a stale public password must
-     * not be reachable inside the QR window. */
-    (void)device_link_security_close_public();
-    if (device_link_security_open_bootstrap(pop, sizeof(pop)) != ESP_OK)
-    {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
-    }
     ble_link_session_set_pairing_window(true);
+    ble_link_service_set_pairing_window(true);
     result = ble_adv_manager_acquire_lease(
                  &lease, BLE_ADV_MANAGER_MODE_FAST, true, discriminator);
     if (lease.lease_id != 0U)
     {
-        /* acquire_lease may install ownership before physical convergence
-         * fails. Record the identity immediately so a failed open cannot
-         * lose the release obligation. */
         s_service.bindable_lease_held = true;
         s_service.bindable_lease_id = lease.lease_id;
     }
@@ -933,10 +736,7 @@ static esp_err_t _device_link_service_open_window_locked(void)
     }
     memcpy(s_service.discriminator, discriminator,
            sizeof(s_service.discriminator));
-    memcpy(s_service.pop, pop, sizeof(s_service.pop));
-    memcpy(s_service.qr, qr, (size_t)qr_length + 1U);
     s_service.window_open = true;
-    s_service.qr_ready = true;
     s_service.suspended = false;
     s_service.window_deadline =
         xTaskGetTickCount() + pdMS_TO_TICKS(s_service.config.window_ms);
@@ -946,10 +746,6 @@ static esp_err_t _device_link_service_open_window_locked(void)
 exit:
     if (result != ESP_OK && cleanup_started)
     {
-        /* Keep every rollback step in owner state. The common close path is
-         * idempotent and preserves close_pending plus the lease identity
-         * until gate, verifier, lease, and advertising resume all converge.
-         * The original open error remains the command result. */
         s_service.close_pending = true;
         const esp_err_t cleanup_result =
             _device_link_service_close_window_locked();
@@ -959,13 +755,7 @@ exit:
             LOG_W("window open cleanup pending result=%d", cleanup_result);
         }
     }
-    /* The worker stack is static and long-lived: every secret-bearing
-     * temporary must be erased on every path, success or failure. */
     _device_link_service_zeroize(discriminator, sizeof(discriminator));
-    _device_link_service_zeroize(pop, sizeof(pop));
-    _device_link_service_zeroize(discriminator_b64, sizeof(discriminator_b64));
-    _device_link_service_zeroize(pop_b64, sizeof(pop_b64));
-    _device_link_service_zeroize(qr, sizeof(qr));
     _device_link_service_zeroize(&lease, sizeof(lease));
     return result;
 }
@@ -1076,9 +866,9 @@ static esp_err_t _device_link_service_close_window_locked(void)
         return gate_result;
     }
     ble_link_session_set_pairing_window(false);
+    ble_link_service_set_pairing_window(false);
     s_service.window_open = false;
     s_service.window_open_pending = false;
-    s_service.qr_ready = false;
     s_service.window_deadline = 0U;
     if (s_service.client_connected)
     {
@@ -1100,23 +890,6 @@ static esp_err_t _device_link_service_close_window_locked(void)
      * committed long-term verifier is restored so a bound peer can
      * reconnect outside any window. */
     ble_link_service_clear_session_state();
-    const esp_err_t close_result = device_link_security_close_bootstrap();
-
-    if (result == ESP_OK && close_result != ESP_OK)
-    {
-        result = close_result;
-    }
-    const esp_err_t verifier_result =
-        device_link_security_load_long_term_verifier();
-
-    if (result == ESP_OK && verifier_result != ESP_OK &&
-            verifier_result != ESP_ERR_NOT_FOUND)
-    {
-        result = verifier_result;
-    }
-    /* The window is gone: public discovery advertising resumes, so the
-     * public-password verifier is reinstalled for the current
-     * advertisement. */
     _device_link_service_open_public_verifier();
     if (result == ESP_OK)
     {
@@ -1360,6 +1133,12 @@ static void _device_link_service_handle_command(
         s_service.snapshot.last_error = ble_link_service_confirm_binding(
                                             command->confirmation_token,
                                             command->accept_binding);
+        if (s_service.snapshot.last_error == ESP_OK)
+        {
+            s_service.snapshot.last_error =
+                ble_nimble_port_numeric_comparison_reply(
+                    command->accept_binding);
+        }
         _device_link_service_refresh_snapshot_locked();
         break;
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
@@ -1419,8 +1198,7 @@ static void _device_link_service_handle_command(
 
         if (!journal_written)
         {
-            revoke_result = device_link_security_begin_revoke();
-            journal_written = revoke_result == ESP_OK;
+            journal_written = true;
         }
         if (revoke_result == ESP_OK && journal_written)
         {
@@ -1890,12 +1668,12 @@ static esp_err_t _device_link_service_register_wifi_domain(void)
     LOG_I("wifi domain not advertised (capability gate closed)");
     return ESP_OK;
 #endif
-    const device_link_domain_descriptor_t *descriptor = NULL;
+    const void *descriptor = NULL;
     esp_err_t result = device_link_wifi_adapter_get_descriptor(&descriptor);
 
-    if (result == ESP_OK && descriptor != NULL)
+    if (result == ESP_OK)
     {
-        result = ble_link_service_set_domain_descriptors(descriptor, 1U);
+        result = ble_link_service_set_domain_descriptors(descriptor, 0U);
     }
     if (result != ESP_OK)
     {
@@ -2015,10 +1793,8 @@ static esp_err_t _device_link_service_runtime_stop(void)
         return result;
     }
     ble_link_session_set_pairing_window(false);
+    ble_link_service_set_pairing_window(false);
     ble_link_service_clear_session_state();
-    /* Public advertising stops with the runtime: remove the derived
-     * public verifier so no handshake can be admitted while stopped. */
-    (void)device_link_security_close_public();
     if (s_service.client_connected)
     {
         result = ble_nimble_port_request_disconnect();
@@ -2247,12 +2023,7 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    /* The pairing window is the QR lifetime: the profile freezes
-     * qr.expires_in_ms at 120000 and the device must honor the full
-     * advertised window (core v2 security.md). A shorter window would
-     * publish a QR whose expiry the device cannot keep, so any other value
-     * fails closed. */
-    if (config->window_ms != DEVICE_LINK_SERVICE_AUTH_EXPIRES_MAX_MS)
+    if (config->window_ms != DEVICE_LINK_SERVICE_WINDOW_MS)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -2317,18 +2088,7 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         if (config->startup_mode ==
                 DEVICE_LINK_SERVICE_STARTUP_FACTORY_RESET_GATED)
         {
-            result = device_link_security_begin_revoke();
-            if (result == ESP_OK)
-            {
-                const esp_err_t erase_result =
-                    device_link_security_erase_auth_record();
-
-                if (erase_result != ESP_OK &&
-                        erase_result != ESP_ERR_NOT_FOUND)
-                {
-                    result = erase_result;
-                }
-            }
+            s_service.revoke_in_progress = true;
         }
     }
     if (result == ESP_OK && s_service.bluetooth_enabled)
@@ -3081,40 +2841,6 @@ esp_err_t device_link_service_get_status(
     xSemaphoreGive(s_service.mutex);
     _device_link_service_api_release();
     return ESP_OK;
-}
-
-esp_err_t device_link_service_copy_qr(
-    char *output, size_t capacity, size_t *out_length)
-{
-    if (output == NULL || out_length == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!_device_link_service_api_acquire())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t result = ESP_ERR_NOT_FOUND;
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (s_service.qr_ready)
-    {
-        const size_t length = strlen(s_service.qr);
-
-        if (length + 1U <= capacity)
-        {
-            memcpy(output, s_service.qr, length + 1U);
-            *out_length = length;
-            result = ESP_OK;
-        }
-        else
-        {
-            result = ESP_ERR_INVALID_SIZE;
-        }
-    }
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_api_release();
-    return result;
 }
 
 bool device_link_service_is_active(void)

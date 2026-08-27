@@ -43,10 +43,6 @@
 #include "ble_nimble_port_task_config.h"
 #include "ble_port_ops.h"
 
-#include "device_link_security.h"
-#include "device_link_security_auth.h"
-
-#include "ble_link_security_ops.h"
 #include "ble_link_service.h"
 #include "ble_link_sec_state.h"
 #include "ble_link_gatt.h"
@@ -87,133 +83,6 @@ static esp_err_t _ble_nimble_port_retain_remote_replacement(
     const ble_link_operation_identity_t *identity);
 static void _ble_nimble_port_clear_provisional_tracking(void);
 
-/**
- * @brief Security 2 ops bound to the device_link_security adapter.
- *
- * The adapter owns the session; the port wires it to the GATT transport
- * (type 0x00 handshake, 0x01 protected). The bootstrap/long-term verifier
- * lifecycle is driven by the link service window ops and the per-peer
- * selection made by the link service before each handshake.
- */
-static esp_err_t _ble_nimble_port_sec_select_verifier(
-    uint8_t peer_addr_type, const uint8_t *peer_addr, size_t peer_addr_len,
-    bool pairing_window_open)
-{
-    return device_link_security_select_verifier(
-               peer_addr_type, peer_addr, peer_addr_len, pairing_window_open);
-}
-
-static device_link_security_verifier_kind_t
-_ble_nimble_port_sec_selected_verifier(void)
-{
-    return device_link_security_selected_verifier();
-}
-
-static esp_err_t _ble_nimble_port_sec_handshake(
-    const uint8_t *input, size_t input_len,
-    uint8_t **output, size_t *output_len,
-    device_link_security_handshake_result_t *handshake_result)
-{
-    return device_link_security_handshake_ex(
-               input, input_len, output, output_len, handshake_result);
-}
-
-static esp_err_t _ble_nimble_port_sec_classify_handshake(
-    const uint8_t *input, size_t input_len,
-    device_link_security_handshake_stage_t *stage)
-{
-    return device_link_security_classify_handshake(
-               input, input_len, stage);
-}
-
-static esp_err_t _ble_nimble_port_sec_unprotect(
-    const uint8_t *input, size_t input_len,
-    uint8_t **output, size_t *output_len)
-{
-    return device_link_security_unprotect(input, input_len,
-                                          output, output_len);
-}
-
-static esp_err_t _ble_nimble_port_sec_protect(
-    const uint8_t *plain, size_t plain_len,
-    uint8_t **cipher, size_t *cipher_len)
-{
-    return device_link_security_protect(plain, plain_len,
-                                        cipher, cipher_len);
-}
-
-static bool _ble_nimble_port_sec_is_authenticated(void)
-{
-    return device_link_security_is_authenticated();
-}
-
-static bool _ble_nimble_port_sec_session_open(void)
-{
-    return device_link_security_session_open();
-}
-
-static void _ble_nimble_port_sec_close_session(void)
-{
-    device_link_security_close_session();
-}
-
-static esp_err_t _ble_nimble_port_sec_discard_provisional_bond(
-    const ble_link_operation_identity_t *identity, bool terminate_conn)
-{
-    return _ble_nimble_port_queue_provisional_unpair(
-               identity, terminate_conn);
-}
-
-static esp_err_t _ble_nimble_port_sec_promote_provisional_bond(
-    const ble_link_operation_identity_t *identity)
-{
-    return _ble_nimble_port_promote_provisional_bond(identity);
-}
-
-static esp_err_t _ble_nimble_port_security_request(
-    const uint8_t *request, size_t request_len,
-    uint8_t **response, size_t *response_len, void *arg)
-{
-    (void)arg;
-    return ble_link_service_process_plaintext(request, request_len,
-            response, response_len);
-}
-
-static void _ble_nimble_port_release_plaintext(
-    uint8_t *response, size_t response_len, void *arg)
-{
-    (void)arg;
-    ble_link_service_release_plaintext(response, response_len);
-}
-
-static esp_err_t _ble_nimble_port_sec_authenticated(void *arg)
-{
-    (void)arg;
-    const esp_err_t result = ble_link_service_on_authenticated(NULL);
-
-    if (result == ESP_OK)
-    {
-        ble_link_gatt_authentication_epoch_advance();
-    }
-    return result;
-}
-
-static const ble_link_security_ops_t s_security_ops =
-{
-    .select_verifier = _ble_nimble_port_sec_select_verifier,
-    .selected_verifier = _ble_nimble_port_sec_selected_verifier,
-    .classify_handshake = _ble_nimble_port_sec_classify_handshake,
-    .handshake = _ble_nimble_port_sec_handshake,
-    .unprotect = _ble_nimble_port_sec_unprotect,
-    .protect = _ble_nimble_port_sec_protect,
-    .is_authenticated = _ble_nimble_port_sec_is_authenticated,
-    .session_open = _ble_nimble_port_sec_session_open,
-    .close_session = _ble_nimble_port_sec_close_session,
-    .discard_provisional_bond =
-    _ble_nimble_port_sec_discard_provisional_bond,
-    .promote_provisional_bond = _ble_nimble_port_sec_promote_provisional_bond,
-    .replace_authorization = _ble_nimble_port_retain_remote_replacement,
-};
 #define DBG_TAG "ble_nimble_port"
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
@@ -244,11 +113,10 @@ static const ble_link_security_ops_t s_security_ops =
 /**
  * @brief Tear down the link-session security for one failure path.
  *
- * A terminal transmission or session failure must close the Security 2
- * session in every layer: the link-session reducer (generation-scoped),
- * the service transaction gate, and the external device_link_security
- * adapter. Calling only some of these leaves a half-open session that a
- * later request could mistake for authenticated.
+ * A terminal transmission or session failure must close the session in
+ * every layer: the link-session reducer (generation-scoped) and the
+ * service transaction gate. Calling only some of these leaves a
+ * half-open session that a later request could mistake for authenticated.
  *
  * @param[in] identity Exact connection and Security 2 operation identity.
  */
@@ -359,7 +227,7 @@ static void _ble_nimble_port_pairing_gate_event(
         const bool open = ble_nimble_pairing_gate_effective_open(
                               &s_pairing_gate_state);
 
-        ble_hs_cfg.sm_sec_lvl = open ? 0 : 1;
+        ble_hs_cfg.sm_sec_lvl = open ? 2 : 2;
         atomic_store_explicit(&s_pairing_gate_applied_seq, sequence,
                               memory_order_release);
         if (s_pairing_gate_ack != NULL)
@@ -2689,8 +2557,8 @@ static esp_err_t _ble_nimble_port_adv_manager_init(void)
 {
     static const uint8_t device_link_uuid[16] =
     {
-        0x8b, 0x03, 0xdc, 0x36, 0xd0, 0x63, 0x05, 0x8d,
-        0x30, 0x42, 0x10, 0xc5, 0x8c, 0xe4, 0x77, 0x2c,
+        0x31, 0x6a, 0x7b, 0x2f, 0x4c, 0x9c, 0x04, 0x9c,
+        0x44, 0x4f, 0xf6, 0x65, 0x10, 0x8c, 0x2a, 0x8f,
     };
     static const uint8_t short_name[] = "MT";
     static ble_adv_manager_config_t config =
@@ -3396,27 +3264,6 @@ static bool _ble_nimble_port_execute_unpair(
 
     if (command->invalidate_authorization)
     {
-        device_link_security_auth_record_t record;
-
-        memset(&record, 0, sizeof(record));
-        const esp_err_t load_result =
-            device_link_security_load_auth_record(&record);
-
-        if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND)
-        {
-            _ble_nimble_port_zeroize(&record, sizeof(record));
-            goto exit;
-        }
-        if (load_result == ESP_OK &&
-                device_link_security_auth_record_valid(&record))
-        {
-            peer_id_addr.type = record.peer_addr_type;
-            memcpy(peer_id_addr.val, record.peer_addr,
-                   sizeof(peer_id_addr.val));
-            peer_addr_valid =
-                _ble_nimble_port_peer_address_valid(&peer_id_addr);
-        }
-        _ble_nimble_port_zeroize(&record, sizeof(record));
         const esp_err_t invalidate_result =
             _ble_nimble_port_invalidate_authorization();
 
@@ -3463,24 +3310,6 @@ static bool _ble_nimble_port_execute_unpair(
          * remaining single bond can only be this ACL's. A committed
          * authorization record therefore means the orphan is already gone
          * and the newer bond must be preserved. */
-        device_link_security_auth_record_t record;
-
-        memset(&record, 0, sizeof(record));
-        const esp_err_t load_result =
-            device_link_security_load_auth_record(&record);
-
-        if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND)
-        {
-            _ble_nimble_port_zeroize(&record, sizeof(record));
-            goto exit;
-        }
-        if (command->provisional && load_result == ESP_OK &&
-                device_link_security_auth_record_valid(&record))
-        {
-            _ble_nimble_port_zeroize(&record, sizeof(record));
-            goto exit;
-        }
-        _ble_nimble_port_zeroize(&record, sizeof(record));
         const esp_err_t delete_result = _ble_nimble_port_delete_all_bonds();
 
         unpair_result = delete_result == ESP_OK ? 0 : -1;
@@ -3509,25 +3338,8 @@ exit:
 
 static esp_err_t _ble_nimble_port_invalidate_authorization(void)
 {
-    esp_err_t result = device_link_security_erase_auth_record();
+    esp_err_t result = ESP_OK;
 
-    if (result == ESP_ERR_NOT_FOUND)
-    {
-        result = ESP_OK;
-    }
-    if (result == ESP_OK)
-    {
-        const esp_err_t verifier_result =
-            device_link_security_load_long_term_verifier();
-
-        if (verifier_result != ESP_OK && verifier_result != ESP_ERR_NOT_FOUND)
-        {
-            result = verifier_result;
-        }
-    }
-    /* Clear live authorization even when persistence cleanup failed. The
-     * durable record or journal remains available for a later retry, while
-     * the current connection is never allowed to stay authorized. */
     ble_link_service_clear_session_state();
     const esp_err_t session_result =
         ble_link_session_set_authorization(false, 0U);
@@ -3614,21 +3426,8 @@ static esp_err_t _ble_nimble_port_bond_store_verified_identity(
  */
 static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
 {
-    device_link_security_auth_record_t record;
     esp_err_t result = ESP_OK;
-
-    memset(&record, 0, sizeof(record));
-    const esp_err_t load_result =
-        device_link_security_load_auth_record(&record);
-    const bool have_record = load_result == ESP_OK;
-    const bool record_valid =
-        have_record && device_link_security_auth_record_valid(&record);
-
-    if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND)
-    {
-        result = load_result;
-        goto exit;
-    }
+    const bool record_valid = false;
     ble_addr_t peers[CONFIG_BT_NIMBLE_MAX_BONDS];
     int count = 0;
 
@@ -3643,81 +3442,13 @@ static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
         result = ESP_FAIL;
         goto exit;
     }
-    bool matching_bond = false;
+    bool matching_bond = count > 0;
     ble_addr_t matching_peer = {0};
 
-    if (!record_valid)
+    (void)record_valid;
+    if (count > 0)
     {
-        ESP_LOGW(TAG, "unexpected %d stored bonds; reconciling", count);
-        for (int i = 0; i < count; ++i)
-        {
-            if (_ble_nimble_port_unpair_peer(&peers[i]) != 0)
-            {
-                ESP_LOGW(TAG, "bond eviction failed");
-                result = ESP_FAIL;
-                goto exit;
-            }
-        }
-    }
-    else
-    {
-        for (int i = 0; i < count; ++i)
-        {
-            const bool matches = peers[i].type == record.peer_addr_type &&
-                                 memcmp(peers[i].val, record.peer_addr,
-                                        DEVICE_LINK_SECURITY_AUTH_PEER_ADDR_BYTES) == 0;
-
-            if (matches)
-            {
-                bool verified = false;
-
-                result = _ble_nimble_port_bond_store_verified_identity(
-                             &peers[i], &verified);
-
-                if (result != ESP_OK)
-                {
-                    goto exit;
-                }
-                if (verified)
-                {
-                    matching_bond = true;
-                    matching_peer = peers[i];
-                    continue;
-                }
-                /* The address matches but the material is missing or
-                 * malformed: durable-invalidate the authorization first,
-                 * then delete the broken bond (never keep an authorized
-                 * identity without its security material). */
-                ESP_LOGW(TAG, "malformed bond for matching record");
-                const esp_err_t invalidate_result =
-                    _ble_nimble_port_invalidate_authorization();
-
-                if (invalidate_result != ESP_OK)
-                {
-                    result = invalidate_result;
-                    goto exit;
-                }
-            }
-            if (_ble_nimble_port_unpair_peer(&peers[i]) != 0)
-            {
-                ESP_LOGW(TAG, "mismatched bond eviction failed");
-                result = ESP_FAIL;
-                goto exit;
-            }
-        }
-    }
-    if (have_record && !matching_bond)
-    {
-        /* Authorization record without its bond: invalidate it and reload
-         * the verifier (none). */
-        const esp_err_t invalidate_result =
-            _ble_nimble_port_invalidate_authorization();
-
-        if (invalidate_result != ESP_OK)
-        {
-            result = invalidate_result;
-            goto exit;
-        }
+        matching_peer = peers[0];
     }
     {
         /* Sweep residual bond records of every object type - even when a
@@ -3784,7 +3515,7 @@ static esp_err_t _ble_nimble_port_reconcile_storage_locked(void)
     }
 
 exit:
-    _ble_nimble_port_zeroize(&record, sizeof(record));
+    (void)matching_peer;
     return result;
 }
 
@@ -4421,9 +4152,9 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
      * journal is already gone the revoke completed (idempotent resume) and
      * nothing must be deleted. */
     bool pending = false;
-    const esp_err_t pending_result =
-        device_link_security_revoke_pending(&pending);
+    const esp_err_t pending_result = ESP_OK;
 
+    pending = false;
     if (pending_result != ESP_OK)
     {
         return pending_result;
@@ -4485,7 +4216,7 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
     }
     /* Durable boundary: only now, with the store verified empty, is the
      * revoke intent cleared. */
-    const esp_err_t journal_result = device_link_security_end_revoke();
+    const esp_err_t journal_result = ESP_OK;
 
     if (journal_result != ESP_OK)
     {
@@ -4541,16 +4272,15 @@ esp_err_t ble_nimble_port_revoke_binding(void)
 
     _ble_nimble_port_storage_lock();
     bool pending = false;
-    const esp_err_t pending_result =
-        device_link_security_revoke_pending(&pending);
+    const esp_err_t pending_result = ESP_OK;
 
+    pending = false;
     if (pending_result != ESP_OK)
     {
         result = pending_result;
     }
     else if (!pending)
     {
-        /* The revoke already completed (journal cleared): nothing to do. */
         result = ESP_OK;
     }
     else if (atomic_exchange_explicit(&s_revoke_command_pending, true,
@@ -4765,8 +4495,8 @@ static esp_err_t _ble_nimble_port_reset_peer_store(void)
     /* Factory-reset-gated startup journals the revoke before host start.
      * on_sync performs and verifies the bond/CCCD sweep before signaling
      * start completion; the marker may disappear only after that sweep. */
-    bool pending = true;
-    const esp_err_t result = device_link_security_revoke_pending(&pending);
+    bool pending = false;
+    const esp_err_t result = ESP_OK;
 
     if (result != ESP_OK)
     {
@@ -4786,8 +4516,7 @@ static esp_err_t _ble_nimble_port_reset_peer_store(void)
 static esp_err_t _ble_nimble_port_resume_revoke_locked(void)
 {
     bool pending = false;
-    const esp_err_t pending_result =
-        device_link_security_revoke_pending(&pending);
+    const esp_err_t pending_result = ESP_OK;
 
     if (pending_result != ESP_OK)
     {
@@ -4796,21 +4525,6 @@ static esp_err_t _ble_nimble_port_resume_revoke_locked(void)
     if (!pending)
     {
         return ESP_OK;
-    }
-    ESP_LOGW(TAG, "resuming interrupted binding revoke");
-    const esp_err_t erase_result =
-        device_link_security_erase_auth_record();
-
-    if (erase_result != ESP_OK && erase_result != ESP_ERR_NOT_FOUND)
-    {
-        return erase_result;
-    }
-    const esp_err_t verifier_result =
-        device_link_security_load_long_term_verifier();
-
-    if (verifier_result != ESP_OK && verifier_result != ESP_ERR_NOT_FOUND)
-    {
-        return verifier_result;
     }
     return _ble_nimble_port_execute_revoke_locked();
 }
@@ -4821,7 +4535,8 @@ static esp_err_t _ble_nimble_port_reconcile_sync_storage(void)
     bool revoke_pending = false;
 
     _ble_nimble_port_storage_lock();
-    result = device_link_security_revoke_pending(&revoke_pending);
+    result = ESP_OK;
+    revoke_pending = false;
     if (result == ESP_OK && revoke_pending)
     {
         /* A journaled revoke intentionally destroys the complete peer store.
@@ -4929,6 +4644,34 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
     default:
         return false;
     }
+}
+
+static uint16_t s_passkey_conn_handle;
+static bool s_passkey_pending;
+
+esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
+{
+    if (!s_passkey_pending)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+#ifndef UNIT_TEST_HOST
+    struct ble_sm_io io;
+
+    memset(&io, 0, sizeof(io));
+    io.action = BLE_SM_IOACT_NUMCMP;
+    io.numcmp_accept = accept ? 1 : 0;
+    const int result = ble_sm_inject_io(s_passkey_conn_handle, &io);
+
+    s_passkey_pending = false;
+    s_passkey_conn_handle = 0U;
+    return result == 0 ? ESP_OK : ESP_FAIL;
+#else
+    (void)accept;
+    s_passkey_pending = false;
+    s_passkey_conn_handle = 0U;
+    return ESP_OK;
+#endif
 }
 
 static int _ble_nimble_port_gap_event(
@@ -5271,6 +5014,15 @@ static int _ble_nimble_port_gap_event(
             return BLE_GAP_REPEAT_PAIRING_IGNORE;
         }
         return BLE_GAP_REPEAT_PAIRING_IGNORE;
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP)
+        {
+            s_passkey_conn_handle = event->passkey.conn_handle;
+            s_passkey_pending = true;
+            (void)ble_link_service_offer_numeric_comparison(
+                event->passkey.params.numcmp);
+        }
+        return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         port_event.type = BLE_PORT_EVENT_ADV_COMPLETE;
         port_event.status = event->adv_complete.reason;
@@ -5412,31 +5164,15 @@ static void _ble_nimble_port_on_reset(int reason)
 }
 
 static bool _ble_nimble_port_link_rx_channel(
-    const ble_gatt_registry_characteristic_t *characteristic,
-    ble_link_service_rx_channel_t *out_channel)
+    const ble_gatt_registry_characteristic_t *characteristic)
 {
-    static const uint8_t session_rx_uuid[16] =
+    static const uint8_t command_rx_uuid[16] =
     {
-        0xa2, 0xf0, 0xcd, 0xfc, 0xe0, 0xe6, 0x5c, 0xb8,
-        0xd8, 0x4d, 0x4c, 0xcb, 0x43, 0xe6, 0x01, 0x48,
-    };
-    static const uint8_t control_rx_uuid[16] =
-    {
-        0xc8, 0x13, 0x3d, 0x40, 0x3d, 0xfb, 0x0c, 0x8e,
-        0x72, 0x47, 0x9d, 0x66, 0x62, 0x46, 0xa1, 0x81,
+        0x31, 0x6a, 0x7b, 0x2f, 0x4c, 0x9c, 0x04, 0x9c,
+        0x44, 0x4f, 0xf6, 0x65, 0x11, 0x8c, 0x2a, 0x8f,
     };
 
-    if (memcmp(characteristic->uuid, session_rx_uuid, 16U) == 0)
-    {
-        *out_channel = BLE_LINK_SERVICE_RX_SESSION;
-        return true;
-    }
-    if (memcmp(characteristic->uuid, control_rx_uuid, 16U) == 0)
-    {
-        *out_channel = BLE_LINK_SERVICE_RX_CONTROL;
-        return true;
-    }
-    return false;
+    return memcmp(characteristic->uuid, command_rx_uuid, 16U) == 0;
 }
 
 static int _ble_nimble_port_access_bridge(
@@ -5454,9 +5190,7 @@ static int _ble_nimble_port_access_bridge(
     {
         return BLE_ATT_ERR_ATTR_NOT_FOUND;
     }
-    ble_link_service_rx_channel_t channel = BLE_LINK_SERVICE_RX_SESSION;
-    const bool link_rx = _ble_nimble_port_link_rx_channel(
-                             characteristic, &channel);
+    const bool link_rx = _ble_nimble_port_link_rx_channel(characteristic);
 
     memset(&port_context, 0, sizeof(port_context));
     port_context.read_out = access_buffer;
@@ -5526,39 +5260,6 @@ static int _ble_nimble_port_access_bridge(
     result = characteristic->access_cb(
                  conn_handle, attr_handle, &port_context,
                  characteristic->arg);
-    if (result == 0 &&
-            port_context.op == BLE_GATT_REGISTRY_OP_WRITE_CHR &&
-            link_rx)
-    {
-        bool partial = false;
-        uint32_t ingress_epoch = 0U;
-        ble_link_reassembly_disposition_t disposition;
-
-        if (ble_link_service_get_reassembly_state_ex(
-                    channel, &partial, &ingress_epoch,
-                    &disposition) == ESP_OK)
-        {
-            uint32_t generation = 0U;
-
-            if (s_link_state_lock == NULL ||
-                    xSemaphoreTakeRecursive(
-                        s_link_state_lock, portMAX_DELAY) == pdTRUE)
-            {
-                generation = s_timer_generation;
-                if (s_link_state_lock != NULL)
-                {
-                    xSemaphoreGiveRecursive(s_link_state_lock);
-                }
-            }
-            if (generation != 0U &&
-                    (!partial || disposition ==
-                     BLE_LINK_REASSEMBLY_NEW_PARTIAL))
-            {
-                _ble_nimble_port_arm_reassembly_idle(
-                    partial, generation, channel, ingress_epoch);
-            }
-        }
-    }
     if (result == 0 &&
             port_context.op == BLE_GATT_REGISTRY_OP_READ_CHR &&
             read_len > 0U)
@@ -5784,20 +5485,10 @@ static int _ble_nimble_port_adv_start_execute(
     adv_data[len++] = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     if (config->service_uuid != NULL)
     {
-        adv_data[len++] = 1U + 16U + (uint8_t)config->service_data_len;
-        adv_data[len++] = BLE_HS_ADV_TYPE_SVC_DATA_UUID128;
+        adv_data[len++] = 17U;
+        adv_data[len++] = BLE_HS_ADV_TYPE_COMP_UUIDS128;
         memcpy(&adv_data[len], config->service_uuid, 16U);
         len += 16U;
-        if (config->service_data_len > 0U)
-        {
-            const size_t copy = config->service_data_len <
-                                sizeof(cmd->service_data) ?
-                                config->service_data_len :
-                                sizeof(cmd->service_data);
-
-            memcpy(&adv_data[len], cmd->service_data, copy);
-            len += copy;
-        }
     }
     if (config->short_name != NULL && config->short_name_len > 0U)
     {
@@ -6223,41 +5914,7 @@ static esp_err_t _ble_nimble_port_rollback_init(
 
 static esp_err_t _ble_nimble_port_link_security_init(void)
 {
-    if (s_port.link_security_initialized)
-    {
-        return ESP_OK;
-    }
-    const device_link_security_config_t security_config =
-    {
-        .username = DEVICE_LINK_SECURITY_USERNAME,
-        .session_id = 1U,
-        .request_cb = _ble_nimble_port_security_request,
-        .request_arg = NULL,
-        .response_release_cb = _ble_nimble_port_release_plaintext,
-        .response_release_arg = NULL,
-        .authenticated_cb = _ble_nimble_port_sec_authenticated,
-        .authenticated_arg = NULL,
-    };
-    esp_err_t result = device_link_security_init(&security_config);
-
-    if (result != ESP_OK)
-    {
-        return result;
-    }
     s_port.link_security_initialized = true;
-    result = device_link_security_load_long_term_verifier();
-    if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
-    {
-        /* A load failure (storage, allocation) or a malformed record must
-         * not block BLE startup: sessions fail closed per-session without
-         * a long-term verifier. A malformed record is preserved (F-5);
-         * binding attempts return INTERNAL until an explicit factory
-         * reset or revoke erases it. The security adapter itself remains
-         * initialized. */
-        LOG_W("long-term verifier load failed result=%d; continuing",
-              result);
-        result = ESP_OK;
-    }
     return ESP_OK;
 }
 
@@ -6410,7 +6067,7 @@ static esp_err_t _ble_nimble_port_init(void)
         gatt_config.att_mtu = 23U;
         gatt_config.tx_queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH;
         gatt_config.publish_link_state = _ble_nimble_port_publish_link_state;
-        gatt_config.security_ops = &s_security_ops;
+        gatt_config.security_ops = NULL;
         result = ble_link_gatt_init(&gatt_config);
         if (result != ESP_OK)
         {
@@ -6516,12 +6173,12 @@ static esp_err_t _ble_nimble_port_init(void)
     ble_hs_cfg.sync_cb = _ble_nimble_port_on_sync;
     ble_hs_cfg.gatts_register_cb = _ble_nimble_port_gatts_register;
     ble_hs_cfg.store_status_cb = _ble_nimble_port_store_status;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_DISP_YES_NO;
     ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_mitm = 1;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_sc_only = 1;
-    ble_hs_cfg.sm_sec_lvl = 1;
+    ble_hs_cfg.sm_sec_lvl = 2;
     /* Identity keys let the GAP reducer verify the peer's SC bond against
      * the NimBLE store before admitting the Device Link session. */
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
@@ -6801,11 +6458,7 @@ static esp_err_t _ble_nimble_port_deinit(void)
      * the boot-scoped session facts and epoch allocator. */
     ble_link_gatt_reset();
     ble_link_session_reset();
-    if (s_port.link_security_initialized)
-    {
-        device_link_security_deinit();
-        s_port.link_security_initialized = false;
-    }
+    s_port.link_security_initialized = false;
     s_adv_conn_handle = 0U;
     s_adv_generation = 0U;
     _ble_nimble_port_clear_provisional_tracking();

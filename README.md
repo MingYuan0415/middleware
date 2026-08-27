@@ -17,17 +17,16 @@
 | `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
-| `ble_runtime` | NimBLE host、静态 GATT、GAP/ADV、Device Link transport、不可变异步身份和 TX/deadline 调度的唯一底层 owner | `bt`；`device_link_security`、`freertos`、`mt_log`（私有） |
-| `device_link_security` | 使用 ESP-IDF 官方 Protocomm Security 2 类型实现握手、bootstrap/long-term verifier 和授权记录 journal；这些 protobuf-c 类型仅属于 ESP-IDF 内部安全实现 | `nv_storage`、`protocomm`；`mbedtls`、`protobuf-c`（私有） |
-| `device_link_service` | 串行拥有绑定窗口、Security 2 会话、授权/清理事务、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link_security`、`event_bus` |
+| `ble_runtime` | NimBLE host、静态 GATT、GAP/ADV、Device Link v1 transport、不可变异步身份和 TX/deadline 调度的唯一底层 owner | `bt`、`device_link`；`freertos`、`mt_log`（私有） |
+| `device_link_service` | 串行拥有绑定窗口、Numeric Comparison 确认、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link`、`event_bus` |
 | `factory_reset_service` | 持有版本化恢复出厂 journal；marker 持久化后才重启，并在全部 reset domain 与广告前置条件收敛后清除 marker | `nv_storage`；`mt_log`（私有） |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
 | `chore_service` | 单一后台杂活 worker：任意任务可提交一次性或周期 job（固定槽位池、协作式取消、挂起后不追补），用于不便在 GUI worker 或调用上下文执行的短时有界工作；禁止 LVGL 调用与长阻塞 | `mt_log`、`esp_timer`、`freertos`、`heap`（私有） |
-| `device_link` | Device Link Core v2 应用层 Typed-TLV、固定分片头、静态领域描述符、路由、操作和 replay 原语；不拥有 NimBLE/Protocomm，不包含应用层 protobuf | 无 |
+| `device_link` | Device Link v1 fixed-binary 编解码与单 slot 操作引擎；不拥有 NimBLE | 无 |
 
 ## 目录结构
 
-每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试还覆盖 `ble_runtime`、`device_link_security`、`device_link_service`、`factory_reset_service`、`device_link` 和 `chore_service`，入口均位于各组件的 `tests/host/`。
+每个 `components/<name>/` 都是独立 ESP-IDF 组件：`include/` 是公开 API，`src/` 是内部实现，`CMakeLists.txt` 声明构建依赖，`idf_component.yml` 声明最低 IDF 版本。可调服务带有 `Kconfig`；当前独立宿主测试还覆盖 `ble_runtime`、`device_link_service`、`factory_reset_service`、`device_link` 和 `chore_service`，入口均位于各组件的 `tests/host/`。
 
 ## 集成与初始化
 
@@ -55,10 +54,10 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 是 Wi-Fi profile、自动连接和无感同步的唯一 owner。`connectivity_manager_request_sync_profile()` 以非零 client sync ID 接受凭据；相同 ID/相同凭据幂等，相同 ID/不同凭据冲突，新 profile 只有 IPv4 和 durable store 都成功后替换旧 profile。密码永不读回；存储结果不明确时保留旧 profile 并返回可恢复的 storage/internal 错误。Device Link 的 Wi-Fi adapter 是第一道防线：`OPEN` 要求空密码、`PERSONAL` 要求 1..64 非空密码、`UNSUPPORTED` 直接 `INVALID_ARGUMENT`；接纳错误按各方法冻结的 `allowed_statuses` 映射（manager 未运行/停机窗口一律 `UNAVAILABLE`，队列满仅 `start_scan`/`set_credentials` 映射 `RESOURCE_EXHAUSTED`，`start_scan`/`disconnect`/`reconnect_saved` 在有在途操作时同步返回 `BUSY`）。manager 终态若先于 Core v2 table 接纳到达，completion bridge 以容量 1、TTL 1 s 的 deferred 槽暂存并在接纳时合并，槽位不会泄漏为永久 PENDING。
-- `device_link_service` worker 是 ACL、Security 2 epoch、授权事务、`link_state` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤；ACL 终态以 generation/handle 清理该 ACL 的全部 epoch，会话级失败仍核对 epoch/flow。Cmd0 只分配一次 epoch，Cmd1 在同一 epoch 认证。`link_state` 的当前值与投递 stamp 在 GATT 锁下分离，认证/CCCD 变化立即要求 fresh 值，提交或异步 completion 失败在 100 ms cooldown 后由 worker retained retry。
+- `device_link_service` worker 是 ACL、Numeric Comparison 确认、`command_rx`/`server_tx` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤。
 - provisional/orphan/replacement cleanup 由 owner 按 100/200/400/800/1000 ms 退避保留，port 以固定 `4 + 1 overflow` 容量和物理目标合并避免队列满丢失。pending cleanup 拒绝新 ACL；live terminal cleanup 保留 session/control write fence 和 host-serialized terminate retry，公开 `link_state` 仍可读，广告仅在所有 cleanup 清空后恢复。peer-store 删除采用单次 explicit delete、逐类型 readback 和完整 host-run sticky error，持久化失败不能被同 run 的 RAM absence 冒充成功；deinit 通过双 host barrier 的 fixed-point drain 保留 revoke/cleanup 义务。
 - `ble_runtime` 的 TX scheduler 以固定 `queue_depth + 1` credit 覆盖 queued、in-flight 和待投递 completion，每个成功提交只产生一个终态。ADV START/STOP 失败保留 generation-scoped obligation，并按 100/200/400/800/1000 ms 退避；普通窗口取消使用不受 ADV 队列容量影响的通知唤醒。pairing gate 的 requested-open 与 cleanup/rejected/revoke/drain hold 独立，effective open 仅在 hold mask 为空时成立；被拒绝 ACL 在 CONNECT host callback 内先关 gate 再保留终止义务。
-- `device_link_security` 在 Cmd1 proof/Resp1 成功后立即标记认证；授权事务按 `PREPARED -> COMMIT_PROBED -> LOCALLY_CONFIRMED -> COMMITTED` 推进，本地确认同时核对 connection generation、security_epoch 与凭据 id，durable Commit 再以 boot-scoped token 探测幂等。durable Commit 的幂等结果在当前 ACL 内跨真实 long-term Security 2 重握手保留，并在 ACL 终态、replacement cutover、revoke/reset 时清除。Recovery Query 将确定不存在与 NVS/损坏记录的 ambiguous 失败分开映射。损坏或 schema 不匹配的 durable 认证记录 fail-closed：启动保留记录并释放内存 verifier（BLE 启动不受阻），commit probe 返回 `INTERNAL` 且绝不静默覆盖，只有显式 factory reset/revoke journal 才擦除。
+- Device Link v1 使用 LE Secure Connections Numeric Comparison；绑定替换为本地清 bond 后再配对。`SET_CREDENTIALS` 只持久化不连接。
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
 - `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。天气响应携带的 `location_key` 是服务端按 0.1° 网格派生的不透明作用域标识：同一网格恒定、不暴露坐标，key 变化即清空旧数据集并按“实时优先”全量刷新，避免跨网格的陈旧或混合快照；可选的 `district` 区县名为显示字段（本地化成功时出现、永不从设备头回显），不参与位置身份判定；缓存不落盘 key 与 district，重启后由会话定位重新建立。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
 - `chore_service` 的 job 是短时有界回调：运行在单 worker 上，串行执行；`run` 须主动轮询取消令牌并及时返回，不得调用 LVGL、发起同步 HTTP 或无限等待。`submit` 成功后参数所有权转移给服务，`release` 在完成、取消或关闭后于 worker 上恰好执行一次；`cancel` 是协作式静默等待（返回即保证 `release` 已执行），拒绝 worker 自身调用。周期 job 从完成时刻固定延迟调度，挂起期间到期不追补，唤醒后最多立即补一次。`suspend`/`resume` 遵循仓库 PAUSE/RESUME 握手（超时回滚），整笔事务由独立生命周期锁串行，杜绝相反命令合并与 ack 互擦；停机会用 STOPPED 位唤醒在途挂起/恢复等待者，不会死锁。job 类 API 可在任意任务调用且与 `deinit` 并发安全：进程生命周期的接纳门先原子关闭、排空在途调用，新实例以新 epoch 重开接纳并沿用单调槽位代际，旧句柄永不指向新实例；仅 init 与并发 deinit 要求调用方串行化。休眠协调中该服务最先挂起、最后恢复。
@@ -126,7 +125,7 @@ cmake --build /tmp/mt-chore
 ctest --test-dir /tmp/mt-chore --output-on-failure
 ```
 
-运行 Device Link Typed-TLV、router、operation 和 wire 套件：
+运行 Device Link v1 codec 和 slot 引擎套件：
 
 
 ```sh
@@ -136,7 +135,7 @@ cmake --build /tmp/mt-device-link
 ctest --test-dir /tmp/mt-device-link --output-on-failure
 ```
 
-运行 NimBLE/Device Link runtime、Security 2 和 service owner 套件（需要先导出
+运行 NimBLE/Device Link runtime 和 service owner 套件（需要先导出
 ESP-IDF v6.0.2 的 `IDF_PATH`）：
 
 ```sh
@@ -145,12 +144,6 @@ cmake -S components/ble_runtime/tests/host -B /tmp/mt-ble-runtime -G Ninja \
 cmake --build /tmp/mt-ble-runtime
 ctest --test-dir /tmp/mt-ble-runtime --output-on-failure
 
-cmake -S components/device_link_security/tests/host \
-    -B /tmp/mt-device-link-security -G Ninja \
-    -DDEVICE_LINK_SECURITY_SANITIZER=none
-cmake --build /tmp/mt-device-link-security
-ctest --test-dir /tmp/mt-device-link-security --output-on-failure
-
 cmake -S components/device_link_service/tests/host \
     -B /tmp/mt-device-link-service -G Ninja \
     -DDEVICE_LINK_SERVICE_SANITIZER=none
@@ -158,11 +151,8 @@ cmake --build /tmp/mt-device-link-service
 ctest --test-dir /tmp/mt-device-link-service --output-on-failure
 ```
 
-三套 sanitizer 选项均接受 `address` 或 `thread`。`ble_runtime` 套件还执行固定
+两套 sanitizer 选项均接受 `address` 或 `thread`。`ble_runtime` 套件还执行固定
 ESP-IDF v6.0.2 内部假设检查；失败时必须审查 NimBLE pairing/store/host-event 时序。
-该基线的 Security2 失败输出不会清零，普通检查确认适配假设但保留生产安全 blocker；发布
-流程调用 `cmake --build <ble-runtime-build> --target device_link_security_release`，该目标设置
-严格 release gate，在候选 IDF 通过 ownership、清零和完整 BLE matrix 前必须失败。
 
 运行恢复出厂 journal 的持久化、故障注入和断电恢复套件：
 

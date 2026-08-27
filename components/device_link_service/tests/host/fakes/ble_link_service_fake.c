@@ -1,158 +1,88 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "ble_link_service.h"
 
-static uint64_t s_next_operation_id = 1U;
-static unsigned s_update_count = 0U;
-static uint64_t s_last_owner_id = 0U;
-static device_link_operation_state_t s_last_state;
-static device_link_status_t s_last_status;
-static size_t s_last_result_len = 0U;
-static bool s_in_flight = false;
-static esp_err_t s_start_result = ESP_OK;
-static bool s_reservation_active = false;
-static uint64_t s_reservation_id = 0U;
+static ble_link_v1_owner_ops_t s_ops;
+static void *s_ops_arg;
+static unsigned s_complete_count;
+static uint32_t s_last_complete_id;
+static device_link_v1_wifi_failure_t s_last_failure;
+static unsigned s_observe_count;
+static device_link_v1_snapshot_t s_last_snapshot;
 
-esp_err_t ble_link_service_async_operation_start(
-    uint8_t domain_id, uint8_t method_id, uint64_t owner_id,
-    device_link_operation_cancel_t cancel, void *cancel_arg,
-    uint64_t *out_operation_id)
-{
-    (void)domain_id;
-    (void)method_id;
-    (void)cancel;
-    (void)cancel_arg;
-    if (out_operation_id == NULL || owner_id == 0U)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_start_result != ESP_OK)
-    {
-        return s_start_result;
-    }
-    *out_operation_id = s_next_operation_id++;
-    return ESP_OK;
-}
-
-esp_err_t ble_link_service_async_operation_reserve(
-    uint8_t domain_id, uint8_t method_id, uint64_t *out_operation_id)
-{
-    (void)domain_id;
-    (void)method_id;
-    if (out_operation_id == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_reservation_active)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (s_start_result != ESP_OK)
-    {
-        return s_start_result;
-    }
-    s_reservation_id = s_next_operation_id++;
-    s_reservation_active = true;
-    *out_operation_id = s_reservation_id;
-    return ESP_OK;
-}
-
-esp_err_t ble_link_service_async_operation_commit(
-    uint64_t operation_id, uint64_t owner_id,
-    device_link_operation_cancel_t cancel, void *cancel_arg)
-{
-    (void)cancel;
-    (void)cancel_arg;
-    if (!s_reservation_active || operation_id != s_reservation_id ||
-            owner_id == 0U)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    s_last_owner_id = owner_id;
-    s_reservation_active = false;
-    s_reservation_id = 0U;
-    return ESP_OK;
-}
-
-esp_err_t ble_link_service_async_operation_abort(uint64_t operation_id)
-{
-    if (!s_reservation_active || operation_id != s_reservation_id)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    s_reservation_active = false;
-    s_reservation_id = 0U;
-    return ESP_OK;
-}
-
-esp_err_t ble_link_service_async_operation_update(
-    uint64_t owner_id, device_link_operation_state_t state,
-    device_link_status_t status, const uint8_t *result, size_t result_len)
-{
-    (void)result;
-    if (owner_id == 0U)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    s_update_count++;
-    s_last_owner_id = owner_id;
-    s_last_state = state;
-    s_last_status = status;
-    s_last_result_len = result_len;
-    return ESP_OK;
-}
-
-bool ble_link_service_async_operation_in_flight(uint8_t domain_id)
-{
-    (void)domain_id;
-    return s_in_flight;
-}
-
-/* Test hooks. */
 void ble_link_service_fake_reset(void)
 {
-    s_update_count = 0U;
-    s_last_owner_id = 0U;
-    s_last_result_len = 0U;
-    s_in_flight = false;
-    s_start_result = ESP_OK;
-    s_reservation_active = false;
-    s_reservation_id = 0U;
+    memset(&s_ops, 0, sizeof(s_ops));
+    s_ops_arg = NULL;
+    s_complete_count = 0U;
+    s_last_complete_id = 0U;
+    s_last_failure = DEVICE_LINK_V1_WIFI_FAILURE_NONE;
+    s_observe_count = 0U;
+    memset(&s_last_snapshot, 0, sizeof(s_last_snapshot));
 }
 
-void ble_link_service_fake_set_in_flight(bool in_flight)
+unsigned ble_link_service_fake_complete_count(void)
 {
-    s_in_flight = in_flight;
+    return s_complete_count;
 }
 
-void ble_link_service_fake_set_start_result(esp_err_t result)
+uint32_t ble_link_service_fake_last_complete_id(void)
 {
-    s_start_result = result;
+    return s_last_complete_id;
 }
 
-unsigned ble_link_service_fake_update_count(void)
+device_link_v1_wifi_failure_t ble_link_service_fake_last_failure(void)
 {
-    return s_update_count;
+    return s_last_failure;
 }
 
-uint64_t ble_link_service_fake_last_owner(void)
+unsigned ble_link_service_fake_observe_count(void)
 {
-    return s_last_owner_id;
+    return s_observe_count;
 }
 
-device_link_operation_state_t ble_link_service_fake_last_state(void)
+const device_link_v1_snapshot_t *ble_link_service_fake_last_snapshot(void)
 {
-    return s_last_state;
+    return &s_last_snapshot;
 }
 
-device_link_status_t ble_link_service_fake_last_status(void)
+void ble_link_service_set_v1_ops(const ble_link_v1_owner_ops_t *ops, void *arg)
 {
-    return s_last_status;
+    if (ops == NULL)
+    {
+        memset(&s_ops, 0, sizeof(s_ops));
+        s_ops_arg = NULL;
+        return;
+    }
+    s_ops = *ops;
+    s_ops_arg = arg;
 }
 
-size_t ble_link_service_fake_last_result_len(void)
+void ble_link_service_observe_snapshot(const device_link_v1_snapshot_t *snapshot)
 {
-    return s_last_result_len;
+    s_observe_count++;
+    if (snapshot != NULL)
+    {
+        s_last_snapshot = *snapshot;
+    }
+}
+
+esp_err_t ble_link_service_complete_operation(
+    uint32_t operation_id, device_link_v1_wifi_failure_t failure,
+    const device_link_v1_network_t *networks, uint8_t count,
+    const device_link_v1_snapshot_t *snapshot)
+{
+    (void)networks;
+    (void)count;
+    s_complete_count++;
+    s_last_complete_id = operation_id;
+    s_last_failure = failure;
+    if (snapshot != NULL)
+    {
+        s_last_snapshot = *snapshot;
+    }
+    return ESP_OK;
 }

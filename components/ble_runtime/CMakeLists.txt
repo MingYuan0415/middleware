@@ -12,13 +12,10 @@ idf_component_register(
         "src/ble_gap_manager.c"
         "src/ble_adv_manager.c"
         "src/ble_tx_scheduler.c"
-        "src/ble_link_state.c"
-        "src/ble_link_reassembler.c"
         "src/ble_link_cleanup_obligation.c"
         "src/ble_link_timer_deadline.c"
         "src/ble_nimble_tx_tracker.c"
         "src/ble_link_session.c"
-        "src/ble_link_events.c"
         "src/ble_link_sec_state.c"
         "src/ble_link_service.c"
         "src/ble_link_gatt.c"
@@ -27,7 +24,6 @@ idf_component_register(
     REQUIRES
         bt
         device_link
-        device_link_security
     PRIV_REQUIRES
         freertos
         mt_log

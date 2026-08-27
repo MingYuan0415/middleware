@@ -209,6 +209,16 @@ esp_err_t connectivity_manager_request_sync_profile(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
+ * @brief Persist credentials without starting a connection.
+ *
+ * @param credentials contains borrowed bytes copied before return.
+ * @param out_operation_id receives the admitted operation generation.
+ */
+esp_err_t connectivity_manager_request_save_profile(
+    const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_operation_id_t *out_operation_id);
+
+/**
  * @brief Disconnect and hold automatic connection for this boot.
  *
  * @param out_operation_id receives the admitted operation generation.

@@ -6,7 +6,6 @@ idf_component_register(
     REQUIRES
         ble_runtime
         device_link
-        device_link_security
         connectivity_manager
         event_bus
         nv_storage
