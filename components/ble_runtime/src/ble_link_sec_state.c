@@ -167,7 +167,7 @@ uint32_t ble_link_sec_state_on_encrypted(
 
 uint32_t ble_link_sec_state_reconcile_snapshot(
     ble_link_sec_state_t *state, bool identity_ready, bool encrypted,
-    bool bonded, bool bond_verified)
+    bool bonded, bool bond_verified, bool refresh_had_bond, bool had_bond)
 {
     uint32_t actions = BLE_LINK_SEC_ACTION_NONE;
 
@@ -179,7 +179,8 @@ uint32_t ble_link_sec_state_reconcile_snapshot(
     if (identity_ready)
     {
         actions |= ble_link_sec_state_on_identity(
-                       state, bonded, bond_verified, false, false);
+                       state, bonded, bond_verified, refresh_had_bond,
+                       had_bond);
     }
     actions |= ble_link_sec_state_on_encrypted(
                    state, encrypted, bonded, bond_verified);

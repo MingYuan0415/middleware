@@ -111,11 +111,13 @@ uint32_t ble_link_sec_state_on_encrypted(
  * @param[in] encrypted Link encryption is active.
  * @param[in] bonded Connection reports a stored bond.
  * @param[in] bond_verified Store bond material is valid.
+ * @param[in] refresh_had_bond True when this ACL has not attempted pairing.
+ * @param[in] had_bond Store currently holds a bond for the resolved identity.
  * @return Combined action mask.
  */
 uint32_t ble_link_sec_state_reconcile_snapshot(
     ble_link_sec_state_t *state, bool identity_ready, bool encrypted,
-    bool bonded, bool bond_verified);
+    bool bonded, bool bond_verified, bool refresh_had_bond, bool had_bond);
 
 /** @brief Feed a disconnect or host reset; resets all facts. */
 uint32_t ble_link_sec_state_on_disconnect(ble_link_sec_state_t *state);

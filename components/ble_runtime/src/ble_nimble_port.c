@@ -34,6 +34,7 @@
 #include "ble_nimble_adv_start.h"
 #include "ble_nimble_peer_identity.h"
 #include "ble_nimble_pairing_gate.h"
+#include "ble_nimble_smp_policy.h"
 #include "ble_nimble_store_guard.h"
 #include "ble_nimble_store_restore_audit.h"
 #include "ble_nimble_store_reset.h"
@@ -67,6 +68,10 @@ _Static_assert(BLE_ADDR_PUBLIC_ID == BLE_NIMBLE_PEER_ADDR_PUBLIC_ID,
                "NimBLE public identity address type changed");
 _Static_assert(BLE_ADDR_RANDOM_ID == BLE_NIMBLE_PEER_ADDR_RANDOM_ID,
                "NimBLE random identity address type changed");
+_Static_assert(BLE_SM_IOACT_NUMCMP == BLE_NIMBLE_SMP_PASSKEY_ACTION_NUMCMP,
+               "NimBLE numeric-comparison action changed");
+_Static_assert(BLE_SM_PAIR_KEY_SZ_MAX == BLE_NIMBLE_SMP_PAIR_KEY_SIZE_MAX,
+               "NimBLE max pairing key size changed");
 
 /* ESP-IDF v6.0.2 exposes this controller-privacy operation only through an
  * internal header. The fixed source and build mode are pinned by the runtime
@@ -2809,6 +2814,12 @@ static void _ble_nimble_port_apply_sec_actions(
                 &s_link_sec_state))
     {
         _ble_nimble_port_mark_provisional_bond(generation, conn_handle);
+        if ((ble_link_session_get_state_flags() &
+                BLE_LINK_STATE_FLAG_BOUND) == 0U)
+        {
+            (void)ble_link_session_set_authorization(true, 0U);
+        }
+        ble_link_gatt_request_link_state_refresh();
     }
     if ((actions & BLE_LINK_SEC_ACTION_REPORT_LINK_ENCRYPTED) != 0U)
     {
@@ -3409,6 +3420,35 @@ static esp_err_t _ble_nimble_port_bond_store_verified_identity(
                     peer_sec.authenticated && our_sec.authenticated &&
                     peer_sec.key_size == 16 && our_sec.key_size == 16;
     return ESP_OK;
+}
+
+static bool _ble_nimble_port_durable_bond_present(void)
+{
+    ble_addr_t peers[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int count = 0;
+    const int enumerate_result = ble_store_util_bonded_peers(
+                                     peers, &count, CONFIG_BT_NIMBLE_MAX_BONDS);
+
+    if (enumerate_result != 0 || count < 0 ||
+            count > CONFIG_BT_NIMBLE_MAX_BONDS)
+    {
+        return true;
+    }
+    for (int i = 0; i < count; ++i)
+    {
+        bool verified = false;
+
+        if (_ble_nimble_port_bond_store_verified_identity(
+                    &peers[i], &verified) != ESP_OK)
+        {
+            return true;
+        }
+        if (verified)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -4684,8 +4724,12 @@ void ble_nimble_port_numeric_comparison_cancel(void)
                          memory_order_acq_rel);
 
     s_passkey_conn_handle = 0U;
+    if (!ble_nimble_smp_numeric_comparison_inject_required(
+                pending, conn_handle))
+    {
+        return;
+    }
 #ifndef UNIT_TEST_HOST
-    if (pending && conn_handle != 0U)
     {
         struct ble_sm_io io;
 
@@ -4694,9 +4738,6 @@ void ble_nimble_port_numeric_comparison_cancel(void)
         io.numcmp_accept = 0;
         (void)ble_sm_inject_io(conn_handle, &io);
     }
-#else
-    (void)pending;
-    (void)conn_handle;
 #endif
 }
 
@@ -4834,7 +4875,8 @@ static int _ble_nimble_port_gap_event(
                  * reducer cannot miss a restored-bond admission. */
                 replay_actions = ble_link_sec_state_reconcile_snapshot(
                                      &s_link_sec_state, identity_ready, true,
-                                     desc.sec_state.bonded, bond_verified);
+                                     desc.sec_state.bonded, bond_verified,
+                                     false, false);
             }
             /* Establish the accepted ACL generation before replaying security
              * facts from the descriptor. Applying them first makes the session
@@ -4959,11 +5001,16 @@ static int _ble_nimble_port_gap_event(
                         s_timer_generation, event->enc_change.conn_handle,
                         &desc.peer_id_addr);
                 }
+                const bool refresh_had_bond = !atomic_load_explicit(
+                                                  &s_acl_pairing_attempted,
+                                                  memory_order_acquire);
                 const uint32_t actions =
                     ble_link_sec_state_reconcile_snapshot(
                         &s_link_sec_state, identity_ready,
                         desc.sec_state.encrypted, desc.sec_state.bonded,
-                        bond_verified);
+                        bond_verified, refresh_had_bond,
+                        identity_ready &&
+                        _ble_nimble_port_peer_has_bond(&desc));
 
                 _ble_nimble_port_apply_sec_actions(
                     actions, event->enc_change.conn_handle);
@@ -5043,11 +5090,14 @@ static int _ble_nimble_port_gap_event(
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         atomic_store_explicit(&s_acl_pairing_attempted, true,
                               memory_order_release);
-        if (!event->repeat_pairing.new_sc ||
-                !event->repeat_pairing.new_bonding ||
-                !event->repeat_pairing.new_authenticated ||
-                event->repeat_pairing.new_key_size != BLE_SM_PAIR_KEY_SZ_MAX ||
-                !_ble_nimble_port_pairing_window_open())
+        if (ble_nimble_smp_repeat_decide(
+                    event->repeat_pairing.new_sc,
+                    event->repeat_pairing.new_bonding,
+                    event->repeat_pairing.new_authenticated,
+                    event->repeat_pairing.new_key_size,
+                    _ble_nimble_port_pairing_window_open(),
+                    _ble_nimble_port_durable_bond_present()) !=
+                BLE_NIMBLE_SMP_REPEAT_RETRY)
         {
             return BLE_GAP_REPEAT_PAIRING_IGNORE;
         }
@@ -5066,7 +5116,8 @@ static int _ble_nimble_port_gap_event(
     case BLE_GAP_EVENT_PASSKEY_ACTION:
         atomic_store_explicit(&s_acl_pairing_attempted, true,
                               memory_order_release);
-        if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP)
+        if (ble_nimble_smp_passkey_decide(event->passkey.params.action) ==
+                BLE_NIMBLE_SMP_PASSKEY_ACCEPT_NUMCMP)
         {
             s_passkey_conn_handle = event->passkey.conn_handle;
             atomic_store_explicit(&s_passkey_pending, true,

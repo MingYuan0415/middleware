@@ -175,7 +175,10 @@ static size_t _ble_link_service_handle_admitted(
         }
         status = device_link_v1_engine_start(
                      &s_service.engine, (device_link_v1_operation_t)request->opcode,
-                     request->request_id, &operation_id);
+                     request->request_id,
+                     request->opcode == DEVICE_LINK_V1_SET_CREDENTIALS ?
+                     &request->payload.credentials : NULL,
+                     &operation_id);
         if (status == DEVICE_LINK_V1_STATUS_ACCEPTED)
         {
             const device_link_v1_status_t submitted =
@@ -529,6 +532,18 @@ void ble_link_service_tick(uint32_t now_ms)
     {
         _ble_link_service_wake();
     }
+}
+
+uint32_t ble_link_service_operation_timeout_remaining_ms(void)
+{
+    _ble_link_service_lock();
+    const uint32_t remaining = device_link_v1_engine_deadline_remaining_ms(
+                                   &s_service.engine,
+                                   (uint32_t)(xTaskGetTickCount() *
+                                       portTICK_PERIOD_MS));
+
+    _ble_link_service_unlock();
+    return remaining;
 }
 
 void ble_link_service_set_att_mtu(uint16_t att_mtu)

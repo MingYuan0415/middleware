@@ -25,6 +25,7 @@ set(TEST_SOURCES
     "${COMPONENT}/src/ble_adv_manager.c"
     "${COMPONENT}/src/ble_nimble_adv_start.c"
     "${COMPONENT}/src/ble_nimble_pairing_gate.c"
+    "${COMPONENT}/src/ble_nimble_smp_policy.c"
     "${COMPONENT}/src/ble_nimble_store_guard.c"
     "${COMPONENT}/src/ble_tx_scheduler.c"
     "${COMPONENT}/src/ble_link_cleanup_obligation.c"
@@ -50,6 +51,7 @@ foreach(test_target IN ITEMS
         test_ble_link_timer_deadline
         test_ble_nimble_peer_identity
         test_ble_nimble_pairing_gate
+        test_ble_nimble_smp_policy
         test_ble_nimble_store_guard
         test_ble_nimble_store_restore_audit
         test_ble_nimble_store_reset
@@ -70,6 +72,10 @@ foreach(test_target IN ITEMS
         add_executable(${test_target}
             ${test_target}.c
             "${COMPONENT}/src/ble_nimble_pairing_gate.c")
+    elseif(test_target STREQUAL test_ble_nimble_smp_policy)
+        add_executable(${test_target}
+            ${test_target}.c
+            "${COMPONENT}/src/ble_nimble_smp_policy.c")
     elseif(test_target STREQUAL test_ble_nimble_peer_identity)
         add_executable(${test_target}
             ${test_target}.c
@@ -139,6 +145,7 @@ set(BLE_RUNTIME_TESTS
     ble_link_timer_deadline
     ble_nimble_peer_identity
     ble_nimble_pairing_gate
+    ble_nimble_smp_policy
     ble_nimble_store_guard
     ble_nimble_store_restore_audit
     ble_nimble_store_reset

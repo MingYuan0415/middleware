@@ -21,6 +21,8 @@ typedef struct device_link_v1_engine
     device_link_v1_snapshot_t current_snapshot;
     device_link_v1_snapshot_t ordinary_snapshot;
     device_link_v1_snapshot_t pre_snapshot;
+    uint8_t admitted_ssid[DEVICE_LINK_V1_MAX_SSID_BYTES];
+    uint8_t admitted_ssid_length;
     uint32_t next_operation_id;
     uint32_t deadline_ms;
     uint8_t response_request_id;
@@ -53,11 +55,16 @@ bool device_link_v1_engine_profile_present(const device_link_v1_engine_t *engine
 /**
  * @brief Admit one asynchronous operation.
  *
+ * SET_CREDENTIALS retains @p credentials SSID for the success snapshot.
+ * Other operations ignore @p credentials.
+ *
+ * @param credentials SET_CREDENTIALS payload; NULL otherwise.
  * @param[out] operation_id Assigned boot-scoped id on ACCEPTED.
  */
 device_link_v1_status_t device_link_v1_engine_start(
     device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, uint32_t *operation_id);
+    uint8_t request_id, const device_link_v1_credentials_t *credentials,
+    uint32_t *operation_id);
 
 /** @brief Apply ACK_OPERATION to the current slot. */
 device_link_v1_status_t device_link_v1_engine_ack(
@@ -72,9 +79,10 @@ device_link_v1_status_t device_link_v1_engine_get_operation(
 /**
  * @brief Complete an ACTIVE operation with a terminal snapshot.
  *
- * SCAN and SET_CREDENTIALS success rebuild the snapshot from the
- * pre-operation state so UNCHANGED postconditions hold. A NONE failure
- * that still cannot satisfy success postconditions becomes INTERNAL.
+ * SCAN success rebuilds the snapshot from the pre-operation state.
+ * SET_CREDENTIALS success keeps that state and installs the admitted SSID.
+ * A NONE failure that still cannot satisfy success postconditions becomes
+ * INTERNAL.
  *
  * @return false when the id, phase, failure, or snapshot is illegal.
  */
@@ -104,6 +112,14 @@ void device_link_v1_engine_arm_deadline(device_link_v1_engine_t *engine,
  */
 bool device_link_v1_engine_tick(device_link_v1_engine_t *engine,
                                 uint32_t now_ms);
+
+/**
+ * @brief Remaining milliseconds until the ACTIVE deadline.
+ *
+ * @return UINT32_MAX when no ACTIVE deadline is armed, 0 when due.
+ */
+uint32_t device_link_v1_engine_deadline_remaining_ms(
+    const device_link_v1_engine_t *engine, uint32_t now_ms);
 
 /**
  * @brief Drop the in-flight indication as undeliverable.
@@ -154,7 +170,8 @@ const device_link_v1_operation_record_t *device_link_v1_engine_record(
 #ifdef UNIT_TEST_HOST
 device_link_v1_status_t device_link_v1_engine_start_with_id(
     device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, uint32_t operation_id);
+    uint8_t request_id, const device_link_v1_credentials_t *credentials,
+    uint32_t operation_id);
 void device_link_v1_engine_test_exhaust_ids(device_link_v1_engine_t *engine);
 void device_link_v1_engine_test_reboot(device_link_v1_engine_t *engine);
 #endif

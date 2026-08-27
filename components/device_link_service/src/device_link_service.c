@@ -526,6 +526,14 @@ static uint32_t _device_link_service_next_wait_ms(void)
     {
         wait_ms = _device_link_service_min_wait(wait_ms, retained_retry_ms);
     }
+    const uint32_t operation_timeout_ms =
+        ble_link_service_operation_timeout_remaining_ms();
+
+    if (operation_timeout_ms != UINT32_MAX)
+    {
+        wait_ms = _device_link_service_min_wait(
+                      wait_ms, operation_timeout_ms);
+    }
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (s_service.bluetooth_transitioning)
@@ -1349,17 +1357,27 @@ static void _device_link_service_worker_tick(void)
     }
     {
         /* A window must be closed when: its deadline expired, a previous
-         * close is pending a retry, or a revoke is in progress (the
+         * close is pending a retry, a revoke is in progress (the
          * security ordering closes the window before the revoke touches
-         * the store). A live, unexpired window without a revoke stays
-         * open; only the remaining-time publication runs. */
+         * the store), or a durable binding is already committed. A live,
+         * unexpired window without a revoke or binding stays open; only
+         * the remaining-time publication runs. */
         const TickType_t now = xTaskGetTickCount();
+        const bool bound = (ble_link_session_get_state_flags() &
+                            BLE_LINK_STATE_FLAG_BOUND) != 0U;
         const bool deadline_reached = s_service.window_open &&
                                       _device_link_service_tick_reached(
                                           now, s_service.window_deadline);
         const bool close_required = s_service.close_pending ||
                                     deadline_reached ||
-                                    s_service.revoke_in_progress;
+                                    s_service.revoke_in_progress ||
+                                    (s_service.window_open && bound);
+
+        if (bound && s_service.window_open_pending)
+        {
+            s_service.window_open_pending = false;
+            publish = true;
+        }
 
         if (close_required && (s_service.window_open ||
                                s_service.window_open_pending ||
@@ -1488,8 +1506,8 @@ static void _device_link_service_worker(void *arg)
         else
         {
             /* Queue producers and TX completions notify this task. Owner
-             * state supplies every retry and protocol deadline, so no timer
-             * event or fixed periodic poll is required. */
+             * state and the link-service operation deadline supply every
+             * retry, so no timer event or fixed periodic poll is required. */
             (void)ulTaskNotifyTake(pdTRUE,
                                    _device_link_service_wait_ticks(
                                        _device_link_service_next_wait_ms()));

@@ -63,6 +63,8 @@ static void _device_link_v1_engine_clear_record(device_link_v1_engine_t *engine)
 {
     memset(&engine->record, 0, sizeof(engine->record));
     memset(&engine->pre_snapshot, 0, sizeof(engine->pre_snapshot));
+    memset(engine->admitted_ssid, 0, sizeof(engine->admitted_ssid));
+    engine->admitted_ssid_length = 0U;
     engine->record_present = false;
     engine->accepted_confirmed = false;
     engine->terminal_emitted = false;
@@ -75,10 +77,18 @@ static void _device_link_v1_engine_clear_record(device_link_v1_engine_t *engine)
 
 static device_link_v1_status_t _device_link_v1_engine_admit(
     device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, uint32_t operation_id)
+    uint8_t request_id, uint32_t operation_id,
+    const device_link_v1_credentials_t *credentials)
 {
     if (!_device_link_v1_engine_ready(engine) || request_id == 0U ||
             operation_id == 0U)
+    {
+        return DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT;
+    }
+    if (operation == DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS &&
+            (credentials == NULL ||
+             credentials->ssid_length == 0U ||
+             credentials->ssid_length > DEVICE_LINK_V1_MAX_SSID_BYTES))
     {
         return DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT;
     }
@@ -95,6 +105,8 @@ static device_link_v1_status_t _device_link_v1_engine_admit(
         return DEVICE_LINK_V1_STATUS_INTERNAL;
     }
     memset(&engine->record, 0, sizeof(engine->record));
+    memset(engine->admitted_ssid, 0, sizeof(engine->admitted_ssid));
+    engine->admitted_ssid_length = 0U;
     engine->record.operation_id = operation_id;
     engine->record.operation = operation;
     engine->record.phase = DEVICE_LINK_V1_OPERATION_ACTIVE;
@@ -109,6 +121,12 @@ static device_link_v1_status_t _device_link_v1_engine_admit(
     engine->pending_accepted = true;
     engine->pending_ack = false;
     engine->deadline_ms = 0U;
+    if (operation == DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS)
+    {
+        memcpy(engine->admitted_ssid, credentials->ssid,
+               credentials->ssid_length);
+        engine->admitted_ssid_length = credentials->ssid_length;
+    }
     if (operation_id == UINT32_MAX)
     {
         engine->ids_exhausted = true;
@@ -159,7 +177,8 @@ bool device_link_v1_engine_profile_present(const device_link_v1_engine_t *engine
 
 device_link_v1_status_t device_link_v1_engine_start(
     device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, uint32_t *operation_id)
+    uint8_t request_id, const device_link_v1_credentials_t *credentials,
+    uint32_t *operation_id)
 {
     if (operation_id == NULL)
     {
@@ -172,7 +191,7 @@ device_link_v1_status_t device_link_v1_engine_start(
     }
     const uint32_t assigned = engine != NULL ? engine->next_operation_id : 0U;
     const device_link_v1_status_t status = _device_link_v1_engine_admit(
-            engine, operation, request_id, assigned);
+            engine, operation, request_id, assigned, credentials);
 
     *operation_id = (status == DEVICE_LINK_V1_STATUS_ACCEPTED) ? assigned : 0U;
     return status;
@@ -256,14 +275,15 @@ bool device_link_v1_engine_complete(
         }
         else if (operation == DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS)
         {
-            if (snapshot->profile_ssid_length > DEVICE_LINK_V1_MAX_SSID_BYTES)
+            if (engine->admitted_ssid_length > DEVICE_LINK_V1_MAX_SSID_BYTES)
             {
                 return false;
             }
             applied = engine->pre_snapshot;
-            applied.profile_ssid_length = snapshot->profile_ssid_length;
-            memcpy(applied.profile_ssid, snapshot->profile_ssid,
-                   snapshot->profile_ssid_length);
+            memset(applied.profile_ssid, 0, sizeof(applied.profile_ssid));
+            applied.profile_ssid_length = engine->admitted_ssid_length;
+            memcpy(applied.profile_ssid, engine->admitted_ssid,
+                   engine->admitted_ssid_length);
         }
     }
     if (!device_link_v1_snapshot_valid(&applied))
@@ -370,6 +390,21 @@ bool device_link_v1_engine_tick(device_link_v1_engine_t *engine,
                engine, engine->record.operation_id,
                DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT, NULL, 0U,
                &engine->current_snapshot);
+}
+
+uint32_t device_link_v1_engine_deadline_remaining_ms(
+    const device_link_v1_engine_t *engine, uint32_t now_ms)
+{
+    if (!_device_link_v1_engine_ready(engine) ||
+            !engine->record_present ||
+            engine->record.phase != DEVICE_LINK_V1_OPERATION_ACTIVE ||
+            engine->deadline_ms == 0U)
+    {
+        return UINT32_MAX;
+    }
+    const int32_t remaining = (int32_t)(engine->deadline_ms - now_ms);
+
+    return remaining <= 0 ? 0U : (uint32_t)remaining;
 }
 
 void device_link_v1_engine_reject_tx(device_link_v1_engine_t *engine)
@@ -552,10 +587,11 @@ const device_link_v1_operation_record_t *device_link_v1_engine_record(
 #ifdef UNIT_TEST_HOST
 device_link_v1_status_t device_link_v1_engine_start_with_id(
     device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, uint32_t operation_id)
+    uint8_t request_id, const device_link_v1_credentials_t *credentials,
+    uint32_t operation_id)
 {
     return _device_link_v1_engine_admit(engine, operation, request_id,
-                                        operation_id);
+                                        operation_id, credentials);
 }
 
 void device_link_v1_engine_test_exhaust_ids(device_link_v1_engine_t *engine)

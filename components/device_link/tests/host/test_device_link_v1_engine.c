@@ -28,6 +28,19 @@ static device_link_v1_snapshot_t _home_connected(void)
     return snapshot;
 }
 
+static device_link_v1_credentials_t _cafe_credentials(void)
+{
+    device_link_v1_credentials_t credentials;
+
+    memset(&credentials, 0, sizeof(credentials));
+    credentials.ssid[0] = 'C';
+    credentials.ssid[1] = 'a';
+    credentials.ssid[2] = 'f';
+    credentials.ssid[3] = 'e';
+    credentials.ssid_length = 4U;
+    return credentials;
+}
+
 static void _boot(device_link_v1_engine_t *engine,
                   const device_link_v1_snapshot_t *snapshot)
 {
@@ -41,12 +54,29 @@ static void _confirm_response(device_link_v1_engine_t *engine)
     device_link_v1_engine_confirm_tx(engine);
 }
 
+static void _start_set_credentials(device_link_v1_engine_t *engine, uint32_t id,
+                                   device_link_v1_status_t expect)
+{
+    const device_link_v1_credentials_t credentials = _cafe_credentials();
+    const device_link_v1_status_t status =
+        device_link_v1_engine_start_with_id(
+            engine, DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, 1U,
+            &credentials, id);
+
+    assert(status == expect);
+    if (status == DEVICE_LINK_V1_STATUS_ACCEPTED)
+    {
+        device_link_v1_engine_arm_response(engine, 1U, true, false);
+        _confirm_response(engine);
+    }
+}
+
 static void _start_id(device_link_v1_engine_t *engine,
                       device_link_v1_operation_t operation, uint32_t id,
                       device_link_v1_status_t expect)
 {
     const device_link_v1_status_t status =
-        device_link_v1_engine_start_with_id(engine, operation, 1U, id);
+        device_link_v1_engine_start_with_id(engine, operation, 1U, NULL, id);
 
     assert(status == expect);
     if (status == DEVICE_LINK_V1_STATUS_ACCEPTED)
@@ -94,7 +124,7 @@ static void _test_connected_terminal_and_ack_order(void)
             &record) == DEVICE_LINK_V1_STATUS_OK);
     assert(record.phase == DEVICE_LINK_V1_OPERATION_ACTIVE);
     assert(device_link_v1_engine_start_with_id(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 3U, 2U) ==
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 3U, NULL, 2U) ==
            DEVICE_LINK_V1_STATUS_BUSY);
     assert(device_link_v1_engine_ack(&engine, 1U,
                                      4U) == DEVICE_LINK_V1_STATUS_BUSY);
@@ -111,7 +141,7 @@ static void _test_connected_terminal_and_ack_order(void)
     assert(device_link_v1_engine_ack(&engine, 99U,
                                      6U) == DEVICE_LINK_V1_STATUS_NOT_FOUND);
     assert(device_link_v1_engine_start_with_id(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 7U, 3U) ==
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 7U, NULL, 3U) ==
            DEVICE_LINK_V1_STATUS_BUSY);
     _ack_ok(&engine, 1U);
     assert(device_link_v1_engine_get_operation(&engine,
@@ -166,7 +196,7 @@ static void _test_unconfirmed_accepted_omits_terminal(void)
 
     _boot(&engine, &idle);
     assert(device_link_v1_engine_start_with_id(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, 20U) ==
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, NULL, 20U) ==
            DEVICE_LINK_V1_STATUS_ACCEPTED);
     device_link_v1_engine_arm_response(&engine, 1U, true, false);
     device_link_v1_engine_disconnect(&engine);
@@ -210,13 +240,13 @@ static void _test_ordinary_coalesce_and_id_exhaustion(void)
     _ack_ok(&engine, UINT32_MAX);
     device_link_v1_engine_test_exhaust_ids(&engine);
     assert(device_link_v1_engine_start(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, &operation_id) ==
-           DEVICE_LINK_V1_STATUS_INTERNAL);
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, NULL,
+               &operation_id) == DEVICE_LINK_V1_STATUS_INTERNAL);
     device_link_v1_engine_test_reboot(&engine);
     device_link_v1_engine_connect(&engine);
     assert(device_link_v1_engine_start(
-               &engine, DEVICE_LINK_V1_OPERATION_CONNECT, 1U, &operation_id) ==
-           DEVICE_LINK_V1_STATUS_ACCEPTED);
+               &engine, DEVICE_LINK_V1_OPERATION_CONNECT, 1U, NULL,
+               &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(operation_id == 1U);
 }
 
@@ -258,7 +288,7 @@ static void _test_abort_tx_keeps_record(void)
 
     _boot(&engine, &idle);
     assert(device_link_v1_engine_start(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, NULL,
                &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
     device_link_v1_engine_arm_response(&engine, 1U, true, false);
     assert(device_link_v1_engine_write_blocked(&engine));
@@ -324,8 +354,7 @@ static void _test_set_credentials_keeps_prior_failure(void)
     saved.profile_ssid[3] = 'e';
     saved.profile_ssid_length = 4U;
     _boot(&engine, &error);
-    _start_id(&engine, DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, 32U,
-              DEVICE_LINK_V1_STATUS_ACCEPTED);
+    _start_set_credentials(&engine, 32U, DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_complete(
                &engine, 32U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U,
                &saved));
@@ -338,6 +367,34 @@ static void _test_set_credentials_keeps_prior_failure(void)
             &record) == DEVICE_LINK_V1_STATUS_OK);
     assert(record.phase == DEVICE_LINK_V1_OPERATION_SUCCEEDED);
     _ack_ok(&engine, 32U);
+}
+
+static void _test_set_credentials_uses_admitted_ssid(void)
+{
+    device_link_v1_engine_t engine;
+    const device_link_v1_snapshot_t idle = _idle();
+    const device_link_v1_snapshot_t home = _home_connected();
+    device_link_v1_credentials_t empty;
+    uint32_t operation_id = 0U;
+
+    _boot(&engine, &idle);
+    assert(device_link_v1_engine_start(
+               &engine, DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, 1U, NULL,
+               &operation_id) == DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT);
+    memset(&empty, 0, sizeof(empty));
+    assert(device_link_v1_engine_start_with_id(
+               &engine, DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS, 1U, &empty,
+               37U) == DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT);
+    _start_set_credentials(&engine, 37U, DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_complete(
+               &engine, 37U, DEVICE_LINK_V1_WIFI_FAILURE_NONE, NULL, 0U,
+               &home));
+    assert(device_link_v1_engine_snapshot(&engine)->state ==
+           DEVICE_LINK_V1_WIFI_IDLE);
+    assert(device_link_v1_engine_snapshot(&engine)->profile_ssid_length == 4U);
+    assert(memcmp(device_link_v1_engine_snapshot(&engine)->profile_ssid,
+                  "Cafe", 4U) == 0);
+    _ack_ok(&engine, 37U);
 }
 
 static void _test_connect_none_mismatch_becomes_internal(void)
@@ -369,7 +426,7 @@ static void _test_rollback_unconfirmed_active(void)
 
     _boot(&engine, &idle);
     assert(device_link_v1_engine_start(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, NULL,
                &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
     assert(device_link_v1_engine_rollback(&engine));
     assert(!device_link_v1_engine_slot_occupied(&engine));
@@ -388,13 +445,20 @@ static void _test_tick_completes_timeout(void)
     _boot(&engine, &idle);
     _start_id(&engine, DEVICE_LINK_V1_OPERATION_SCAN, 35U,
               DEVICE_LINK_V1_STATUS_ACCEPTED);
+    assert(device_link_v1_engine_deadline_remaining_ms(&engine, 1000U) ==
+           UINT32_MAX);
     device_link_v1_engine_arm_deadline(&engine, 1000U, 50U);
+    assert(device_link_v1_engine_deadline_remaining_ms(&engine, 1000U) == 50U);
+    assert(device_link_v1_engine_deadline_remaining_ms(&engine, 1049U) == 1U);
     assert(!device_link_v1_engine_tick(&engine, 1049U));
+    assert(device_link_v1_engine_deadline_remaining_ms(&engine, 1050U) == 0U);
     assert(device_link_v1_engine_tick(&engine, 1050U));
     assert(device_link_v1_engine_get_operation(&engine,
             &record) == DEVICE_LINK_V1_STATUS_OK);
     assert(record.phase == DEVICE_LINK_V1_OPERATION_FAILED);
     assert(record.failure == DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    assert(device_link_v1_engine_deadline_remaining_ms(&engine, 1050U) ==
+           UINT32_MAX);
     _ack_ok(&engine, 35U);
 }
 
@@ -407,7 +471,7 @@ static void _test_init_disconnected(void)
     device_link_v1_engine_init(&engine, &idle);
     assert(!engine.connected);
     assert(device_link_v1_engine_start(
-               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U,
+               &engine, DEVICE_LINK_V1_OPERATION_SCAN, 1U, NULL,
                &operation_id) == DEVICE_LINK_V1_STATUS_INTERNAL);
 }
 
@@ -447,6 +511,7 @@ int main(void)
     _test_abort_tx_keeps_record();
     _test_scan_rebuilds_unchanged_snapshot();
     _test_set_credentials_keeps_prior_failure();
+    _test_set_credentials_uses_admitted_ssid();
     _test_connect_none_mismatch_becomes_internal();
     _test_rollback_unconfirmed_active();
     _test_tick_completes_timeout();

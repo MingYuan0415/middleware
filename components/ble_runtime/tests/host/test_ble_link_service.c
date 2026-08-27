@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "ble_link_service.h"
 #include "device_link_v1.h"
@@ -272,6 +274,25 @@ static void test_submit_failure_returns_internal_without_slot(void)
     TEST_ASSERT_EQUAL(DEVICE_LINK_V1_STATUS_NOT_FOUND, s_tx[2]);
 }
 
+static void test_operation_timeout_remaining_tracks_deadline(void)
+{
+    const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+
+    _reset();
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_operation_timeout_remaining_ms());
+    _execute_write(scan, sizeof(scan));
+    TEST_ASSERT_TRUE(ble_link_service_operation_timeout_remaining_ms() <=
+                     DEVICE_LINK_V1_OPERATION_TIMEOUT_MS);
+    TEST_ASSERT_TRUE(ble_link_service_operation_timeout_remaining_ms() !=
+                     UINT32_MAX);
+    ble_link_service_tick(
+        (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) +
+        DEVICE_LINK_V1_OPERATION_TIMEOUT_MS);
+    TEST_ASSERT_EQUAL(UINT32_MAX,
+                      ble_link_service_operation_timeout_remaining_ms());
+}
+
 static void test_stale_generation_is_dropped(void)
 {
     const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
@@ -298,6 +319,7 @@ int main(void)
     test_execute_output_failure_unblocks_writes();
     test_abort_tx_rejects_stale_identity();
     test_submit_failure_returns_internal_without_slot();
+    test_operation_timeout_remaining_tracks_deadline();
     test_stale_generation_is_dropped();
     return 0;
 }

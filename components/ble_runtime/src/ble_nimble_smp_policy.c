@@ -1,0 +1,30 @@
+#include "ble_nimble_smp_policy.h"
+
+ble_nimble_smp_passkey_decision_t ble_nimble_smp_passkey_decide(
+    uint8_t action)
+{
+    if (action == BLE_NIMBLE_SMP_PASSKEY_ACTION_NUMCMP)
+    {
+        return BLE_NIMBLE_SMP_PASSKEY_ACCEPT_NUMCMP;
+    }
+    return BLE_NIMBLE_SMP_PASSKEY_TERMINATE;
+}
+
+ble_nimble_smp_repeat_decision_t ble_nimble_smp_repeat_decide(
+    bool new_sc, bool new_bonding, bool new_authenticated,
+    uint8_t new_key_size, bool bindable, bool durable_bond_present)
+{
+    if (!new_sc || !new_bonding || !new_authenticated ||
+            new_key_size != BLE_NIMBLE_SMP_PAIR_KEY_SIZE_MAX ||
+            !bindable || durable_bond_present)
+    {
+        return BLE_NIMBLE_SMP_REPEAT_IGNORE;
+    }
+    return BLE_NIMBLE_SMP_REPEAT_RETRY;
+}
+
+bool ble_nimble_smp_numeric_comparison_inject_required(
+    bool pending, uint16_t conn_handle)
+{
+    return pending && conn_handle != 0U;
+}

@@ -101,6 +101,13 @@ esp_err_t ble_link_service_pump_tx(void);
 void ble_link_service_tick(uint32_t now_ms);
 
 /**
+ * @brief Remaining milliseconds until the ACTIVE operation deadline.
+ *
+ * @return UINT32_MAX when no ACTIVE deadline is armed, 0 when due.
+ */
+uint32_t ble_link_service_operation_timeout_remaining_ms(void);
+
+/**
  * @brief Record the negotiated ATT MTU used to size indications.
  *
  * @param[in] att_mtu Negotiated ATT MTU, clamped to at least 23.
