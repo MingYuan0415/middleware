@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -15,9 +16,14 @@
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"
 
+static uint8_t s_firmware_major;
+static uint8_t s_firmware_minor;
+static uint8_t s_firmware_patch;
+
 typedef struct device_link_wifi_bridge
 {
     bool started;
+    bool status_seen;
     uint32_t ble_operation_id;
     connectivity_manager_operation_id_t manager_operation_id;
     device_link_v1_operation_t operation;
@@ -88,9 +94,8 @@ static void _device_link_wifi_map_snapshot(
     {
         out->state = DEVICE_LINK_V1_WIFI_UNAVAILABLE;
         out->failure = DEVICE_LINK_V1_WIFI_FAILURE_RADIO;
-        return;
     }
-    if (status->state == CONNECTIVITY_MANAGER_STATE_SCANNING)
+    else if (status->state == CONNECTIVITY_MANAGER_STATE_SCANNING)
     {
         out->state = DEVICE_LINK_V1_WIFI_SCANNING;
         out->failure = DEVICE_LINK_V1_WIFI_FAILURE_NONE;
@@ -133,18 +138,18 @@ static void _device_link_wifi_map_snapshot(
     }
 }
 
-static uint32_t _device_link_wifi_authmode(
+static device_link_v1_wifi_security_t _device_link_wifi_security(
     connectivity_manager_security_t security)
 {
     if (security == CONNECTIVITY_MANAGER_SECURITY_OPEN)
     {
-        return DEVICE_LINK_V1_WIFI_AUTH_OPEN;
+        return DEVICE_LINK_V1_WIFI_OPEN;
     }
     if (security == CONNECTIVITY_MANAGER_SECURITY_PERSONAL)
     {
-        return DEVICE_LINK_V1_WIFI_AUTH_WPA2_PSK;
+        return DEVICE_LINK_V1_WIFI_PERSONAL;
     }
-    return 1U;
+    return (device_link_v1_wifi_security_t)0;
 }
 
 static void _device_link_wifi_on_status(
@@ -157,11 +162,13 @@ static void _device_link_wifi_on_status(
     device_link_v1_operation_t operation;
 
     _device_link_wifi_lock();
-    if (status->generation <= s_bridge.last_status_generation)
+    if (s_bridge.status_seen &&
+            status->generation <= s_bridge.last_status_generation)
     {
         _device_link_wifi_unlock();
         return;
     }
+    s_bridge.status_seen = true;
     s_bridge.last_status_generation = status->generation;
     ble_operation_id = s_bridge.ble_operation_id;
     manager_operation_id = s_bridge.manager_operation_id;
@@ -244,7 +251,7 @@ static void _device_link_wifi_on_scan(
 
         memcpy(source[i].ssid, scan->records[i].ssid, ssid_length);
         source[i].ssid_length = (uint8_t)ssid_length;
-        source[i].authmode = _device_link_wifi_authmode(
+        source[i].security = _device_link_wifi_security(
                                  scan->records[i].security);
         source[i].rssi_dbm = scan->records[i].rssi;
     }
@@ -305,6 +312,14 @@ static void _device_link_wifi_event(
     }
 }
 
+void device_link_wifi_adapter_set_firmware(uint8_t major, uint8_t minor,
+        uint8_t patch)
+{
+    s_firmware_major = major;
+    s_firmware_minor = minor;
+    s_firmware_patch = patch;
+}
+
 void device_link_wifi_adapter_fill_info(device_link_v1_info_t *info, void *arg)
 {
     (void)arg;
@@ -312,9 +327,9 @@ void device_link_wifi_adapter_fill_info(device_link_v1_info_t *info, void *arg)
     {
         return;
     }
-    info->firmware_major = 0U;
-    info->firmware_minor = 1U;
-    info->firmware_patch = 0U;
+    info->firmware_major = s_firmware_major;
+    info->firmware_minor = s_firmware_minor;
+    info->firmware_patch = s_firmware_patch;
 }
 
 device_link_v1_status_t device_link_wifi_adapter_submit(
@@ -426,6 +441,12 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
         return result;
     }
     s_bridge.started = true;
+    connectivity_manager_status_snapshot_t status;
+
+    if (connectivity_manager_get_status(&status) == ESP_OK)
+    {
+        _device_link_wifi_on_status(&status);
+    }
     return ESP_OK;
 }
 

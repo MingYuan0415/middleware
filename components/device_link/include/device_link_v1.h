@@ -33,13 +33,6 @@ extern "C" {
 #define DEVICE_LINK_V1_ATT_CCCD_NOT_ENABLED 0xfdu
 #define DEVICE_LINK_V1_ATT_TX_INDICATION_PENDING 0xfeU
 
-#define DEVICE_LINK_V1_WIFI_AUTH_OPEN 0U
-#define DEVICE_LINK_V1_WIFI_AUTH_WPA_PSK 2U
-#define DEVICE_LINK_V1_WIFI_AUTH_WPA2_PSK 3U
-#define DEVICE_LINK_V1_WIFI_AUTH_WPA_WPA2_PSK 4U
-#define DEVICE_LINK_V1_WIFI_AUTH_WPA3_PSK 6U
-#define DEVICE_LINK_V1_WIFI_AUTH_WPA2_WPA3_PSK 7U
-
 typedef enum device_link_v1_status
 {
     DEVICE_LINK_V1_STATUS_OK = 0,
@@ -145,7 +138,7 @@ typedef struct device_link_v1_scan_source
 {
     uint8_t ssid[DEVICE_LINK_V1_MAX_SSID_BYTES];
     uint8_t ssid_length;
-    uint32_t authmode;
+    device_link_v1_wifi_security_t security;
     int8_t rssi_dbm;
 } device_link_v1_scan_source_t;
 

@@ -37,6 +37,8 @@ typedef struct ble_link_service
     uint32_t tx_flow_id;
     uint32_t next_flow_id;
     uint16_t att_mtu;
+    bool rx_reserved;
+    ble_link_work_t *rx_owner;
     bool pairing_window_open;
     bool confirmation_pending;
     bool connection_valid;
@@ -74,6 +76,20 @@ static void _ble_link_service_wake(void)
     if (s_service.wake != NULL)
     {
         s_service.wake(s_service.wake_arg);
+    }
+}
+
+static void _ble_link_service_drop_reservation(void)
+{
+    s_service.rx_reserved = false;
+    s_service.rx_owner = NULL;
+}
+
+static void _ble_link_service_clear_reservation(ble_link_work_t *work)
+{
+    if (s_service.rx_owner == work)
+    {
+        _ble_link_service_drop_reservation();
     }
 }
 
@@ -238,8 +254,13 @@ static esp_err_t _ble_link_service_pump_locked(void)
 {
     uint8_t value[DEVICE_LINK_V1_MAX_ATT_VALUE_BYTES];
     size_t length = 0U;
-    const device_link_v1_tx_kind_t kind =
-        device_link_v1_engine_next_tx(&s_service.engine);
+    device_link_v1_tx_kind_t kind;
+
+    if (s_service.rx_reserved)
+    {
+        return ESP_OK;
+    }
+    kind = device_link_v1_engine_next_tx(&s_service.engine);
 
     if (kind == DEVICE_LINK_V1_TX_NONE)
     {
@@ -331,6 +352,7 @@ void ble_link_service_reset(void)
     s_service.passkey = 0U;
     s_service.tx_flow_id = 0U;
     s_service.tx_length = 0U;
+    _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
 }
 
@@ -396,6 +418,12 @@ esp_err_t ble_link_service_accept(
         return ESP_ERR_INVALID_ARG;
     }
     _ble_link_service_lock();
+    if (s_service.rx_reserved ||
+            device_link_v1_engine_write_blocked(&s_service.engine))
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     ble_link_work_t *work = _ble_link_service_alloc_work();
 
     if (work == NULL)
@@ -403,6 +431,8 @@ esp_err_t ble_link_service_accept(
         _ble_link_service_unlock();
         return ESP_ERR_NO_MEM;
     }
+    s_service.rx_reserved = true;
+    s_service.rx_owner = work;
     work->att_mtu = (uint16_t)facts->preferred_att_mtu;
     work->generation = facts->connection_generation;
     if (facts->preferred_att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU)
@@ -434,8 +464,15 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
     if (!s_service.connection_valid ||
             work->generation != s_service.connection_generation)
     {
+        _ble_link_service_clear_reservation(work);
         _ble_link_service_unlock();
         return ESP_OK;
+    }
+    if (device_link_v1_engine_write_blocked(&s_service.engine))
+    {
+        _ble_link_service_clear_reservation(work);
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
     memset(&input, 0, sizeof(input));
     input.att_mtu = work->att_mtu;
@@ -451,6 +488,7 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
     device_link_v1_route_write(&input, &route);
     if (route.kind == DEVICE_LINK_V1_ROUTE_ATT)
     {
+        _ble_link_service_clear_reservation(work);
         _ble_link_service_unlock();
         return ESP_ERR_INVALID_STATE;
     }
@@ -469,6 +507,7 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
         device_link_v1_engine_arm_response(&s_service.engine,
                                            route.request.request_id, false, false);
     }
+    _ble_link_service_clear_reservation(work);
     if (length == 0U)
     {
         device_link_v1_engine_abort_tx(&s_service.engine);
@@ -494,6 +533,7 @@ void ble_link_service_release_work(ble_link_work_t *work)
         return;
     }
     _ble_link_service_lock();
+    _ble_link_service_clear_reservation(work);
     memset(work, 0, sizeof(*work));
     _ble_link_service_unlock();
 }
@@ -574,7 +614,8 @@ esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last)
 bool ble_link_service_write_blocked(void)
 {
     _ble_link_service_lock();
-    const bool blocked = device_link_v1_engine_write_blocked(&s_service.engine);
+    const bool blocked = s_service.rx_reserved ||
+                         device_link_v1_engine_write_blocked(&s_service.engine);
 
     _ble_link_service_unlock();
     return blocked;
@@ -590,6 +631,7 @@ void ble_link_service_abort_transactions(void)
     _ble_link_service_lock();
     device_link_v1_engine_disconnect(&s_service.engine);
     device_link_v1_engine_connect(&s_service.engine);
+    _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
 }
 
@@ -613,6 +655,7 @@ void ble_link_service_clear_session_state(void)
     s_service.confirmation_pending = false;
     s_service.confirmation_token = 0U;
     s_service.passkey = 0U;
+    _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
 }
 
@@ -640,6 +683,7 @@ esp_err_t ble_link_service_abort_tx_if_current(
         return ESP_ERR_NOT_FOUND;
     }
     device_link_v1_engine_abort_tx(&s_service.engine);
+    _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
     return ESP_OK;
 }

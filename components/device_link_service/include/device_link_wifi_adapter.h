@@ -11,7 +11,11 @@
 extern "C" {
 #endif
 
-/** @brief Fill GET_INFO firmware fields. */
+/** @brief Install the product compatibility firmware triple for GET_INFO. */
+void device_link_wifi_adapter_set_firmware(uint8_t major, uint8_t minor,
+        uint8_t patch);
+
+/** @brief Fill GET_INFO firmware fields from the installed product version. */
 void device_link_wifi_adapter_fill_info(device_link_v1_info_t *info, void *arg);
 
 /** @brief Submit one admitted Device Link operation to connectivity_manager. */

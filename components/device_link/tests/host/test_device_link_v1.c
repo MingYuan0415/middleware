@@ -250,22 +250,29 @@ static void _test_scan_filter(void)
     memset(source, 0, sizeof(source));
     source[0].ssid[0] = 'A';
     source[0].ssid_length = 1U;
-    source[0].authmode = DEVICE_LINK_V1_WIFI_AUTH_OPEN;
+    source[0].security = DEVICE_LINK_V1_WIFI_OPEN;
     source[0].rssi_dbm = -40;
     source[1].ssid_length = 0U;
-    source[1].authmode = DEVICE_LINK_V1_WIFI_AUTH_OPEN;
+    source[1].security = DEVICE_LINK_V1_WIFI_OPEN;
     source[2].ssid[0] = 'B';
     source[2].ssid_length = 1U;
-    source[2].authmode = 1U;
+    source[2].security = (device_link_v1_wifi_security_t)0;
     source[2].rssi_dbm = -30;
     source[3].ssid[0] = 'A';
     source[3].ssid_length = 1U;
-    source[3].authmode = DEVICE_LINK_V1_WIFI_AUTH_WPA2_PSK;
+    source[3].security = DEVICE_LINK_V1_WIFI_PERSONAL;
     source[3].rssi_dbm = -20;
     assert(device_link_v1_filter_scan_networks(source, 4U, out, 5U) == 2U);
     assert(out[0].security == DEVICE_LINK_V1_WIFI_OPEN);
     assert(out[1].security == DEVICE_LINK_V1_WIFI_PERSONAL);
     assert(out[1].ssid[0] == 'A');
+
+    source[0].rssi_dbm = -50;
+    source[0].security = DEVICE_LINK_V1_WIFI_PERSONAL;
+    source[3].rssi_dbm = -10;
+    assert(device_link_v1_filter_scan_networks(source, 4U, out, 5U) == 1U);
+    assert(out[0].security == DEVICE_LINK_V1_WIFI_PERSONAL);
+    assert(out[0].rssi_dbm == -10);
 }
 
 int main(void)

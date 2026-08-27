@@ -287,24 +287,13 @@ static size_t _device_link_v1_encode_networks(
     return offset;
 }
 
-static bool _device_link_v1_security_from_authmode(
-    uint32_t authmode, device_link_v1_wifi_security_t *security)
+static bool _device_link_v1_scan_key_equal(
+    const device_link_v1_network_t *left,
+    const device_link_v1_network_t *right)
 {
-    if (authmode == DEVICE_LINK_V1_WIFI_AUTH_OPEN)
-    {
-        *security = DEVICE_LINK_V1_WIFI_OPEN;
-        return true;
-    }
-    if (authmode == DEVICE_LINK_V1_WIFI_AUTH_WPA_PSK ||
-            authmode == DEVICE_LINK_V1_WIFI_AUTH_WPA2_PSK ||
-            authmode == DEVICE_LINK_V1_WIFI_AUTH_WPA_WPA2_PSK ||
-            authmode == DEVICE_LINK_V1_WIFI_AUTH_WPA3_PSK ||
-            authmode == DEVICE_LINK_V1_WIFI_AUTH_WPA2_WPA3_PSK)
-    {
-        *security = DEVICE_LINK_V1_WIFI_PERSONAL;
-        return true;
-    }
-    return false;
+    return left->security == right->security &&
+           left->ssid_length == right->ssid_length &&
+           memcmp(left->ssid, right->ssid, left->ssid_length) == 0;
 }
 
 bool device_link_v1_att_value_length_valid(size_t length)
@@ -760,9 +749,10 @@ uint8_t device_link_v1_filter_scan_networks(
     {
         out_capacity = DEVICE_LINK_V1_MAX_SCAN_NETWORKS;
     }
-    for (uint8_t i = 0U; i < source_count && count < out_capacity; ++i)
+    for (uint8_t i = 0U; i < source_count; ++i)
     {
         device_link_v1_network_t network;
+        bool replaced = false;
 
         memset(&network, 0, sizeof(network));
         if (source[i].ssid_length < 1U ||
@@ -772,10 +762,25 @@ uint8_t device_link_v1_filter_scan_networks(
         }
         memcpy(network.ssid, source[i].ssid, source[i].ssid_length);
         network.ssid_length = source[i].ssid_length;
+        network.security = source[i].security;
         network.rssi_dbm = source[i].rssi_dbm;
-        if (!_device_link_v1_security_from_authmode(source[i].authmode,
-                &network.security) ||
-                !_device_link_v1_network_valid(&network))
+        if (!_device_link_v1_network_valid(&network))
+        {
+            continue;
+        }
+        for (uint8_t j = 0U; j < count; ++j)
+        {
+            if (_device_link_v1_scan_key_equal(&out[j], &network))
+            {
+                if (network.rssi_dbm > out[j].rssi_dbm)
+                {
+                    out[j] = network;
+                }
+                replaced = true;
+                break;
+            }
+        }
+        if (replaced || count >= out_capacity)
         {
             continue;
         }

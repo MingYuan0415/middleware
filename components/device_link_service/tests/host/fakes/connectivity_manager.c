@@ -38,6 +38,23 @@ void connectivity_manager_fake_reset(void)
     memset(&s_last_saved, 0, sizeof(s_last_saved));
     memset(s_saved_ssid, 0, sizeof(s_saved_ssid));
     memset(s_saved_password, 0, sizeof(s_saved_password));
+    memset(&s_status, 0, sizeof(s_status));
+    s_status.generation = 1U;
+    s_status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    s_status.available = true;
+    s_status.radio_available = true;
+    s_status.profile_persisted = true;
+    s_status.auto_connect = true;
+    s_status.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
+}
+
+void connectivity_manager_fake_set_status(
+    const connectivity_manager_status_snapshot_t *snapshot)
+{
+    if (snapshot != NULL)
+    {
+        s_status = *snapshot;
+    }
 }
 
 const connectivity_manager_credentials_t *connectivity_manager_fake_last_saved(

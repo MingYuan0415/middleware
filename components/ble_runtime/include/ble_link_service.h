@@ -114,6 +114,13 @@ uint32_t ble_link_service_operation_timeout_remaining_ms(void);
  */
 void ble_link_service_set_att_mtu(uint16_t att_mtu);
 esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
+
+/**
+ * @brief True while a Write is reserved or a `server_tx` indication is
+ * unconfirmed.
+ *
+ * GATT must reject a new Write with ATT `0xfe` when this is true.
+ */
 bool ble_link_service_write_blocked(void);
 bool ble_link_service_response_in_flight(void);
 void ble_link_service_abort_transactions(void);

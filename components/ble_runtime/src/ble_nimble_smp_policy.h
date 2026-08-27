@@ -62,6 +62,37 @@ ble_nimble_smp_repeat_decision_t ble_nimble_smp_repeat_decide(
 bool ble_nimble_smp_numeric_comparison_inject_required(
     bool pending, uint16_t conn_handle);
 
+/**
+ * @brief Decide whether a Numeric Comparison inject consumed the pending
+ * action.
+ *
+ * @param inject_result NimBLE `ble_sm_inject_io` return value.
+ * @return true when the pending flag and connection handle may be cleared.
+ */
+bool ble_nimble_smp_numeric_comparison_reply_committed(int inject_result);
+
+/**
+ * @brief Decide whether a failed Numeric Comparison inject may restore
+ * pending state.
+ *
+ * Restore only when the connection identity is unchanged. A disconnect or
+ * a new passkey offer advances the epoch and must not revive a stale
+ * pending flag.
+ *
+ * @param inject_committed True when `ble_sm_inject_io` consumed the action.
+ * @param begin_epoch Epoch sampled when the reply cleared pending.
+ * @param current_epoch Epoch after inject returned.
+ * @param begin_handle Connection handle sampled with `begin_epoch`.
+ * @param current_handle Connection handle after inject returned.
+ * @return true when pending may be set again for the same action.
+ */
+bool ble_nimble_smp_numeric_comparison_restore_pending(
+    bool inject_committed,
+    uint32_t begin_epoch,
+    uint32_t current_epoch,
+    uint16_t begin_handle,
+    uint16_t current_handle);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,8 +1,8 @@
 lock_format=2
-contract_commit=ec245e4e1bbf85ef73b003132679227d6ef4591b
+contract_commit=0bbb552fe8781f4a973d1ef6e0fd88c09159b742
 profile=device-link/v1
 schema_format=fixed-binary/1
-schema_digest=2b6a39f2dc2bc9f846ee4ab79dc4fc0f15c0208c43dcfc08117ef1372e4bdda8
+schema_digest=465bdc3dd09cb8b053a63d778d3e80d2f06fe3957a5e466f564fedc24353e5ed
 release_state=freeze_candidate
 release_tag=none
 pin_state=working_tree_candidate

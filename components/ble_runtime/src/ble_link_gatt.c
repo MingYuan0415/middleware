@@ -260,6 +260,10 @@ static int _ble_link_gatt_access(
                            &facts, BLE_LINK_SERVICE_RX_SESSION, context->write_data,
                            context->write_len, &work);
 
+    if (result == ESP_ERR_INVALID_STATE)
+    {
+        return (int)DEVICE_LINK_V1_ATT_TX_INDICATION_PENDING;
+    }
     if (result != ESP_OK || work == NULL)
     {
         return BLE_ATT_ERR_INSUFFICIENT_RESOURCES;

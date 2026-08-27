@@ -4714,16 +4714,44 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
 }
 
 static uint16_t s_passkey_conn_handle;
-static atomic_bool s_passkey_pending = ATOMIC_VAR_INIT(false);
+static bool s_passkey_pending;
+static uint32_t s_passkey_epoch;
+static SemaphoreHandle_t s_passkey_lock;
+static StaticSemaphore_t s_passkey_lock_control;
 static atomic_bool s_acl_pairing_attempted = ATOMIC_VAR_INIT(false);
+
+static void _ble_nimble_port_passkey_lock(void)
+{
+    if (s_passkey_lock == NULL)
+    {
+        s_passkey_lock = xSemaphoreCreateMutexStatic(&s_passkey_lock_control);
+    }
+    if (s_passkey_lock != NULL)
+    {
+        (void)xSemaphoreTake(s_passkey_lock, portMAX_DELAY);
+    }
+}
+
+static void _ble_nimble_port_passkey_unlock(void)
+{
+    if (s_passkey_lock != NULL)
+    {
+        (void)xSemaphoreGive(s_passkey_lock);
+    }
+}
 
 void ble_nimble_port_numeric_comparison_cancel(void)
 {
-    const uint16_t conn_handle = s_passkey_conn_handle;
-    const bool pending = atomic_exchange_explicit(&s_passkey_pending, false,
-                         memory_order_acq_rel);
+    uint16_t conn_handle;
+    bool pending;
 
+    _ble_nimble_port_passkey_lock();
+    conn_handle = s_passkey_conn_handle;
+    pending = s_passkey_pending;
+    s_passkey_pending = false;
     s_passkey_conn_handle = 0U;
+    s_passkey_epoch++;
+    _ble_nimble_port_passkey_unlock();
     if (!ble_nimble_smp_numeric_comparison_inject_required(
                 pending, conn_handle))
     {
@@ -4743,26 +4771,49 @@ void ble_nimble_port_numeric_comparison_cancel(void)
 
 esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept)
 {
-    if (!atomic_exchange_explicit(&s_passkey_pending, false,
-                                  memory_order_acq_rel))
+    uint16_t conn_handle;
+    uint32_t epoch;
+    int result;
+
+    _ble_nimble_port_passkey_lock();
+    if (!s_passkey_pending)
     {
+        _ble_nimble_port_passkey_unlock();
         return ESP_ERR_INVALID_STATE;
     }
+    s_passkey_pending = false;
+    conn_handle = s_passkey_conn_handle;
+    epoch = s_passkey_epoch;
+    _ble_nimble_port_passkey_unlock();
 #ifndef UNIT_TEST_HOST
-    struct ble_sm_io io;
+    {
+        struct ble_sm_io io;
 
-    memset(&io, 0, sizeof(io));
-    io.action = BLE_SM_IOACT_NUMCMP;
-    io.numcmp_accept = accept ? 1 : 0;
-    const int result = ble_sm_inject_io(s_passkey_conn_handle, &io);
-
-    s_passkey_conn_handle = 0U;
-    return result == 0 ? ESP_OK : ESP_FAIL;
+        memset(&io, 0, sizeof(io));
+        io.action = BLE_SM_IOACT_NUMCMP;
+        io.numcmp_accept = accept ? 1 : 0;
+        result = ble_sm_inject_io(conn_handle, &io);
+    }
 #else
     (void)accept;
-    s_passkey_conn_handle = 0U;
-    return ESP_OK;
+    result = 0;
 #endif
+    const bool committed =
+        ble_nimble_smp_numeric_comparison_reply_committed(result);
+
+    _ble_nimble_port_passkey_lock();
+    if (ble_nimble_smp_numeric_comparison_restore_pending(
+                committed, epoch, s_passkey_epoch, conn_handle,
+                s_passkey_conn_handle))
+    {
+        s_passkey_pending = true;
+    }
+    else if (committed)
+    {
+        s_passkey_conn_handle = 0U;
+    }
+    _ble_nimble_port_passkey_unlock();
+    return committed ? ESP_OK : ESP_FAIL;
 }
 
 static int _ble_nimble_port_gap_event(
@@ -5119,9 +5170,11 @@ static int _ble_nimble_port_gap_event(
         if (ble_nimble_smp_passkey_decide(event->passkey.params.action) ==
                 BLE_NIMBLE_SMP_PASSKEY_ACCEPT_NUMCMP)
         {
+            _ble_nimble_port_passkey_lock();
             s_passkey_conn_handle = event->passkey.conn_handle;
-            atomic_store_explicit(&s_passkey_pending, true,
-                                  memory_order_release);
+            s_passkey_pending = true;
+            s_passkey_epoch++;
+            _ble_nimble_port_passkey_unlock();
             (void)ble_link_service_offer_numeric_comparison(
                 event->passkey.params.numcmp);
             return 0;
@@ -6250,8 +6303,16 @@ static esp_err_t _ble_nimble_port_init(void)
         s_cleanup_drain_lock = xSemaphoreCreateMutexStatic(
                                    &s_cleanup_drain_lock_control);
     }
+    if (s_passkey_lock == NULL)
+    {
+        s_passkey_lock = xSemaphoreCreateMutexStatic(
+                             &s_passkey_lock_control);
+    }
+    s_passkey_pending = false;
+    s_passkey_conn_handle = 0U;
     if (s_pairing_gate_ack == NULL || s_pairing_gate_lock == NULL ||
-            s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL)
+            s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL ||
+            s_passkey_lock == NULL)
     {
         return _ble_nimble_port_rollback_init(
                    ESP_ERR_NO_MEM, true, false, false);

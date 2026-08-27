@@ -35,6 +35,9 @@ typedef struct device_link_service_config
     uint32_t task_priority; /**< Worker task priority. */
     uint32_t window_ms; /**< Binding window duration in milliseconds. */
     device_link_service_startup_mode_t startup_mode; /**< Advertising gate. */
+    uint8_t firmware_major; /**< Product compatibility major version. */
+    uint8_t firmware_minor; /**< Product compatibility minor version. */
+    uint8_t firmware_patch; /**< Product compatibility patch version. */
 } device_link_service_config_t;
 
 /** @brief Device Link service state visible to applications. */

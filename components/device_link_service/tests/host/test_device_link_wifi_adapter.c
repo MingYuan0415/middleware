@@ -13,6 +13,8 @@
 #include "event_bus.h"
 
 extern void connectivity_manager_fake_reset(void);
+extern void connectivity_manager_fake_set_status(
+    const connectivity_manager_status_snapshot_t *snapshot);
 extern void connectivity_manager_fake_set_scan(
     const connectivity_manager_scan_snapshot_t *snapshot);
 extern void connectivity_manager_fake_set_request_result(esp_err_t result);
@@ -34,6 +36,7 @@ static void test_fill_info(void)
     device_link_v1_info_t info;
 
     memset(&info, 0xff, sizeof(info));
+    device_link_wifi_adapter_set_firmware(0U, 1U, 0U);
     device_link_wifi_adapter_fill_info(&info, NULL);
     assert(info.firmware_major == 0U);
     assert(info.firmware_minor == 1U);
@@ -253,6 +256,102 @@ static void test_complete_failure_keeps_bridge_id(void)
     device_link_wifi_adapter_bridge_stop();
 }
 
+static void test_bridge_start_seeds_saved_profile(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 4U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    status.available = true;
+    status.radio_available = true;
+    status.saved_profile = true;
+    status.profile_persisted = true;
+    memcpy(status.ssid, "cafe", 4U);
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    connectivity_manager_fake_set_status(&status);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(ble_link_service_fake_observe_count() >= 1U);
+    assert(ble_link_service_fake_last_snapshot()->state ==
+           DEVICE_LINK_V1_WIFI_CONNECTED);
+    assert(ble_link_service_fake_last_snapshot()->profile_ssid_length == 4U);
+    assert(memcmp(ble_link_service_fake_last_snapshot()->profile_ssid,
+                  "cafe", 4U) == 0);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_bridge_start_seeds_generation_zero(void)
+{
+    connectivity_manager_status_snapshot_t status;
+    unsigned observe_count;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 0U;
+    status.state = CONNECTIVITY_MANAGER_STATE_OFFLINE;
+    status.failure = CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
+    status.available = false;
+    status.radio_available = false;
+    status.saved_profile = true;
+    status.profile_persisted = true;
+    memcpy(status.ssid, "cafe", 4U);
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    connectivity_manager_fake_set_status(&status);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    observe_count = ble_link_service_fake_observe_count();
+    assert(observe_count >= 1U);
+    assert(ble_link_service_fake_last_snapshot()->state ==
+           DEVICE_LINK_V1_WIFI_UNAVAILABLE);
+    assert(ble_link_service_fake_last_snapshot()->failure ==
+           DEVICE_LINK_V1_WIFI_FAILURE_RADIO);
+    assert(ble_link_service_fake_last_snapshot()->profile_ssid_length == 4U);
+    assert(memcmp(ble_link_service_fake_last_snapshot()->profile_ssid,
+                  "cafe", 4U) == 0);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_observe_count() == observe_count);
+    status.generation = 1U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
+    status.available = true;
+    status.radio_available = true;
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_last_snapshot()->state ==
+           DEVICE_LINK_V1_WIFI_CONNECTED);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_radio_unavailable_keeps_saved_profile(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 5U;
+    status.state = CONNECTIVITY_MANAGER_STATE_OFFLINE;
+    status.failure = CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
+    status.available = true;
+    status.radio_available = false;
+    status.saved_profile = true;
+    status.profile_persisted = true;
+    memcpy(status.ssid, "cafe", 4U);
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    connectivity_manager_fake_set_status(&status);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(ble_link_service_fake_last_snapshot()->state ==
+           DEVICE_LINK_V1_WIFI_UNAVAILABLE);
+    assert(ble_link_service_fake_last_snapshot()->failure ==
+           DEVICE_LINK_V1_WIFI_FAILURE_RADIO);
+    assert(ble_link_service_fake_last_snapshot()->profile_ssid_length == 4U);
+    assert(memcmp(ble_link_service_fake_last_snapshot()->profile_ssid,
+                  "cafe", 4U) == 0);
+    device_link_wifi_adapter_bridge_stop();
+}
+
 int main(void)
 {
     test_fill_info();
@@ -264,5 +363,8 @@ int main(void)
     test_canceled_connect_completes_timeout();
     test_scan_timeout_maps_timeout();
     test_complete_failure_keeps_bridge_id();
+    test_bridge_start_seeds_saved_profile();
+    test_bridge_start_seeds_generation_zero();
+    test_radio_unavailable_keeps_saved_profile();
     return 0;
 }

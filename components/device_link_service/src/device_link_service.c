@@ -2088,6 +2088,9 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
                           memory_order_release);
     memset(&s_service, 0, sizeof(s_service));
     s_service.config = *config;
+    device_link_wifi_adapter_set_firmware(config->firmware_major,
+                                          config->firmware_minor,
+                                          config->firmware_patch);
     s_service.startup_gate_released =
         config->startup_mode == DEVICE_LINK_SERVICE_STARTUP_NORMAL;
     bool policy_enabled = true;

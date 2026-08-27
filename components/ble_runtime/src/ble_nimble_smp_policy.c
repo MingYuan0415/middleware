@@ -28,3 +28,21 @@ bool ble_nimble_smp_numeric_comparison_inject_required(
 {
     return pending && conn_handle != 0U;
 }
+
+bool ble_nimble_smp_numeric_comparison_reply_committed(int inject_result)
+{
+    return inject_result == 0;
+}
+
+bool ble_nimble_smp_numeric_comparison_restore_pending(
+    bool inject_committed,
+    uint32_t begin_epoch,
+    uint32_t current_epoch,
+    uint16_t begin_handle,
+    uint16_t current_handle)
+{
+    return !inject_committed &&
+           begin_epoch == current_epoch &&
+           begin_handle != 0U &&
+           begin_handle == current_handle;
+}
