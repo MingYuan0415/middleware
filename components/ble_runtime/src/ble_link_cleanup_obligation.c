@@ -8,21 +8,8 @@ static bool _ble_link_cleanup_identity_valid(
     return identity != NULL && identity->generation != 0U &&
            identity->token != 0U &&
            (identity->kind == BLE_LINK_OPERATION_PROVISIONAL_DISCARD ||
-            identity->kind == BLE_LINK_OPERATION_PEER_CLEANUP ||
-            identity->kind == BLE_LINK_OPERATION_REMOTE_REPLACEMENT) &&
+            identity->kind == BLE_LINK_OPERATION_PEER_CLEANUP) &&
            identity->conn_handle != UINT16_MAX;
-}
-
-static bool _ble_link_cleanup_same_operation(
-    const ble_link_operation_identity_t *left,
-    const ble_link_operation_identity_t *right)
-{
-    return left != NULL && right != NULL &&
-           left->generation == right->generation &&
-           left->security_epoch == right->security_epoch &&
-           left->flow_id == right->flow_id &&
-           left->token == right->token &&
-           left->conn_handle == right->conn_handle;
 }
 
 static ble_link_cleanup_slot_t *_ble_link_cleanup_slot(
@@ -247,35 +234,6 @@ void ble_link_cleanup_finish(
         }
         return;
     }
-}
-
-ble_link_cleanup_promote_result_t ble_link_cleanup_promote(
-    ble_link_cleanup_state_t *state,
-    const ble_link_operation_identity_t *identity)
-{
-    if (state == NULL || identity == NULL ||
-            identity->kind != BLE_LINK_OPERATION_PROVISIONAL_PROMOTE)
-    {
-        return BLE_LINK_CLEANUP_PROMOTE_NOT_FOUND;
-    }
-    for (size_t i = 0U; i <= BLE_LINK_CLEANUP_OBLIGATION_CAPACITY; ++i)
-    {
-        ble_link_cleanup_slot_t *const slot =
-            _ble_link_cleanup_slot(state, i);
-
-        if (slot->active && slot->request.provisional &&
-                _ble_link_cleanup_same_operation(
-                    &slot->request.identity, identity))
-        {
-            if (slot->in_progress)
-            {
-                return BLE_LINK_CLEANUP_PROMOTE_IN_PROGRESS;
-            }
-            memset(slot, 0, sizeof(*slot));
-            return BLE_LINK_CLEANUP_PROMOTE_COMPLETE;
-        }
-    }
-    return BLE_LINK_CLEANUP_PROMOTE_NOT_FOUND;
 }
 
 bool ble_link_cleanup_terminal_fence_retain(

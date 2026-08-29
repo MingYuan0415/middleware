@@ -50,14 +50,6 @@ typedef struct ble_link_cleanup_state
     uint16_t terminal_fence_conn_handle;
 } ble_link_cleanup_state_t;
 
-/** @brief Result of an exact provisional promotion attempt. */
-typedef enum ble_link_cleanup_promote_result
-{
-    BLE_LINK_CLEANUP_PROMOTE_NOT_FOUND = 0,
-    BLE_LINK_CLEANUP_PROMOTE_IN_PROGRESS,
-    BLE_LINK_CLEANUP_PROMOTE_COMPLETE,
-} ble_link_cleanup_promote_result_t;
-
 /** @brief Reset all retained cleanup and terminal-fence state. */
 void ble_link_cleanup_reset(ble_link_cleanup_state_t *state);
 
@@ -76,17 +68,6 @@ void ble_link_cleanup_finish(
     ble_link_cleanup_state_t *state,
     const ble_link_cleanup_request_t *request, bool complete,
     uint64_t retry_not_before_us);
-
-/**
- * @brief Retire a provisional discard after the same operation was promoted.
- *
- * Kind is intentionally excluded from the match: the caller supplies a
- * PROVISIONAL_PROMOTE identity while the retained slot is a
- * PROVISIONAL_DISCARD. Every other identity field must match exactly.
- */
-ble_link_cleanup_promote_result_t ble_link_cleanup_promote(
-    ble_link_cleanup_state_t *state,
-    const ble_link_operation_identity_t *identity);
 
 /** @brief Retain the terminal write fence for one exact ACL generation. */
 bool ble_link_cleanup_terminal_fence_retain(

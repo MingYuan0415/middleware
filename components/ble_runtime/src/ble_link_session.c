@@ -424,8 +424,6 @@ static ble_link_session_state_t _ble_link_session_get_state_locked(
             s_session.identity_known && s_session.security2_open &&
             s_session.authorized)
     {
-        /* Exactly the control/session admission condition: a state name
-         * must never admit traffic the query would reject. */
         return BLE_LINK_SESSION_AUTHORIZED;
     }
     if (s_session.encrypted && s_session.bond_verified &&
@@ -522,17 +520,13 @@ static uint32_t _ble_link_session_get_state_flags_locked(void)
     {
         flags |= BLE_LINK_STATE_FLAG_BOUND;
     }
-    /* AUTHENTICATED implies BOUND: a bootstrap Security 2 session without a
-     * committed record does not publish the flag. */
+    /* v1 authentication is the verified LE Secure Connections bond itself;
+     * there is no application-layer authentication handshake. */
     if (s_session.bound && s_session.encrypted && s_session.bond_verified &&
-            s_session.identity_known && s_session.security2_open)
+            s_session.identity_known)
     {
         flags |= BLE_LINK_STATE_FLAG_AUTHENTICATED;
     }
-    /* AUTHORIZED implies AUTHENTICATED and BOUND: the flag is masked with
-     * the full AUTHENTICATED fact set so the published 16-byte value is
-     * always a coherent combination even if a future path sets the
-     * authorized fact before its prerequisites converge. */
     if (s_session.authorized && s_session.bound && s_session.encrypted &&
             s_session.bond_verified && s_session.identity_known &&
             s_session.security2_open)

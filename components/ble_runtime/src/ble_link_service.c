@@ -85,6 +85,21 @@ static void _ble_link_service_drop_reservation(void)
     s_service.rx_owner = NULL;
 }
 
+static bool _ble_link_service_clear_session_state_locked(void)
+{
+    const bool confirmation_changed = s_service.confirmation_pending;
+
+    device_link_v1_engine_disconnect(&s_service.engine);
+    s_service.connection_valid = false;
+    s_service.connection_generation = 0U;
+    s_service.conn_handle = 0U;
+    s_service.confirmation_pending = false;
+    s_service.confirmation_token = 0U;
+    s_service.passkey = 0U;
+    _ble_link_service_drop_reservation();
+    return confirmation_changed;
+}
+
 static void _ble_link_service_clear_reservation(ble_link_work_t *work)
 {
     if (s_service.rx_owner == work)
@@ -342,18 +357,17 @@ void ble_link_service_init(
 
 void ble_link_service_reset(void)
 {
+    bool confirmation_changed;
+
     _ble_link_service_lock();
-    device_link_v1_engine_disconnect(&s_service.engine);
-    s_service.connection_valid = false;
-    s_service.connection_generation = 0U;
-    s_service.conn_handle = 0U;
-    s_service.confirmation_pending = false;
-    s_service.confirmation_token = 0U;
-    s_service.passkey = 0U;
+    confirmation_changed = _ble_link_service_clear_session_state_locked();
     s_service.tx_flow_id = 0U;
     s_service.tx_length = 0U;
-    _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
+    if (confirmation_changed)
+    {
+        _ble_link_service_wake();
+    }
 }
 
 void ble_link_service_set_v1_ops(const ble_link_v1_owner_ops_t *ops, void *arg)
@@ -637,26 +651,41 @@ void ble_link_service_abort_transactions(void)
 
 void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle)
 {
+    bool confirmation_changed;
+
     _ble_link_service_lock();
+    confirmation_changed = s_service.confirmation_pending &&
+                           (!s_service.connection_valid ||
+                            generation != s_service.connection_generation ||
+                            conn_handle != s_service.conn_handle);
+    if (confirmation_changed)
+    {
+        s_service.confirmation_pending = false;
+        s_service.confirmation_token = 0U;
+        s_service.passkey = 0U;
+    }
     s_service.connection_generation = generation;
     s_service.conn_handle = conn_handle;
     s_service.connection_valid = generation != 0U;
     device_link_v1_engine_connect(&s_service.engine);
     _ble_link_service_unlock();
+    if (confirmation_changed)
+    {
+        _ble_link_service_wake();
+    }
 }
 
 void ble_link_service_clear_session_state(void)
 {
+    bool confirmation_changed;
+
     _ble_link_service_lock();
-    device_link_v1_engine_disconnect(&s_service.engine);
-    s_service.connection_valid = false;
-    s_service.connection_generation = 0U;
-    s_service.conn_handle = 0U;
-    s_service.confirmation_pending = false;
-    s_service.confirmation_token = 0U;
-    s_service.passkey = 0U;
-    _ble_link_service_drop_reservation();
+    confirmation_changed = _ble_link_service_clear_session_state_locked();
     _ble_link_service_unlock();
+    if (confirmation_changed)
+    {
+        _ble_link_service_wake();
+    }
 }
 
 esp_err_t ble_link_service_clear_session_state_if_current(
@@ -668,8 +697,14 @@ esp_err_t ble_link_service_clear_session_state_if_current(
         _ble_link_service_unlock();
         return ESP_ERR_NOT_FOUND;
     }
+    const bool confirmation_changed =
+        _ble_link_service_clear_session_state_locked();
+
     _ble_link_service_unlock();
-    ble_link_service_clear_session_state();
+    if (confirmation_changed)
+    {
+        _ble_link_service_wake();
+    }
     return ESP_OK;
 }
 
@@ -701,39 +736,30 @@ esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept)
     s_service.confirmation_token = 0U;
     s_service.passkey = 0U;
     _ble_link_service_unlock();
+    _ble_link_service_wake();
     (void)accept;
     return ESP_OK;
 }
 
-bool ble_link_service_pending_confirmation(void)
+ble_link_confirmation_snapshot_t ble_link_service_get_confirmation(void)
 {
-    _ble_link_service_lock();
-    const bool pending = s_service.confirmation_pending;
+    ble_link_confirmation_snapshot_t snapshot;
 
+    _ble_link_service_lock();
+    snapshot.pending = s_service.confirmation_pending;
+    snapshot.token = s_service.confirmation_token;
+    snapshot.numeric_comparison = s_service.passkey;
     _ble_link_service_unlock();
-    return pending;
+    return snapshot;
 }
 
-uint64_t ble_link_service_confirmation_token(void)
+esp_err_t ble_link_service_offer_numeric_comparison(
+    uint32_t passkey, uint64_t *out_token)
 {
-    _ble_link_service_lock();
-    const uint64_t token = s_service.confirmation_token;
-
-    _ble_link_service_unlock();
-    return token;
-}
-
-uint32_t ble_link_service_numeric_comparison_value(void)
-{
-    _ble_link_service_lock();
-    const uint32_t passkey = s_service.passkey;
-
-    _ble_link_service_unlock();
-    return passkey;
-}
-
-esp_err_t ble_link_service_offer_numeric_comparison(uint32_t passkey)
-{
+    if (out_token == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     _ble_link_service_lock();
     s_service.passkey = passkey;
     s_service.confirmation_pending = true;
@@ -743,51 +769,8 @@ esp_err_t ble_link_service_offer_numeric_comparison(uint32_t passkey)
     }
     s_service.confirmation_token = s_service.next_token;
     ++s_service.next_token;
+    *out_token = s_service.confirmation_token;
     _ble_link_service_unlock();
     _ble_link_service_wake();
-    return ESP_OK;
-}
-
-esp_err_t ble_link_service_register_remote_replacement(
-    const ble_link_operation_identity_t *identity)
-{
-    (void)identity;
-    return ESP_OK;
-}
-
-bool ble_link_service_delayed_replacement_pending(uint32_t generation)
-{
-    (void)generation;
-    return false;
-}
-
-uint32_t ble_link_service_retained_retry_remaining_ms(void)
-{
-    return UINT32_MAX;
-}
-
-bool ble_link_service_retained_cleanup_pending(void)
-{
-    return false;
-}
-
-void ble_link_service_idle_timeout(uint32_t generation)
-{
-    (void)generation;
-}
-
-void ble_link_service_idle_timeout_epoch(uint32_t generation, uint32_t epoch)
-{
-    (void)generation;
-    (void)epoch;
-}
-
-uint32_t ble_link_service_auth_expiry_remaining_ms(void)
-{
-    return UINT32_MAX;
-}
-
-esp_err_t ble_link_service_auth_expiry_tick(void)
-{
     return ESP_OK;
 }

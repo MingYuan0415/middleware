@@ -197,7 +197,6 @@ static ble_nimble_adv_start_ops_t _guard_ops(void)
 static void _init_manager(void)
 {
     static const uint8_t short_name[] = "MT";
-    static const uint8_t public_instance_id[] = {0x12U, 0x34U, 0x56U};
     static const ble_adv_manager_config_t config =
     {
         .fast_interval_ms = 100U,
@@ -206,8 +205,6 @@ static void _init_manager(void)
         .short_name = short_name,
         .short_name_len = sizeof(short_name) - 1U,
         .service_uuid = s_uuid,
-        .adv_version = 2U,
-        .public_instance_id = public_instance_id,
         .now_ms = _fake_now_ms,
         .arm_timer = _fake_arm_timer,
         .timer_arg = NULL,
@@ -293,8 +290,7 @@ static void test_acquire_fast_starts_fast_adv(void)
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPED,
                       ble_adv_manager_get_state());
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(1U, lease.lease_id);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STARTING,
                       ble_adv_manager_get_state());
@@ -315,8 +311,7 @@ static void test_fast_window_expires_falls_back_to_slow(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -344,8 +339,7 @@ static void test_release_last_lease_stops(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_release_lease(lease.lease_id));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
@@ -366,8 +360,7 @@ static void test_slow_lease_skips_fast(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STARTING,
                       ble_adv_manager_get_state());
     TEST_ASSERT_TRUE(s_last_config_valid);
@@ -385,8 +378,7 @@ static void test_connect_stops_adv_disconnect_resumes(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -414,8 +406,7 @@ static void test_start_failure_faults(void)
     _init_manager();
     s_start_result = ESP_FAIL;
     TEST_ASSERT_EQUAL(ESP_FAIL, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED,
                       ble_adv_manager_get_state());
     s_start_result = ESP_OK;
@@ -431,8 +422,7 @@ static void test_async_start_failure_recovers(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(ESP_FAIL);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED,
                       ble_adv_manager_get_state());
@@ -460,7 +450,7 @@ static void test_async_start_failure_backoff_is_bounded(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(ESP_FAIL);
     TEST_ASSERT_EQUAL(100U,
                       ble_adv_manager_get_retry_remaining_ms());
@@ -498,7 +488,7 @@ static void test_start_target_change_resets_backoff(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(ESP_FAIL);
     TEST_ASSERT_EQUAL(100U,
                       ble_adv_manager_get_retry_remaining_ms());
@@ -528,7 +518,7 @@ static void test_async_stop_failure_respects_cooldown(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_set_paused(true));
     TEST_ASSERT_EQUAL(1U, s_stop_calls);
@@ -566,7 +556,7 @@ static void test_retry_deadline_wraps_monotonic_clock(void)
     _init_manager();
     s_now_ms = UINT32_MAX - 50U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(ESP_FAIL);
     TEST_ASSERT_EQUAL(100U,
                       ble_adv_manager_get_retry_remaining_ms());
@@ -588,14 +578,12 @@ static void test_fast_lease_escalates_slow_adv(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &slow_lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          false, NULL));
+                          &slow_lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &fast_lease, BLE_ADV_MANAGER_MODE_FAST,
-                          false, NULL));
+                          &fast_lease, BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
                       ble_adv_manager_get_state());
     _emit_adv_stopped(0);
@@ -625,49 +613,38 @@ static void test_fast_lease_escalates_slow_adv(void)
                       ble_adv_manager_get_state());
 }
 
-static void test_bindable_payload_built(void)
+static void test_bindable_control_is_explicit(void)
 {
-    const uint8_t discriminator[3] = {0xef, 0xcd, 0xab};
     ble_adv_lease_t lease;
 
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, true,
-                          discriminator));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, true));
     TEST_ASSERT_TRUE(s_last_config_valid);
-    TEST_ASSERT_EQUAL(5U, s_last_config.service_data_len);
-    TEST_ASSERT_EQUAL(0x02U, s_last_config.service_data[0]);
-    TEST_ASSERT_EQUAL(0x01U, s_last_config.service_data[1]);
-    TEST_ASSERT_EQUAL(0xefU, s_last_config.service_data[2]);
-    TEST_ASSERT_EQUAL(0xcdU, s_last_config.service_data[3]);
-    TEST_ASSERT_EQUAL(0xabU, s_last_config.service_data[4]);
+    TEST_ASSERT_TRUE(s_last_config.bindable);
     TEST_ASSERT_EQUAL(0U, memcmp(s_uuid, s_last_config.service_uuid, 16U));
 }
 
-static void test_bindable_lease_release_clears_payload(void)
+static void test_bindable_lease_release_restarts_with_closed_gate(void)
 {
-    const uint8_t discriminator[3] = {0xef, 0xcd, 0xab};
     ble_adv_lease_t bindable_lease;
     ble_adv_lease_t slow_lease;
 
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &slow_lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          false, NULL));
+                          &slow_lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &bindable_lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          true, discriminator));
+                          &bindable_lease, BLE_ADV_MANAGER_MODE_SLOW, true));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
                       ble_adv_manager_get_state());
     _emit_adv_stopped(0);
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
-    TEST_ASSERT_EQUAL(0x01U, s_last_config.service_data[1]);
-    TEST_ASSERT_EQUAL(0xefU, s_last_config.service_data[2]);
+    TEST_ASSERT_TRUE(s_last_config.bindable);
     TEST_ASSERT_EQUAL(ESP_OK,
                       ble_adv_manager_release_lease(bindable_lease.lease_id));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
@@ -676,10 +653,7 @@ static void test_bindable_lease_release_clears_payload(void)
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
-    TEST_ASSERT_EQUAL(0x00U, s_last_config.service_data[1]);
-    TEST_ASSERT_EQUAL(0x12U, s_last_config.service_data[2]);
-    TEST_ASSERT_EQUAL(0x34U, s_last_config.service_data[3]);
-    TEST_ASSERT_EQUAL(0x56U, s_last_config.service_data[4]);
+    TEST_ASSERT_TRUE(!s_last_config.bindable);
 }
 
 static void test_lease_capacity_enforced(void)
@@ -691,12 +665,10 @@ static void test_lease_capacity_enforced(void)
     for (uint8_t i = 0U; i < BLE_ADV_MANAGER_MAX_LEASES; ++i)
     {
         TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                              &lease, BLE_ADV_MANAGER_MODE_SLOW,
-                              false, NULL));
+                              &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     }
     TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
 }
 
 static void test_stale_adv_started_rejected_by_generation(void)
@@ -707,8 +679,7 @@ static void test_stale_adv_started_rejected_by_generation(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -746,7 +717,7 @@ static void test_stale_adv_stopped_rejected_by_generation(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_set_paused(true));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
@@ -791,8 +762,7 @@ static void test_stop_submission_failure_faults(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -817,8 +787,7 @@ static void test_stop_submission_failure_faults(void)
                       ble_adv_manager_get_state());
     /* A fresh lease starts advertising again. */
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STARTING,
                       ble_adv_manager_get_state());
     _emit_adv_started(0);
@@ -834,8 +803,7 @@ static void test_paused_keeps_fast_window(void)
     _init_manager();
     const unsigned int cancel_before = s_timer_cancel_calls;
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -865,8 +833,7 @@ static void test_rejected_connect_ignored(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     /* A rejected CONNECT (accepted=false) must not mark the manager
      * connected: its disconnect must never retire the real ACL's state. */
@@ -897,8 +864,7 @@ static void test_release_failure_restores_fast_window(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -949,8 +915,7 @@ static void test_release_failure_expired_window_stays_closed(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -994,8 +959,7 @@ static void test_release_failure_at_exact_deadline_stays_closed(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -1032,8 +996,7 @@ static void test_release_last_fast_lease_cancels_window(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -1065,15 +1028,13 @@ static void test_deinit_rejects_calls(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     ble_adv_manager_deinit();
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPED,
                       ble_adv_manager_get_state());
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_adv_manager_acquire_lease(
                           &lease,
-                          BLE_ADV_MANAGER_MODE_FAST,
-                          false, NULL));
+                          BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
                       ble_adv_manager_release_lease(lease.lease_id));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
@@ -1090,8 +1051,7 @@ static void test_last_lease_stop_failure_retries_on_event(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -1116,23 +1076,15 @@ static void test_last_lease_stop_failure_retries_on_event(void)
 
 static void test_invalid_arguments_rejected(void)
 {
-    static const uint8_t zero_discriminator[3] = {0U, 0U, 0U};
-
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_adv_manager_acquire_lease(
-                          NULL, BLE_ADV_MANAGER_MODE_FAST,
-                          false, NULL));
+                          NULL, BLE_ADV_MANAGER_MODE_FAST, false));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_adv_manager_acquire_lease(
                           &(ble_adv_lease_t)
     {
         0
-    }, BLE_ADV_MANAGER_MODE_FAST, true, NULL));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, ble_adv_manager_acquire_lease(
-                          &(ble_adv_lease_t)
-    {
-        0
-    }, BLE_ADV_MANAGER_MODE_FAST, true, zero_discriminator));
+    }, (ble_adv_manager_mode_t)99, true));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       ble_adv_manager_handle_event(NULL));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
@@ -1153,8 +1105,7 @@ static void test_reset_and_sync(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAST,
                       ble_adv_manager_get_state());
@@ -1172,14 +1123,12 @@ static void test_reset_and_sync(void)
 
 static void test_bindable_start_stale_after_gate_rolls_back(void)
 {
-    static const uint8_t discriminator[3] = {0x11U, 0x22U, 0x33U};
     ble_adv_lease_t lease;
 
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, true,
-                          discriminator));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, true));
     const uint32_t generation = s_last_config.generation;
     const ble_nimble_adv_start_ops_t ops = _guard_ops();
 
@@ -1201,14 +1150,12 @@ static void test_bindable_start_stale_after_gate_rolls_back(void)
 
 static void test_bindable_start_stale_during_host_call_is_stopped(void)
 {
-    static const uint8_t discriminator[3] = {0x44U, 0x55U, 0x66U};
     ble_adv_lease_t lease;
 
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_FAST, true,
-                          discriminator));
+                          &lease, BLE_ADV_MANAGER_MODE_FAST, true));
     const uint32_t generation = s_last_config.generation;
     const ble_nimble_adv_start_ops_t ops = _guard_ops();
 
@@ -1232,7 +1179,7 @@ static void test_reset_adv_complete_does_not_requeue_retired_start(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     const uint32_t retired_generation = s_last_config.generation;
 
     TEST_ASSERT_TRUE(ble_adv_manager_start_command_current(
@@ -1273,7 +1220,7 @@ static void test_reset_retires_queued_stop_command(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_set_paused(true));
     const uint32_t retired_generation = s_last_stop_generation;
@@ -1299,7 +1246,7 @@ static void test_adv_complete_cannot_discharge_failed_stop(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_set_paused(true));
     _emit_adv_stopped(ESP_FAIL);
@@ -1331,8 +1278,7 @@ static void test_reset_quarantines_late_stop(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     memset(&event, 0, sizeof(event));
     event.type = BLE_PORT_EVENT_RESET;
@@ -1363,8 +1309,7 @@ static void test_adv_complete_without_connection_restarts(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false,
-                          NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
@@ -1383,7 +1328,7 @@ static void test_pause_preserves_lease_and_resumes(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
@@ -1408,7 +1353,7 @@ static void test_pause_reasons_are_independent(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW,
                       ble_adv_manager_get_state());
@@ -1468,7 +1413,7 @@ static void test_pause_retries_failed_stop(void)
     _reset_harness();
     _init_manager();
     TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false, NULL));
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
     _emit_adv_started(0);
     s_stop_result = ESP_FAIL;
     TEST_ASSERT_EQUAL(ESP_FAIL, ble_adv_manager_set_paused(true));
@@ -1484,51 +1429,55 @@ static void test_pause_retries_failed_stop(void)
                       ble_adv_manager_get_state());
 }
 
-static void test_zero_identifier_never_published(void)
+static void test_adv_payload_encoding(void)
 {
-    /* The v2 service data identifier must be non-zero in both modes: a
-     * zero public instance id or zero bindable discriminator must fault
-     * the start instead of publishing a zero identifier. */
     static const uint8_t short_name[] = "MT";
-    static const uint8_t zero_public_instance_id[3] = {0U, 0U, 0U};
-    static const ble_adv_manager_config_t zero_config =
+    static const uint8_t service_uuid[] =
     {
-        .fast_interval_ms = 100U,
-        .slow_interval_ms = 700U,
-        .fast_window_ms = 30000U,
+        0x31U, 0x6aU, 0x7bU, 0x2fU, 0x4cU, 0x9cU, 0x04U, 0x9cU,
+        0x44U, 0x4fU, 0xf6U, 0x65U, 0x10U, 0x8cU, 0x2aU, 0x8fU,
+    };
+    static const uint8_t expected[] =
+    {
+        0x02U, 0x01U, 0x06U,
+        0x11U, 0x07U, 0x31U, 0x6aU, 0x7bU, 0x2fU, 0x4cU,
+        0x9cU, 0x04U, 0x9cU, 0x44U, 0x4fU, 0xf6U, 0x65U,
+        0x10U, 0x8cU, 0x2aU, 0x8fU,
+        0x03U, 0x08U, 0x4dU, 0x54U,
+    };
+    ble_port_adv_config_t config =
+    {
         .short_name = short_name,
         .short_name_len = sizeof(short_name) - 1U,
-        .service_uuid = s_uuid,
-        .adv_version = 2U,
-        .public_instance_id = zero_public_instance_id,
-        .now_ms = _fake_now_ms,
-        .arm_timer = _fake_arm_timer,
-        .timer_arg = NULL,
-        .ops = &s_fake_ops,
-        .lock = NULL,
-        .unlock = NULL,
-        .lock_arg = NULL,
+        .service_uuid = service_uuid,
+        .bindable = false,
     };
-    const uint8_t zero_discriminator[3] = {0U, 0U, 0U};
-    ble_adv_lease_t lease;
+    uint8_t payload[BLE_NIMBLE_ADV_DATA_MAX_BYTES];
+    size_t payload_len = 0U;
 
-    _reset_harness();
-    ble_adv_manager_init(&zero_config);
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
-                      ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          false, NULL));
-    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED,
-                      ble_adv_manager_get_state());
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_nimble_adv_encode(&config, payload, &payload_len));
+    TEST_ASSERT_EQUAL(sizeof(expected), payload_len);
+    TEST_ASSERT_EQUAL(0, memcmp(expected, payload, sizeof(expected)));
 
-    _reset_harness();
-    _init_manager();
-    /* The bindable path rejects a zero discriminator at lease admission;
-     * the start-time check remains as publication-point defense. */
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
-                      ble_adv_manager_acquire_lease(
-                          &lease, BLE_ADV_MANAGER_MODE_SLOW,
-                          true, zero_discriminator));
+    config.bindable = true;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_nimble_adv_encode(&config, payload, &payload_len));
+    TEST_ASSERT_EQUAL(sizeof(expected), payload_len);
+    TEST_ASSERT_EQUAL(0, memcmp(expected, payload, sizeof(expected)));
+
+    config.short_name = NULL;
+    config.short_name_len = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_nimble_adv_encode(&config, payload, &payload_len));
+    TEST_ASSERT_EQUAL(21U, payload_len);
+
+    static const uint8_t overlong_name[] = "123456789";
+
+    config.short_name = overlong_name;
+    config.short_name_len = sizeof(overlong_name) - 1U;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      ble_nimble_adv_encode(&config, payload, &payload_len));
 }
 
 int main(void)
@@ -1545,8 +1494,8 @@ int main(void)
     test_async_stop_failure_respects_cooldown();
     test_retry_deadline_wraps_monotonic_clock();
     test_fast_lease_escalates_slow_adv();
-    test_bindable_payload_built();
-    test_bindable_lease_release_clears_payload();
+    test_bindable_control_is_explicit();
+    test_bindable_lease_release_restarts_with_closed_gate();
     test_lease_capacity_enforced();
     test_invalid_arguments_rejected();
     test_reset_and_sync();
@@ -1556,7 +1505,7 @@ int main(void)
     test_reset_retires_queued_stop_command();
     test_adv_complete_cannot_discharge_failed_stop();
     test_reset_quarantines_late_stop();
-    test_zero_identifier_never_published();
+    test_adv_payload_encoding();
     test_adv_complete_without_connection_restarts();
     test_pause_preserves_lease_and_resumes();
     test_pause_reasons_are_independent();

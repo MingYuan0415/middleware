@@ -24,8 +24,7 @@ static ble_link_timer_deadline_command_t _arm(
             .security_epoch = generation + 100U,
             .flow_id = token + 100U,
             .token = token,
-            .kind = kind == 2U ? BLE_LINK_OPERATION_TX_INDICATE :
-            BLE_LINK_OPERATION_REASSEMBLY_SESSION,
+            .kind = BLE_LINK_OPERATION_TX_INDICATE,
             .conn_handle = 6U,
         },
         .deadline_us = deadline_us,
@@ -47,8 +46,7 @@ static ble_link_timer_deadline_command_t _disarm(
             .security_epoch = generation + 100U,
             .flow_id = token + 100U,
             .token = token,
-            .kind = kind == 2U ? BLE_LINK_OPERATION_TX_INDICATE :
-            BLE_LINK_OPERATION_REASSEMBLY_SESSION,
+            .kind = BLE_LINK_OPERATION_TX_INDICATE,
             .conn_handle = 6U,
         },
     };

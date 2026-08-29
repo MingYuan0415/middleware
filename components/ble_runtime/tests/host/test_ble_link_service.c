@@ -47,6 +47,13 @@ static unsigned s_submit_calls;
 static esp_err_t s_output_result = ESP_OK;
 static device_link_v1_status_t s_submit_result = DEVICE_LINK_V1_STATUS_ACCEPTED;
 static uint32_t s_last_flow_id;
+static unsigned s_wake_calls;
+
+static void _wake(void *arg)
+{
+    (void)arg;
+    ++s_wake_calls;
+}
 
 static esp_err_t _output(const uint8_t *value, size_t len,
                          ble_link_service_tx_channel_t channel, bool is_last,
@@ -119,8 +126,10 @@ static void _reset(void)
     s_output_result = ESP_OK;
     s_submit_result = DEVICE_LINK_V1_STATUS_ACCEPTED;
     s_last_flow_id = 0U;
+    s_wake_calls = 0U;
     ble_link_service_init(BOOT_ID, _output, NULL, NULL, 0U);
     ble_link_service_set_v1_ops(&ops, NULL);
+    ble_link_service_set_worker_wake(_wake, NULL);
     ble_link_service_set_pairing_window(true);
     ble_link_service_on_connect(1U, 7U);
 }
@@ -191,14 +200,88 @@ static void test_scan_occupies_slot_until_ack(void)
 
 static void test_numeric_comparison_offer(void)
 {
+    ble_link_confirmation_snapshot_t confirmation;
+    uint64_t offered_token;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      ble_link_service_offer_numeric_comparison(
+                          123456U, NULL));
+    TEST_ASSERT_EQUAL(0U, s_wake_calls);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_offer_numeric_comparison(
+                          123456U, &offered_token));
+    TEST_ASSERT_EQUAL(1U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(confirmation.pending);
+    TEST_ASSERT_EQUAL(offered_token, confirmation.token);
+    TEST_ASSERT_EQUAL(123456U, confirmation.numeric_comparison);
+    const uint64_t first_token = confirmation.token;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_offer_numeric_comparison(
+                          654321U, &offered_token));
+    TEST_ASSERT_EQUAL(2U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(confirmation.pending);
+    TEST_ASSERT_EQUAL(offered_token, confirmation.token);
+    TEST_ASSERT_TRUE(offered_token != first_token);
+    TEST_ASSERT_EQUAL(654321U, confirmation.numeric_comparison);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_confirm_binding(first_token, true));
+    TEST_ASSERT_EQUAL(2U, s_wake_calls);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
+                          confirmation.token, true));
+    TEST_ASSERT_EQUAL(3U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(!confirmation.pending);
+    TEST_ASSERT_EQUAL(0U, confirmation.token);
+    TEST_ASSERT_EQUAL(0U, confirmation.numeric_comparison);
+
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(3U, s_wake_calls);
+}
+
+static void test_numeric_comparison_disconnect_wakes_owner(void)
+{
+    ble_link_confirmation_snapshot_t confirmation;
+    uint64_t offered_token;
+
     _reset();
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_offer_numeric_comparison(
-                          123456U));
-    TEST_ASSERT_TRUE(ble_link_service_pending_confirmation());
-    TEST_ASSERT_EQUAL(123456U, ble_link_service_numeric_comparison_value());
-    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_confirm_binding(
-                          ble_link_service_confirmation_token(), true));
-    TEST_ASSERT_TRUE(!ble_link_service_pending_confirmation());
+                          123456U, &offered_token));
+    TEST_ASSERT_TRUE(offered_token != 0U);
+    TEST_ASSERT_EQUAL(1U, s_wake_calls);
+    ble_link_service_clear_session_state();
+    TEST_ASSERT_EQUAL(2U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(!confirmation.pending);
+    TEST_ASSERT_EQUAL(0U, confirmation.token);
+    TEST_ASSERT_EQUAL(0U, confirmation.numeric_comparison);
+}
+
+static void test_numeric_comparison_reset_and_new_connection_wake_owner(void)
+{
+    ble_link_confirmation_snapshot_t confirmation;
+    uint64_t offered_token;
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_offer_numeric_comparison(
+                          123456U, &offered_token));
+    TEST_ASSERT_EQUAL(1U, s_wake_calls);
+    ble_link_service_reset();
+    TEST_ASSERT_EQUAL(2U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(!confirmation.pending);
+
+    ble_link_service_on_connect(2U, 9U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_offer_numeric_comparison(
+                          654321U, &offered_token));
+    TEST_ASSERT_EQUAL(3U, s_wake_calls);
+    ble_link_service_on_connect(3U, 10U);
+    TEST_ASSERT_EQUAL(4U, s_wake_calls);
+    confirmation = ble_link_service_get_confirmation();
+    TEST_ASSERT_TRUE(!confirmation.pending);
+    TEST_ASSERT_EQUAL(0U, confirmation.token);
+    TEST_ASSERT_EQUAL(0U, confirmation.numeric_comparison);
 }
 
 static void test_scan_without_owner_returns_internal(void)
@@ -463,6 +546,8 @@ int main(void)
     test_get_info_response();
     test_scan_occupies_slot_until_ack();
     test_numeric_comparison_offer();
+    test_numeric_comparison_disconnect_wakes_owner();
+    test_numeric_comparison_reset_and_new_connection_wake_owner();
     test_scan_without_owner_returns_internal();
     test_execute_output_failure_unblocks_writes();
     test_abort_tx_rejects_stale_identity();

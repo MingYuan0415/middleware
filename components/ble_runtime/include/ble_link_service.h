@@ -21,13 +21,11 @@ extern "C" {
 typedef enum
 {
     BLE_LINK_SERVICE_TX_SESSION = 0,
-    BLE_LINK_SERVICE_TX_CONTROL_RESPONSE,
 } ble_link_service_tx_channel_t;
 
 typedef enum
 {
     BLE_LINK_SERVICE_RX_SESSION = 0,
-    BLE_LINK_SERVICE_RX_CONTROL,
 } ble_link_service_rx_channel_t;
 
 typedef esp_err_t (*ble_link_service_output_t)(
@@ -60,6 +58,14 @@ typedef struct ble_link_v1_owner_ops
         const device_link_v1_credentials_t *credentials,
         uint32_t operation_id, void *arg);
 } ble_link_v1_owner_ops_t;
+
+/** @brief One coherent local Numeric Comparison confirmation snapshot. */
+typedef struct ble_link_confirmation_snapshot
+{
+    bool pending; /**< A local confirmation decision is required. */
+    uint64_t token; /**< Exact local confirmation transaction token. */
+    uint32_t numeric_comparison; /**< Six-digit value, valid while pending. */
+} ble_link_confirmation_snapshot_t;
 
 typedef struct ble_link_work ble_link_work_t;
 typedef esp_err_t (*ble_link_work_submit_fn)(ble_link_work_t *work, void *arg);
@@ -132,20 +138,13 @@ esp_err_t ble_link_service_abort_tx_if_current(
     const ble_link_operation_identity_t *identity);
 
 esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept);
-bool ble_link_service_pending_confirmation(void);
-uint64_t ble_link_service_confirmation_token(void);
-uint32_t ble_link_service_numeric_comparison_value(void);
-esp_err_t ble_link_service_offer_numeric_comparison(uint32_t passkey);
 
-esp_err_t ble_link_service_register_remote_replacement(
-    const ble_link_operation_identity_t *identity);
-void ble_link_service_idle_timeout(uint32_t generation);
-void ble_link_service_idle_timeout_epoch(uint32_t generation, uint32_t epoch);
-bool ble_link_service_delayed_replacement_pending(uint32_t generation);
-uint32_t ble_link_service_retained_retry_remaining_ms(void);
-bool ble_link_service_retained_cleanup_pending(void);
-uint32_t ble_link_service_auth_expiry_remaining_ms(void);
-esp_err_t ble_link_service_auth_expiry_tick(void);
+/** @brief Return the current confirmation tuple from one locked read. */
+ble_link_confirmation_snapshot_t ble_link_service_get_confirmation(void);
+
+esp_err_t ble_link_service_offer_numeric_comparison(
+    uint32_t passkey, uint64_t *out_token);
+
 
 #ifdef __cplusplus
 }

@@ -51,6 +51,18 @@ static void test_repeat_ignores_verified_store_bond(void)
                          true, true) == BLE_NIMBLE_SMP_REPEAT_IGNORE);
 }
 
+static void test_candidate_cleanup_only_discards_uncommitted_new_pairing(void)
+{
+    TEST_ASSERT_FALSE(ble_nimble_smp_candidate_cleanup_required(
+                          true, true, false));
+    TEST_ASSERT_FALSE(ble_nimble_smp_candidate_cleanup_required(
+                          false, false, false));
+    TEST_ASSERT_TRUE(ble_nimble_smp_candidate_cleanup_required(
+                         false, true, false));
+    TEST_ASSERT_FALSE(ble_nimble_smp_candidate_cleanup_required(
+                          false, true, true));
+}
+
 static void test_cancel_injects_reject_when_pending(void)
 {
     TEST_ASSERT_TRUE(ble_nimble_smp_numeric_comparison_inject_required(
@@ -111,6 +123,7 @@ int main(void)
     test_passkey_accepts_only_numeric_comparison();
     test_repeat_retries_only_leftover_mitm_in_window();
     test_repeat_ignores_verified_store_bond();
+    test_candidate_cleanup_only_discards_uncommitted_new_pairing();
     test_cancel_injects_reject_when_pending();
     test_reply_keeps_pending_when_inject_fails();
     test_restore_pending_requires_same_connection();

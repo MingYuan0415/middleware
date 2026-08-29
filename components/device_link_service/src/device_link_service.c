@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -10,7 +11,6 @@
 #include "freertos/task.h"
 
 #include "esp_err.h"
-#include "esp_random.h"
 #ifndef UNIT_TEST_HOST
     #include "nvs.h"
 #endif
@@ -26,6 +26,7 @@
 #include "ble_runtime.h"
 
 #include "device_link_service.h"
+#include "device_link_confirmation.h"
 #include "device_link_wifi_adapter.h"
 #include "event_bus.h"
 
@@ -33,7 +34,6 @@
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
-#define DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES 3U
 #define DEVICE_LINK_SERVICE_RETRY_MS 100U
 #define DEVICE_LINK_SERVICE_REMAINING_PUBLISH_MS 1000U
 #define DEVICE_LINK_SERVICE_WINDOW_MS 120000U
@@ -124,10 +124,11 @@ typedef struct device_link_service
     bool client_connected;
     uint16_t client_conn_handle; /**< Accepted ACL handle, 0 when idle. */
     uint32_t client_generation; /**< Accepted ACL generation, 0 when idle. */
+    bool status_dirty; /**< External state awaits owner publication. */
+    bool status_publish_ready; /**< Initial status is already published. */
     bool window_open_pending; /**< Window deferred until the ACL is gone. */
     bool revoke_in_progress; /**< Journaled revoke awaiting completion. */
     bool suspended;
-    uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
     TickType_t window_deadline;
     TickType_t last_remaining_publish;
 } device_link_service_t;
@@ -201,12 +202,6 @@ static void _device_link_service_zeroize(void *data, size_t size)
     {
         bytes[i] = 0U;
     }
-}
-
-static void _device_link_service_zero_secrets(void)
-{
-    _device_link_service_zeroize(s_service.discriminator,
-                                 sizeof(s_service.discriminator));
 }
 
 static bool _device_link_service_policy_valid(
@@ -509,8 +504,7 @@ static esp_err_t _device_link_service_deinit_return(esp_err_t result)
 
 static uint32_t _device_link_service_next_wait_ms(void)
 {
-    uint32_t wait_ms = ble_link_service_auth_expiry_remaining_ms();
-
+    uint32_t wait_ms = UINT32_MAX;
     const uint32_t link_state_retry_ms =
         ble_link_gatt_link_state_retry_remaining_ms();
 
@@ -518,13 +512,6 @@ static uint32_t _device_link_service_next_wait_ms(void)
     {
         wait_ms = _device_link_service_min_wait(
                       wait_ms, link_state_retry_ms);
-    }
-    const uint32_t retained_retry_ms =
-        ble_link_service_retained_retry_remaining_ms();
-
-    if (retained_retry_ms != UINT32_MAX)
-    {
-        wait_ms = _device_link_service_min_wait(wait_ms, retained_retry_ms);
     }
     const uint32_t operation_timeout_ms =
         ble_link_service_operation_timeout_remaining_ms();
@@ -589,6 +576,22 @@ static device_link_service_state_t _device_link_service_derive_state(void)
     return DEVICE_LINK_SERVICE_STATE_ADVERTISING;
 }
 
+static bool _device_link_service_sync_confirmation_locked(void)
+{
+    const ble_link_confirmation_snapshot_t confirmation =
+        ble_link_service_get_confirmation();
+    const bool changed = device_link_confirmation_sync(
+                             &s_service.snapshot, &confirmation);
+
+    if (changed)
+    {
+        LOG_I("confirmation pending=%u token=%" PRIu64 " generation=%" PRIu64,
+              confirmation.pending, confirmation.token,
+              s_service.snapshot.generation + 1U);
+    }
+    return changed;
+}
+
 static void _device_link_service_refresh_snapshot_locked(void)
 {
     s_service.snapshot.state = _device_link_service_derive_state();
@@ -598,23 +601,9 @@ static void _device_link_service_refresh_snapshot_locked(void)
                                           s_service.slow_lease_held &&
                                           !s_service.window_open &&
                                           !s_service.client_connected;
-    s_service.snapshot.instance_id[0] = 0U;
-    s_service.snapshot.instance_id[1] = 0U;
-    s_service.snapshot.instance_id[2] = 0U;
-    if (s_service.bluetooth_enabled && s_service.config.runtime_port != NULL &&
-            s_service.config.runtime_port->get_public_instance_id != NULL)
-    {
-        (void)s_service.config.runtime_port->get_public_instance_id(
-            s_service.snapshot.instance_id);
-    }
     s_service.snapshot.active = s_service.window_open ||
                                 s_service.window_open_pending;
-    s_service.snapshot.pending_confirmation =
-        ble_link_service_pending_confirmation();
-    s_service.snapshot.confirmation_token =
-        ble_link_service_confirmation_token();
-    s_service.snapshot.numeric_comparison =
-        ble_link_service_numeric_comparison_value();
+    (void)_device_link_service_sync_confirmation_locked();
     s_service.snapshot.bound =
         (ble_link_session_get_state_flags() &
          BLE_LINK_STATE_FLAG_BOUND) != 0U;
@@ -622,6 +611,7 @@ static void _device_link_service_refresh_snapshot_locked(void)
     s_service.snapshot.window_remaining_ms =
         s_service.window_open ?
         _device_link_service_remaining_ms(s_service.window_deadline) : 0U;
+    s_service.status_dirty = false;
 }
 
 static void _device_link_service_wake_worker(void *arg)
@@ -634,10 +624,6 @@ static void _device_link_service_wake_worker(void *arg)
     {
         (void)xTaskNotifyGive(task);
     }
-}
-
-static void _device_link_service_open_public_verifier(void)
-{
 }
 
 static esp_err_t _device_link_service_continue_revoke(void)
@@ -665,10 +651,9 @@ static esp_err_t _device_link_service_open_window_locked(void)
     }
     if (s_service.close_pending)
     {
-        /* The previous close did not complete its teardown obligation
-         * (bootstrap verifier / long-term reload): a new window must not
-         * open on top of it. Fail closed until the worker retry finishes
-         * the close. */
+        /* The previous close did not complete its teardown obligation. A
+         * new window must not open on top of it. Fail closed until the
+         * worker retry finishes the close. */
         return ESP_ERR_INVALID_STATE;
     }
     if (s_service.window_open)
@@ -707,18 +692,11 @@ static esp_err_t _device_link_service_open_window_locked(void)
         }
         return ESP_OK;
     }
-    uint8_t discriminator[DEVICE_LINK_SERVICE_DISCRIMINATOR_BYTES];
     ble_adv_lease_t lease;
     bool cleanup_started = false;
     esp_err_t result = ESP_OK;
 
     memset(&lease, 0, sizeof(lease));
-    esp_fill_random(discriminator, sizeof(discriminator));
-    if (discriminator[0] == 0U && discriminator[1] == 0U &&
-            discriminator[2] == 0U)
-    {
-        discriminator[2] = 0x5aU;
-    }
     cleanup_started = true;
     result = ble_adv_manager_set_pause_reason(
                  BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, true);
@@ -729,7 +707,7 @@ static esp_err_t _device_link_service_open_window_locked(void)
     ble_link_session_set_pairing_window(true);
     ble_link_service_set_pairing_window(true);
     result = ble_adv_manager_acquire_lease(
-                 &lease, BLE_ADV_MANAGER_MODE_FAST, true, discriminator);
+                 &lease, BLE_ADV_MANAGER_MODE_FAST, true);
     if (lease.lease_id != 0U)
     {
         s_service.bindable_lease_held = true;
@@ -750,8 +728,6 @@ static esp_err_t _device_link_service_open_window_locked(void)
     {
         goto exit;
     }
-    memcpy(s_service.discriminator, discriminator,
-           sizeof(s_service.discriminator));
     s_service.window_open = true;
     s_service.suspended = false;
     s_service.window_deadline =
@@ -771,7 +747,6 @@ exit:
             LOG_W("window open cleanup pending result=%d", cleanup_result);
         }
     }
-    _device_link_service_zeroize(discriminator, sizeof(discriminator));
     _device_link_service_zeroize(&lease, sizeof(lease));
     return result;
 }
@@ -896,9 +871,10 @@ static esp_err_t _device_link_service_close_window_locked(void)
         ((session_flags & BLE_LINK_STATE_FLAG_BOUND) != 0U) &&
         (((session_flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U) ||
          ((session_flags & BLE_LINK_STATE_FLAG_AUTHORIZED) != 0U));
+    const ble_link_confirmation_snapshot_t confirmation =
+        ble_link_service_get_confirmation();
     const bool drop_acl = s_service.client_connected &&
-                          (ble_link_service_pending_confirmation() ||
-                           !verified_bound);
+                          (confirmation.pending || !verified_bound);
 
     if (drop_acl)
     {
@@ -916,21 +892,18 @@ static esp_err_t _device_link_service_close_window_locked(void)
     /* A closed window invalidates any prepared pairing transaction. A
      * verified bound session is left intact so the peer can keep using
      * the existing ACL outside the window. */
-    if (!verified_bound || ble_link_service_pending_confirmation())
+    if (!verified_bound || confirmation.pending)
     {
         _device_link_service_clear_link_session();
     }
-    _device_link_service_open_public_verifier();
     if (result == ESP_OK)
     {
         result = ble_adv_manager_set_pause_reason(
                      BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, false);
     }
-    _device_link_service_zero_secrets();
     if (result != ESP_OK)
     {
-        /* The window flags are already cleared, but the teardown
-         * obligation (bootstrap verifier / long-term reload) is not done:
+        /* The window flags are already cleared, but teardown is incomplete:
          * keep the close pending so the worker tick retries the cleanup. */
         s_service.close_pending = true;
         return result;
@@ -943,8 +916,6 @@ static void _device_link_service_ble_event(
     const ble_port_event_t *event, void *arg)
 {
     (void)arg;
-    device_link_service_snapshot_t snapshot;
-    bool publish = false;
     bool state_changed = false;
 
     if (event->type != BLE_PORT_EVENT_CONNECT &&
@@ -971,7 +942,6 @@ static void _device_link_service_ble_event(
         s_service.client_connected = true;
         s_service.client_conn_handle = event->conn_handle;
         s_service.client_generation = event->identity.generation;
-        publish = true;
         state_changed = true;
     }
     else if (event->type == BLE_PORT_EVENT_DISCONNECT &&
@@ -986,7 +956,6 @@ static void _device_link_service_ble_event(
         s_service.client_connected = false;
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
-        publish = true;
         state_changed = true;
     }
     else if (event->type == BLE_PORT_EVENT_RESET)
@@ -994,26 +963,13 @@ static void _device_link_service_ble_event(
         s_service.client_connected = false;
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
-        publish = true;
         state_changed = true;
     }
-    if (publish &&
-            _device_link_service_lifecycle() ==
-            DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING)
+    if (state_changed)
     {
-        _device_link_service_refresh_snapshot_locked();
-        s_service.snapshot.generation++;
-        snapshot = s_service.snapshot;
-    }
-    else
-    {
-        publish = false;
+        s_service.status_dirty = true;
     }
     xSemaphoreGive(s_service.mutex);
-    if (publish)
-    {
-        _device_link_service_publish_now(&snapshot);
-    }
     if (state_changed)
     {
         _device_link_service_wake_worker(NULL);
@@ -1100,22 +1056,19 @@ static void _device_link_service_handle_command(
 {
     if (command->type == DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK)
     {
-        const bool pending_before = ble_link_service_pending_confirmation();
         const uint32_t link_flags_before = ble_link_session_get_state_flags();
         const esp_err_t result = ble_link_service_execute(command->link_work);
-        const bool pending_after = ble_link_service_pending_confirmation();
         const uint32_t link_flags_after = ble_link_session_get_state_flags();
 
         ble_link_service_release_work(command->link_work);
-        /* The worker owns link-state delivery. In particular a durable Commit
-         * changes AUTHORIZED while processing this work and must force a fresh
-         * snapshot for an already-enabled CCCD. */
+        /* The worker owns link-state delivery. Any session flag transition
+         * must force a fresh snapshot for an already-enabled CCCD. */
         if (link_flags_before != link_flags_after)
         {
             ble_link_gatt_request_link_state_refresh();
         }
         (void)ble_link_gatt_refresh_link_state();
-        if (result == ESP_OK && pending_before == pending_after)
+        if (result == ESP_OK)
         {
             return;
         }
@@ -1160,17 +1113,20 @@ static void _device_link_service_handle_command(
         }
         break;
     case DEVICE_LINK_SERVICE_COMMAND_CONFIRM_BINDING:
-        if (!ble_link_service_pending_confirmation() ||
+    {
+        const ble_link_confirmation_snapshot_t confirmation =
+            ble_link_service_get_confirmation();
+
+        if (!confirmation.pending ||
                 command->confirmation_token == 0U ||
-                command->confirmation_token !=
-                ble_link_service_confirmation_token())
+                command->confirmation_token != confirmation.token)
         {
             s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
             break;
         }
         s_service.snapshot.last_error =
             ble_nimble_port_numeric_comparison_reply(
-                command->accept_binding);
+                command->confirmation_token, command->accept_binding);
         if (s_service.snapshot.last_error == ESP_OK)
         {
             s_service.snapshot.last_error =
@@ -1180,6 +1136,7 @@ static void _device_link_service_handle_command(
         }
         _device_link_service_refresh_snapshot_locked();
         break;
+    }
     case DEVICE_LINK_SERVICE_COMMAND_SUSPEND:
         /* Suspend always ends with no window and the suspended flag set,
          * so an OPEN that raced into the FIFO first cannot leave a window
@@ -1313,7 +1270,8 @@ static void _device_link_service_worker_tick(void)
         _device_link_service_apply_bluetooth_policy(retry_target, 0U);
     }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    const bool runtime_ready = s_service.runtime_started;
+    const bool runtime_ready = s_service.runtime_started &&
+                               s_service.status_publish_ready;
     xSemaphoreGive(s_service.mutex);
     if (!runtime_ready)
     {
@@ -1331,15 +1289,8 @@ static void _device_link_service_worker_tick(void)
         (void)ble_link_gatt_refresh_link_state();
     }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    /* An expired authorize transaction converges the snapshot state back
-     * to BOOTSTRAP_AUTHENTICATED even without further protocol traffic. */
-    const bool pending_before = ble_link_service_pending_confirmation();
-
-    (void)ble_link_service_auth_expiry_tick();
-    if (ble_link_service_pending_confirmation() != pending_before)
-    {
-        publish = true;
-    }
+    publish = s_service.status_dirty;
+    publish = _device_link_service_sync_confirmation_locked() || publish;
     if (s_service.window_open_pending)
     {
         /* A window deferred until the existing ACL is gone: retry the
@@ -1495,6 +1446,31 @@ static void _device_link_service_worker(void *arg)
     {
         device_link_service_command_t command;
 
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        const bool publish_ready = s_service.status_publish_ready;
+        const device_link_service_lifecycle_t lifecycle =
+            _device_link_service_lifecycle();
+
+        xSemaphoreGive(s_service.mutex);
+        if (!publish_ready)
+        {
+            if (lifecycle == DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING &&
+                    xQueueReceive(s_service.queue, &command, 0U) == pdTRUE)
+            {
+                if (command.type == DEVICE_LINK_SERVICE_COMMAND_DEINIT)
+                {
+                    break;
+                }
+                if (command.type == DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK)
+                {
+                    ble_link_service_release_work(command.link_work);
+                }
+                continue;
+            }
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
         if (xQueueReceive(s_service.queue, &command, 0U) == pdTRUE)
         {
             if (command.type == DEVICE_LINK_SERVICE_COMMAND_DEINIT)
@@ -1600,18 +1576,15 @@ static void _device_link_service_worker(void *arg)
         }
         if (session_retired)
         {
-            /* clear_session_state retired protocol response flow first, so
-             * this pump can only advance retained cleanup/replacement work;
-             * no post-terminal protocol frame is submitted. */
+            /* clear_session_state retired the protocol response flow first,
+             * so no post-terminal frame can be submitted. */
             (void)ble_link_service_pump_tx();
         }
-        const bool service_cleanup_pending =
-            ble_link_service_retained_cleanup_pending();
         const bool port_cleanup_pending =
             ble_nimble_port_cleanup_pending();
 
         if (worker_result == ESP_OK && !revoke_pending &&
-                !service_cleanup_pending && !port_cleanup_pending)
+                !port_cleanup_pending)
         {
             /* A fresh host-queue barrier closes the last producer/check race.
              * With admission and advertising already closed, a second empty
@@ -1624,7 +1597,6 @@ static void _device_link_service_worker(void *arg)
                 revoke_pending = s_service.revoke_in_progress;
                 xSemaphoreGive(s_service.mutex);
                 if (!revoke_pending &&
-                        !ble_link_service_retained_cleanup_pending() &&
                         !ble_nimble_port_cleanup_pending())
                 {
                     break;
@@ -1777,12 +1749,6 @@ static esp_err_t _device_link_service_runtime_start(void)
         {
             result = _device_link_service_acquire_slow_lease();
         }
-        if (result == ESP_OK)
-        {
-            /* Public advertising is live: install the derived public
-             * password so public-discovery handshakes can be admitted. */
-            _device_link_service_open_public_verifier();
-        }
     }
     if (result == ESP_OK)
     {
@@ -1885,7 +1851,7 @@ static esp_err_t _device_link_service_acquire_slow_lease(void)
     memset(&lease, 0, sizeof(lease));
     const esp_err_t result = ble_adv_manager_acquire_lease(
                                  &lease, BLE_ADV_MANAGER_MODE_SLOW,
-                                 false, NULL);
+                                 false);
 
     if (lease.lease_id != 0U)
     {
@@ -2033,7 +1999,6 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
         }
     }
     _device_link_service_release_resources();
-    _device_link_service_zero_secrets();
     if (first_error == ESP_OK)
     {
         (void)_device_link_service_transition(
@@ -2224,12 +2189,6 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         result = _device_link_service_acquire_slow_lease();
     }
-    if (result == ESP_OK && s_service.bluetooth_enabled)
-    {
-        /* Public advertising is live after startup: install the derived
-         * public password, mirroring the runtime_start path. */
-        _device_link_service_open_public_verifier();
-    }
     if (result == ESP_OK)
     {
         /* v1 Wi-Fi commands occupy the single operation slot. Install the
@@ -2241,30 +2200,31 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         return _device_link_service_rollback_init(result);
     }
-    /* The initial snapshot is prepared under the lock and copied before
-     * RUNNING is exposed, so the publish afterwards never touches service
-     * state: get_status sees a complete snapshot, a publisher-context
-     * subscriber that re-enters the API sees a running service, and no
-     * teardown can race the publication. Consumers apply generation
-     * filtering (the setup pages do), so a concurrent worker publication
-     * arriving first is harmless. */
+    /* The owner remains publication-gated until this first snapshot is on
+     * the bus. A subscriber may re-enter the RUNNING API while it is being
+     * published; any resulting state change is marked dirty and published
+     * by the owner after the gate opens. */
     {
         device_link_service_snapshot_t snapshot;
 
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        s_service.snapshot.generation = 1U;
         s_service.snapshot.available = true;
         s_service.snapshot.last_error = s_service.bluetooth_policy_error;
         /* Reconcile any connection tracked during STARTING, then expose
          * RUNNING while still holding the mutex so no STARTING callback
          * can update state between the refresh and the store. */
         _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation = 1U;
         (void)_device_link_service_transition(
             DEVICE_LINK_SERVICE_LIFECYCLE_STARTING,
             DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING);
         snapshot = s_service.snapshot;
         xSemaphoreGive(s_service.mutex);
         _device_link_service_publish_now(&snapshot);
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.status_publish_ready = true;
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_wake_worker(NULL);
     }
     LOG_I("ready: window=%lu ms", (unsigned long)config->window_ms);
     return ESP_OK;
@@ -2316,15 +2276,13 @@ esp_err_t device_link_service_release_startup_gate(void)
     }
     if (result == ESP_OK)
     {
-        _device_link_service_refresh_snapshot_locked();
-        s_service.snapshot.generation++;
+        s_service.status_dirty = true;
     }
-    const device_link_service_snapshot_t snapshot = s_service.snapshot;
 
     xSemaphoreGive(s_service.mutex);
     if (result == ESP_OK)
     {
-        _device_link_service_publish_now(&snapshot);
+        _device_link_service_wake_worker(NULL);
     }
     _device_link_service_api_release();
     return result;
@@ -2485,7 +2443,6 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
     if (teardown_result == ESP_OK)
     {
         _device_link_service_release_resources();
-        _device_link_service_zero_secrets();
         (void)_device_link_service_transition(
             DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
             DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED);

@@ -62,9 +62,6 @@ const ble_port_ops_t *ble_nimble_port_get_ops(void);
  */
 const ble_runtime_host_port_t *ble_nimble_port_get(void);
 
-/** @brief Copy the boot-scoped public discovery instance identifier. */
-esp_err_t ble_nimble_port_get_public_instance_id(uint8_t out_instance_id[3]);
-
 /**
  * @brief Request a local binding revoke (bond/CCCD deletion on the host
  * core).
@@ -78,8 +75,9 @@ esp_err_t ble_nimble_port_get_public_instance_id(uint8_t out_instance_id[3]);
  */
 esp_err_t ble_nimble_port_revoke_binding(void);
 
-/** @brief Complete Numeric Comparison with the local Yes/No decision. */
-esp_err_t ble_nimble_port_numeric_comparison_reply(bool accept);
+/** @brief Complete the exact Numeric Comparison with the local decision. */
+esp_err_t ble_nimble_port_numeric_comparison_reply(
+    uint64_t token, bool accept);
 
 /** @brief Drop a pending Numeric Comparison without injecting a reply. */
 void ble_nimble_port_numeric_comparison_cancel(void);

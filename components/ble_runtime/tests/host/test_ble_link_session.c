@@ -445,6 +445,44 @@ static void test_state_flags(void)
                       ble_link_session_get_state_flags());
 }
 
+static void test_v1_verified_bond_is_authenticated_without_security2(void)
+{
+    ble_link_session_init(BOOT1);
+    _connect(GEN1);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_LINK_ENCRYPTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN1, BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_identity_known(GEN1, true));
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_authorization(true, 1U));
+    const uint32_t flags = ble_link_session_get_state_flags();
+
+    TEST_ASSERT_TRUE((flags & BLE_LINK_STATE_FLAG_BOUND) != 0U);
+    TEST_ASSERT_TRUE((flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U);
+    TEST_ASSERT_EQUAL(0U, flags & BLE_LINK_STATE_FLAG_AUTHORIZED);
+}
+
+static void test_removed_prior_bond_restores_bindable_current_acl(void)
+{
+    ble_link_session_init(BOOT1);
+    ble_link_session_set_pairing_window(true);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_authorization(true, 1U));
+    _connect(GEN1);
+    TEST_ASSERT_TRUE((ble_link_session_get_state_flags() &
+                      BLE_LINK_STATE_FLAG_BOUND) != 0U);
+
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      ble_link_session_set_authorization(false, 0U));
+    const uint32_t flags = ble_link_session_get_state_flags();
+
+    TEST_ASSERT_TRUE((flags & BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED) != 0U);
+    TEST_ASSERT_TRUE((flags & BLE_LINK_STATE_FLAG_BINDABLE) != 0U);
+    TEST_ASSERT_EQUAL(0U, flags & BLE_LINK_STATE_FLAG_BOUND);
+}
+
 static void test_reconnect_with_same_revision(void)
 {
     ble_link_session_init(BOOT1);
@@ -737,6 +775,8 @@ int main(void)
     test_invalid_channel_rejected();
     test_facts_reflect_state();
     test_state_flags();
+    test_v1_verified_bond_is_authenticated_without_security2();
+    test_removed_prior_bond_restores_bindable_current_acl();
     test_reconnect_with_same_revision();
     test_reconnect_after_security2_closed();
     test_match_without_record_rejected();

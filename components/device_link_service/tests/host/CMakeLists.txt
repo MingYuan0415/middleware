@@ -45,18 +45,18 @@ target_compile_options(test_device_link_wifi_adapter PRIVATE
     -Werror
     -Wpedantic
     -UNDEBUG)
-add_test(NAME device_link_wifi_adapter COMMAND test_device_link_wifi_adapter)
-set_tests_properties(device_link_wifi_adapter PROPERTIES TIMEOUT 10)
-
 add_executable(test_device_link_service
-               test_device_link_service.c)
+               test_device_link_service.c
+               "${COMPONENT}/src/device_link_confirmation.c")
 target_compile_features(test_device_link_service PRIVATE c_std_11)
 target_compile_definitions(test_device_link_service PRIVATE
     _POSIX_C_SOURCE=200809L
     UNIT_TEST_HOST)
 target_include_directories(test_device_link_service PRIVATE
                            "${COMPONENT}/include"
+                           "${COMPONENT}/src"
                            "${BLE_RUNTIME}/include"
+                           "${DEVICE_LINK}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
                            "${HOST_CONNECTIVITY}/include")
 target_compile_options(test_device_link_service PRIVATE
@@ -66,9 +66,6 @@ target_compile_options(test_device_link_service PRIVATE
     -Werror
     -Wpedantic
     -UNDEBUG)
-add_test(NAME device_link_service COMMAND test_device_link_service)
-set_tests_properties(device_link_service PROPERTIES TIMEOUT 10)
-
 if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "address")
     foreach(target IN ITEMS test_device_link_wifi_adapter
             test_device_link_service)
@@ -95,3 +92,20 @@ elseif(NOT DEVICE_LINK_SERVICE_SANITIZER STREQUAL "none")
     message(FATAL_ERROR
         "Unsupported DEVICE_LINK_SERVICE_SANITIZER=${DEVICE_LINK_SERVICE_SANITIZER}")
 endif()
+
+if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "thread" AND
+        DEVICE_LINK_SERVICE_SETARCH AND
+        CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    add_test(NAME device_link_wifi_adapter COMMAND
+        ${DEVICE_LINK_SERVICE_SETARCH} x86_64 -R
+        $<TARGET_FILE:test_device_link_wifi_adapter>)
+    add_test(NAME device_link_service COMMAND
+        ${DEVICE_LINK_SERVICE_SETARCH} x86_64 -R
+        $<TARGET_FILE:test_device_link_service>)
+else()
+    add_test(NAME device_link_wifi_adapter COMMAND
+        test_device_link_wifi_adapter)
+    add_test(NAME device_link_service COMMAND test_device_link_service)
+endif()
+set_tests_properties(device_link_wifi_adapter device_link_service
+    PROPERTIES TIMEOUT 10)

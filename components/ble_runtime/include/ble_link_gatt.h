@@ -118,14 +118,6 @@ esp_err_t ble_link_gatt_update_identity(
     uint8_t peer_addr_type, const uint8_t peer_addr[6]);
 
 /**
- * @brief Notify the 5000 ms reassembly idle timeout fired for a generation.
- *
- * @param[in] generation Generation the timer was armed for.
- */
-void ble_link_gatt_on_reassembly_idle_generation(
-    uint32_t generation, uint32_t epoch);
-
-/**
  * @brief Update the negotiated ATT MTU.
  *
  * @param[in] mtu Negotiated ATT MTU, at least 23.

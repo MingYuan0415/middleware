@@ -14,7 +14,6 @@ extern "C" {
 #endif
 
 #define BLE_ADV_MANAGER_MAX_LEASES 4U
-#define BLE_ADV_MANAGER_DISCRIMINATOR_BYTES 3U
 
 /** @brief Advertising state machine states. */
 typedef enum
@@ -58,8 +57,7 @@ typedef struct ble_adv_lease
 {
     uint8_t lease_id;              /**< 1..BLE_ADV_MANAGER_MAX_LEASES. */
     ble_adv_manager_mode_t mode;
-    bool bindable;                 /**< Carry BINDABLE flag and discriminator. */
-    uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES];
+    bool bindable;                 /**< Request the internal pairing gate. */
 } ble_adv_lease_t;
 
 /**
@@ -67,9 +65,9 @@ typedef struct ble_adv_lease
  *
  * Fast and slow intervals and the fast window duration are runtime policy,
  * calibrated on hardware; the contract only freezes the advertisement
- * content. The service data layout (adv version, flags, identifier)
- * follows the Device Link discovery contract. The service UUID is in
- * little-endian wire order, matching the frozen advertising fixture.
+ * content. The service UUID is in little-endian wire order, matching the
+ * frozen advertising fixture. Bindable state controls only the host pairing
+ * gate and does not alter the advertising payload.
  *
  * arm_timer may be NULL when the caller polls both manager deadline queries.
  * When provided, arm_timer(delay > 0) notifies the owner that a fast window or
@@ -86,8 +84,6 @@ typedef struct ble_adv_manager_config
     const uint8_t *short_name;   /**< Short local name bytes, e.g. "MT". */
     size_t short_name_len;
     const uint8_t *service_uuid; /**< 16-byte 128-bit Device Link UUID. */
-    uint8_t adv_version;         /**< Published Device Link advertisement version. */
-    const uint8_t *public_instance_id; /**< Boot-scoped public identifier. */
     uint32_t (*now_ms)(void);    /**< Monotonic millisecond clock. */
     void (*arm_timer)(uint32_t delay_ms, void *arg); /**< Window notify. */
     void *timer_arg;
@@ -122,21 +118,18 @@ void ble_adv_manager_deinit(void);
  * The first lease starts connectable advertising (fast unless only slow
  * leases are held); the last release stops it. A fast lease acquired while
  * advertising at slow speed escalates advertising to fast. A bindable lease
- * is released without affecting other leases; the advertisement carries the
- * discriminator only while at least one bindable lease is held.
+ * opens the pairing gate while advertising starts and is released without
+ * affecting other leases; it does not alter the on-air payload.
  *
  * @param[out] out         Assigned lease.
  * @param[in] mode         Advertising class.
- * @param[in] bindable     Set BINDABLE and carry the discriminator.
- * @param[in] discriminator 24-bit discovery discriminator in little-endian
- *                          wire order, required when bindable is set.
+ * @param[in] bindable     Request the internal pairing gate.
  * @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM when full,
  *         ESP_ERR_INVALID_STATE after deinit, or a port error from the
  *         advertising operations.
  */
 esp_err_t ble_adv_manager_acquire_lease(
-    ble_adv_lease_t *out, ble_adv_manager_mode_t mode, bool bindable,
-    const uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES]);
+    ble_adv_lease_t *out, ble_adv_manager_mode_t mode, bool bindable);
 
 /**
  * @brief Release a lease.

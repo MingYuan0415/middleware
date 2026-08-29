@@ -54,6 +54,15 @@ ble_nimble_smp_repeat_decision_t ble_nimble_smp_repeat_decide(
     uint8_t new_key_size, bool bindable, bool durable_bond_present);
 
 /**
+ * @brief Decide whether a disconnected pairing candidate needs bond cleanup.
+ *
+ * @return true only for a fresh pairing that started but never reached the
+ *         verified durable-bond boundary.
+ */
+bool ble_nimble_smp_candidate_cleanup_required(
+    bool had_bond, bool pairing_started, bool bond_committed);
+
+/**
  * @brief Return whether cancel must inject a Numeric Comparison reject.
  *
  * @param pending Passkey action is still outstanding.

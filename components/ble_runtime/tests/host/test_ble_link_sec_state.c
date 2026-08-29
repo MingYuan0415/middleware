@@ -139,6 +139,24 @@ static void test_new_peer_in_window_is_admitted(void)
     assert(again == BLE_LINK_SEC_ACTION_NONE);
 }
 
+static void test_removed_malformed_bond_becomes_fresh_candidate(void)
+{
+    ble_link_sec_state_t state;
+
+    ble_link_sec_state_reset(&state);
+    assert(ble_link_sec_state_on_connect(
+               &state, true, true, true, true, false) ==
+           BLE_LINK_SEC_ACTION_NONE);
+    ble_link_sec_state_on_prior_bond_removed(&state);
+    assert(!state.had_bond);
+    const uint32_t actions = ble_link_sec_state_on_encrypted(
+                                 &state, true, true, true);
+
+    assert((actions & BLE_LINK_SEC_ACTION_REPORT_BOND_VERIFIED) != 0U);
+    assert((actions & BLE_LINK_SEC_ACTION_DELETE_BOND) == 0U);
+    assert(ble_link_sec_state_provisional_bond_verified(&state));
+}
+
 static void test_unpaired_disconnect_does_not_create_provisional_bond(void)
 {
     ble_link_sec_state_t state;
@@ -322,6 +340,7 @@ int main(void)
     test_identity_before_enc_change_converges();
     test_connect_bond_snapshot_is_not_overwritten();
     test_new_peer_in_window_is_admitted();
+    test_removed_malformed_bond_becomes_fresh_candidate();
     test_unpaired_disconnect_does_not_create_provisional_bond();
     test_malformed_bond_deleted_and_terminated();
     test_unknown_peer_outside_window_terminated();

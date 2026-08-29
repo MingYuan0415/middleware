@@ -23,6 +23,12 @@ ble_nimble_smp_repeat_decision_t ble_nimble_smp_repeat_decide(
     return BLE_NIMBLE_SMP_REPEAT_RETRY;
 }
 
+bool ble_nimble_smp_candidate_cleanup_required(
+    bool had_bond, bool pairing_started, bool bond_committed)
+{
+    return !had_bond && pairing_started && !bond_committed;
+}
+
 bool ble_nimble_smp_numeric_comparison_inject_required(
     bool pending, uint16_t conn_handle)
 {

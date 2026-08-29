@@ -457,12 +457,6 @@ esp_err_t ble_link_gatt_update_identity(
     return ESP_OK;
 }
 
-void ble_link_gatt_on_reassembly_idle_generation(
-    uint32_t generation, uint32_t epoch)
-{
-    ble_link_service_idle_timeout_epoch(generation, epoch);
-}
-
 void ble_link_gatt_set_att_mtu(uint16_t mtu)
 {
     uint16_t applied = 0U;

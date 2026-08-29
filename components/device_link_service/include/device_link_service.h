@@ -73,7 +73,6 @@ typedef struct device_link_service_status
     bool enabled; /**< Effective persistent Bluetooth policy. */
     bool transitioning; /**< Runtime is converging to the requested policy. */
     bool public_discovery; /**< Public discovery advertisement is active. */
-    uint8_t instance_id[3]; /**< Boot-scoped public discovery identifier. */
     bool active; /**< A binding window owns the bindable advertisement. */
     bool client_connected; /**< One BLE transport client is connected. */
     bool bound; /**< A durable Device Link bond is present. */
@@ -148,7 +147,7 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms);
 esp_err_t device_link_service_open_window(void);
 
 /**
- * @brief Close the binding window and clear every window secret.
+ * @brief Close the binding window and cancel pending local confirmation.
  * @return ESP_OK when admitted or already idle; otherwise a lifecycle error.
  */
 esp_err_t device_link_service_close_window(void);
@@ -156,9 +155,10 @@ esp_err_t device_link_service_close_window(void);
 /**
  * @brief Accept or deny the pending binding confirmation.
  *
- * The decision is applied serially in the service worker, so it cannot
- * race a window close or a disconnect. Accepting arms the active
- * authorize transaction; denying invalidates it.
+ * The decision is applied serially in the service worker and must match the
+ * exact token currently exposed in the status snapshot. A successful NimBLE
+ * reply consumes the prompt; an injection failure keeps it available for
+ * retry unless a disconnect or cancellation has already retired it.
  *
  * @param[in] token Token from the status snapshot that exposed the prompt.
  * @param[in] accept True to confirm the binding, false to deny it.
@@ -170,9 +170,9 @@ esp_err_t device_link_service_confirm_binding(
 /**
  * @brief Revoke the current binding (local operation, no wire command).
  *
- * Journals the revoke intent, erases the authorization record and its
- * verifier, clears the session state, and deletes the bond/CCCD on the
- * host core. A crash mid-revoke resumes at startup before advertising.
+ * Journals the revoke intent, clears the BOUND/session state, and deletes the
+ * bond/CCCD on the host core. A crash mid-revoke resumes at startup before
+ * advertising.
  *
  * @return ESP_OK when admitted; otherwise a lifecycle error.
  */
@@ -183,8 +183,7 @@ esp_err_t device_link_service_revoke_binding(void);
  *
  * Reads the service snapshot; the fact is refreshed by the worker.
  *
- * @return True while an authorize transaction is active and not yet
- *         confirmed or denied.
+ * @return True while Numeric Comparison awaits the local decision.
  */
 bool device_link_service_pending_confirmation(void);
 

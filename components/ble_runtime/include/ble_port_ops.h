@@ -62,10 +62,9 @@ typedef struct ble_port_event
 /**
  * @brief Advertising configuration carried by the port.
  *
- * The port converts this into host advertising fields and the host copies
- * the field pointers shallowly, so the configuration object and all buffers
- * it points to must stay valid until advertising is stopped. Fields and
- * payload must stay inside the legacy advertising limit.
+ * The port converts this into host advertising fields. Bindable is an
+ * internal pairing-gate control and is never serialized into advertising.
+ * All encoded fields must stay inside the legacy advertising limit.
  */
 typedef struct ble_port_adv_config
 {
@@ -73,8 +72,7 @@ typedef struct ble_port_adv_config
     const uint8_t *short_name; /**< Short local name bytes, optional. */
     size_t short_name_len;
     const uint8_t *service_uuid; /**< 16-byte 128-bit UUID, wire order. */
-    const uint8_t *service_data; /**< Payload after the UUID, optional. */
-    size_t service_data_len;
+    bool bindable; /**< Open the pairing gate for this advertising target. */
     uint32_t generation; /**< Caller-assigned command identity. */
 } ble_port_adv_config_t;
 

@@ -1,10 +1,56 @@
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_err.h"
 
 #include "ble_adv_manager.h"
 #include "ble_nimble_adv_start.h"
+
+#define BLE_NIMBLE_ADV_TYPE_FLAGS 0x01U
+#define BLE_NIMBLE_ADV_TYPE_COMPLETE_UUIDS128 0x07U
+#define BLE_NIMBLE_ADV_TYPE_SHORT_NAME 0x08U
+#define BLE_NIMBLE_ADV_FLAGS 0x06U
+
+esp_err_t ble_nimble_adv_encode(
+    const ble_port_adv_config_t *config,
+    uint8_t output[BLE_NIMBLE_ADV_DATA_MAX_BYTES], size_t *output_len)
+{
+    if (config == NULL || output == NULL || output_len == NULL ||
+            config->service_uuid == NULL ||
+            (config->short_name_len > 0U && config->short_name == NULL))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t name_bytes = config->short_name_len > 0U
+                              ? 2U + config->short_name_len : 0U;
+    const size_t required = 3U + 18U + name_bytes;
+
+    if (config->short_name_len > UINT8_MAX - 1U ||
+            required > BLE_NIMBLE_ADV_DATA_MAX_BYTES)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t length = 0U;
+
+    output[length++] = 2U;
+    output[length++] = BLE_NIMBLE_ADV_TYPE_FLAGS;
+    output[length++] = BLE_NIMBLE_ADV_FLAGS;
+    output[length++] = 17U;
+    output[length++] = BLE_NIMBLE_ADV_TYPE_COMPLETE_UUIDS128;
+    memcpy(&output[length], config->service_uuid, 16U);
+    length += 16U;
+    if (config->short_name_len > 0U)
+    {
+        output[length++] = 1U + (uint8_t)config->short_name_len;
+        output[length++] = BLE_NIMBLE_ADV_TYPE_SHORT_NAME;
+        memcpy(&output[length], config->short_name, config->short_name_len);
+        length += config->short_name_len;
+    }
+    *output_len = length;
+    return ESP_OK;
+}
 
 static bool _ble_nimble_adv_start_current(
     uint32_t generation, bool bindable,

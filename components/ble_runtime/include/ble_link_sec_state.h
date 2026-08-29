@@ -67,6 +67,10 @@ uint32_t ble_link_sec_state_on_connect(
     ble_link_sec_state_t *state, bool window_open, bool identity_ready,
     bool had_bond, bool bonded, bool bond_verified);
 
+/** @brief Convert a removed prior bond into a fresh pairing candidate. */
+void ble_link_sec_state_on_prior_bond_removed(
+    ble_link_sec_state_t *state);
+
 /**
  * @brief Feed an identity resolution event (IDENTITY_RESOLVED, or a
  * static identity known after connect).

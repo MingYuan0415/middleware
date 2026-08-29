@@ -11,8 +11,6 @@
 #define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
-#define BLE_ADV_MANAGER_FLAG_BINDABLE 0x01U
-#define BLE_ADV_MANAGER_SERVICE_DATA_BYTES 5U
 #define BLE_ADV_MANAGER_RETRY_INITIAL_MS 100U
 #define BLE_ADV_MANAGER_RETRY_MAX_MS 1000U
 #define BLE_ADV_MANAGER_PAUSE_REASON_LEGACY (UINT32_C(1) << 31)
@@ -29,7 +27,6 @@ typedef struct ble_adv_lease_slot
     uint8_t id;
     ble_adv_manager_mode_t mode;
     bool bindable;
-    uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES];
     bool in_use;
 } ble_adv_lease_slot_t;
 
@@ -50,14 +47,13 @@ typedef struct ble_adv_manager
     uint32_t retry_not_before_ms;
     bool retry_start_target_valid;
     ble_adv_manager_mode_t retry_start_mode;
-    uint8_t retry_start_service_data[BLE_ADV_MANAGER_SERVICE_DATA_BYTES];
+    bool retry_start_bindable;
     uint32_t fast_deadline_ms;
     bool fast_window_active;
     ble_adv_manager_mode_t started_mode;
     uint32_t start_generation;
     uint32_t stop_generation;
     ble_port_adv_config_t adv_config;
-    uint8_t service_data[BLE_ADV_MANAGER_SERVICE_DATA_BYTES];
 } ble_adv_manager_t;
 
 static ble_adv_manager_t s_manager;
@@ -81,8 +77,7 @@ static void _ble_adv_manager_clear_retry(void)
     s_manager.retry_generation = 0U;
     s_manager.retry_not_before_ms = 0U;
     s_manager.retry_start_target_valid = false;
-    memset(s_manager.retry_start_service_data, 0,
-           sizeof(s_manager.retry_start_service_data));
+    s_manager.retry_start_bindable = false;
 }
 
 static uint32_t _ble_adv_manager_retry_delay_ms(uint8_t attempts)
@@ -109,9 +104,7 @@ static void _ble_adv_manager_schedule_retry(
         action == BLE_ADV_MANAGER_RETRY_START &&
         (!s_manager.retry_start_target_valid ||
          s_manager.retry_start_mode != s_manager.started_mode ||
-         memcmp(s_manager.retry_start_service_data,
-                s_manager.service_data,
-                sizeof(s_manager.retry_start_service_data)) != 0);
+         s_manager.retry_start_bindable != s_manager.adv_config.bindable);
 
     if (s_manager.retry_action != action || start_target_changed)
     {
@@ -122,8 +115,7 @@ static void _ble_adv_manager_schedule_retry(
     {
         s_manager.retry_start_target_valid = true;
         s_manager.retry_start_mode = s_manager.started_mode;
-        memcpy(s_manager.retry_start_service_data, s_manager.service_data,
-               sizeof(s_manager.retry_start_service_data));
+        s_manager.retry_start_bindable = s_manager.adv_config.bindable;
     }
     s_manager.retry_generation = generation;
     if (s_manager.retry_attempts < UINT8_MAX)
@@ -146,18 +138,6 @@ static bool _ble_adv_manager_retry_ready(void)
     return s_manager.retry_pending &&
            _ble_adv_manager_deadline_reached(
                s_manager.config->now_ms(), s_manager.retry_not_before_ms);
-}
-
-static bool _ble_adv_manager_discriminator_is_zero(
-    const uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES])
-{
-    uint8_t combined = 0U;
-
-    for (size_t i = 0U; i < BLE_ADV_MANAGER_DISCRIMINATOR_BYTES; ++i)
-    {
-        combined |= discriminator[i];
-    }
-    return combined == 0U;
 }
 
 static void _ble_adv_manager_lock(void)
@@ -189,45 +169,22 @@ static bool _ble_adv_manager_has_fast_lease(void)
     return false;
 }
 
-static bool _ble_adv_manager_effective_payload(
-    bool *bindable_out, uint8_t discriminator_out[
-        BLE_ADV_MANAGER_DISCRIMINATOR_BYTES])
+static bool _ble_adv_manager_effective_bindable(void)
 {
     for (size_t i = 0U; i < BLE_ADV_MANAGER_MAX_LEASES; ++i)
     {
         if (s_manager.leases[i].in_use && s_manager.leases[i].bindable)
         {
-            *bindable_out = true;
-            memcpy(discriminator_out, s_manager.leases[i].discriminator,
-                   BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
             return true;
         }
     }
-    *bindable_out = false;
-    memset(discriminator_out, 0, BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     return false;
 }
 
-static bool _ble_adv_manager_payload_changed(void)
+static bool _ble_adv_manager_bindable_changed(void)
 {
-    bool bindable;
-    uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES];
-
-    (void)_ble_adv_manager_effective_payload(&bindable, discriminator);
-    if (s_manager.adv_config.service_data == NULL)
-    {
-        return false;
-    }
-    if (!bindable && s_manager.config->public_instance_id != NULL)
-    {
-        memcpy(discriminator, s_manager.config->public_instance_id,
-               sizeof(discriminator));
-    }
-    return s_manager.service_data[1] != (bindable
-                                         ? BLE_ADV_MANAGER_FLAG_BINDABLE
-                                         : 0U) ||
-           memcmp(&s_manager.service_data[2], discriminator,
-                  BLE_ADV_MANAGER_DISCRIMINATOR_BYTES) != 0;
+    return s_manager.adv_config.bindable !=
+           _ble_adv_manager_effective_bindable();
 }
 
 static ble_adv_manager_mode_t _ble_adv_manager_effective_mode(void)
@@ -265,36 +222,14 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
     const uint16_t interval = mode == BLE_ADV_MANAGER_MODE_FAST
                               ? config->fast_interval_ms
                               : config->slow_interval_ms;
-    bool bindable;
-    uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES];
     esp_err_t result;
 
-    (void)_ble_adv_manager_effective_payload(&bindable, discriminator);
     memset(&s_manager.adv_config, 0, sizeof(s_manager.adv_config));
     s_manager.adv_config.interval_ms = interval;
     s_manager.adv_config.short_name = config->short_name;
     s_manager.adv_config.short_name_len = config->short_name_len;
     s_manager.adv_config.service_uuid = config->service_uuid;
-    s_manager.service_data[0] = config->adv_version;
-    s_manager.service_data[1] = bindable ? BLE_ADV_MANAGER_FLAG_BINDABLE : 0U;
-    if (!bindable && config->public_instance_id != NULL)
-    {
-        memcpy(discriminator, config->public_instance_id,
-               sizeof(discriminator));
-    }
-    if (_ble_adv_manager_discriminator_is_zero(discriminator))
-    {
-        /* The v2 service data identifier must be non-zero in both modes:
-         * a zero identifier would break scan correlation and must never
-         * be published, regardless of what the caller supplied. */
-        s_manager.state = BLE_ADV_MANAGER_STATE_FAULTED;
-        return ESP_ERR_INVALID_STATE;
-    }
-    memcpy(&s_manager.service_data[2], discriminator,
-           BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
-    s_manager.adv_config.service_data = s_manager.service_data;
-    s_manager.adv_config.service_data_len =
-        BLE_ADV_MANAGER_SERVICE_DATA_BYTES;
+    s_manager.adv_config.bindable = _ble_adv_manager_effective_bindable();
     if (s_manager.start_generation == UINT32_MAX)
     {
         s_manager.state = BLE_ADV_MANAGER_STATE_FAULTED;
@@ -465,7 +400,7 @@ static esp_err_t _ble_adv_manager_converge(void)
                       : BLE_ADV_MANAGER_MODE_SLOW;
     }
     effective = _ble_adv_manager_effective_mode();
-    if (effective != active_mode || _ble_adv_manager_payload_changed())
+    if (effective != active_mode || _ble_adv_manager_bindable_changed())
     {
         if (active_mode == BLE_ADV_MANAGER_MODE_FAST &&
                 effective == BLE_ADV_MANAGER_MODE_SLOW)
@@ -515,21 +450,16 @@ void ble_adv_manager_deinit(void)
 }
 
 esp_err_t ble_adv_manager_acquire_lease(
-    ble_adv_lease_t *out, ble_adv_manager_mode_t mode, bool bindable,
-    const uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES])
+    ble_adv_lease_t *out, ble_adv_manager_mode_t mode, bool bindable)
 {
     size_t slot = BLE_ADV_MANAGER_MAX_LEASES;
 
-    if (out == NULL || (bindable && discriminator == NULL))
+    if (out == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
     if (mode != BLE_ADV_MANAGER_MODE_FAST &&
             mode != BLE_ADV_MANAGER_MODE_SLOW)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (bindable && _ble_adv_manager_discriminator_is_zero(discriminator))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -555,16 +485,6 @@ esp_err_t ble_adv_manager_acquire_lease(
     s_manager.leases[slot].id = (uint8_t)(slot + 1U);
     s_manager.leases[slot].mode = mode;
     s_manager.leases[slot].bindable = bindable;
-    if (bindable)
-    {
-        memcpy(s_manager.leases[slot].discriminator, discriminator,
-               BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
-    }
-    else
-    {
-        memset(s_manager.leases[slot].discriminator, 0,
-               BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
-    }
     s_manager.leases[slot].in_use = true;
     s_manager.lease_count++;
     if (mode == BLE_ADV_MANAGER_MODE_FAST)
@@ -576,8 +496,6 @@ esp_err_t ble_adv_manager_acquire_lease(
         out->lease_id = s_manager.leases[slot].id;
         out->mode = mode;
         out->bindable = bindable;
-        memcpy(out->discriminator, s_manager.leases[slot].discriminator,
-               BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     }
     const esp_err_t result = _ble_adv_manager_converge();
 
@@ -620,11 +538,9 @@ esp_err_t ble_adv_manager_release_lease(uint8_t lease_id)
 
     if (result != ESP_OK)
     {
-        /* A synchronous stop failure: restore the slot COMPLETELY (the
-         * discriminator was never cleared) so the owner can retry the
-         * release instead of being left with a phantom advertisement
-         * whose payload no longer matches the QR. The fast window is
-         * restored to its EXACT prior state: an active window keeps its
+        /* A synchronous stop failure restores the complete lease so the
+         * owner can retry the release. The fast window is restored to its
+         * exact prior state: an active window keeps its
          * original deadline (an expired or inactive window must not be
          * recreated with a fresh full duration). */
         s_manager.leases[slot].in_use = true;
@@ -676,8 +592,8 @@ esp_err_t ble_adv_manager_release_lease(uint8_t lease_id)
         _ble_adv_manager_unlock();
         return result;
     }
-    /* The release converged: only now is the discriminator erased. The
-     * fast window is active exactly while a FAST lease exists (invariant:
+    /* The release converged. The fast window is active exactly while a
+     * FAST lease exists (invariant:
      * no FAST lease means no fast window), so a release that removed the
      * last FAST lease retires the window through the regular helper: it
      * both clears the state and announces the cancel to the timer owner
@@ -686,8 +602,6 @@ esp_err_t ble_adv_manager_release_lease(uint8_t lease_id)
     {
         _ble_adv_manager_arm_fast_window(false);
     }
-    memset(s_manager.leases[slot].discriminator, 0,
-           BLE_ADV_MANAGER_DISCRIMINATOR_BYTES);
     _ble_adv_manager_unlock();
     return result;
 }
@@ -944,11 +858,8 @@ uint32_t ble_adv_manager_get_retry_remaining_ms(void)
 
 bool ble_adv_manager_bindable_requested(void)
 {
-    bool bindable = false;
-    uint8_t discriminator[BLE_ADV_MANAGER_DISCRIMINATOR_BYTES];
-
     _ble_adv_manager_lock();
-    (void)_ble_adv_manager_effective_payload(&bindable, discriminator);
+    const bool bindable = _ble_adv_manager_effective_bindable();
     _ble_adv_manager_unlock();
     return bindable;
 }

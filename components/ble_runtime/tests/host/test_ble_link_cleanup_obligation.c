@@ -78,28 +78,6 @@ static void test_new_acl_does_not_overwrite_old_cleanup(void)
     TEST_ASSERT_EQUAL(new_acl.peer_addr[0], due.peer_addr[0]);
 }
 
-static void test_only_exact_transaction_promote_clears_discard(void)
-{
-    ble_link_cleanup_state_t state;
-    const ble_link_cleanup_request_t request = _request(9U, 10U, 11U);
-    ble_link_operation_identity_t stale = request.identity;
-
-    ble_link_cleanup_reset(&state);
-    TEST_ASSERT_TRUE(ble_link_cleanup_retain(
-                         &state, &request, 0U));
-    stale.kind = BLE_LINK_OPERATION_PROVISIONAL_PROMOTE;
-    stale.token++;
-    TEST_ASSERT_EQUAL(BLE_LINK_CLEANUP_PROMOTE_NOT_FOUND,
-                      ble_link_cleanup_promote(&state, &stale));
-    TEST_ASSERT_EQUAL(0U, ble_link_cleanup_remaining_us(&state, 0U));
-    stale = request.identity;
-    stale.kind = BLE_LINK_OPERATION_PROVISIONAL_PROMOTE;
-    TEST_ASSERT_EQUAL(BLE_LINK_CLEANUP_PROMOTE_COMPLETE,
-                      ble_link_cleanup_promote(&state, &stale));
-    TEST_ASSERT_EQUAL(UINT64_MAX,
-                      ble_link_cleanup_remaining_us(&state, 0U));
-}
-
 static void test_fifth_distinct_cleanup_uses_fail_closed_overflow(void)
 {
     ble_link_cleanup_state_t state;
@@ -168,7 +146,7 @@ static void test_repeated_peer_cleanup_does_not_consume_slots(void)
 
     first.identity.kind = BLE_LINK_OPERATION_PEER_CLEANUP;
     first.provisional = false;
-    repeated.identity.kind = BLE_LINK_OPERATION_REMOTE_REPLACEMENT;
+    repeated.identity.kind = BLE_LINK_OPERATION_PEER_CLEANUP;
     repeated.provisional = false;
     repeated.terminate_conn = true;
     repeated.invalidate_authorization = true;
@@ -218,11 +196,11 @@ static void test_unresolved_delete_all_coalesces_global_target(void)
     ble_link_cleanup_request_t first = _request(200U, 210U, 10U);
     ble_link_cleanup_request_t repeated = _request(201U, 211U, 11U);
 
-    first.identity.kind = BLE_LINK_OPERATION_REMOTE_REPLACEMENT;
+    first.identity.kind = BLE_LINK_OPERATION_PEER_CLEANUP;
     first.provisional = false;
     first.peer_addr_valid = false;
     first.delete_all_if_unresolved = true;
-    repeated.identity.kind = BLE_LINK_OPERATION_REMOTE_REPLACEMENT;
+    repeated.identity.kind = BLE_LINK_OPERATION_PEER_CLEANUP;
     repeated.provisional = false;
     repeated.peer_addr_valid = false;
     repeated.delete_all_if_unresolved = true;
@@ -235,26 +213,6 @@ static void test_unresolved_delete_all_coalesces_global_target(void)
     TEST_ASSERT_TRUE(due.invalidate_authorization);
     ble_link_cleanup_finish(&state, &due, true, 0U);
     TEST_ASSERT_FALSE(ble_link_cleanup_pending(&state));
-}
-
-static void test_promote_distinguishes_busy_from_stale(void)
-{
-    ble_link_cleanup_state_t state;
-    ble_link_cleanup_request_t executing;
-    const ble_link_cleanup_request_t request = _request(120U, 130U, 140U);
-    ble_link_operation_identity_t promote = request.identity;
-
-    promote.kind = BLE_LINK_OPERATION_PROVISIONAL_PROMOTE;
-    ble_link_cleanup_reset(&state);
-    TEST_ASSERT_TRUE(ble_link_cleanup_retain(&state, &request, 0U));
-    TEST_ASSERT_TRUE(ble_link_cleanup_take_due(&state, 0U, &executing));
-    TEST_ASSERT_EQUAL(BLE_LINK_CLEANUP_PROMOTE_IN_PROGRESS,
-                      ble_link_cleanup_promote(&state, &promote));
-    ble_link_cleanup_finish(&state, &executing, false, 10U);
-    TEST_ASSERT_EQUAL(BLE_LINK_CLEANUP_PROMOTE_COMPLETE,
-                      ble_link_cleanup_promote(&state, &promote));
-    TEST_ASSERT_EQUAL(BLE_LINK_CLEANUP_PROMOTE_NOT_FOUND,
-                      ble_link_cleanup_promote(&state, &promote));
 }
 
 static void test_terminal_fence_survives_cleanup_and_handle_reuse(void)
@@ -310,13 +268,11 @@ int main(void)
 {
     test_retry_survives_missing_wake_hint();
     test_new_acl_does_not_overwrite_old_cleanup();
-    test_only_exact_transaction_promote_clears_discard();
     test_fifth_distinct_cleanup_uses_fail_closed_overflow();
     test_repeated_provisional_teardown_coalesces();
     test_repeated_peer_cleanup_does_not_consume_slots();
     test_strengthened_in_progress_cleanup_runs_follow_up();
     test_unresolved_delete_all_coalesces_global_target();
-    test_promote_distinguishes_busy_from_stale();
     test_terminal_fence_survives_cleanup_and_handle_reuse();
     test_disconnected_cleanup_does_not_create_permanent_fence();
     return 0;

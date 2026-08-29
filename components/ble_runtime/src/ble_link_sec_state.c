@@ -68,6 +68,21 @@ uint32_t ble_link_sec_state_on_connect(
     return BLE_LINK_SEC_ACTION_NONE;
 }
 
+void ble_link_sec_state_on_prior_bond_removed(
+    ble_link_sec_state_t *state)
+{
+    if (state == NULL || !state->active)
+    {
+        return;
+    }
+    state->encrypted = false;
+    state->had_bond = false;
+    state->bonded = false;
+    state->bond_verified = false;
+    state->finalized = false;
+    state->link_encrypted_reported = false;
+}
+
 uint32_t ble_link_sec_state_on_identity(
     ble_link_sec_state_t *state, bool bonded, bool bond_verified,
     bool refresh_had_bond, bool had_bond)
