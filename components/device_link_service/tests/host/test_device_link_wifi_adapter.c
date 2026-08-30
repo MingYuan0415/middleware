@@ -256,6 +256,138 @@ static void test_complete_failure_keeps_bridge_id(void)
     device_link_wifi_adapter_bridge_stop();
 }
 
+static void test_terminal_completion_retries_on_owner_tick(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 7U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.operation_complete = true;
+    status.operation_id = 1U;
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_complete_result(ESP_ERR_INVALID_STATE);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(
+               DEVICE_LINK_V1_OPERATION_DISCONNECT, NULL, 24U, NULL) ==
+           DEVICE_LINK_V1_STATUS_ACCEPTED);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 1U);
+    ble_link_service_fake_set_complete_result(ESP_OK);
+    device_link_wifi_adapter_tick();
+    assert(ble_link_service_fake_complete_count() == 2U);
+    assert(ble_link_service_fake_last_complete_id() == 24U);
+    device_link_wifi_adapter_tick();
+    assert(ble_link_service_fake_complete_count() == 2U);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_nonterminal_status_keeps_pending_terminal(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 7U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.operation_complete = true;
+    status.operation_id = 1U;
+    status.operation_canceled = true;
+    status.last_error = ESP_ERR_NOT_FINISHED;
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_complete_result(ESP_ERR_INVALID_STATE);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(
+               DEVICE_LINK_V1_OPERATION_CONNECT, NULL, 25U, NULL) ==
+           DEVICE_LINK_V1_STATUS_ACCEPTED);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 1U);
+
+    status.generation = 8U;
+    status.operation_complete = false;
+    status.operation_canceled = false;
+    status.last_error = ESP_OK;
+    status.state = CONNECTIVITY_MANAGER_STATE_CONNECTING;
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 2U);
+    assert(ble_link_service_fake_last_failure() ==
+           DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    ble_link_service_fake_set_complete_result(ESP_OK);
+    device_link_wifi_adapter_tick();
+    assert(ble_link_service_fake_complete_count() == 3U);
+    assert(ble_link_service_fake_last_failure() ==
+           DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_clear_pending_drops_terminal_retry(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 7U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.operation_complete = true;
+    status.operation_id = 1U;
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_complete_result(ESP_ERR_INVALID_STATE);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(
+               DEVICE_LINK_V1_OPERATION_DISCONNECT, NULL, 26U, NULL) ==
+           DEVICE_LINK_V1_STATUS_ACCEPTED);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 1U);
+    device_link_wifi_adapter_clear_pending();
+    ble_link_service_fake_set_complete_result(ESP_OK);
+    device_link_wifi_adapter_tick();
+    assert(ble_link_service_fake_complete_count() == 1U);
+    device_link_wifi_adapter_bridge_stop();
+}
+
+static void test_missing_engine_operation_drops_terminal(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 7U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.operation_complete = true;
+    status.operation_id = 1U;
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    ble_link_service_fake_set_complete_result(ESP_ERR_NOT_FOUND);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(
+               DEVICE_LINK_V1_OPERATION_DISCONNECT, NULL, 27U, NULL) ==
+           DEVICE_LINK_V1_STATUS_ACCEPTED);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 1U);
+    ble_link_service_fake_set_complete_result(ESP_OK);
+    device_link_wifi_adapter_tick();
+    assert(ble_link_service_fake_complete_count() == 1U);
+    device_link_wifi_adapter_bridge_stop();
+}
+
 static void test_bridge_start_seeds_saved_profile(void)
 {
     connectivity_manager_status_snapshot_t status;
@@ -363,6 +495,10 @@ int main(void)
     test_canceled_connect_completes_timeout();
     test_scan_timeout_maps_timeout();
     test_complete_failure_keeps_bridge_id();
+    test_terminal_completion_retries_on_owner_tick();
+    test_nonterminal_status_keeps_pending_terminal();
+    test_clear_pending_drops_terminal_retry();
+    test_missing_engine_operation_drops_terminal();
     test_bridge_start_seeds_saved_profile();
     test_bridge_start_seeds_generation_zero();
     test_radio_unavailable_keeps_saved_profile();

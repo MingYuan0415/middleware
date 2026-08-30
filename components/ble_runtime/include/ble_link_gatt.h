@@ -29,10 +29,6 @@ typedef struct ble_link_gatt_config
     uint8_t peer_addr[6];         /**< SMP peer identity address. */
     uint16_t att_mtu;             /**< Negotiated ATT MTU, 23 default. */
     size_t tx_queue_depth;        /**< TX scheduler queue depth. */
-    esp_err_t (*publish_link_state)(const uint8_t *value, size_t len,
-                                    void *arg); /**< Unused in v1. */
-    void *publish_arg;
-    const void *security_ops; /**< Unused; v1 has no application encryption. */
 } ble_link_gatt_config_t;
 
 /**
@@ -77,21 +73,6 @@ esp_err_t ble_link_gatt_restart(void);
 void ble_link_gatt_update_handles(void);
 
 /**
- * @brief Update session-derived facts after connection changes.
- *
- * @return ESP_OK, or ESP_ERR_INVALID_ARG.
- */
-esp_err_t ble_link_gatt_refresh_link_state(void);
-
-void ble_link_gatt_authentication_epoch_advance(void);
-void ble_link_gatt_cccd_epoch_advance(void);
-void ble_link_gatt_mark_link_state_dirty(void);
-void ble_link_gatt_request_link_state_refresh(void);
-bool ble_link_gatt_link_state_dirty(void);
-bool ble_link_gatt_link_state_retry_pending(void);
-uint32_t ble_link_gatt_link_state_retry_remaining_ms(void);
-
-/**
  * @brief Advance the connection identity (new connection or generation).
  *
  * @param[in] generation New connection generation.
@@ -131,11 +112,8 @@ void ble_link_gatt_set_att_mtu(uint16_t mtu);
  */
 esp_err_t ble_link_gatt_get_att_mtu(uint32_t *out_mtu);
 
-uint16_t ble_link_gatt_link_state_handle(void);
 uint16_t ble_link_gatt_session_tx_handle(void);
-uint16_t ble_link_gatt_control_tx_handle(void);
 uint16_t ble_link_gatt_session_rx_handle(void);
-uint16_t ble_link_gatt_control_rx_handle(void);
 
 #ifdef __cplusplus
 }

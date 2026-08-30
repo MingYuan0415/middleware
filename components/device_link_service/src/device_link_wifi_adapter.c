@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -28,6 +29,16 @@ typedef struct device_link_wifi_bridge
     connectivity_manager_operation_id_t manager_operation_id;
     device_link_v1_operation_t operation;
     uint64_t last_status_generation;
+    bool terminal_pending;
+    bool terminal_completing;
+    bool terminal_warning_logged;
+    uint64_t terminal_generation;
+    uint64_t completed_terminal_generation;
+    uint32_t terminal_ble_operation_id;
+    connectivity_manager_operation_id_t terminal_manager_operation_id;
+    device_link_v1_operation_t terminal_operation;
+    device_link_v1_wifi_failure_t terminal_failure;
+    device_link_v1_snapshot_t terminal_snapshot;
     uint64_t last_scan_generation;
     event_bus_sub_handle_t subscription;
 } device_link_wifi_bridge_t;
@@ -152,14 +163,92 @@ static device_link_v1_wifi_security_t _device_link_wifi_security(
     return (device_link_v1_wifi_security_t)0;
 }
 
+static void _device_link_wifi_drop_terminal_locked(uint32_t ble_operation_id)
+{
+    s_bridge.terminal_pending = false;
+    s_bridge.terminal_completing = false;
+    s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_ble_operation_id = 0U;
+    s_bridge.terminal_manager_operation_id = 0U;
+    if (s_bridge.ble_operation_id == ble_operation_id)
+    {
+        s_bridge.ble_operation_id = 0U;
+        s_bridge.manager_operation_id = 0U;
+    }
+}
+
+static void _device_link_wifi_try_complete_terminal(void)
+{
+    device_link_v1_snapshot_t snapshot;
+    uint32_t ble_operation_id;
+    uint64_t generation;
+    device_link_v1_wifi_failure_t failure;
+
+    _device_link_wifi_lock();
+    if (!s_bridge.terminal_pending || s_bridge.terminal_completing ||
+            s_bridge.terminal_ble_operation_id == 0U)
+    {
+        _device_link_wifi_unlock();
+        return;
+    }
+    s_bridge.terminal_completing = true;
+    snapshot = s_bridge.terminal_snapshot;
+    ble_operation_id = s_bridge.terminal_ble_operation_id;
+    generation = s_bridge.terminal_generation;
+    failure = s_bridge.terminal_failure;
+    _device_link_wifi_unlock();
+
+    const esp_err_t result = ble_link_service_complete_operation(
+                                 ble_operation_id, failure, NULL, 0U, &snapshot);
+
+    if (result != ESP_OK)
+    {
+        bool log_warning = false;
+
+        _device_link_wifi_lock();
+        if (s_bridge.terminal_pending &&
+                s_bridge.terminal_ble_operation_id == ble_operation_id &&
+                s_bridge.terminal_generation == generation)
+        {
+            if (result == ESP_ERR_NOT_FOUND)
+            {
+                _device_link_wifi_drop_terminal_locked(ble_operation_id);
+            }
+            else
+            {
+                s_bridge.terminal_completing = false;
+                if (!s_bridge.terminal_warning_logged)
+                {
+                    s_bridge.terminal_warning_logged = true;
+                    log_warning = true;
+                }
+            }
+        }
+        _device_link_wifi_unlock();
+        if (log_warning)
+        {
+            LOG_W("terminal completion retry op=%u generation=%" PRIu64
+                  " result=%d", ble_operation_id, generation, result);
+            ble_link_service_wake_owner();
+        }
+        return;
+    }
+
+    _device_link_wifi_lock();
+    if (s_bridge.terminal_pending &&
+            s_bridge.terminal_ble_operation_id == ble_operation_id &&
+            s_bridge.terminal_generation == generation)
+    {
+        s_bridge.completed_terminal_generation = generation;
+        _device_link_wifi_drop_terminal_locked(ble_operation_id);
+    }
+    _device_link_wifi_unlock();
+}
+
 static void _device_link_wifi_on_status(
     const connectivity_manager_status_snapshot_t *status)
 {
     device_link_v1_snapshot_t snapshot;
-
-    uint32_t ble_operation_id;
-    connectivity_manager_operation_id_t manager_operation_id;
-    device_link_v1_operation_t operation;
 
     _device_link_wifi_lock();
     if (s_bridge.status_seen &&
@@ -170,24 +259,28 @@ static void _device_link_wifi_on_status(
     }
     s_bridge.status_seen = true;
     s_bridge.last_status_generation = status->generation;
-    ble_operation_id = s_bridge.ble_operation_id;
-    manager_operation_id = s_bridge.manager_operation_id;
-    operation = s_bridge.operation;
     _device_link_wifi_unlock();
     _device_link_wifi_map_snapshot(status, &snapshot);
     ble_link_service_observe_snapshot(&snapshot);
-    if (!status->operation_complete ||
-            status->operation_id != manager_operation_id ||
-            ble_operation_id == 0U)
+    if (!status->operation_complete)
     {
-        return;
-    }
-    if (operation == DEVICE_LINK_V1_OPERATION_SCAN)
-    {
+        _device_link_wifi_try_complete_terminal();
         return;
     }
     device_link_v1_wifi_failure_t failure =
         _device_link_wifi_map_failure(status->failure);
+
+    _device_link_wifi_lock();
+    if (status->operation_id != s_bridge.manager_operation_id ||
+            s_bridge.ble_operation_id == 0U ||
+            s_bridge.operation == DEVICE_LINK_V1_OPERATION_SCAN)
+    {
+        _device_link_wifi_unlock();
+        _device_link_wifi_try_complete_terminal();
+        return;
+    }
+    const uint32_t ble_operation_id = s_bridge.ble_operation_id;
+    const device_link_v1_operation_t operation = s_bridge.operation;
 
     if (status->operation_canceled ||
             status->last_error == ESP_ERR_NOT_FINISHED)
@@ -199,18 +292,17 @@ static void _device_link_wifi_on_status(
     {
         failure = DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL;
     }
-    if (ble_link_service_complete_operation(
-                ble_operation_id, failure, NULL, 0U, &snapshot) != ESP_OK)
-    {
-        return;
-    }
-    _device_link_wifi_lock();
-    if (s_bridge.ble_operation_id == ble_operation_id)
-    {
-        s_bridge.ble_operation_id = 0U;
-        s_bridge.manager_operation_id = 0U;
-    }
+    s_bridge.terminal_pending = true;
+    s_bridge.terminal_completing = false;
+    s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_generation = status->generation;
+    s_bridge.terminal_ble_operation_id = ble_operation_id;
+    s_bridge.terminal_manager_operation_id = status->operation_id;
+    s_bridge.terminal_operation = operation;
+    s_bridge.terminal_failure = failure;
+    s_bridge.terminal_snapshot = snapshot;
     _device_link_wifi_unlock();
+    _device_link_wifi_try_complete_terminal();
 }
 
 static void _device_link_wifi_on_scan(
@@ -384,6 +476,11 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
         return DEVICE_LINK_V1_STATUS_INTERNAL;
     }
     _device_link_wifi_lock();
+    s_bridge.terminal_pending = false;
+    s_bridge.terminal_completing = false;
+    s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_ble_operation_id = 0U;
+    s_bridge.terminal_manager_operation_id = 0U;
     s_bridge.ble_operation_id = operation_id;
     s_bridge.manager_operation_id = manager_id;
     s_bridge.operation = operation;
@@ -460,5 +557,23 @@ void device_link_wifi_adapter_bridge_stop(void)
     ble_link_service_set_v1_ops(NULL, NULL);
     _device_link_wifi_lock();
     memset(&s_bridge, 0, sizeof(s_bridge));
+    _device_link_wifi_unlock();
+}
+
+void device_link_wifi_adapter_tick(void)
+{
+    _device_link_wifi_try_complete_terminal();
+}
+
+void device_link_wifi_adapter_clear_pending(void)
+{
+    _device_link_wifi_lock();
+    s_bridge.terminal_pending = false;
+    s_bridge.terminal_completing = false;
+    s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_ble_operation_id = 0U;
+    s_bridge.terminal_manager_operation_id = 0U;
+    s_bridge.ble_operation_id = 0U;
+    s_bridge.manager_operation_id = 0U;
     _device_link_wifi_unlock();
 }

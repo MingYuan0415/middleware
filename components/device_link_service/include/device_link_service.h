@@ -234,8 +234,8 @@ bool device_link_service_is_active(void);
  * @brief Report whether the service blocks standby.
  *
  * The current conservative product policy treats an open or deferred binding
- * window and every connected ACL as busy. This includes public-only
- * link_state readers, so standby never suspends a live BLE transport.
+ * window and every connected ACL as busy, so standby never suspends a live
+ * BLE transport.
  *
  * @return true while a window is open/deferred or a client is connected.
  */

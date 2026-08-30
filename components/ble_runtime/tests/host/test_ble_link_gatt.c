@@ -118,8 +118,6 @@ static void test_registers_two_characteristics(void)
     ble_link_gatt_update_handles();
     TEST_ASSERT_EQUAL(0x10U, ble_link_gatt_session_rx_handle());
     TEST_ASSERT_EQUAL(0x12U, ble_link_gatt_session_tx_handle());
-    TEST_ASSERT_EQUAL(0U, ble_link_gatt_link_state_handle());
-    TEST_ASSERT_EQUAL(0U, ble_link_gatt_control_tx_handle());
 }
 
 static void test_att_mtu_clamps_to_profile(void)

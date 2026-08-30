@@ -93,3 +93,7 @@ esp_err_t ble_link_service_complete_operation(
     }
     return s_complete_result;
 }
+
+void ble_link_service_wake_owner(void)
+{
+}

@@ -132,6 +132,7 @@ static void _reset(void)
     ble_link_service_set_worker_wake(_wake, NULL);
     ble_link_service_set_pairing_window(true);
     ble_link_service_on_connect(1U, 7U);
+    ble_link_service_set_transport_admitted(1U, 7U, true);
 }
 
 static void _confirm_tx(void)
@@ -296,6 +297,7 @@ static void test_scan_without_owner_returns_internal(void)
     ble_link_service_init(BOOT_ID, _output, NULL, NULL, 0U);
     ble_link_service_set_pairing_window(true);
     ble_link_service_on_connect(1U, 7U);
+    ble_link_service_set_transport_admitted(1U, 7U, true);
     _execute_write(scan, sizeof(scan));
     TEST_ASSERT_TRUE(s_tx_len >= 3U);
     TEST_ASSERT_EQUAL(DEVICE_LINK_V1_SCAN | DEVICE_LINK_V1_RESPONSE_MASK,
@@ -320,6 +322,41 @@ static void test_execute_output_failure_unblocks_writes(void)
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_link_service_execute(work));
     ble_link_service_release_work(work);
     TEST_ASSERT_TRUE(!ble_link_service_write_blocked());
+}
+
+static void test_execute_rechecks_transport_admission(void)
+{
+    const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+    ble_link_work_t *work = NULL;
+    const ble_link_service_facts_t facts = _facts();
+
+    _reset();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &facts, BLE_LINK_SERVICE_RX_SESSION, scan,
+                          sizeof(scan), &work));
+    ble_link_service_set_transport_admitted(1U, 7U, false);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE,
+                      ble_link_service_execute(work));
+    TEST_ASSERT_EQUAL(0U, s_submit_calls);
+    TEST_ASSERT_TRUE(!ble_link_service_write_blocked());
+    ble_link_service_release_work(work);
+}
+
+static void test_stale_transport_update_is_ignored(void)
+{
+    const uint8_t scan[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+    ble_link_work_t *work = NULL;
+    const ble_link_service_facts_t facts = _facts();
+
+    _reset();
+    ble_link_service_set_transport_admitted(2U, 7U, false);
+    ble_link_service_set_transport_admitted(1U, 8U, false);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &facts, BLE_LINK_SERVICE_RX_SESSION, scan,
+                          sizeof(scan), &work));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(work));
+    TEST_ASSERT_EQUAL(1U, s_submit_calls);
+    ble_link_service_release_work(work);
 }
 
 static void test_abort_tx_rejects_stale_identity(void)
@@ -394,6 +431,7 @@ static void test_stale_work_does_not_release_new_reservation(void)
                           sizeof(request), &old_work));
     ble_link_service_reset();
     ble_link_service_on_connect(2U, 9U);
+    ble_link_service_set_transport_admitted(2U, 9U, true);
     facts.connection_generation = 2U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
                           &facts, BLE_LINK_SERVICE_RX_SESSION, request,
@@ -550,6 +588,8 @@ int main(void)
     test_numeric_comparison_reset_and_new_connection_wake_owner();
     test_scan_without_owner_returns_internal();
     test_execute_output_failure_unblocks_writes();
+    test_execute_rechecks_transport_admission();
+    test_stale_transport_update_is_ignored();
     test_abort_tx_rejects_stale_identity();
     test_submit_failure_returns_internal_without_slot();
     test_operation_timeout_remaining_tracks_deadline();

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "device_link_v1.h"
 #include "esp_err.h"
@@ -32,6 +33,12 @@ esp_err_t device_link_wifi_adapter_get_descriptor(const void **descriptor);
 
 esp_err_t device_link_wifi_adapter_bridge_start(void);
 void device_link_wifi_adapter_bridge_stop(void);
+
+/** @brief Retry a retained Wi-Fi terminal completion from the owner task. */
+void device_link_wifi_adapter_tick(void);
+
+/** @brief Drop operation completion state when the BLE session is retired. */
+void device_link_wifi_adapter_clear_pending(void);
 
 #ifdef __cplusplus
 }

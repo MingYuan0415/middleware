@@ -80,6 +80,19 @@ void ble_link_service_init(
 void ble_link_service_reset(void);
 void ble_link_service_set_v1_ops(const ble_link_v1_owner_ops_t *ops, void *arg);
 void ble_link_service_set_pairing_window(bool open);
+
+/**
+ * @brief Update current server_tx indication admission.
+ *
+ * Stale connection identities are ignored. Execution checks this state under
+ * the same lock that admits domain operations.
+ *
+ * @param[in] generation Current connection generation.
+ * @param[in] conn_handle Current connection handle.
+ * @param[in] admitted True when the server_tx indication CCCD is enabled.
+ */
+void ble_link_service_set_transport_admitted(
+    uint32_t generation, uint16_t conn_handle, bool admitted);
 void ble_link_service_observe_snapshot(const device_link_v1_snapshot_t *snapshot);
 esp_err_t ble_link_service_complete_operation(
     uint32_t operation_id, device_link_v1_wifi_failure_t failure,

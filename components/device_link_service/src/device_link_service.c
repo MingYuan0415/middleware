@@ -505,14 +505,6 @@ static esp_err_t _device_link_service_deinit_return(esp_err_t result)
 static uint32_t _device_link_service_next_wait_ms(void)
 {
     uint32_t wait_ms = UINT32_MAX;
-    const uint32_t link_state_retry_ms =
-        ble_link_gatt_link_state_retry_remaining_ms();
-
-    if (link_state_retry_ms != UINT32_MAX)
-    {
-        wait_ms = _device_link_service_min_wait(
-                      wait_ms, link_state_retry_ms);
-    }
     const uint32_t operation_timeout_ms =
         ble_link_service_operation_timeout_remaining_ms();
 
@@ -802,6 +794,7 @@ static void _device_link_service_clear_link_session(void)
 {
     ble_nimble_port_numeric_comparison_cancel();
     ble_link_service_clear_session_state();
+    device_link_wifi_adapter_clear_pending();
 }
 
 static esp_err_t _device_link_service_close_window_locked(void)
@@ -917,6 +910,7 @@ static void _device_link_service_ble_event(
 {
     (void)arg;
     bool state_changed = false;
+    bool retire_wifi_operation = false;
 
     if (event->type != BLE_PORT_EVENT_CONNECT &&
             event->type != BLE_PORT_EVENT_DISCONNECT &&
@@ -957,6 +951,7 @@ static void _device_link_service_ble_event(
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
         state_changed = true;
+        retire_wifi_operation = true;
     }
     else if (event->type == BLE_PORT_EVENT_RESET)
     {
@@ -964,12 +959,17 @@ static void _device_link_service_ble_event(
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
         state_changed = true;
+        retire_wifi_operation = true;
     }
     if (state_changed)
     {
         s_service.status_dirty = true;
     }
     xSemaphoreGive(s_service.mutex);
+    if (retire_wifi_operation)
+    {
+        device_link_wifi_adapter_clear_pending();
+    }
     if (state_changed)
     {
         _device_link_service_wake_worker(NULL);
@@ -1056,18 +1056,9 @@ static void _device_link_service_handle_command(
 {
     if (command->type == DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK)
     {
-        const uint32_t link_flags_before = ble_link_session_get_state_flags();
         const esp_err_t result = ble_link_service_execute(command->link_work);
-        const uint32_t link_flags_after = ble_link_session_get_state_flags();
 
         ble_link_service_release_work(command->link_work);
-        /* The worker owns link-state delivery. Any session flag transition
-         * must force a fresh snapshot for an already-enabled CCCD. */
-        if (link_flags_before != link_flags_after)
-        {
-            ble_link_gatt_request_link_state_refresh();
-        }
-        (void)ble_link_gatt_refresh_link_state();
         if (result == ESP_OK)
         {
             return;
@@ -1282,12 +1273,9 @@ static void _device_link_service_worker_tick(void)
      * callback. Continue it from this owner task so no GATT submit is
      * re-entered from NimBLE's completion stack. */
     (void)ble_link_service_pump_tx();
+    device_link_wifi_adapter_tick();
     ble_link_service_tick(
         (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
-    if (ble_link_gatt_link_state_dirty())
-    {
-        (void)ble_link_gatt_refresh_link_state();
-    }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     publish = s_service.status_dirty;
     publish = _device_link_service_sync_confirmation_locked() || publish;

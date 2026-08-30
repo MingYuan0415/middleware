@@ -381,42 +381,6 @@ void ble_link_gatt_update_handles(void)
     _ble_link_gatt_unlock();
 }
 
-esp_err_t ble_link_gatt_refresh_link_state(void)
-{
-    return ESP_OK;
-}
-
-void ble_link_gatt_authentication_epoch_advance(void)
-{
-}
-
-void ble_link_gatt_cccd_epoch_advance(void)
-{
-}
-
-void ble_link_gatt_mark_link_state_dirty(void)
-{
-}
-
-void ble_link_gatt_request_link_state_refresh(void)
-{
-}
-
-bool ble_link_gatt_link_state_dirty(void)
-{
-    return false;
-}
-
-bool ble_link_gatt_link_state_retry_pending(void)
-{
-    return false;
-}
-
-uint32_t ble_link_gatt_link_state_retry_remaining_ms(void)
-{
-    return UINT32_MAX;
-}
-
 void ble_link_gatt_set_connection(
     uint32_t generation, uint16_t conn_handle,
     uint8_t peer_addr_type, const uint8_t peer_addr[6])
@@ -495,11 +459,6 @@ esp_err_t ble_link_gatt_get_att_mtu(uint32_t *out_mtu)
     return ESP_OK;
 }
 
-uint16_t ble_link_gatt_link_state_handle(void)
-{
-    return 0U;
-}
-
 uint16_t ble_link_gatt_session_tx_handle(void)
 {
     _ble_link_gatt_lock();
@@ -509,11 +468,6 @@ uint16_t ble_link_gatt_session_tx_handle(void)
     return handle;
 }
 
-uint16_t ble_link_gatt_control_tx_handle(void)
-{
-    return 0U;
-}
-
 uint16_t ble_link_gatt_session_rx_handle(void)
 {
     _ble_link_gatt_lock();
@@ -521,9 +475,4 @@ uint16_t ble_link_gatt_session_rx_handle(void)
 
     _ble_link_gatt_unlock();
     return handle;
-}
-
-uint16_t ble_link_gatt_control_rx_handle(void)
-{
-    return 0U;
 }

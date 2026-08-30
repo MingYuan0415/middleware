@@ -42,6 +42,7 @@ typedef struct ble_link_service
     bool pairing_window_open;
     bool confirmation_pending;
     bool connection_valid;
+    bool transport_admitted;
     uint32_t connection_generation;
     uint16_t conn_handle;
     uint64_t confirmation_token;
@@ -91,6 +92,7 @@ static bool _ble_link_service_clear_session_state_locked(void)
 
     device_link_v1_engine_disconnect(&s_service.engine);
     s_service.connection_valid = false;
+    s_service.transport_admitted = false;
     s_service.connection_generation = 0U;
     s_service.conn_handle = 0U;
     s_service.confirmation_pending = false;
@@ -406,6 +408,15 @@ esp_err_t ble_link_service_complete_operation(
     const device_link_v1_snapshot_t *snapshot)
 {
     _ble_link_service_lock();
+    const device_link_v1_operation_record_t *record =
+        device_link_v1_engine_record(&s_service.engine);
+
+    if (record == NULL || record->operation_id != operation_id ||
+            record->phase != DEVICE_LINK_V1_OPERATION_ACTIVE)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
     const bool ok = device_link_v1_engine_complete(
                         &s_service.engine, operation_id, failure, networks, count,
                         snapshot);
@@ -481,6 +492,12 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
         _ble_link_service_clear_reservation(work);
         _ble_link_service_unlock();
         return ESP_OK;
+    }
+    if (!s_service.transport_admitted)
+    {
+        _ble_link_service_clear_reservation(work);
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
     if (device_link_v1_engine_write_blocked(&s_service.engine))
     {
@@ -667,12 +684,26 @@ void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle)
     s_service.connection_generation = generation;
     s_service.conn_handle = conn_handle;
     s_service.connection_valid = generation != 0U;
+    s_service.transport_admitted = false;
     device_link_v1_engine_connect(&s_service.engine);
     _ble_link_service_unlock();
     if (confirmation_changed)
     {
         _ble_link_service_wake();
     }
+}
+
+void ble_link_service_set_transport_admitted(
+    uint32_t generation, uint16_t conn_handle, bool admitted)
+{
+    _ble_link_service_lock();
+    if (s_service.connection_valid &&
+            s_service.connection_generation == generation &&
+            s_service.conn_handle == conn_handle)
+    {
+        s_service.transport_admitted = admitted;
+    }
+    _ble_link_service_unlock();
 }
 
 void ble_link_service_clear_session_state(void)

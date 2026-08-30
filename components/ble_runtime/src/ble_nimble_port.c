@@ -397,8 +397,6 @@ static bool _ble_nimble_port_capture_connection_identity(
 static bool _ble_nimble_port_connection_identity_matches(
     const ble_port_event_t *event, ble_link_operation_kind_t kind,
     uint32_t generation, uint16_t conn_handle, bool match_security_epoch);
-static bool _ble_nimble_port_gap_is_subscribed_kind(
-    uint16_t conn_handle, uint16_t attr_handle, bool notify);
 static esp_err_t _ble_nimble_port_wait_for_adv_stopped(
     ble_adv_manager_pause_reason_t reason);
 static esp_err_t _ble_nimble_port_queue_peer_unpair_address(
@@ -533,51 +531,6 @@ static void _ble_nimble_port_gap_consumer(
         return;
     }
     (void)_ble_nimble_port_gap_handle_event(&manager_event);
-}
-
-static esp_err_t _ble_nimble_port_publish_link_state(
-    const uint8_t *value, size_t len, void *arg)
-{
-    (void)arg;
-    const uint16_t handle = ble_link_gatt_link_state_handle();
-
-    if (handle == 0U)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ble_gap_manager_snapshot_t snapshot;
-
-    if (_ble_nimble_port_gap_snapshot(&snapshot) != ESP_OK ||
-            !snapshot.connected)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    /* tx_admission: authorized; the link_state notification CCCD must be
-     * enabled. */
-    uint32_t admission_error = 0U;
-
-    if (ble_link_session_query_admission(
-                snapshot.generation, BLE_LINK_SESSION_CHANNEL_EVENT,
-                &admission_error) != ESP_OK ||
-            admission_error != BLE_LINK_ERROR_OK ||
-            !_ble_nimble_port_gap_is_subscribed_kind(
-                snapshot.conn_handle, handle, true))
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    /* The raw link_state notification is not a service transaction: its
-     * completion must not release the service response gate. */
-    const ble_link_operation_identity_t identity =
-    {
-        .generation = snapshot.generation,
-        .security_epoch = ble_link_session_security2_epoch(),
-        .kind = BLE_LINK_OPERATION_TX_NOTIFY,
-        .conn_handle = snapshot.conn_handle,
-    };
-
-    return ble_tx_scheduler_submit(
-               BLE_TX_SCHEDULER_KIND_NOTIFY, &identity, handle,
-               value, len, false);
 }
 
 /* The indication confirmation deadline is retained independently of the
@@ -1418,25 +1371,6 @@ static bool _ble_nimble_port_connection_identity_matches(
     return !match_security_epoch ||
            event->identity.security_epoch ==
            ble_link_session_security2_epoch();
-}
-
-static bool _ble_nimble_port_gap_is_subscribed_kind(
-    uint16_t conn_handle, uint16_t attr_handle, bool notify)
-{
-    bool subscribed = false;
-
-    if (s_link_state_lock != NULL &&
-            xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY) != pdTRUE)
-    {
-        return false;
-    }
-    subscribed = ble_gap_manager_is_subscribed_kind(
-                     conn_handle, attr_handle, notify);
-    if (s_link_state_lock != NULL)
-    {
-        xSemaphoreGiveRecursive(s_link_state_lock);
-    }
-    return subscribed;
 }
 
 static void _ble_nimble_port_storage_lock(void)
@@ -2294,9 +2228,11 @@ static void _ble_nimble_port_link_gatt_consumer(
         if (_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_SUBSCRIBE,
                     s_timer_generation, s_link_conn_handle, true) &&
-                event->attr_handle == ble_link_gatt_link_state_handle())
+                event->attr_handle == ble_link_gatt_session_tx_handle())
         {
-            ble_link_gatt_cccd_epoch_advance();
+            ble_link_service_set_transport_admitted(
+                event->identity.generation, event->conn_handle,
+                event->indicate);
         }
         break;
     default:
@@ -2342,10 +2278,6 @@ static void _ble_nimble_port_link_gatt_consumer(
             }
         }
     }
-    /* Host callbacks only retain the refresh fact and wake the Device Link
-     * owner. Encoding, submission, and delivery-stamp mutation stay in the
-     * owner task and cannot race SUBSCRIBE or TX completion callbacks. */
-    ble_link_gatt_request_link_state_refresh();
 }
 
 static void _ble_nimble_port_adv_consumer(
@@ -2407,20 +2339,11 @@ static void _ble_nimble_port_tx_consumer(
          * scheduler (production_indicate) takes the lock itself. */
         const esp_err_t result = ble_tx_scheduler_handle_notify_tx(event);
 
-        if (result == ESP_OK &&
+        if (result == ESP_OK && event->indication &&
                 (event->tx_result == BLE_PORT_TX_TIMEOUT ||
                  event->tx_result == BLE_PORT_TX_ERROR))
         {
-            if (event->indication)
-            {
-                (void)ble_link_service_abort_tx_if_current(&event->identity);
-            }
-            else if (event->attr_handle ==
-                     ble_link_gatt_link_state_handle())
-            {
-                /* link_state notifications are best effort. */
-                ble_link_gatt_mark_link_state_dirty();
-            }
+            (void)ble_link_service_abort_tx_if_current(&event->identity);
         }
         else if (result != ESP_OK && result != ESP_ERR_NOT_FOUND &&
                  result != ESP_ERR_INVALID_STATE)
@@ -2428,11 +2351,6 @@ static void _ble_nimble_port_tx_consumer(
             if (event->indication)
             {
                 (void)ble_link_service_abort_tx_if_current(&event->identity);
-            }
-            else if (event->attr_handle ==
-                     ble_link_gatt_link_state_handle())
-            {
-                ble_link_gatt_mark_link_state_dirty();
             }
             LOG_E("tx scheduler event failed result=%d", result);
         }
@@ -2800,7 +2718,6 @@ static void _ble_nimble_port_apply_sec_actions(
              * be externally visible. */
             _ble_nimble_port_commit_provisional_bond(
                 generation, conn_handle);
-            ble_link_gatt_request_link_state_refresh();
             ble_link_service_wake_owner();
         }
         else
@@ -4832,7 +4749,6 @@ static int _ble_nimble_port_gap_event(
             }
             _ble_nimble_port_apply_sec_actions(
                 replay_actions, event->connect.conn_handle);
-            ble_link_gatt_request_link_state_refresh();
             return 0;
         }
         break;
@@ -5063,7 +4979,6 @@ static int _ble_nimble_port_gap_event(
              * global BOUND fact before retrying SMP so the open window is not
              * mistaken for an already completed pairing. */
             (void)ble_link_session_set_authorization(false, 0U);
-            ble_link_gatt_request_link_state_refresh();
             ble_link_service_wake_owner();
             ble_hs_cfg.sm_sc_only = 1;
             return BLE_GAP_REPEAT_PAIRING_RETRY;
@@ -5338,9 +5253,8 @@ static int _ble_nimble_port_access_bridge(
             }
             if (terminal_fenced)
             {
-                /* Preserve public link_state reads, but terminal cleanup
-                 * owns every session/control write until this exact ACL is
-                 * retired by DISCONNECT or RESET. */
+                /* Terminal cleanup owns every Device Link command write until
+                 * this exact ACL is retired by DISCONNECT or RESET. */
                 return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
             }
         }
@@ -6150,8 +6064,6 @@ static esp_err_t _ble_nimble_port_init(void)
         }
         gatt_config.att_mtu = 23U;
         gatt_config.tx_queue_depth = CONFIG_BLE_RUNTIME_TX_QUEUE_DEPTH;
-        gatt_config.publish_link_state = _ble_nimble_port_publish_link_state;
-        gatt_config.security_ops = NULL;
         result = ble_link_gatt_init(&gatt_config);
         if (result != ESP_OK)
         {

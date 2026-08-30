@@ -54,12 +54,18 @@ The database contains one service and two characteristics:
 - `command_rx`: authenticated Write Request.
 - `server_tx`: authenticated Indicate with CCCD value `02 00`.
 
+There is no application-layer Security 2 handshake and no legacy
+`link_state`, `control_rx`, or `control_tx` characteristic in v1. Link
+authentication is provided solely by the bonded Secure Connections transport.
+
 The preferred and required ATT MTU is 498, yielding a 495-byte characteristic
 value. Each Write contains one complete v1 frame; there is no application-layer
 fragment reassembly. The route gate checks encryption, verified SC/MITM bond,
 CCCD state, size, and the single outstanding indication before dispatching
-application work. ATT security errors remain visible to the client so it can
-initiate pairing.
+application work. The owner repeats the current connection and `server_tx`
+CCCD check immediately before queued work executes, so disabling indications
+cannot start a Wi-Fi operation whose result has no return path. ATT security
+errors remain visible to the client so it can initiate pairing.
 
 The TX scheduler permits one indication in flight. A two-second absolute
 deadline retires the exact operation on timeout while keeping a raw-callback
