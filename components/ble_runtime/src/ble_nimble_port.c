@@ -5072,11 +5072,22 @@ static int _ble_nimble_port_gap_event(
     case BLE_GAP_EVENT_PASSKEY_ACTION:
     {
         ble_gap_manager_snapshot_t snapshot;
+        const esp_err_t snapshot_result =
+            _ble_nimble_port_gap_snapshot(&snapshot);
 
-        if (_ble_nimble_port_gap_snapshot(&snapshot) != ESP_OK ||
+        LOG_I("passkey action received handle=%u action=%u",
+              event->passkey.conn_handle, event->passkey.params.action);
+
+        if (snapshot_result != ESP_OK ||
                 !snapshot.connected ||
                 snapshot.conn_handle != event->passkey.conn_handle)
         {
+            LOG_W("passkey action dropped handle=%u snapshot_result=%d "
+                  "connected=%u current_handle=%u",
+                  event->passkey.conn_handle, snapshot_result,
+                  snapshot_result == ESP_OK && snapshot.connected,
+                  snapshot_result == ESP_OK ? snapshot.conn_handle
+                  : BLE_NIMBLE_SMP_CONN_HANDLE_NONE);
 #ifndef UNIT_TEST_HOST
             (void)ble_gap_terminate(event->passkey.conn_handle,
                                     BLE_ERR_CONN_TERM_LOCAL);
@@ -5181,10 +5192,13 @@ static int _ble_nimble_port_gap_connection_event(
         return 0;
     }
     /* Most GAP connection events are already delivered to the global listener.
-     * NimBLE v6.0.2 emits these two only through the callback captured by
-     * ble_gap_adv_start(); forward only them to avoid double reduction. */
+     * NimBLE v6.0.2 emits identity resolution, repeat pairing and passkey
+     * actions only through the callback captured by ble_gap_adv_start();
+     * forward those three to avoid dropping security events or double
+     * reducing the events handled by the global listener. */
     if (event->type == BLE_GAP_EVENT_IDENTITY_RESOLVED ||
-            event->type == BLE_GAP_EVENT_REPEAT_PAIRING)
+            event->type == BLE_GAP_EVENT_REPEAT_PAIRING ||
+            event->type == BLE_GAP_EVENT_PASSKEY_ACTION)
     {
         return _ble_nimble_port_gap_event(event, arg);
     }
