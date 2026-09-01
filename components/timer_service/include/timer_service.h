@@ -10,6 +10,7 @@
 extern "C" {
 #endif
 
+/** @brief Completion edge emitted by the timer owner. */
 typedef enum
 {
     TIMER_SERVICE_IDLE = 0,
@@ -24,9 +25,29 @@ typedef enum
     TIMER_SERVICE_FOCUS_BREAK,
 } timer_service_focus_phase_t;
 
+/** @brief Completion edge emitted by the timer owner. */
+typedef enum
+{
+    TIMER_SERVICE_COMPLETION_COUNTDOWN = 0,
+    TIMER_SERVICE_COMPLETION_FOCUS_CYCLE,
+} timer_service_completion_type_t;
+
+/** @brief Small completion event delivered outside the timer lock. */
+typedef struct timer_service_completion_event
+{
+    uint32_t generation;
+    timer_service_completion_type_t type;
+} timer_service_completion_event_t;
+
+/** @brief Optional callback invoked by the timer worker or API caller. */
+typedef void (*timer_service_completion_cb_t)(
+    const timer_service_completion_event_t *event, void *user_data);
+
 typedef struct timer_service_config
 {
     int64_t (*monotonic_time_us)(void);
+    timer_service_completion_cb_t completion_cb; /**< Optional completion callback. */
+    void *completion_user_data; /**< Opaque callback context. */
 } timer_service_config_t;
 
 typedef struct timer_service_snapshot

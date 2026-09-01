@@ -13,6 +13,8 @@
 | `imu_service` | 周期采样 QMI8658C 适配器，缓存带 sequence 的三轴快照并发布状态/中断事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |
 | `audio_service` | 管理 BSP ES8311/NS4150B 全双工 PCM、音量、静音和 PA 生命周期 | `bsp`；`freertos`、`mt_log`（私有） |
 | `sd_storage_service` | 通过板级 mount adapter 管理可移除存储生命周期，不绑定 SDSPI/SDMMC 实现 | `freertos`、`mt_log`（私有） |
+| `timer_service` | 以单调时间维护倒计时、秒表和专注阶段，提供线程安全 snapshot、完成回调与命令状态机 | `esp_common`、`freertos` |
+| `recorder_service` | 独占录音音频会话和 SD WAV 文件；通过专属 worker 异步执行录音、播放、删除和 WAV finalize，提供 generation snapshot 与有界完成文件列表 | `audio_service`、`sd_storage_service`；`esp_timer`、`mt_log`（私有） |
 | `system_pm` | 串行执行外设休眠钩子、ESP32 轻睡眠与唤醒恢复，并管理 CPU 最高频率锁 | `mt_log` 和 ESP-IDF PM/GPIO/硬件支持组件（私有） |
 | `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
@@ -61,6 +63,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `time_service_set_network_ready()` 是非阻塞电平通知。每个 IPv4 联网周期只启动一次系统 SNTP，首次成功更新后立即停止；掉线和待机也会停止，唤醒后等待 Wi-Fi 重连取得新 IPv4 再同步。应用的“立即校时”可在在线时另行发起一次请求，页面关闭不取消系统请求。
 - `weather_service` 将定位、HTTPS、JSON、重试和缓存全部留在 PSRAM worker 中。每个 IPv4 会话只请求一次定位；手动刷新不重复定位。天气响应携带的 `location_key` 是服务端按 0.1° 网格派生的不透明作用域标识：同一网格恒定、不暴露坐标，key 变化即清空旧数据集并按“实时优先”全量刷新，避免跨网格的陈旧或混合快照；可选的 `district` 区县名为显示字段（本地化成功时出现、永不从设备头回显），不参与位置身份判定；缓存不落盘 key 与 district，重启后由会话定位重新建立。UI 只 acquire/release 不可变快照，事件仅携带 generation、状态和 changed mask。
 - `chore_service` 的 job 是短时有界回调：运行在单 worker 上，串行执行；`run` 须主动轮询取消令牌并及时返回，不得调用 LVGL、发起同步 HTTP 或无限等待。`submit` 成功后参数所有权转移给服务，`release` 在完成、取消或关闭后于 worker 上恰好执行一次；`cancel` 是协作式静默等待（返回即保证 `release` 已执行），拒绝 worker 自身调用。周期 job 从完成时刻固定延迟调度，挂起期间到期不追补，唤醒后最多立即补一次。`suspend`/`resume` 遵循仓库 PAUSE/RESUME 握手（超时回滚），整笔事务由独立生命周期锁串行，杜绝相反命令合并与 ack 互擦；停机会用 STOPPED 位唤醒在途挂起/恢复等待者，不会死锁。job 类 API 可在任意任务调用且与 `deinit` 并发安全：进程生命周期的接纳门先原子关闭、排空在途调用，新实例以新 epoch 重开接纳并沿用单调槽位代际，旧句柄永不指向新实例；仅 init 与并发 deinit 要求调用方串行化。休眠协调中该服务最先挂起、最后恢复。
+- `recorder_service` 的公开 start/pause/resume/stop/play/delete 只接纳命令并立即返回；实际文件系统和音频 I/O 在 Recorder 专属 worker 串行执行。不得把录音或播放主循环提交到 `chore_service`；Chore 仅用于短时、有明确上限的索引、容量和元数据任务。
 
 显示 TE 同步不属于 middleware 服务 API。BSP 通过 `bsp_display_port_t.te` 导出 GPIO13 上升沿、所选 SPI 频率（项目经验默认 40 MHz；80 MHz 为超规格实验）、4 data lines 和当前 16 bpp 物理参数；`layers/app_manager` 据此启用 TE sync，并补充 adapter 默认 13/1 ms、66% 刷新窗口。
 
