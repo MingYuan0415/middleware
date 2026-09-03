@@ -881,11 +881,45 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                              cJSON_GetObjectItemCaseSensitive(source, "id") : NULL;
     const cJSON *data = cJSON_IsObject(root) ?
                         cJSON_GetObjectItemCaseSensitive(root, "data") : NULL;
+    weather_service_location_t embedded = {0};
     bool valid = cJSON_IsNumber(version) && version->valuedouble == 1.0 &&
                  cJSON_IsString(source_id) && source_id->valuestring != NULL &&
                  strcmp(source_id->valuestring, "qweather") == 0 &&
                  cJSON_IsObject(data) &&
-                 _weather_parse_public_location(root, &snapshot->location);
+                 _weather_parse_public_location(root, &embedded);
+    if (valid)
+    {
+        /* The /location endpoint is the authoritative localized display
+         * source: it is the only response that can carry a Chinese city and
+         * an optional district. A weather payload echoes its own provider
+         * city, which the server must keep consistent with /location for the
+         * same location_key; the coarse grid identity, not the display text,
+         * is the scope. So on an unchanged location_key keep the staged
+         * /location display fields and only adopt the embedded location on a
+         * real drift or when no location is staged yet. available,
+         * acquired_at and reused always stay as staged. */
+        const bool same_scope = snapshot->location.available &&
+                                embedded.location_key[0] != '\0' &&
+                                strcmp(embedded.location_key,
+                                       snapshot->location.location_key) == 0;
+        if (!same_scope)
+        {
+            memcpy(snapshot->location.city, embedded.city,
+                   sizeof(snapshot->location.city));
+            memcpy(snapshot->location.district, embedded.district,
+                   sizeof(snapshot->location.district));
+            memcpy(snapshot->location.region, embedded.region,
+                   sizeof(snapshot->location.region));
+            memcpy(snapshot->location.country, embedded.country,
+                   sizeof(snapshot->location.country));
+            memcpy(snapshot->location.timezone, embedded.timezone,
+                   sizeof(snapshot->location.timezone));
+            memcpy(snapshot->location.provider, embedded.provider,
+                   sizeof(snapshot->location.provider));
+            memcpy(snapshot->location.location_key, embedded.location_key,
+                   sizeof(snapshot->location.location_key));
+        }
+    }
     uint32_t mask = 0U;
     esp_err_t result = ESP_ERR_INVALID_RESPONSE;
     if (valid)

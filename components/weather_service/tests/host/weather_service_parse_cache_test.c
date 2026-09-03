@@ -475,6 +475,45 @@ static void _test_weather(void)
                                         &changed) == ESP_ERR_INVALID_RESPONSE);
 }
 
+static void _test_weather_location_localization(void)
+{
+    static const char current[] =
+        "{\"observed_at\":\"2026-08-05T07:50:00+08:00\","
+        "\"temperature_c\":31.2,\"feels_like_c\":35.6,"
+        "\"condition_code\":\"101\",\"condition_text\":\"Cloudy\","
+        "\"wind_degrees\":135,\"wind_speed_kmh\":12.3,"
+        "\"wind_direction\":\"SE\",\"wind_scale\":\"3\","
+        "\"humidity_percent\":72,\"precipitation_mm\":0.2,"
+        "\"pressure_hpa\":1004,\"visibility_km\":18.5}";
+    weather_service_snapshot_t snapshot = {0};
+    uint32_t changed = 0U;
+    snapshot.location.available = true;
+    snapshot.location.acquired_at = 555;
+    memcpy(snapshot.location.city, "\xe6\x96\xb0\xe7\x95\x8c",
+           strlen("\xe6\x96\xb0\xe7\x95\x8c") + 1U);
+    memcpy(snapshot.location.district, "\xe5\x8c\x97\xe5\x8c\xba",
+           strlen("\xe5\x8c\x97\xe5\x8c\xba") + 1U);
+    memcpy(snapshot.location.location_key, "9f4a2b3c8d1e5f06",
+           sizeof("9f4a2b3c8d1e5f06"));
+    CHECK(_parse(WEATHER_SERVICE_KIND_CURRENT, current, &snapshot,
+                 &changed) == ESP_OK);
+    CHECK(strcmp(snapshot.location.city, "\xe6\x96\xb0\xe7\x95\x8c") == 0);
+    CHECK(strcmp(snapshot.location.district,
+                 "\xe5\x8c\x97\xe5\x8c\xba") == 0);
+    CHECK(snapshot.location.acquired_at == 555);
+
+    weather_service_snapshot_t drifted = {0};
+    drifted.location.available = true;
+    memcpy(drifted.location.city, "\xe6\x96\xb0\xe7\x95\x8c",
+           strlen("\xe6\x96\xb0\xe7\x95\x8c") + 1U);
+    memcpy(drifted.location.location_key, "0000000000000000",
+           sizeof("0000000000000000"));
+    CHECK(_parse(WEATHER_SERVICE_KIND_CURRENT, current, &drifted,
+                 &changed) == ESP_OK);
+    CHECK(strcmp(drifted.location.city, "Shenzhen") == 0);
+    CHECK(strcmp(drifted.location.district, "Nanshan") == 0);
+}
+
 static void _test_cache(void)
 {
     char directory[] = "/tmp/mt-weather-XXXXXX";
@@ -670,6 +709,7 @@ int main(void)
     weather_service_parse_init();
     _test_location();
     _test_weather();
+    _test_weather_location_localization();
     _test_alert_boundaries();
     _test_cache();
     _test_cache_legacy_coordinate_slots();
