@@ -17,6 +17,7 @@ set(HOST_CONNECTIVITY "${PROJECT_ROOT}/tests/connectivity/host")
 project(ble_runtime_host_tests C)
 
 enable_testing()
+find_package(Threads REQUIRED)
 
 set(TEST_SOURCES
     "${COMPONENT}/src/ble_runtime.c"
@@ -55,6 +56,7 @@ foreach(test_target IN ITEMS
         test_ble_nimble_store_guard
         test_ble_nimble_store_restore_audit
         test_ble_nimble_store_reset
+        test_ble_nimble_port_revoke_journal
         test_ble_nimble_tx_tracker
         test_ble_link_session
         test_ble_link_sec_state
@@ -92,6 +94,12 @@ foreach(test_target IN ITEMS
         add_executable(${test_target}
             ${test_target}.c
             "${COMPONENT}/src/ble_nimble_store_reset.c")
+    elseif(test_target STREQUAL test_ble_nimble_port_revoke_journal)
+        add_executable(${test_target}
+            ${test_target}.c
+            "${COMPONENT}/src/ble_nimble_port_revoke_journal.c"
+            "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c")
+        target_link_libraries(${test_target} PRIVATE Threads::Threads)
     elseif(test_target STREQUAL test_ble_nimble_tx_tracker)
         add_executable(${test_target}
             ${test_target}.c
@@ -149,6 +157,7 @@ set(BLE_RUNTIME_TESTS
     ble_nimble_store_guard
     ble_nimble_store_restore_audit
     ble_nimble_store_reset
+    ble_nimble_port_revoke_journal
     ble_nimble_tx_tracker
     ble_link_session ble_link_sec_state
     ble_link_service ble_link_gatt ble_event_router)

@@ -34,6 +34,7 @@
 #include "ble_nimble_adv_start.h"
 #include "ble_nimble_peer_identity.h"
 #include "ble_nimble_pairing_gate.h"
+#include "ble_nimble_port_revoke_journal.h"
 #include "ble_nimble_smp_policy.h"
 #include "ble_nimble_store_guard.h"
 #include "ble_nimble_store_restore_audit.h"
@@ -4022,9 +4023,9 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
      * journal is already gone the revoke completed (idempotent resume) and
      * nothing must be deleted. */
     bool pending = false;
-    const esp_err_t pending_result = ESP_OK;
+    const esp_err_t pending_result =
+        ble_nimble_port_revoke_journal_pending(&pending);
 
-    pending = false;
     if (pending_result != ESP_OK)
     {
         return pending_result;
@@ -4086,7 +4087,7 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
     }
     /* Durable boundary: only now, with the store verified empty, is the
      * revoke intent cleared. */
-    const esp_err_t journal_result = ESP_OK;
+    const esp_err_t journal_result = ble_nimble_port_revoke_journal_end();
 
     if (journal_result != ESP_OK)
     {
@@ -4141,9 +4142,9 @@ esp_err_t ble_nimble_port_revoke_binding(void)
 
     _ble_nimble_port_storage_lock();
     bool pending = false;
-    const esp_err_t pending_result = ESP_OK;
+    const esp_err_t pending_result =
+        ble_nimble_port_revoke_journal_pending(&pending);
 
-    pending = false;
     if (pending_result != ESP_OK)
     {
         result = pending_result;
@@ -4365,7 +4366,8 @@ static esp_err_t _ble_nimble_port_reset_peer_store(void)
      * on_sync performs and verifies the bond/CCCD sweep before signaling
      * start completion; the marker may disappear only after that sweep. */
     bool pending = false;
-    const esp_err_t result = ESP_OK;
+    const esp_err_t result =
+        ble_nimble_port_revoke_journal_pending(&pending);
 
     if (result != ESP_OK)
     {
@@ -4385,7 +4387,8 @@ static esp_err_t _ble_nimble_port_reset_peer_store(void)
 static esp_err_t _ble_nimble_port_resume_revoke_locked(void)
 {
     bool pending = false;
-    const esp_err_t pending_result = ESP_OK;
+    const esp_err_t pending_result =
+        ble_nimble_port_revoke_journal_pending(&pending);
 
     if (pending_result != ESP_OK)
     {
@@ -4404,8 +4407,7 @@ static esp_err_t _ble_nimble_port_reconcile_sync_storage(void)
     bool revoke_pending = false;
 
     _ble_nimble_port_storage_lock();
-    result = ESP_OK;
-    revoke_pending = false;
+    result = ble_nimble_port_revoke_journal_pending(&revoke_pending);
     if (result == ESP_OK && revoke_pending)
     {
         /* A journaled revoke intentionally destroys the complete peer store.

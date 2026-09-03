@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/device_link_confirmation.c"
+        "src/device_link_revoke_progress.c"
         "src/device_link_service.c"
         "src/device_link_wifi_adapter.c"
     INCLUDE_DIRS "include"

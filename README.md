@@ -56,7 +56,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。
 - `connectivity_manager` 是 Wi-Fi profile、自动连接和无感同步的唯一 owner。`connectivity_manager_request_sync_profile()` 以非零 client sync ID 接受凭据；相同 ID/相同凭据幂等，相同 ID/不同凭据冲突，新 profile 只有 IPv4 和 durable store 都成功后替换旧 profile。密码永不读回；存储结果不明确时保留旧 profile 并返回可恢复的 storage/internal 错误。Device Link 的 Wi-Fi adapter 是第一道防线：`OPEN` 要求空密码、`PERSONAL` 要求 1..64 非空密码、`UNSUPPORTED` 直接 `INVALID_ARGUMENT`；接纳错误按各方法冻结的 `allowed_statuses` 映射（manager 未运行/停机窗口一律 `UNAVAILABLE`，队列满仅 `start_scan`/`set_credentials` 映射 `RESOURCE_EXHAUSTED`，`start_scan`/`disconnect`/`reconnect_saved` 在有在途操作时同步返回 `BUSY`）。manager 终态若先于 Core v2 table 接纳到达，completion bridge 以容量 1、TTL 1 s 的 deferred 槽暂存并在接纳时合并，槽位不会泄漏为永久 PENDING。
-- `device_link_service` worker 是 ACL、Numeric Comparison 确认、`command_rx`/`server_tx` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤。
+- `device_link_service` worker 是 ACL、Numeric Comparison 确认、`command_rx`/`server_tx` 投递和清理义务的逻辑 owner。生产队列和 TX completion 通过 task notification 唤醒；worker 按最近绝对 deadline 等待并在每个循环出口 sweep。所有迟到事件以 `{generation, security_epoch, flow_id, token, kind, conn_handle}` 过滤。本地撤销入队不代表完成；worker 在 revoke journal 消失前保持广告暂停并按 100 ms 周期继续推进。
 - provisional/orphan/replacement cleanup 由 owner 按 100/200/400/800/1000 ms 退避保留，port 以固定 `4 + 1 overflow` 容量和物理目标合并避免队列满丢失。pending cleanup 拒绝新 ACL；live terminal cleanup 保留 session/control write fence 和 host-serialized terminate retry，公开 `link_state` 仍可读，广告仅在所有 cleanup 清空后恢复。peer-store 删除采用单次 explicit delete、逐类型 readback 和完整 host-run sticky error，持久化失败不能被同 run 的 RAM absence 冒充成功；deinit 通过双 host barrier 的 fixed-point drain 保留 revoke/cleanup 义务。
 - `ble_runtime` 的 TX scheduler 以固定 `queue_depth + 1` credit 覆盖 queued、in-flight 和待投递 completion，每个成功提交只产生一个终态。ADV START/STOP 失败保留 generation-scoped obligation，并按 100/200/400/800/1000 ms 退避；普通窗口取消使用不受 ADV 队列容量影响的通知唤醒。pairing gate 的 requested-open 与 cleanup/rejected/revoke/drain hold 独立，effective open 仅在 hold mask 为空时成立；被拒绝 ACL 在 CONNECT host callback 内先关 gate 再保留终止义务。
 - Device Link v1 使用 LE Secure Connections Numeric Comparison；绑定替换为本地清 bond 后再配对。`SET_CREDENTIALS` 只持久化不连接。
@@ -73,7 +73,9 @@ Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，N
 IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
 stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
 256 KiB，Chore stack 4096 和 job 容量 8。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
-`app_product_config_t` 在运行时传入。恢复出厂启动先清 Wi-Fi profile，再以 gated 模式
+`app_product_config_t` 在运行时传入。恢复出厂启动先清 Wi-Fi profile、引导状态、App
+Manager 偏好和内置 App 状态，data 挂载后由 `fs_storage_wipe_data()` 清空 `/data`
+下全部应用数据文件（天气缓存等；不清外置 SD 卡），再以 gated 模式
 清 Device Link 授权、bond/CCCD 和易失状态，并在广告暂停时预取得 slow lease；全局 marker
 清除后仅解除广告 pause，再允许平台及网络继续启动。marker 清除前任一持久化、擦除或广告
 前置步骤失败均中止本次启动；清除后的物理 START 失败由 ADV owner 有界退避重试。`SYSTEM_PM_DEVELOPMENT_MODE` 是根产品开发 gate，

@@ -3,9 +3,7 @@
 #include <string.h>
 
 #include "nv_storage.h"
-
-#define ESP_ERR_NVS_NOT_FOUND 0x1102
-#define ESP_ERR_NVS_INVALID_LENGTH 0x1106
+#include "nvs.h"
 
 #define NV_STORAGE_FAKE_CAPACITY 512U
 #define NV_STORAGE_FAKE_KEYS 4U

@@ -23,10 +23,12 @@
 #include "ble_link_service.h"
 
 #include "ble_nimble_port.h"
+#include "ble_nimble_port_revoke_journal.h"
 #include "ble_runtime.h"
 
 #include "device_link_service.h"
 #include "device_link_confirmation.h"
+#include "device_link_revoke_progress.h"
 #include "device_link_wifi_adapter.h"
 #include "event_bus.h"
 
@@ -620,9 +622,7 @@ static void _device_link_service_wake_worker(void *arg)
 
 static esp_err_t _device_link_service_continue_revoke(void)
 {
-    const esp_err_t result = ble_nimble_port_revoke_binding();
-
-    return result == ESP_OK ? ESP_OK : ESP_ERR_INVALID_STATE;
+    return device_link_revoke_progress();
 }
 
 static esp_err_t _device_link_service_close_window_locked(void);
@@ -1185,7 +1185,8 @@ static void _device_link_service_handle_command(
 
         if (!journal_written)
         {
-            journal_written = true;
+            revoke_result = ble_nimble_port_revoke_journal_begin();
+            journal_written = revoke_result == ESP_OK;
         }
         if (revoke_result == ESP_OK && journal_written)
         {
@@ -1393,10 +1394,12 @@ static void _device_link_service_worker_tick(void)
         if (revoke_result == ESP_OK && s_service.revoke_in_progress)
         {
             s_service.revoke_in_progress = false;
+            s_service.snapshot.last_error = ESP_OK;
             release_revoke_pause = true;
             revoke_publish = true;
         }
         else if (revoke_result != ESP_OK &&
+                 revoke_result != ESP_ERR_NOT_FINISHED &&
                  s_service.snapshot.last_error != revoke_result)
         {
             s_service.snapshot.last_error = revoke_result;
@@ -1557,7 +1560,7 @@ static void _device_link_service_worker(void *arg)
                           resume_result);
                 }
             }
-            else
+            else if (revoke_result != ESP_ERR_NOT_FINISHED)
             {
                 worker_result = revoke_result;
             }
@@ -2083,7 +2086,11 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         if (config->startup_mode ==
                 DEVICE_LINK_SERVICE_STARTUP_FACTORY_RESET_GATED)
         {
-            s_service.revoke_in_progress = true;
+            result = ble_nimble_port_revoke_journal_begin();
+            if (result == ESP_OK)
+            {
+                s_service.revoke_in_progress = true;
+            }
         }
     }
     if (result == ESP_OK && s_service.bluetooth_enabled)

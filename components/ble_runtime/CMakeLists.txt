@@ -6,6 +6,7 @@ idf_component_register(
         "src/ble_nimble_adv_start.c"
         "src/ble_nimble_peer_identity.c"
         "src/ble_nimble_pairing_gate.c"
+        "src/ble_nimble_port_revoke_journal.c"
         "src/ble_nimble_smp_policy.c"
         "src/ble_nimble_store_guard.c"
         "src/ble_nimble_store_restore_audit.c"
@@ -29,4 +30,5 @@ idf_component_register(
         freertos
         mt_log
         nvs_flash
+        nv_storage
 )

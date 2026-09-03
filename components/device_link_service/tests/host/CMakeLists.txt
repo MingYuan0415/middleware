@@ -47,25 +47,35 @@ target_compile_options(test_device_link_wifi_adapter PRIVATE
     -UNDEBUG)
 add_executable(test_device_link_service
                test_device_link_service.c
-               "${COMPONENT}/src/device_link_confirmation.c")
+               "${COMPONENT}/src/device_link_confirmation.c"
+               "${COMPONENT}/src/device_link_revoke_progress.c"
+               "${COMPONENT}/src/device_link_service.c")
 target_compile_features(test_device_link_service PRIVATE c_std_11)
 target_compile_definitions(test_device_link_service PRIVATE
     _POSIX_C_SOURCE=200809L
-    UNIT_TEST_HOST)
+    UNIT_TEST_HOST
+    CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
+    CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144)
 target_include_directories(test_device_link_service PRIVATE
                            "${COMPONENT}/include"
                            "${COMPONENT}/src"
                            "${BLE_RUNTIME}/include"
                            "${DEVICE_LINK}/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
                            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/nv_storage/include"
+                           "${PROJECT_ROOT}/layers/middleware/components/wifi_service/include"
                            "${HOST_CONNECTIVITY}/include")
 target_compile_options(test_device_link_service PRIVATE
     -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
+    -ffunction-sections
+    -fdata-sections
     -Wall
     -Wextra
     -Werror
     -Wpedantic
     -UNDEBUG)
+target_link_options(test_device_link_service PRIVATE -Wl,--gc-sections)
 if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "address")
     foreach(target IN ITEMS test_device_link_wifi_adapter
             test_device_link_service)

@@ -121,7 +121,13 @@ Peer cleanup verifies removal of OUR_SEC, PEER_SEC, CCCD, and applicable privacy
 records. Store write and restore errors are sticky for the current host run;
 absence from the RAM mirror cannot retire a cleanup after persistence failed.
 Local revoke and factory reset use a journaled full-store reset and reopen
-advertising only after durable NVS and RAM mirrors are both empty.
+advertising only after durable NVS and RAM mirrors are both empty. The journal
+is `ble_nimble_port_revoke_journal` (versioned `ble.revoke` blob in
+`nv_storage`): `begin` persists the intent, `pending` fails closed on a
+malformed blob, and `end` clears it only after the verified-empty sweep. A
+revoke request only queues host-core work; Device Link observes journal absence
+before declaring completion and retries while the marker remains. `begin`
+rewrites malformed markers, including blobs larger than the current version.
 
 The root build pins the required ESP-IDF v6.0.2 behavior, including
 `MYNEWT_VAL_BLE_RESTART_PAIR=0`. `scripts/check_idf_assumptions.sh` verifies the
