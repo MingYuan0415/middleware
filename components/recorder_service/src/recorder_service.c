@@ -90,11 +90,11 @@ static recorder_runtime_t s_recorder;
 #endif
 static bool s_initialized;
 #ifdef ESP_PLATFORM
-static uint32_t s_next_operation_id;
+    static uint32_t s_next_operation_id;
 #endif
 
 #ifdef ESP_PLATFORM
-static void _recorder_command_task(void *argument);
+    static void _recorder_command_task(void *argument);
 #endif
 
 static void _recorder_lock(void)
@@ -196,7 +196,6 @@ static bool _recorder_header_valid(const recorder_wav_header_t *header,
            (uint64_t)header->data_size + sizeof(*header) <= file_size;
 }
 
-#ifdef ESP_PLATFORM
 static void _recorder_snapshot_update(uint32_t duration_ms)
 {
     const uint64_t free_bytes = _recorder_free_bytes(
@@ -210,7 +209,6 @@ static void _recorder_snapshot_update(uint32_t duration_ms)
     s_recorder.snapshot.free_bytes = free_bytes;
     _recorder_unlock();
 }
-#endif
 
 static uint32_t _recorder_duration_locked(int64_t now_us)
 {
@@ -446,7 +444,7 @@ static void _recorder_task(void *argument)
         if (playback)
         {
             const uint32_t position = _recorder_elapsed_ms(
-                s_recorder.started_us, esp_timer_get_time());
+                                          s_recorder.started_us, esp_timer_get_time());
             s_recorder.snapshot.playback_position_ms =
                 position < s_recorder.snapshot.playback_duration_ms ?
                 position : s_recorder.snapshot.playback_duration_ms;
@@ -578,6 +576,15 @@ esp_err_t recorder_service_get_snapshot(recorder_service_snapshot_t *snapshot)
     {
         return ESP_ERR_INVALID_STATE;
     }
+#ifndef ESP_PLATFORM
+    /* The host build has no streaming worker to run periodic snapshot
+     * refreshes, so fold one in at read time. Device builds are unchanged. */
+    _recorder_lock();
+    const uint32_t live_duration = _recorder_duration_locked(
+                                       esp_timer_get_time());
+    _recorder_unlock();
+    _recorder_snapshot_update(live_duration);
+#endif
     _recorder_lock();
     *snapshot = s_recorder.snapshot;
     _recorder_unlock();
