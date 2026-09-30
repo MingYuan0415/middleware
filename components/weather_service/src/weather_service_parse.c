@@ -31,7 +31,7 @@ static void _weather_parse_release(void *memory)
 #endif
 
 static atomic_flag s_weather_parse_initialized = ATOMIC_FLAG_INIT;
-static atomic_bool s_weather_parse_ready = ATOMIC_VAR_INIT(false);
+static atomic_bool s_weather_parse_ready = false;
 
 void weather_service_parse_init(void)
 {

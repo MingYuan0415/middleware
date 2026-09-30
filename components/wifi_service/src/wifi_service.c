@@ -22,10 +22,10 @@ _Static_assert(sizeof(wifi_service_scan_snapshot_t) <=
 
 wifi_service_shared_t g_wifi_service =
 {
-    .core_state = ATOMIC_VAR_INIT(WIFI_CORE_EMPTY),
-    .generation = ATOMIC_VAR_INIT(1U),
+    .core_state = WIFI_CORE_EMPTY,
+    .generation = 1U,
 #ifdef WIFI_SERVICE_TESTING
-    .worker_credentials_zero = ATOMIC_VAR_INIT(true),
+    .worker_credentials_zero = true,
 #endif
 };
 

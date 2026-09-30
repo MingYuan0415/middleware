@@ -52,7 +52,7 @@ static power_service_state_t s_state = POWER_SERVICE_STATE_STOPPED;
 static power_service_snapshot_t s_snapshot;
 static power_service_irq_event_t s_pending_irq_event;
 static bool s_irq_event_pending;
-static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
+static atomic_bool s_worker_event_tail_complete = true;
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 

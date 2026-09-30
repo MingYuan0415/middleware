@@ -144,15 +144,14 @@ static device_link_service_t s_service;
 
 /* One CAS-visible word prevents an admission that sampled an old RUNNING
  * instance from crossing a full deinit/reinit ABA cycle. */
-static atomic_uint_fast64_t s_api_state = ATOMIC_VAR_INIT(
-        DEVICE_LINK_SERVICE_LIFECYCLE_UNINITIALIZED);
-static atomic_uint s_worker_result = ATOMIC_VAR_INIT(0U);
-static atomic_bool s_worker_exited = ATOMIC_VAR_INIT(false);
-static atomic_bool s_deinit_command_admitted = ATOMIC_VAR_INIT(false);
+static atomic_uint_fast64_t s_api_state = DEVICE_LINK_SERVICE_LIFECYCLE_UNINITIALIZED;
+static atomic_uint s_worker_result = 0U;
+static atomic_bool s_worker_exited = false;
+static atomic_bool s_deinit_command_admitted = false;
 /* BLE callbacks become live before the worker is created. Publish its handle
  * atomically and issue one catch-up notification after publication so work
  * retained during STARTING cannot lose its wake. */
-static atomic_uintptr_t s_worker_task = ATOMIC_VAR_INIT((uintptr_t)NULL);
+static atomic_uintptr_t s_worker_task = (uintptr_t)NULL;
 static atomic_flag s_deinit_guard = ATOMIC_FLAG_INIT;
 #ifdef UNIT_TEST_HOST
     static device_link_service_test_api_acquire_hook_t s_api_acquire_hook;

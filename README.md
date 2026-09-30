@@ -94,7 +94,11 @@ Manager 偏好和内置 App 状态，data 挂载后由 `fs_storage_wipe_data()` 
 
 ## 宿主测试
 
-需要 CMake 3.16+、Ninja、C11 编译器和 pthread。从本 middleware 子模块根目录运行 NVS 套件：
+需要 CMake 3.22+、Ninja、C11 编译器和 pthread。按根仓库
+`AGENTS.md` 的影响面表选择对应组件的 `tests/host` 套件。以下保留一个
+普通 profile 示例；ASan/TSan 只在内存所有权或并发改动时按风险追加。
+
+从本 middleware 子模块根目录运行 NVS 套件：
 
 ```sh
 cmake -S components/nv_storage/tests/host -B /tmp/mt-nv -G Ninja \
@@ -103,7 +107,7 @@ cmake --build /tmp/mt-nv
 ctest --test-dir /tmp/mt-nv --output-on-failure
 ```
 
-运行时间服务的回调代际门和端口排空屏障套件：
+需要时运行时间服务的回调代际门和端口排空屏障套件：
 
 ```sh
 cmake -S components/time_service/tests/host -B /tmp/mt-time -G Ninja \
@@ -141,7 +145,7 @@ ctest --test-dir /tmp/mt-device-link --output-on-failure
 ```
 
 运行 NimBLE/Device Link runtime 和 service owner 套件（需要先导出
-ESP-IDF v6.0.2 的 `IDF_PATH`）：
+ESP-IDF v6.1 的 `IDF_PATH`）：
 
 ```sh
 cmake -S components/ble_runtime/tests/host -B /tmp/mt-ble-runtime -G Ninja \
@@ -157,7 +161,7 @@ ctest --test-dir /tmp/mt-device-link-service --output-on-failure
 ```
 
 两套 sanitizer 选项均接受 `address` 或 `thread`。`ble_runtime` 套件还执行固定
-ESP-IDF v6.0.2 内部假设检查；失败时必须审查 NimBLE pairing/store/host-event 时序。
+ESP-IDF v6.1 内部假设检查；失败时必须审查 NimBLE pairing/store/host-event 时序。
 
 运行恢复出厂 journal 的持久化、故障注入和断电恢复套件：
 

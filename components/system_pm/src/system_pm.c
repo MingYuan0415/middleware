@@ -53,7 +53,7 @@ static uint32_t s_request_generation;
 static uint32_t s_pending_completion_generation;
 static uint32_t s_completed_generation;
 static esp_err_t s_request_complete_result;
-static atomic_bool s_worker_event_tail_complete = ATOMIC_VAR_INIT(true);
+static atomic_bool s_worker_event_tail_complete = true;
 static system_pm_state_t s_state = SYSTEM_PM_STATE_STOPPED;
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 

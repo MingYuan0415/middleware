@@ -38,9 +38,9 @@ typedef struct weather_http_context
     bool retry_after_overflow;
 } weather_http_context_t;
 
-static atomic_uintptr_t s_active_client = ATOMIC_VAR_INIT((uintptr_t)NULL);
-static atomic_uint s_cancel_readers = ATOMIC_VAR_INIT(0U);
-static atomic_ullong s_cancel_generation = ATOMIC_VAR_INIT(0U);
+static atomic_uintptr_t s_active_client = (uintptr_t)NULL;
+static atomic_uint s_cancel_readers = 0U;
+static atomic_ullong s_cancel_generation = 0U;
 
 static void _weather_port_secure_clear(void *memory, size_t size)
 {

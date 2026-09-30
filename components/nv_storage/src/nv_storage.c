@@ -29,7 +29,7 @@ typedef enum nv_storage_state
     NV_STORAGE_DEINITIALIZING,
 } nv_storage_state_t;
 
-static atomic_uint s_lifecycle = ATOMIC_VAR_INIT(NV_STORAGE_UNINITIALIZED);
+static atomic_uint s_lifecycle = NV_STORAGE_UNINITIALIZED;
 static atomic_flag s_cleanup_busy = ATOMIC_FLAG_INIT;
 static SemaphoreHandle_t s_registry_mutex;
 static StaticSemaphore_t s_registry_mutex_storage;

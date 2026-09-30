@@ -41,6 +41,34 @@ set(TEST_SOURCES
     "${DEVICE_LINK}/src/device_link_v1_engine.c"
     "${HOST_CONNECTIVITY}/freertos_host.c")
 
+add_library(ble_runtime_common OBJECT ${TEST_SOURCES})
+target_compile_features(ble_runtime_common PRIVATE c_std_11)
+target_compile_definitions(ble_runtime_common PRIVATE
+    _POSIX_C_SOURCE=200809L
+    UNIT_TEST_HOST)
+target_compile_options(ble_runtime_common PRIVATE
+    -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
+    -Wall -Wextra -Werror -Wpedantic -UNDEBUG)
+target_include_directories(ble_runtime_common PRIVATE
+    "${COMPONENT}/include"
+    "${COMPONENT}/src"
+    "${DEVICE_LINK}/include"
+    "${CMAKE_CURRENT_LIST_DIR}/fakes"
+    "${ESP_ERR}")
+if(BLE_RUNTIME_SANITIZER STREQUAL "address")
+    target_compile_options(ble_runtime_common PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=all)
+elseif(BLE_RUNTIME_SANITIZER STREQUAL "thread")
+    target_compile_options(ble_runtime_common PRIVATE
+        -fsanitize=thread
+        -fno-omit-frame-pointer)
+elseif(NOT BLE_RUNTIME_SANITIZER STREQUAL "none")
+    message(FATAL_ERROR
+        "Unsupported BLE_RUNTIME_SANITIZER=${BLE_RUNTIME_SANITIZER}")
+endif()
+
 foreach(test_target IN ITEMS
         test_ble_runtime
         test_ble_gatt_registry
@@ -109,7 +137,9 @@ foreach(test_target IN ITEMS
             ${test_target}.c
             "${COMPONENT}/src/ble_link_sec_state.c")
     else()
-        add_executable(${test_target} ${test_target}.c ${TEST_SOURCES})
+        add_executable(${test_target}
+            ${test_target}.c
+            $<TARGET_OBJECTS:ble_runtime_common>)
     endif()
     target_compile_features(${test_target} PRIVATE c_std_11)
     target_compile_definitions(${test_target} PRIVATE

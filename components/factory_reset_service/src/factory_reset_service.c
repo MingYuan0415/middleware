@@ -45,9 +45,8 @@ _Static_assert(sizeof(factory_reset_service_marker_t) == 16U,
 static factory_reset_service_config_t s_config;
 /* A single CAS-visible word prevents an API that sampled an old RUNNING
  * instance from crossing a complete deinit/reinit ABA cycle. */
-static atomic_uint s_api_state = ATOMIC_VAR_INIT(
-                                     FACTORY_RESET_SERVICE_STOPPED);
-static atomic_bool s_request_admitted = ATOMIC_VAR_INIT(false);
+static atomic_uint s_api_state = FACTORY_RESET_SERVICE_STOPPED;
+static atomic_bool s_request_admitted = false;
 static atomic_flag s_operation_busy = ATOMIC_FLAG_INIT;
 #ifdef UNIT_TEST_HOST
     static factory_reset_service_test_api_acquire_hook_t s_api_acquire_hook;

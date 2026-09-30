@@ -129,7 +129,7 @@ revoke request only queues host-core work; Device Link observes journal absence
 before declaring completion and retries while the marker remains. `begin`
 rewrites malformed markers, including blobs larger than the current version.
 
-The root build pins the required ESP-IDF v6.0.2 behavior, including
+The root build pins the required ESP-IDF v6.1 behavior, including
 `MYNEWT_VAL_BLE_RESTART_PAIR=0`. `scripts/check_idf_assumptions.sh` verifies the
 GAP, GATT, ATT, SM, store, and host-event source assumptions used here.
 

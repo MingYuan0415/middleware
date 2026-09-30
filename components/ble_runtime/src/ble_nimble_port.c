@@ -76,7 +76,7 @@ _Static_assert(BLE_SM_PAIR_KEY_SZ_MAX == BLE_NIMBLE_SMP_PAIR_KEY_SIZE_MAX,
 _Static_assert(BLE_HS_CONN_HANDLE_NONE == BLE_NIMBLE_SMP_CONN_HANDLE_NONE,
                "NimBLE missing-connection handle changed");
 
-/* ESP-IDF v6.0.2 exposes this controller-privacy operation only through an
+/* ESP-IDF v6.1 exposes this controller-privacy operation only through an
  * internal header. The fixed source and build mode are pinned by the runtime
  * assumptions test. */
 int ble_hs_pvcy_remove_entry(uint8_t addr_type, const uint8_t *addr);
@@ -197,16 +197,16 @@ static StaticSemaphore_t s_pairing_gate_ack_control;
 static StaticSemaphore_t s_pairing_gate_lock_control;
 static SemaphoreHandle_t s_pairing_gate_ack;
 static SemaphoreHandle_t s_pairing_gate_lock;
-static atomic_uint s_pairing_gate_requested_seq = ATOMIC_VAR_INIT(0U);
-static atomic_uint s_pairing_gate_applied_seq = ATOMIC_VAR_INIT(0U);
+static atomic_uint s_pairing_gate_requested_seq = 0U;
+static atomic_uint s_pairing_gate_applied_seq = 0U;
 static ble_nimble_pairing_gate_state_t s_pairing_gate_state;
-static atomic_bool s_pairing_gate_event_queued = ATOMIC_VAR_INIT(false);
-static atomic_uintptr_t s_nimble_host_task = ATOMIC_VAR_INIT(0U);
-static atomic_bool s_terminate_event_queued = ATOMIC_VAR_INIT(false);
-static atomic_bool s_cleanup_draining = ATOMIC_VAR_INIT(false);
-static atomic_bool s_cleanup_drain_event_queued = ATOMIC_VAR_INIT(false);
-static atomic_uint s_cleanup_drain_requested_seq = ATOMIC_VAR_INIT(0U);
-static atomic_uint s_cleanup_drain_applied_seq = ATOMIC_VAR_INIT(0U);
+static atomic_bool s_pairing_gate_event_queued = false;
+static atomic_uintptr_t s_nimble_host_task = 0U;
+static atomic_bool s_terminate_event_queued = false;
+static atomic_bool s_cleanup_draining = false;
+static atomic_bool s_cleanup_drain_event_queued = false;
+static atomic_uint s_cleanup_drain_requested_seq = 0U;
+static atomic_uint s_cleanup_drain_applied_seq = 0U;
 static StaticSemaphore_t s_cleanup_drain_ack_control;
 static StaticSemaphore_t s_cleanup_drain_lock_control;
 static SemaphoreHandle_t s_cleanup_drain_ack;
@@ -214,7 +214,7 @@ static SemaphoreHandle_t s_cleanup_drain_lock;
 /* False from init/reset until host synchronization and durable store
  * reconciliation both complete. The ADV owner checks this immediately before
  * every queued physical command. */
-static atomic_bool s_adv_host_ready = ATOMIC_VAR_INIT(false);
+static atomic_bool s_adv_host_ready = false;
 
 static uint8_t _ble_nimble_port_sm_sec_lvl(bool open)
 {
@@ -580,8 +580,8 @@ static StaticQueue_t s_timer_queue_storage;
 static ble_nimble_port_timer_command_t s_timer_queue_items[16];
 static QueueHandle_t s_timer_command_queue;
 static TaskHandle_t s_timer_owner_task;
-static atomic_uintptr_t s_timer_wake_task = ATOMIC_VAR_INIT(0U);
-static atomic_uint s_timer_callbacks_active = ATOMIC_VAR_INIT(0U);
+static atomic_uintptr_t s_timer_wake_task = 0U;
+static atomic_uint s_timer_callbacks_active = 0U;
 static SemaphoreHandle_t s_timer_exit;
 static uint32_t s_timer_generation;
 static uint16_t s_link_conn_handle;
@@ -2795,7 +2795,7 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
         LOG_W("peer privacy cleanup failed result=%d", privacy_result);
         return privacy_result;
     }
-    /* IDF v6.0.2 ble_gap_unpair() logs but discards a nonzero result from
+    /* IDF v6.1 ble_gap_unpair() logs but discards a nonzero result from
      * ble_store_util_delete_peer(). Perform the single explicit durable
      * delete and honor its result instead. */
     int result = ble_store_util_delete_peer(peer_id_addr);
@@ -2845,7 +2845,7 @@ static int _ble_nimble_port_unpair_peer(const ble_addr_t *peer_id_addr)
             }
         }
     }
-    /* IDF v6.0.2 does not treat BLE_ADDR_ANY as a wildcard for RPA records,
+    /* IDF v6.1 does not treat BLE_ADDR_ANY as a wildcard for RPA records,
      * so its PEER_ADDR iterator cannot verify deletion. The config store does
      * support an exact identity key; use it for the targeted readback. */
     struct ble_store_key_rpa_rec rpa_key =
@@ -3749,7 +3749,7 @@ static esp_err_t _ble_nimble_port_reset_audit_empty(void *context)
  * Used by the revoke sweep: PEER_SEC and CCCD records carry the peer identity
  * even when the OUR_SEC record (the bonded_peers() index) was already deleted
  * by an interrupted unpair. RPA records use the durable exact-key collector
- * below because IDF v6.0.2 cannot iterate that family.
+ * below because IDF v6.1 cannot iterate that family.
  */
 typedef struct ble_nimble_port_residual_sweep
 {
@@ -4494,7 +4494,7 @@ static uint32_t s_passkey_epoch;
 static uint64_t s_passkey_confirmation_token;
 static SemaphoreHandle_t s_passkey_lock;
 static StaticSemaphore_t s_passkey_lock_control;
-static atomic_bool s_acl_pairing_attempted = ATOMIC_VAR_INIT(false);
+static atomic_bool s_acl_pairing_attempted = false;
 
 static void _ble_nimble_port_passkey_lock(void)
 {
@@ -5109,7 +5109,7 @@ static int _ble_nimble_port_gap_connection_event(
         return 0;
     }
     /* Most GAP connection events are already delivered to the global listener.
-     * NimBLE v6.0.2 emits identity resolution, repeat pairing and passkey
+     * NimBLE v6.1 emits identity resolution, repeat pairing and passkey
      * actions only through the callback captured by ble_gap_adv_start();
      * forward those three to avoid dropping security events or double
      * reducing the events handled by the global listener. */
@@ -5143,7 +5143,7 @@ static void _ble_nimble_port_on_sync(void)
             _ble_nimble_port_latch_storage_error(guard_result);
             LOG_E("store write guard unavailable result=%d", guard_result);
         }
-        /* IDF v6.0.2 logs and discards config-store restore failures. Under
+        /* IDF v6.1 logs and discards config-store restore failures. Under
          * one storage transaction, either resume a journaled full-store erase
          * or audit the durable counts before destructive reconciliation. */
         if (_ble_nimble_port_storage_error_load() == ESP_OK)

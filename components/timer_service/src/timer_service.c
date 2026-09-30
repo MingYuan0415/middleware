@@ -31,7 +31,7 @@ typedef struct timer_service_runtime
 
 static timer_service_runtime_t s_timer;
 static atomic_flag s_lock = ATOMIC_FLAG_INIT;
-static atomic_bool s_initialized = ATOMIC_VAR_INIT(false);
+static atomic_bool s_initialized = false;
 
 static void _timer_lock(void)
 {

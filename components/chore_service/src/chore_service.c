@@ -106,7 +106,7 @@ static uint32_t s_chore_generation_high_water;
 #define CHORE_API_EPOCH_MASK  (CHORE_API_EPOCH_VALUE << CHORE_API_EPOCH_SHIFT)
 #define CHORE_API_COUNT_MASK  (UINT32_C(0xFFFF))
 
-static atomic_uint s_chore_admission = ATOMIC_VAR_INIT(0U);
+static atomic_uint s_chore_admission = 0U;
 
 static void _chore_api_leave(void)
 {

@@ -251,10 +251,9 @@ typedef struct manager_shared
 } manager_shared_t;
 
 static manager_shared_t s_manager;
-static atomic_int s_manager_lifecycle =
-    ATOMIC_VAR_INIT(MANAGER_LIFECYCLE_OFFLINE);
-static atomic_uint s_manager_api_users = ATOMIC_VAR_INIT(0U);
-static atomic_bool s_manager_deinit_active = ATOMIC_VAR_INIT(false);
+static atomic_int s_manager_lifecycle = MANAGER_LIFECYCLE_OFFLINE;
+static atomic_uint s_manager_api_users = 0U;
+static atomic_bool s_manager_deinit_active = false;
 
 static esp_err_t _manager_profile_store(const manager_profile_t *profile);
 

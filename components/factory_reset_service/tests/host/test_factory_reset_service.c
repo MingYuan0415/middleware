@@ -277,8 +277,8 @@ static void test_api_admission_rejects_retired_instance(void)
     request_thread_result_t request = {0};
     api_acquire_barrier_t barrier =
     {
-        .entered = ATOMIC_VAR_INIT(false),
-        .release = ATOMIC_VAR_INIT(false),
+        .entered = false,
+        .release = false,
     };
     pthread_t thread;
 
