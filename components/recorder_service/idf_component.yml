@@ -1,0 +1,10 @@
+version: "0.1.0"
+description: "WAV audio recorder and playback service for microtech middleware"
+dependencies:
+  idf: ">=5.0"
+  audio_service:
+    path: "../audio_service"
+  sd_storage_service:
+    path: "../sd_storage_service"
+  mt_log:
+    path: "../mt_log"

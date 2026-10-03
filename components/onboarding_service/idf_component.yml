@@ -1,0 +1,6 @@
+version: "0.1.0"
+description: "First-run onboarding state service for microtech middleware"
+dependencies:
+  idf: ">=5.0"
+  nv_storage:
+    path: "../nv_storage"

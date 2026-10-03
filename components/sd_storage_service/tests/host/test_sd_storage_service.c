@@ -110,6 +110,13 @@ static void _test_successful_lifecycle(void)
     assert(adapter.allocation_unit_size == 16U * 1024U);
     assert(sd_storage_service_get_handle() == &s_handle);
 
+    assert(sd_storage_service_get_snapshot(NULL) == ESP_ERR_INVALID_ARG);
+    sd_storage_service_snapshot_t mounted_snapshot = {0};
+    assert(sd_storage_service_get_snapshot(&mounted_snapshot) == ESP_OK);
+    assert(mounted_snapshot.mounted);
+    assert(mounted_snapshot.generation != 0U);
+    assert(strcmp(mounted_snapshot.mount_path, "/sdcard") == 0);
+
     sd_storage_service_config_t config = {0};
     assert(sd_storage_service_get_config(&config) == ESP_OK);
     assert(strcmp(config.mount_path, "/sdcard") == 0);
@@ -121,6 +128,13 @@ static void _test_successful_lifecycle(void)
     assert(adapter.unmount_calls == 1);
     assert(!sd_storage_service_is_mounted());
     assert(sd_storage_service_get_mount_path() == NULL);
+
+    sd_storage_service_snapshot_t unmounted_snapshot = {0};
+    assert(sd_storage_service_get_snapshot(&unmounted_snapshot) == ESP_OK);
+    assert(!unmounted_snapshot.mounted);
+    assert(unmounted_snapshot.mount_path == NULL);
+    assert(unmounted_snapshot.generation > mounted_snapshot.generation);
+
     assert(sd_storage_service_deinit() == ESP_OK);
 }
 

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -47,6 +48,14 @@ typedef struct sd_storage_service_mount_ops
     bool (*is_mounted)(void *context, void *handle);
 } sd_storage_service_mount_ops_t;
 
+/** @brief Point-in-time SD mount state with a transition generation. */
+typedef struct sd_storage_service_snapshot
+{
+    bool mounted;           /**< Whether a filesystem is currently mounted. */
+    uint32_t generation;    /**< Increments on each mount/unmount transition. */
+    const char *mount_path; /**< Active mount path while the service holds a handle (STARTED or CLEANUP_PENDING); else NULL. */
+} sd_storage_service_snapshot_t;
+
 /** @brief Register board mount operations before initialization. */
 esp_err_t sd_storage_service_register_mount_ops(
     const sd_storage_service_mount_ops_t *ops);
@@ -73,6 +82,21 @@ const char *sd_storage_service_get_mount_path(void);
 
 /** @brief Return the board-owned adapter handle, or NULL when unmounted. */
 void *sd_storage_service_get_handle(void);
+
+/**
+ * @brief Read a consistent SD mount snapshot.
+ *
+ * This service has no card-detect signal on the current board, so it cannot
+ * observe hot-plug presence. The generation only advances when this service
+ * transitions between mounted and unmounted states, letting consumers detect
+ * a new mount epoch instead of polling is_mounted().
+ *
+ * @param snapshot receives the mount flag, generation, and active path.
+ *
+ * @return ESP_OK on success; ESP_ERR_INVALID_ARG for a NULL snapshot.
+ */
+esp_err_t sd_storage_service_get_snapshot(
+    sd_storage_service_snapshot_t *snapshot);
 
 /** @brief Copy the active service configuration. */
 esp_err_t sd_storage_service_get_config(sd_storage_service_config_t *config);

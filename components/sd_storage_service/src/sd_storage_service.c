@@ -30,6 +30,7 @@ typedef enum sd_storage_service_state
 } sd_storage_service_state_t;
 
 static sd_storage_service_state_t s_state = SD_STORAGE_SERVICE_STATE_STOPPED;
+static uint32_t s_generation;
 
 static bool _allocation_unit_valid(size_t size)
 {
@@ -205,6 +206,7 @@ static esp_err_t _sd_storage_service_mount(
     s_handle = handle;
     s_mounted = true;
     s_state = SD_STORAGE_SERVICE_STATE_STARTED;
+    ++s_generation;
     taskEXIT_CRITICAL(&s_state_lock);
     LOG_I("SD filesystem mounted at %s", s_mount_path);
     return ESP_OK;
@@ -261,6 +263,7 @@ esp_err_t sd_storage_service_deinit(void)
     s_handle = NULL;
     s_mounted = false;
     s_state = SD_STORAGE_SERVICE_STATE_STOPPED;
+    ++s_generation;
     taskEXIT_CRITICAL(&s_state_lock);
     LOG_I("SD filesystem unmounted");
     return ESP_OK;
@@ -303,6 +306,24 @@ void *sd_storage_service_get_handle(void)
     void *handle = owns_handle ? s_handle : NULL;
     taskEXIT_CRITICAL(&s_state_lock);
     return handle;
+}
+
+esp_err_t sd_storage_service_get_snapshot(
+    sd_storage_service_snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_state_lock);
+    const bool owns_handle = s_state == SD_STORAGE_SERVICE_STATE_STARTED ||
+                             s_state == SD_STORAGE_SERVICE_STATE_CLEANUP_PENDING;
+    snapshot->mounted = s_state == SD_STORAGE_SERVICE_STATE_STARTED &&
+                        s_mounted;
+    snapshot->generation = s_generation;
+    snapshot->mount_path = owns_handle ? s_mount_path : NULL;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return ESP_OK;
 }
 
 esp_err_t sd_storage_service_get_config(sd_storage_service_config_t *config)

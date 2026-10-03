@@ -1,0 +1,18 @@
+version: "0.1.0"
+description: "Device Link BLE product policy service for MicroTech middleware"
+dependencies:
+  idf: ">=5.0"
+  ble_runtime:
+    path: "../ble_runtime"
+  device_link:
+    path: "../device_link"
+  connectivity_manager:
+    path: "../connectivity_manager"
+  event_bus:
+    path: "../event_bus"
+  mt_log:
+    path: "../mt_log"
+  nv_storage:
+    path: "../nv_storage"
+  wifi_service:
+    path: "../wifi_service"

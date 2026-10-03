@@ -1,0 +1,12 @@
+version: "0.1.0"
+description: "Wi-Fi connectivity policy manager and radio executor for microtech middleware"
+dependencies:
+  idf: ">=5.0"
+  event_bus:
+    path: "../event_bus"
+  mt_log:
+    path: "../mt_log"
+  nv_storage:
+    path: "../nv_storage"
+  wifi_service:
+    path: "../wifi_service"
