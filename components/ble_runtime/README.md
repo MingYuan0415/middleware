@@ -30,7 +30,7 @@ drains all retained obligations, then crosses a second barrier before exit.
 Asynchronous work carries `ble_link_operation_identity_t`:
 
 ```text
-{generation, security_epoch, flow_id, token, kind, conn_handle}
+{generation, flow_id, token, kind, conn_handle}
 ```
 
 Disconnect, reset, MTU, encryption, subscription, TX completion, termination,

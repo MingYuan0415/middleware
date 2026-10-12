@@ -2,15 +2,12 @@
 #define __BLE_LINK_SESSION_H__
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
-
 #include "esp_err.h"
 
-#define BLE_LINK_ERROR_OK 1U
-#define BLE_LINK_ERROR_UNAUTHENTICATED 6U
-#define BLE_LINK_ERROR_PERMISSION_DENIED 7U
-#define BLE_LINK_ERROR_UNAVAILABLE 14U
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define BLE_LINK_STATE_FLAG_BINDABLE UINT32_C(0x01)
 #define BLE_LINK_STATE_FLAG_BOUND UINT32_C(0x02)
@@ -18,40 +15,17 @@
 #define BLE_LINK_STATE_FLAG_BLUETOOTH_ENABLED UINT32_C(0x08)
 #define BLE_LINK_STATE_FLAG_TRANSITIONING UINT32_C(0x10)
 #define BLE_LINK_STATE_FLAG_AUTHENTICATED UINT32_C(0x20)
-#define BLE_LINK_STATE_FLAG_AUTHORIZED UINT32_C(0x40)
 #define BLE_LINK_STATE_FLAG_ERROR UINT32_C(0x80)
 
+/** @brief Current ACL identity and encryption facts. */
 typedef struct ble_link_dispatcher_facts
 {
     uint64_t active_boot_id;
     uint32_t connection_generation;
     bool encrypted;
-    bool session_authenticated;
-    bool authorized;
-    bool recovery_query;
 } ble_link_dispatcher_facts_t;
 
-#ifdef UNIT_TEST_HOST
-    /**
-    * @brief Test-only seam: set the epoch allocator value directly.
-    */
-    void ble_link_session_test_set_epoch(uint32_t value);
-#endif
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/** @brief Derived link session states. */
-typedef enum
-{
-    BLE_LINK_SESSION_INACTIVE = 0,    /**< No active ACL. */
-    BLE_LINK_SESSION_CONNECTED,       /**< ACL up, admission facts pending. */
-    BLE_LINK_SESSION_AUTHENTICATED,   /**< Session channel admitted. */
-    BLE_LINK_SESSION_AUTHORIZED,      /**< Control channel admitted. */
-} ble_link_session_state_t;
-
-/** @brief Asynchronous connection facts reported to the session. */
+/** @brief Facts supplied by the connection owner and security reducer. */
 typedef enum
 {
     BLE_LINK_SESSION_EVENT_ACL_CONNECTED = 0,
@@ -60,302 +34,37 @@ typedef enum
     BLE_LINK_SESSION_EVENT_SC_BOND_VERIFIED,
 } ble_link_session_event_t;
 
-/**
- * @brief Report a change to the committed authorization record.
- *
- * The authorization record is a persistent device fact with a monotonic
- * revision from the caller. An event whose revision is not newer than the
- * last accepted one is ignored, so late or reordered callbacks cannot
- * resurrect an authorization that was revoked. The record is not tied to
- * any connection generation: it survives disconnects and is reflected in
- * the BOUND state flag.
- *
- * @param[in] committed True when an authorization record is committed.
- * @param[in] revision  Monotonic revision of the authorization change.
- * @return ESP_OK, including stale revisions.
- */
-esp_err_t ble_link_session_set_authorization(
-    bool committed, uint32_t revision);
-
-/**
- * @brief Whether the authorization revision space is exhausted.
- *
- * Non-mutating capacity check for preflight validation: once exhausted,
- * no commit may install durable credentials (fail closed).
- *
- * @return True when the revision space is exhausted.
- */
-bool ble_link_session_authorization_exhausted(void);
-
-/**
- * @brief Begin a Security 2 handshake and allocate its logical epoch.
- *
- * A Cmd0 calls this exactly once. It immediately retires any previous
- * Security 2 session, allocates the new epoch, and leaves control admission
- * closed until ble_link_session_security2_authenticate_current() accepts
- * Cmd1 for that same epoch.
- *
- * @param[in]  generation Current connection generation.
- * @param[out] out_epoch  Fresh epoch for this handshake.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE when the generation is not
- *         current or the epoch allocator is exhausted.
- */
-esp_err_t ble_link_session_security2_begin(
-    uint32_t generation, uint32_t *out_epoch);
-
-/**
- * @brief Mark the current handshaking Security 2 epoch authenticated.
- *
- * @param[in] generation Current connection generation.
- * @param[in] epoch Epoch allocated by the corresponding Cmd0.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale epoch/generation or
- *         when no handshake is active.
- */
-esp_err_t ble_link_session_security2_authenticate_current(
-    uint32_t generation, uint32_t epoch);
-
-/**
- * @brief Allocate and authenticate one Security 2 epoch atomically.
- *
- * Compatibility helper for callers that do not model Cmd0/Cmd1 separately.
- * New handshake owners should use begin/authenticate_current explicitly.
- */
-esp_err_t ble_link_session_security2_open(
-    uint32_t generation, uint32_t *out_epoch);
-
-/** @brief Return the current boot-scoped Security 2 epoch. */
-uint32_t ble_link_session_security2_epoch(void);
-
-/**
- * @brief Report that the current session matched the committed record at
- * the allocator's current epoch.
- *
- * Convenience for flows that do not track the handshake epoch themselves.
- *
- * @param[in] generation Current connection generation.
- * @param[in] revision   Authorization revision the session matched.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE.
- */
-esp_err_t ble_link_session_report_session_match_current(
-    uint32_t generation, uint32_t revision);
-
-/**
- * @brief Close the Security 2 session for the current generation.
- *
- * Allocates a fresh epoch internally so the close always takes effect
- * regardless of which epoch opened the session. Clears the session match.
- *
- * @param[in] generation Current connection generation.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE when the generation is not
- *         current.
- */
-esp_err_t ble_link_session_security2_close_current(uint32_t generation);
-
-/**
- * @brief Report that the current generation session matched the committed
- * authorization record.
- *
- * Called after a Security 2 handshake completes with the long-term
- * credentials whose authorization record was committed at the given
- * revision. The call succeeds only while the Security 2 session opened by
- * the given epoch is still current, a committed record exists, and the
- * revision equals the current record revision; a match for a revoked or
- * replaced record, or for a closed handshake, has no effect.
- *
- * @param[in] generation      Current connection generation.
- * @param[in] revision        Authorization revision the session matched.
- * @param[in] security2_epoch Epoch of the Security 2 session that matched.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE when the epoch is not current,
- *         no committed record matches the revision, or the generation is
- *         not current.
- */
-esp_err_t ble_link_session_report_session_match(
-    uint32_t generation, uint32_t revision, uint32_t security2_epoch);
-
-/** @brief Characteristics whose admission the session gates. */
-typedef enum
-{
-    BLE_LINK_SESSION_CHANNEL_LINK_STATE = 0,
-    BLE_LINK_SESSION_CHANNEL_SESSION,
-    BLE_LINK_SESSION_CHANNEL_CONTROL,
-    BLE_LINK_SESSION_CHANNEL_EVENT,
-} ble_link_session_channel_t;
-
-/**
- * @brief Initialize the session manager for a boot.
- *
- * @param[in] boot_id Fresh nonzero random value for this boot, generated by
- *                    the caller.
- */
+/** @brief Initialize boot identity and session state. */
 void ble_link_session_init(uint64_t boot_id);
-
-/**
- * @brief Clear the current session state.
- *
- * The boot-scoped Security 2 epoch allocator is preserved, so an exhausted
- * allocator stays locked until a fresh boot calls init().
- */
+/** @brief Reset runtime state while retaining boot identity. */
 void ble_link_session_reset(void);
-
-/**
- * @brief Report one asynchronous connection fact.
- *
- * Every event is checked against the current generation; late events from a
- * retired generation have no effect and return ESP_OK. ACL connection
- * generations must be strictly increasing: an ACL_CONNECTED with a
- * generation not newer than the last accepted one is ignored (ESP_OK), while
- * a genuinely new connection while a session is active is rejected with
- * ESP_ERR_INVALID_STATE.
- *
- * @param[in] generation Current connection generation.
- * @param[in] event      Reported fact.
- * @return ESP_OK (including ignored stale events), or
- *         ESP_ERR_INVALID_STATE for a fact inconsistent with the current
- *         session state.
- */
-esp_err_t ble_link_session_handle_event(
-    uint32_t generation, ble_link_session_event_t event);
-
-/**
- * @brief Pin the pairing-window admission state to the current ACL.
- *
- * The global window may close while an ACL is still being finalized. The
- * connection keeps the decision captured at CONNECT; a later connection uses
- * the new global state.
- *
- * @param[in] generation Current connection generation.
- * @param[in] open      Window state captured at connection admission.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale generation.
- */
-esp_err_t ble_link_session_set_connection_pairing_window(
-    uint32_t generation, bool open);
-
-/**
- * @brief Read the pairing-window state pinned to the current ACL.
- *
- * @param[in] generation Current connection generation.
- * @param[out] out_open  Pinned window state.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE for a stale generation.
- */
-esp_err_t ble_link_session_get_connection_pairing_window(
-    uint32_t generation, bool *out_open);
-
-/**
- * @brief Clear the link security facts (encryption dropped).
- *
- * Called when the link is no longer encrypted; the Security 2 session and
- * authorization are closed separately by the caller.
- *
- * @param[in] generation Current connection generation.
- */
-void ble_link_session_clear_link_security(uint32_t generation);
-
-/**
- * @brief Open or close the local pairing window.
- *
- * An unknown peer may pair only while the window is open.
- *
- * @param[in] open True to open the window.
- */
+/** @brief Apply a generation-scoped fact; stale generations are ignored. */
+esp_err_t ble_link_session_handle_event(uint32_t generation, ble_link_session_event_t event);
+/** @brief Set committed bond state; revision zero advances the local revision. */
+esp_err_t ble_link_session_set_authorization(bool committed, uint32_t revision);
+/** @brief Set the local admission window independently of the current ACL. */
 void ble_link_session_set_pairing_window(bool open);
-
-/**
- * @brief Query admission for one characteristic.
- *
- * @param[in]  generation Current connection generation.
- * @param[in]  channel    Characteristic channel.
- * @param[out] out_error  Stable LinkError value: BLE_LINK_ERROR_OK when
- *                        admitted, or a rejection code.
- * @return ESP_OK, or ESP_ERR_INVALID_ARG.
- */
-esp_err_t ble_link_session_query_admission(
-    uint32_t generation, ble_link_session_channel_t channel,
-    uint32_t *out_error);
-
-/**
- * @brief Current session state for the given generation.
- *
- * @param[in] generation Current connection generation.
- * @return State, or BLE_LINK_SESSION_INACTIVE when no session matches.
- */
-ble_link_session_state_t ble_link_session_get_state(uint32_t generation);
-
-/**
- * @brief Session facts for the current connection generation.
- *
- * @param[in]  generation Current connection generation.
- * @param[out] facts      Facts filled with the current admission state.
- * @return ESP_OK when a session is active, ESP_ERR_INVALID_STATE otherwise.
- */
-esp_err_t ble_link_session_get_facts(
-    uint32_t generation, ble_link_dispatcher_facts_t *facts);
-
-/**
- * @brief Set whether the peer identity is known and matched.
- *
- * Production calls this after the bond store identity/SC/LTK verification
- * completes; the session channel admission requires it (fail closed).
- *
- * @param[in] generation Current connection generation.
- * @param[in] known      True when the peer identity was verified.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE.
- */
-esp_err_t ble_link_session_set_identity_known(
-    uint32_t generation, bool known);
-
-/**
- * @brief Security facts not carried by the dispatcher facts.
- *
- * @param[in]  generation Current connection generation.
- * @param[out] out_bond_verified SC bond verified for the connection.
- * @param[out] out_identity_known Peer identity known and matched.
- * @return ESP_OK, or ESP_ERR_INVALID_STATE without a matching session.
- */
-esp_err_t ble_link_session_get_security_facts(
-    uint32_t generation, bool *out_bond_verified,
-    bool *out_identity_known);
-
-/**
- * @brief Current PublicLinkState flags for the boot.
- *
- * BINDABLE reflects the local pairing window and is mutually exclusive
- * with BOUND; BOUND reflects the existence of a committed authorization
- * record (a persistent device fact, not tied to the current connection).
- * AUTHENTICATED is only published for a bound session, and AUTHORIZED
- * implies AUTHENTICATED and BOUND.
- *
- * @return BLE_LINK_STATE_FLAG_* combination valid under the v2 GATT
- *         cross-flag implications.
- */
+/** @brief Capture the pairing window admitted for this connection. */
+esp_err_t ble_link_session_set_connection_pairing_window(uint32_t generation, bool open);
+/** @brief Read the pairing window captured for this connection. */
+esp_err_t ble_link_session_get_connection_pairing_window(uint32_t generation, bool *out_open);
+/** @brief Clear encryption, bond and identity facts for the current generation. */
+void ble_link_session_clear_link_security(uint32_t generation);
+/** @brief Read current ACL facts, rejecting a retired generation. */
+esp_err_t ble_link_session_get_facts(uint32_t generation, ble_link_dispatcher_facts_t *facts);
+/** @brief Record whether the connection's peer identity has been verified. */
+esp_err_t ble_link_session_set_identity_known(uint32_t generation, bool known);
+/** @brief Read verified bond and identity facts for the current connection. */
+esp_err_t ble_link_session_get_security_facts(uint32_t generation, bool *out_bond_verified,
+        bool *out_identity_known);
+/** @brief Return discovery, bond and verified SC authentication state flags. */
 uint32_t ble_link_session_get_state_flags(void);
-
-/**
- * @brief Drive the TRANSITIONING link-state flag for binding and
- * authorization transitions.
- *
- * The service arms this while an authorization transaction is live
- * (Prepare through durable Commit) and clears it when the transaction is
- * cleared, denied, or retired. Security 2 handshakes set the flag
- * internally.
- *
- * @param[in] active True while an authorization transition is in progress.
- */
+/** @brief Mark an in-flight binding/revocation transition. */
 void ble_link_session_set_authorization_transitioning(bool active);
-
-/**
- * @brief Latch the ERROR link-state flag for an unrecoverable runtime
- * state.
- *
- * Once latched, the flag stays set until the next boot; clients must stop
- * sensitive retries and wait for a fresh boot ID. The session also latches
- * ERROR itself when its boot-scoped epoch allocator is exhausted.
- *
- * @param[in] error True to enter the unrecoverable error state.
- */
+/** @brief Latch an unrecoverable runtime error until reset. */
 void ble_link_session_set_error(bool error);
 
 #ifdef __cplusplus
 }
 #endif
-
 #endif /* __BLE_LINK_SESSION_H__ */

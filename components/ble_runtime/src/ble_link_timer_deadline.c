@@ -43,9 +43,6 @@ bool ble_link_timer_deadline_apply(
     else if (slot->armed &&
              ((command->identity.generation != 0U &&
                command->identity.generation != slot->identity.generation) ||
-              (command->identity.security_epoch != 0U &&
-               command->identity.security_epoch !=
-               slot->identity.security_epoch) ||
               (command->identity.flow_id != 0U &&
                command->identity.flow_id != slot->identity.flow_id) ||
               (command->identity.token != 0U &&

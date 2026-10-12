@@ -397,7 +397,7 @@ static bool _ble_nimble_port_capture_connection_identity(
     ble_port_event_t *event, ble_link_operation_kind_t kind);
 static bool _ble_nimble_port_connection_identity_matches(
     const ble_port_event_t *event, ble_link_operation_kind_t kind,
-    uint32_t generation, uint16_t conn_handle, bool match_security_epoch);
+    uint32_t generation, uint16_t conn_handle);
 static esp_err_t _ble_nimble_port_wait_for_adv_stopped(
     ble_adv_manager_pause_reason_t reason);
 static esp_err_t _ble_nimble_port_queue_peer_unpair_address(
@@ -1347,7 +1347,6 @@ static bool _ble_nimble_port_capture_connection_identity(
         event->identity = (ble_link_operation_identity_t)
         {
             .generation = snapshot.generation,
-            .security_epoch = ble_link_session_security2_epoch(),
             .kind = kind,
             .conn_handle = event->conn_handle,
         };
@@ -1358,7 +1357,7 @@ static bool _ble_nimble_port_capture_connection_identity(
 
 static bool _ble_nimble_port_connection_identity_matches(
     const ble_port_event_t *event, ble_link_operation_kind_t kind,
-    uint32_t generation, uint16_t conn_handle, bool match_security_epoch)
+    uint32_t generation, uint16_t conn_handle)
 {
     if (event == NULL || event->conn_handle != conn_handle ||
             event->identity.generation != generation ||
@@ -1369,9 +1368,7 @@ static bool _ble_nimble_port_connection_identity_matches(
     {
         return false;
     }
-    return !match_security_epoch ||
-           event->identity.security_epoch ==
-           ble_link_session_security2_epoch();
+    return true;
 }
 
 static void _ble_nimble_port_storage_lock(void)
@@ -2088,7 +2085,7 @@ static void _ble_nimble_port_link_gatt_consumer(
         if (snapshot.connected && event->accepted &&
                 _ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_CONNECT,
-                    snapshot.generation, snapshot.conn_handle, true))
+                    snapshot.generation, snapshot.conn_handle))
         {
             struct ble_gap_conn_desc desc;
             uint8_t peer_type = 0U;
@@ -2116,7 +2113,7 @@ static void _ble_nimble_port_link_gatt_consumer(
          * compare against the remembered connection identity. */
         if (!_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_DISCONNECT,
-                    s_timer_generation, s_link_conn_handle, true))
+                    s_timer_generation, s_link_conn_handle))
         {
             break;
         }
@@ -2141,10 +2138,7 @@ static void _ble_nimble_port_link_gatt_consumer(
             (void)_ble_nimble_port_arm_indication_timeout(
                 false, &indication);
         }
-        /* A disconnect with an unconfirmed response must not leave the
-         * transaction gate busy for the next connection, and the Security
-         * 2 session must not survive into the next connection (cross-
-         * connection state reuse). */
+        /* Retire the transaction gate before the next ACL is admitted. */
         s_link_conn_handle = 0U;
         s_timer_generation = 0U;
         break;
@@ -2154,7 +2148,6 @@ static void _ble_nimble_port_link_gatt_consumer(
             teardown_identity = (ble_link_operation_identity_t)
             {
                 .generation = s_timer_generation,
-                .security_epoch = ble_link_session_security2_epoch(),
                 .kind = BLE_LINK_OPERATION_RESET,
                 .conn_handle = s_link_conn_handle,
             };
@@ -2197,7 +2190,7 @@ static void _ble_nimble_port_link_gatt_consumer(
     case BLE_PORT_EVENT_ENC_CHANGE:
         if (!_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_ENCRYPT_CHANGE,
-                    s_timer_generation, s_link_conn_handle, true))
+                    s_timer_generation, s_link_conn_handle))
         {
             break;
         }
@@ -2219,7 +2212,7 @@ static void _ble_nimble_port_link_gatt_consumer(
     case BLE_PORT_EVENT_MTU:
         if (!_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_MTU,
-                    s_timer_generation, s_link_conn_handle, true))
+                    s_timer_generation, s_link_conn_handle))
         {
             break;
         }
@@ -2228,7 +2221,7 @@ static void _ble_nimble_port_link_gatt_consumer(
     case BLE_PORT_EVENT_SUBSCRIBE:
         if (_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_SUBSCRIBE,
-                    s_timer_generation, s_link_conn_handle, true) &&
+                    s_timer_generation, s_link_conn_handle) &&
                 event->attr_handle == ble_link_gatt_session_tx_handle())
         {
             ble_link_service_set_transport_admitted(
@@ -2304,7 +2297,7 @@ static void _ble_nimble_port_adv_consumer(
          * connection and the accepted disconnect still reaches advertising. */
         if (!_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_DISCONNECT,
-                    s_adv_generation, s_adv_conn_handle, false))
+                    s_adv_generation, s_adv_conn_handle))
         {
             return;
         }
@@ -2361,7 +2354,7 @@ static void _ble_nimble_port_tx_consumer(
         /* Only the current connection's disconnect resets the scheduler. */
         if (!_ble_nimble_port_connection_identity_matches(
                     event, BLE_LINK_OPERATION_DISCONNECT,
-                    s_timer_generation, s_link_conn_handle, false))
+                    s_timer_generation, s_link_conn_handle))
         {
             break;
         }
@@ -2901,7 +2894,6 @@ static esp_err_t _ble_nimble_port_queue_peer_unpair_address(
         .identity =
         {
             .generation = generation,
-            .security_epoch = ble_link_session_security2_epoch(),
             .token = token,
             .kind = BLE_LINK_OPERATION_PEER_CLEANUP,
             .conn_handle = conn_handle,
@@ -3024,7 +3016,6 @@ static esp_err_t _ble_nimble_port_queue_terminal_provisional_unpair(
     const ble_link_operation_identity_t cleanup_identity =
     {
         .generation = terminal_identity->generation,
-        .security_epoch = terminal_identity->security_epoch,
         .token = token,
         .kind = BLE_LINK_OPERATION_PROVISIONAL_DISCARD,
         .conn_handle = terminal_identity->conn_handle,
@@ -4061,7 +4052,6 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
         const ble_link_operation_identity_t identity =
         {
             .generation = snapshot.generation,
-            .security_epoch = ble_link_session_security2_epoch(),
             .kind = BLE_LINK_OPERATION_TERMINATE,
             .conn_handle = snapshot.conn_handle,
         };
@@ -4196,7 +4186,6 @@ esp_err_t ble_nimble_port_request_disconnect(void)
     const ble_link_operation_identity_t identity =
     {
         .generation = snapshot.generation,
-        .security_epoch = ble_link_session_security2_epoch(),
         .kind = BLE_LINK_OPERATION_TERMINATE,
         .conn_handle = snapshot.conn_handle,
     };
@@ -4307,7 +4296,6 @@ esp_err_t ble_nimble_port_begin_cleanup_drain(void)
         const ble_link_operation_identity_t identity =
         {
             .generation = snapshot.generation,
-            .security_epoch = ble_link_session_security2_epoch(),
             .kind = BLE_LINK_OPERATION_TERMINATE,
             .conn_handle = snapshot.conn_handle,
         };

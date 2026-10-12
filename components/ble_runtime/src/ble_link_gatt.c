@@ -149,8 +149,6 @@ static esp_err_t _ble_link_gatt_service_facts(ble_link_service_facts_t *out)
     out->preferred_att_mtu = config.att_mtu;
     out->conn_handle = config.conn_handle;
     out->encrypted = session_facts.encrypted;
-    out->session_authenticated = session_facts.session_authenticated;
-    out->authorized = session_facts.authorized;
     out->identity_known = identity_known;
     out->secure_connections_bond_verified = bond_verified;
     out->pairing_window_open = pairing_window_open;
@@ -243,9 +241,7 @@ static int _ble_link_gatt_access(
     input.att_mtu = att_mtu;
     input.att_value_length = context->write_len;
     input.encrypted = facts.encrypted;
-    input.authenticated = facts.encrypted &&
-                          (facts.secure_connections_bond_verified ||
-                           facts.session_authenticated);
+    input.authenticated = facts.encrypted && facts.secure_connections_bond_verified;
     input.subscription_enabled = ble_gap_manager_is_subscribed_kind(
                                      conn_handle, server_tx, false);
     input.indication_outstanding = ble_link_service_write_blocked();

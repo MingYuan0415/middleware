@@ -13,7 +13,6 @@ static ble_link_operation_identity_t _identity(uint32_t token)
     return (ble_link_operation_identity_t)
     {
         .generation = 7U,
-        .security_epoch = 3U,
         .flow_id = token + 10U,
         .token = token,
         .kind = BLE_LINK_OPERATION_TX_INDICATE,

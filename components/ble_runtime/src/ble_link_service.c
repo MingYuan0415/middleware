@@ -465,8 +465,7 @@ esp_err_t ble_link_service_accept(
         s_service.att_mtu = (uint16_t)facts->preferred_att_mtu;
     }
     work->encrypted = facts->encrypted;
-    work->authenticated = facts->secure_connections_bond_verified ||
-                          facts->session_authenticated;
+    work->authenticated = facts->secure_connections_bond_verified;
     work->length = (uint16_t)len;
     memcpy(work->value, value, len);
     *out_work = work;

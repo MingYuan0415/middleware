@@ -46,7 +46,6 @@
     } while (0)
 
 #define TEST_GENERATION 101U
-#define TEST_SECURITY_EPOCH 7U
 
 static esp_err_t _test_submit(
     ble_tx_scheduler_kind_t kind, uint16_t conn_handle,
@@ -56,7 +55,6 @@ static esp_err_t _test_submit(
     const ble_link_operation_identity_t identity =
     {
         .generation = TEST_GENERATION,
-        .security_epoch = TEST_SECURITY_EPOCH,
         .flow_id = flow_id,
         .kind = kind == BLE_TX_SCHEDULER_KIND_INDICATE ?
         BLE_LINK_OPERATION_TX_INDICATE :
@@ -426,8 +424,6 @@ static void test_flow_identity_survives_completion(void)
     TEST_ASSERT_EQUAL(token, s_last_completion_token);
     TEST_ASSERT_EQUAL(TEST_GENERATION,
                       s_last_completion_identity.generation);
-    TEST_ASSERT_EQUAL(TEST_SECURITY_EPOCH,
-                      s_last_completion_identity.security_epoch);
     TEST_ASSERT_EQUAL(BLE_LINK_OPERATION_TX_INDICATE,
                       s_last_completion_identity.kind);
     TEST_ASSERT_EQUAL(7U, s_last_completion_identity.conn_handle);
@@ -472,7 +468,6 @@ static void test_stale_full_identity_completion_is_ignored(void)
     ble_link_operation_identity_t new_identity =
     {
         .generation = TEST_GENERATION + 1U,
-        .security_epoch = TEST_SECURITY_EPOCH + 1U,
         .flow_id = 102U,
         .kind = BLE_LINK_OPERATION_TX_INDICATE,
         .conn_handle = 7U,
@@ -504,8 +499,6 @@ static void test_stale_full_identity_completion_is_ignored(void)
     TEST_ASSERT_EQUAL(2U, s_completions);
     TEST_ASSERT_EQUAL(TEST_GENERATION + 1U,
                       s_last_completion_identity.generation);
-    TEST_ASSERT_EQUAL(TEST_SECURITY_EPOCH + 1U,
-                      s_last_completion_identity.security_epoch);
     TEST_ASSERT_EQUAL(102U, s_last_completion_identity.flow_id);
     TEST_ASSERT_FALSE(ble_tx_scheduler_is_busy());
 }
@@ -965,7 +958,6 @@ static void test_invalid_arguments_rejected(void)
     ble_link_operation_identity_t identity =
     {
         .generation = TEST_GENERATION,
-        .security_epoch = TEST_SECURITY_EPOCH,
         .kind = BLE_LINK_OPERATION_TX_NOTIFY,
         .conn_handle = 7U,
     };

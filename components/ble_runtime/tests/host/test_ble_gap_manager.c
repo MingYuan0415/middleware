@@ -266,7 +266,6 @@ static void test_retained_cleanup_rejects_new_connection(void)
     request.identity = (ble_link_operation_identity_t)
     {
         .generation = 1U,
-        .security_epoch = 2U,
         .flow_id = 3U,
         .token = 4U,
         .kind = BLE_LINK_OPERATION_PROVISIONAL_DISCARD,

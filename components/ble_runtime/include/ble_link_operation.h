@@ -36,7 +36,6 @@ typedef enum ble_link_operation_kind
 typedef struct ble_link_operation_identity
 {
     uint32_t generation;
-    uint32_t security_epoch;
     uint32_t flow_id;
     uint32_t token;
     ble_link_operation_kind_t kind;
@@ -50,7 +49,6 @@ static inline bool ble_link_operation_identity_equal(
 {
     return left != NULL && right != NULL &&
            left->generation == right->generation &&
-           left->security_epoch == right->security_epoch &&
            left->flow_id == right->flow_id &&
            left->token == right->token &&
            left->kind == right->kind &&

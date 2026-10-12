@@ -17,7 +17,6 @@ static ble_link_cleanup_request_t _request(
     request.identity = (ble_link_operation_identity_t)
     {
         .generation = generation,
-        .security_epoch = generation + 10U,
         .flow_id = token + 20U,
         .token = token,
         .kind = BLE_LINK_OPERATION_PROVISIONAL_DISCARD,

@@ -45,18 +45,17 @@ target_compile_options(test_device_link_wifi_adapter PRIVATE
     -Werror
     -Wpedantic
     -UNDEBUG)
-add_executable(test_device_link_service
-               test_device_link_service.c
+add_executable(test_device_link_status_helpers
+               test_device_link_status_helpers.c
                "${COMPONENT}/src/device_link_confirmation.c"
-               "${COMPONENT}/src/device_link_revoke_progress.c"
-               "${COMPONENT}/src/device_link_service.c")
-target_compile_features(test_device_link_service PRIVATE c_std_11)
-target_compile_definitions(test_device_link_service PRIVATE
+               "${COMPONENT}/src/device_link_revoke_progress.c")
+target_compile_features(test_device_link_status_helpers PRIVATE c_std_11)
+target_compile_definitions(test_device_link_status_helpers PRIVATE
     _POSIX_C_SOURCE=200809L
     UNIT_TEST_HOST
     CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
     CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144)
-target_include_directories(test_device_link_service PRIVATE
+target_include_directories(test_device_link_status_helpers PRIVATE
                            "${COMPONENT}/include"
                            "${COMPONENT}/src"
                            "${BLE_RUNTIME}/include"
@@ -66,19 +65,16 @@ target_include_directories(test_device_link_service PRIVATE
                            "${PROJECT_ROOT}/layers/middleware/components/nv_storage/include"
                            "${PROJECT_ROOT}/layers/middleware/components/wifi_service/include"
                            "${HOST_CONNECTIVITY}/include")
-target_compile_options(test_device_link_service PRIVATE
+target_compile_options(test_device_link_status_helpers PRIVATE
     -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
-    -ffunction-sections
-    -fdata-sections
     -Wall
     -Wextra
     -Werror
     -Wpedantic
     -UNDEBUG)
-target_link_options(test_device_link_service PRIVATE -Wl,--gc-sections)
 if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "address")
     foreach(target IN ITEMS test_device_link_wifi_adapter
-            test_device_link_service)
+            test_device_link_status_helpers)
         target_compile_options(${target} PRIVATE
             -fsanitize=address,undefined
             -fno-omit-frame-pointer
@@ -90,7 +86,7 @@ if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "address")
     endforeach()
 elseif(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "thread")
     foreach(target IN ITEMS test_device_link_wifi_adapter
-            test_device_link_service)
+            test_device_link_status_helpers)
         target_compile_options(${target} PRIVATE
             -fsanitize=thread
             -fno-omit-frame-pointer)
@@ -109,13 +105,13 @@ if(DEVICE_LINK_SERVICE_SANITIZER STREQUAL "thread" AND
     add_test(NAME device_link_wifi_adapter COMMAND
         ${DEVICE_LINK_SERVICE_SETARCH} x86_64 -R
         $<TARGET_FILE:test_device_link_wifi_adapter>)
-    add_test(NAME device_link_service COMMAND
+    add_test(NAME device_link_status_helpers COMMAND
         ${DEVICE_LINK_SERVICE_SETARCH} x86_64 -R
-        $<TARGET_FILE:test_device_link_service>)
+        $<TARGET_FILE:test_device_link_status_helpers>)
 else()
     add_test(NAME device_link_wifi_adapter COMMAND
         test_device_link_wifi_adapter)
-    add_test(NAME device_link_service COMMAND test_device_link_service)
+    add_test(NAME device_link_status_helpers COMMAND test_device_link_status_helpers)
 endif()
-set_tests_properties(device_link_wifi_adapter device_link_service
+set_tests_properties(device_link_wifi_adapter device_link_status_helpers
     PROPERTIES TIMEOUT 10)

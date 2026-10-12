@@ -21,7 +21,6 @@ static ble_link_timer_deadline_command_t _arm(
         .identity =
         {
             .generation = generation,
-            .security_epoch = generation + 100U,
             .flow_id = token + 100U,
             .token = token,
             .kind = BLE_LINK_OPERATION_TX_INDICATE,
@@ -43,7 +42,6 @@ static ble_link_timer_deadline_command_t _disarm(
         .identity =
         {
             .generation = generation,
-            .security_epoch = generation + 100U,
             .flow_id = token + 100U,
             .token = token,
             .kind = BLE_LINK_OPERATION_TX_INDICATE,
@@ -307,7 +305,6 @@ static void test_terminate_obligation_retries_until_complete(void)
     const ble_link_operation_identity_t identity =
     {
         .generation = 7U,
-        .security_epoch = 2U,
         .flow_id = 4U,
         .token = 5U,
         .kind = BLE_LINK_OPERATION_TERMINATE,
@@ -335,14 +332,13 @@ static void test_terminate_obligation_retries_until_complete(void)
     const ble_link_operation_identity_t disconnect =
     {
         .generation = identity.generation,
-        .security_epoch = identity.security_epoch + 1U,
         .flow_id = identity.flow_id + 1U,
         .token = identity.token + 1U,
         .kind = BLE_LINK_OPERATION_DISCONNECT,
         .conn_handle = identity.conn_handle,
     };
 
-    /* A terminal GAP event has its own kind/token/epoch. Physical ACL
+    /* A terminal GAP event has its own kind/token. Physical ACL
      * retirement is authoritative for the matching generation and handle. */
     TEST_ASSERT_TRUE(ble_link_timer_terminate_retire(
                          &state, &disconnect));

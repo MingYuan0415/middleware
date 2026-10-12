@@ -861,8 +861,7 @@ static esp_err_t _device_link_service_close_window_locked(void)
     const uint32_t session_flags = ble_link_session_get_state_flags();
     const bool verified_bound =
         ((session_flags & BLE_LINK_STATE_FLAG_BOUND) != 0U) &&
-        (((session_flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U) ||
-         ((session_flags & BLE_LINK_STATE_FLAG_AUTHORIZED) != 0U));
+        ((session_flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U);
     const ble_link_confirmation_snapshot_t confirmation =
         ble_link_service_get_confirmation();
     const bool drop_acl = s_service.client_connected &&

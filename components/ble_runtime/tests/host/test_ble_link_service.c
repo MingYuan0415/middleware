@@ -101,8 +101,7 @@ static ble_link_service_facts_t _facts(void)
     facts.preferred_att_mtu = DEVICE_LINK_V1_REQUIRED_ATT_MTU;
     facts.conn_handle = 7U;
     facts.encrypted = true;
-    facts.session_authenticated = true;
-    facts.authorized = true;
+    facts.secure_connections_bond_verified = true;
     facts.identity_known = true;
     facts.secure_connections_bond_verified = true;
     facts.pairing_window_open = true;

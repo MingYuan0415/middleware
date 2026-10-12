@@ -37,12 +37,9 @@ typedef struct ble_link_service_facts
 {
     uint64_t active_boot_id;
     uint32_t connection_generation;
-    uint32_t security_epoch;
     uint32_t preferred_att_mtu;
     uint16_t conn_handle;
     bool encrypted;
-    bool session_authenticated;
-    bool authorized;
     bool identity_known;
     bool secure_connections_bond_verified;
     bool pairing_window_open;
