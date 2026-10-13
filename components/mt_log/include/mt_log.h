@@ -60,26 +60,6 @@ extern "C" {
 #endif
 
 /**
- * @brief Save an ESP-IDF error location and jump to the function exit label.
- *
- * @note The caller must declare an error variable and a line variable, and
- *       provide an `exit` label in the same function. The error expression is
- *       evaluated once before the jump decision.
- *
- * @param err is the ESP-IDF error value to check.
- * @param line receives the source line where the error was detected.
- */
-#define MT_ERROR_HANDLE(err, line) \
-    do \
-    { \
-        if ((err) != ESP_OK) \
-        { \
-            (line) = __LINE__; \
-            goto exit; \
-        } \
-    } while (0)
-
-/**
  * @brief Initialize the process logging facade.
  *
  * @return ESP_OK when logging is ready.
