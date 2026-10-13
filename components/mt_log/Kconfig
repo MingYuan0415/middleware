@@ -1,0 +1,11 @@
+menu "MicroTech logging"
+
+config MT_LOG_DEFAULT_LEVEL
+    int "Default compile-time log level (1=Error, 2=Warn, 3=Info, 4=Debug, 5=Verbose)"
+    range 1 5
+    default 3
+    help
+        Compile-time verbosity ceiling for source files that do not define
+        their own DBG_LVL. A file that defines DBG_LVL keeps its local
+        ceiling and is unaffected by this option.
+endmenu

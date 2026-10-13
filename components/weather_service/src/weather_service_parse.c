@@ -1,5 +1,4 @@
 #define DBG_TAG "weather_parse"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "weather_service_internal.h"

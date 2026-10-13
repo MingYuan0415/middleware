@@ -1,5 +1,4 @@
 #define DBG_TAG "recorder_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "recorder_service.h"

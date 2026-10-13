@@ -5,7 +5,6 @@
 #include "freertos/FreeRTOS.h"
 
 #define DBG_TAG "sd_storage"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "sd_storage_service.h"

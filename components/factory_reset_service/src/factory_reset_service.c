@@ -1,5 +1,4 @@
 #define DBG_TAG "factory_reset"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "factory_reset_service.h"

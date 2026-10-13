@@ -1,5 +1,4 @@
 #define DBG_TAG "wifi_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "wifi_service_internal.h"

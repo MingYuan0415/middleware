@@ -1,5 +1,4 @@
 #define DBG_TAG "ble_revoke_jrnl"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "ble_nimble_port_revoke_journal.h"

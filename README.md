@@ -6,7 +6,7 @@
 
 | 组件 | 职责与当前状态 | 直接组件依赖 |
 | --- | --- | --- |
-| `mt_log` | 封装 ESP-IDF 日志级别，并提供统一 `exit` 错误处理宏 | 无 |
+| `mt_log` | 按文件 `DBG_LVL`（未定义时用 Kconfig 全局上限 `MT_LOG_DEFAULT_LEVEL`）在编译期封装 ESP-IDF 日志级别，并提供统一 `exit` 错误处理宏 | 无 |
 | `event_bus` | 固定容量、线程安全的发布/订阅总线，支持发布者任务和 UI worker 两种分发上下文 | `mt_log`（私有） |
 | `nv_storage` | 管理默认 NVS 分区，提供标量 K-V API 和固定池 Blob 注册/校验/默认值回退 | `freertos`、`nvs_flash`、`mt_log`（私有） |
 | `power_service` | 通过板级操作表采样 PMU，并以独立周期消费 latched IRQ；缓存快照并发布状态/IRQ 事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |

@@ -1,5 +1,4 @@
 #define DBG_TAG "power_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "power_service.h"

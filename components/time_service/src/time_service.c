@@ -1,5 +1,4 @@
 #define DBG_TAG "time_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "time_service.h"

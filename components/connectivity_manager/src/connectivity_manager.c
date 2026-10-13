@@ -1,5 +1,4 @@
 #define DBG_TAG "connectivity"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "connectivity_manager.h"

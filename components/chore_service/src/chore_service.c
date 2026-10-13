@@ -1,5 +1,4 @@
 #define DBG_TAG "chore_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "chore_service.h"

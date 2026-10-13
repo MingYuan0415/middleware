@@ -1,5 +1,4 @@
 #define DBG_TAG "wifi_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #if CONFIG_MAIN_PROJECT_TASK_AFFINITY_CPU0 || \

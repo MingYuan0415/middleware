@@ -3,7 +3,6 @@
  */
 
 #define DBG_TAG "event_bus"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "event_bus.h"

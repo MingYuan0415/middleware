@@ -8,6 +8,15 @@
 extern "C" {
 #endif
 
+/*
+ * A source file may pick its own compile-time ceiling by defining DBG_LVL
+ * before including this header. Otherwise the project-wide default from
+ * Kconfig (CONFIG_MT_LOG_DEFAULT_LEVEL) applies.
+ */
+#ifndef DBG_LVL
+#define DBG_LVL CONFIG_MT_LOG_DEFAULT_LEVEL
+#endif
+
 /* DBG_LVL values */
 #define DBG_ERROR   1
 #define DBG_WARN    2

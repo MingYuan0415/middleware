@@ -33,7 +33,6 @@
 #include "event_bus.h"
 
 #define DBG_TAG "device_link_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #define DEVICE_LINK_SERVICE_RETRY_MS 100U

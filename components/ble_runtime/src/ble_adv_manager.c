@@ -8,7 +8,6 @@
 #include "ble_adv_manager.h"
 
 #define DBG_TAG "ble_adv_manager"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #define BLE_ADV_MANAGER_RETRY_INITIAL_MS 100U

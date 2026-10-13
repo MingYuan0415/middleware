@@ -88,7 +88,6 @@ static esp_err_t _ble_nimble_port_queue_terminal_provisional_unpair(
 static void _ble_nimble_port_clear_provisional_tracking(void);
 
 #define DBG_TAG "ble_nimble_port"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #define BLE_NIMBLE_PORT_INDICATION_TIMEOUT_MS 2000U

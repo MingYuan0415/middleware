@@ -1,5 +1,4 @@
 #define DBG_TAG "device_link_revoke"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 #include "device_link_revoke_progress.h"

@@ -6,7 +6,6 @@
 #include <string.h>
 
 #define DBG_TAG "audio_service"
-#define DBG_LVL DBG_INFO
 #include "mt_log.h"
 
 typedef esp_err_t (*audio_service_io_op_t)(void *data, size_t bytes,
