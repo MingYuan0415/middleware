@@ -93,6 +93,22 @@ void ble_nimble_port_numeric_comparison_cancel(void);
 esp_err_t ble_nimble_port_request_disconnect(void);
 
 /**
+ * @brief Wait for NimBLE host synchronization after a runtime start.
+ *
+ * Advertising and lease operations issued before host sync are rejected by
+ * the port guard and only recovered by the advertising manager's retry timer.
+ * Device Link waits for this boundary before acquiring its persistent lease,
+ * so a fast stop/start cycle cannot leave the runtime started without
+ * advertising.
+ *
+ * @param timeout_ms Maximum wait in milliseconds.
+ * @return ESP_OK when the host is synchronized and advertising may proceed;
+ *         ESP_ERR_INVALID_STATE when the port is not started or is quiescing;
+ *         ESP_ERR_TIMEOUT when the wait expires.
+ */
+esp_err_t ble_nimble_port_wait_for_host_sync(uint32_t timeout_ms);
+
+/**
  * @brief Close new-link admission and wait for a NimBLE host-event barrier.
  *
  * The barrier closes the SMP gate on the host core. Once it returns, every

@@ -168,6 +168,18 @@ esp_err_t ble_adv_manager_set_pause_reason(
     ble_adv_manager_pause_reason_t reason, bool active);
 
 /**
+ * @brief Report whether one pause reason is currently active.
+ *
+ * The NimBLE port uses this to keep the service-teardown STOP from waiting on
+ * a pairing-gate host event; the host is about to be deinitialized and the
+ * gate state resets on the next init.
+ *
+ * @param[in] reason Owner-specific reason.
+ * @return True while the reason is held.
+ */
+bool ble_adv_manager_pause_reason_active(ble_adv_manager_pause_reason_t reason);
+
+/**
  * @brief Compatibility pause owner for callers without an owner identity.
  *
  * This maps to a private LEGACY reason and cannot release any reason acquired

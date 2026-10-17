@@ -68,9 +68,11 @@ typedef struct device_link_service_status
     uint64_t generation; /**< Monotonic status generation for this boot. */
     device_link_service_state_t state; /**< Current service state. */
     int32_t last_error; /**< Local diagnostic error, never sent over BLE. */
+    int32_t policy_error; /**< Last Bluetooth policy transition result. */
     uint32_t window_remaining_ms; /**< Remaining binding window time. */
     bool available; /**< Service lifecycle is initialized. */
     bool enabled; /**< Effective persistent Bluetooth policy. */
+    bool desired_enabled; /**< Requested target; equals enabled when idle. */
     bool transitioning; /**< Runtime is converging to the requested policy. */
     bool public_discovery; /**< Public discovery advertisement is active. */
     bool active; /**< A binding window owns the bindable advertisement. */
@@ -109,12 +111,21 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config);
  *
  * This API is intended for the local settings owner. It is deliberately not
  * exposed as a Device Link method: a remote peer must not be able to disable
- * the only recovery transport. The worker persists the requested value before
- * changing the NimBLE runtime and retains a bounded retry obligation when the
- * physical transition fails.
+ * the only recovery transport. The call only records the latest target; the
+ * service worker persists it before changing the NimBLE runtime, so callers
+ * do not need a stack that survives cache-disable flash operations and never
+ * block on the BLE teardown. Repeating a target is idempotent, and the latest
+ * target supersedes any queued/intermediate state. The status snapshot exposes
+ * desired_enabled, enabled, transitioning, and policy_error.
  *
  * @param enabled Desired effective policy.
- * @param timeout_ms Total wait for this transition, or WAIT_FOREVER.
+ * @param timeout_ms Zero returns once the target is recorded; otherwise wait
+ *                   for the transition to settle, or
+ *                   DEVICE_LINK_SERVICE_WAIT_FOREVER.
+ * @return ESP_OK when the target is recorded (zero timeout) or the effective
+ *         policy matches it; the last policy error if the transition failed;
+ *         ESP_ERR_INVALID_STATE when the service is not running;
+ *         ESP_ERR_TIMEOUT when a bounded wait expires (the target remains).
  */
 esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms);
 

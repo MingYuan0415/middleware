@@ -761,6 +761,16 @@ esp_err_t ble_adv_manager_set_paused(bool paused)
                BLE_ADV_MANAGER_PAUSE_REASON_LEGACY, paused);
 }
 
+bool ble_adv_manager_pause_reason_active(ble_adv_manager_pause_reason_t reason)
+{
+    _ble_adv_manager_lock();
+    const bool active = s_manager.config != NULL &&
+                        (s_manager.pause_reasons & (uint32_t)reason) != 0U;
+
+    _ble_adv_manager_unlock();
+    return active;
+}
+
 void ble_adv_manager_handle_fast_window_expired(void)
 {
     _ble_adv_manager_lock();

@@ -4193,6 +4193,31 @@ esp_err_t ble_nimble_port_request_disconnect(void)
            ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
+esp_err_t ble_nimble_port_wait_for_host_sync(uint32_t timeout_ms)
+{
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    for (;;)
+    {
+        if (!s_port.started || s_port.quiescing)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (atomic_load_explicit(&s_adv_host_ready,
+                                 memory_order_acquire) &&
+                ble_hs_synced())
+        {
+            return ESP_OK;
+        }
+        if (xTaskGetTickCount() - started >= timeout)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10U));
+    }
+}
+
 esp_err_t ble_nimble_port_begin_cleanup_drain(void)
 {
     if (s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL ||
@@ -5607,6 +5632,14 @@ static void _ble_nimble_port_adv_task(void *param)
                                             &s_adv_host_ready,
                                             memory_order_acquire) &&
                                         ble_hs_synced();
+                /* During service teardown the host is about to be
+                 * deinitialized, so waiting for a pairing-gate host event can
+                 * only stall the STOP. The gate state is reset on the next
+                 * init; keep the STOP completion successful. */
+                const bool shutdown_active =
+                    s_port.quiescing ||
+                    ble_adv_manager_pause_reason_active(
+                        BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN);
 
                 if (!command_current || !host_ready)
                 {
@@ -5622,7 +5655,8 @@ static void _ble_nimble_port_adv_task(void *param)
                 {
                     LOG_E("adv stop failed result=%d", result);
                 }
-                if (!ble_adv_manager_bindable_requested())
+                if (!shutdown_active &&
+                        !ble_adv_manager_bindable_requested())
                 {
                     const esp_err_t gate_result =
                         _ble_nimble_port_set_pairing_gate(false);
@@ -5780,6 +5814,7 @@ static esp_err_t _ble_nimble_port_quiesce_adv(void)
                    pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) !=
             pdTRUE)
     {
+        ESP_LOGE(TAG, "adv quit queue timeout");
         s_port.deinit_failed = true;
         s_port.deinit_error = ESP_ERR_TIMEOUT;
         return ESP_ERR_TIMEOUT;
@@ -5789,6 +5824,7 @@ static esp_err_t _ble_nimble_port_quiesce_adv(void)
                        pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) !=
             pdTRUE)
     {
+        ESP_LOGE(TAG, "adv task quit timeout");
         s_port.deinit_failed = true;
         s_port.deinit_error = ESP_ERR_TIMEOUT;
         return ESP_ERR_TIMEOUT;
@@ -6344,6 +6380,7 @@ static esp_err_t _ble_nimble_port_stop(void)
                            pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
                 pdTRUE)
         {
+            ESP_LOGE(TAG, "nimble_port_stop did not complete");
             s_port.deinit_failed = true;
             s_port.deinit_error = ESP_ERR_TIMEOUT;
             return ESP_ERR_TIMEOUT;
@@ -6361,6 +6398,7 @@ static esp_err_t _ble_nimble_port_stop(void)
                            pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
                 pdTRUE)
         {
+            ESP_LOGE(TAG, "nimble host task did not exit");
             s_port.deinit_failed = true;
             s_port.deinit_error = ESP_ERR_TIMEOUT;
             return ESP_ERR_TIMEOUT;

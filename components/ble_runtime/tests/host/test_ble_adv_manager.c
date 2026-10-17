@@ -1480,6 +1480,26 @@ static void test_adv_payload_encoding(void)
                       ble_nimble_adv_encode(&config, payload, &payload_len));
 }
 
+static void test_pause_reason_active_accessor(void)
+{
+    _reset_harness();
+    _init_manager();
+    TEST_ASSERT_TRUE(!ble_adv_manager_pause_reason_active(
+                         BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN));
+    TEST_ASSERT_EQUAL(
+        ESP_OK, ble_adv_manager_set_pause_reason(
+            BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN, true));
+    TEST_ASSERT_TRUE(ble_adv_manager_pause_reason_active(
+                         BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN));
+    TEST_ASSERT_TRUE(!ble_adv_manager_pause_reason_active(
+                         BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION));
+    TEST_ASSERT_EQUAL(
+        ESP_OK, ble_adv_manager_set_pause_reason(
+            BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN, false));
+    TEST_ASSERT_TRUE(!ble_adv_manager_pause_reason_active(
+                         BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN));
+}
+
 int main(void)
 {
     test_acquire_fast_starts_fast_adv();
@@ -1509,6 +1529,7 @@ int main(void)
     test_adv_complete_without_connection_restarts();
     test_pause_preserves_lease_and_resumes();
     test_pause_reasons_are_independent();
+    test_pause_reason_active_accessor();
     test_pause_retries_failed_stop();
     test_stale_adv_started_rejected_by_generation();
     test_stale_adv_stopped_rejected_by_generation();

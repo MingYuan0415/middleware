@@ -9,7 +9,7 @@ Device Link v1 产品策略 owner：持有 `ble_runtime` 生命周期，管理�
 - `device_link_service_init()` / `deinit()`：启动或停止服务与 BLE runtime（`runtime_port` 为必需项）。
 - `open_window()` / `close_window()` / `confirm_binding()` / `pending_confirmation()`：配对窗口与本地确认；确认 token 必须与状态快照中的一致。
 - `revoke_binding()`：本地撤销绑定（journaled，无线上命令）。
-- `set_enabled()`：本地持久化并应用 Bluetooth 启用策略。
+- `set_enabled()`：记录最新目标；service worker 持久化并以有界状态机收敛，状态快照暴露 desired/effective/policy_error。
 - `release_startup_gate()`：`FACTORY_RESET_GATED` 启动模式在复位域清除后提交可见性。
 - `suspend()` / `resume()` / `get_status()` / `is_active()` / `is_busy()`：待机与状态查询。
 - `include/device_link_wifi_adapter.h` 提供 GET_INFO 固件三元组、Device Link 操作到 `connectivity_manager` 的提交适配与 bridge 生命周期。

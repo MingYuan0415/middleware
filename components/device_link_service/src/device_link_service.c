@@ -42,6 +42,9 @@
 #define DEVICE_LINK_SERVICE_BLUETOOTH_POLICY_MAGIC UINT32_C(0x444c4254)
 #define DEVICE_LINK_SERVICE_BLUETOOTH_POLICY_VERSION 1U
 #define DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_MS 1000U
+#define DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_ATTEMPTS 2U
+#define DEVICE_LINK_SERVICE_BLUETOOTH_TRANSITION_TIMEOUT_MS 5000U
+#define DEVICE_LINK_SERVICE_BLE_HOST_SYNC_TIMEOUT_MS 2000U
 
 typedef struct device_link_service_bluetooth_policy
 {
@@ -69,7 +72,6 @@ typedef enum
     DEVICE_LINK_SERVICE_COMMAND_RESUME,
     DEVICE_LINK_SERVICE_COMMAND_PROCESS_LINK,
     DEVICE_LINK_SERVICE_COMMAND_REVOKE,
-    DEVICE_LINK_SERVICE_COMMAND_SET_ENABLED,
     DEVICE_LINK_SERVICE_COMMAND_DEINIT,
 } device_link_service_command_type_t;
 
@@ -80,7 +82,6 @@ typedef struct device_link_service_command
     device_link_confirmation_token_t confirmation_token; /**< Exact local
                                                            * decision. */
     bool accept_binding; /**< Confirm (true) or deny (false). */
-    bool enabled; /**< Requested local Bluetooth policy. */
     ble_link_work_t *link_work; /**< Owned completed Link message. */
 } device_link_service_command_t;
 
@@ -104,13 +105,11 @@ typedef struct device_link_service
     bool runtime_started;
     bool runtime_initialized;
     bool bluetooth_enabled;
-    bool bluetooth_target_enabled;
+    bool bluetooth_desired_enabled;
     bool bluetooth_transitioning;
-    uint32_t bluetooth_request_sequence;
-    uint32_t bluetooth_applied_sequence;
-    esp_err_t bluetooth_transition_result;
     uint8_t bluetooth_retry_attempt;
     TickType_t bluetooth_retry_not_before;
+    TickType_t bluetooth_transition_deadline;
     bool bluetooth_policy_default_pending;
     esp_err_t bluetooth_policy_error;
     bool startup_gate_released;
@@ -588,6 +587,8 @@ static void _device_link_service_refresh_snapshot_locked(void)
 {
     s_service.snapshot.state = _device_link_service_derive_state();
     s_service.snapshot.enabled = s_service.bluetooth_enabled;
+    s_service.snapshot.desired_enabled = s_service.bluetooth_desired_enabled;
+    s_service.snapshot.policy_error = s_service.bluetooth_policy_error;
     s_service.snapshot.transitioning = s_service.bluetooth_transitioning;
     s_service.snapshot.public_discovery = s_service.bluetooth_enabled &&
                                           s_service.slow_lease_held &&
@@ -988,64 +989,172 @@ static uint32_t _device_link_service_bluetooth_retry_delay_ms(
            DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_MS : delay;
 }
 
-static void _device_link_service_schedule_bluetooth_retry_locked(void)
-{
-    const uint32_t delay = _device_link_service_bluetooth_retry_delay_ms(
-                               s_service.bluetooth_retry_attempt);
-
-    if (s_service.bluetooth_retry_attempt < UINT8_MAX)
-    {
-        s_service.bluetooth_retry_attempt++;
-    }
-    s_service.bluetooth_retry_not_before = xTaskGetTickCount() +
-                                           pdMS_TO_TICKS(delay);
-}
-
-static void _device_link_service_apply_bluetooth_policy(
-    bool enabled, uint32_t sequence)
+static void _device_link_service_bt_power_step(void)
 {
     device_link_service_snapshot_t snapshot;
-    esp_err_t result;
+    bool target = false;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    s_service.bluetooth_transitioning = true;
-    s_service.bluetooth_target_enabled = enabled;
-    _device_link_service_refresh_snapshot_locked();
-    s_service.snapshot.generation++;
-    snapshot = s_service.snapshot;
-    xSemaphoreGive(s_service.mutex);
-    _device_link_service_publish_now(&snapshot);
-
-    result = enabled ? _device_link_service_runtime_start() :
-             _device_link_service_runtime_stop();
-
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    s_service.bluetooth_transition_result = result;
-    if (result == ESP_OK)
+    if (!s_service.bluetooth_transitioning)
     {
-        s_service.bluetooth_enabled = enabled;
+        xSemaphoreGive(s_service.mutex);
+        return;
+    }
+    if (s_service.bluetooth_desired_enabled == s_service.bluetooth_enabled)
+    {
         s_service.bluetooth_transitioning = false;
         s_service.bluetooth_retry_attempt = 0U;
         s_service.bluetooth_retry_not_before = 0U;
-        s_service.bluetooth_policy_error = ESP_OK;
+        s_service.bluetooth_transition_deadline = 0U;
+        _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation++;
+        snapshot = s_service.snapshot;
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+        return;
+    }
+    const TickType_t now = xTaskGetTickCount();
+
+    if (s_service.bluetooth_retry_not_before != 0U &&
+            (int32_t)(now - s_service.bluetooth_retry_not_before) < 0)
+    {
+        xSemaphoreGive(s_service.mutex);
+        return;
+    }
+    if (s_service.bluetooth_transition_deadline == 0U)
+    {
+        s_service.bluetooth_transition_deadline =
+            now + pdMS_TO_TICKS(
+                DEVICE_LINK_SERVICE_BLUETOOTH_TRANSITION_TIMEOUT_MS);
+    }
+    if ((int32_t)(now - s_service.bluetooth_transition_deadline) >= 0)
+    {
+        const bool effective = s_service.bluetooth_enabled;
+
+        s_service.bluetooth_policy_error = ESP_ERR_TIMEOUT;
+        s_service.snapshot.last_error = ESP_ERR_TIMEOUT;
+        s_service.bluetooth_desired_enabled = s_service.bluetooth_enabled;
+        s_service.bluetooth_transitioning = false;
+        s_service.bluetooth_retry_attempt = 0U;
+        s_service.bluetooth_retry_not_before = 0U;
+        s_service.bluetooth_transition_deadline = 0U;
+        _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation++;
+        snapshot = s_service.snapshot;
+        xSemaphoreGive(s_service.mutex);
+        _device_link_service_publish_now(&snapshot);
+        LOG_E("bluetooth policy transition timed out; effective=%d",
+              (int)effective);
+        if (_device_link_service_store_bluetooth_policy(effective) != ESP_OK)
+        {
+            LOG_W("bluetooth policy rollback after timeout failed");
+        }
+        return;
+    }
+    target = s_service.bluetooth_desired_enabled;
+    xSemaphoreGive(s_service.mutex);
+
+    const esp_err_t store = _device_link_service_store_bluetooth_policy(target);
+    esp_err_t result = store;
+
+    if (store == ESP_OK)
+    {
+        result = target ? _device_link_service_runtime_start() :
+                 _device_link_service_runtime_stop();
+    }
+
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    const bool superseded = s_service.bluetooth_desired_enabled != target;
+
+    if (result == ESP_OK)
+    {
+        s_service.bluetooth_enabled = target;
+        s_service.bluetooth_retry_attempt = 0U;
+        s_service.bluetooth_retry_not_before = 0U;
+        s_service.bluetooth_transition_deadline = 0U;
+        s_service.bluetooth_transitioning =
+            s_service.bluetooth_desired_enabled != s_service.bluetooth_enabled;
+        if (!superseded)
+        {
+            s_service.bluetooth_policy_error = ESP_OK;
+        }
     }
     else
     {
-        s_service.bluetooth_policy_error = result;
-        s_service.bluetooth_transitioning =
-            s_service.bluetooth_enabled != s_service.bluetooth_target_enabled;
-        _device_link_service_schedule_bluetooth_retry_locked();
         s_service.snapshot.last_error = result;
-    }
-    if (sequence != 0U)
-    {
-        s_service.bluetooth_applied_sequence = sequence;
+        LOG_W("bluetooth policy attempt failed target=%d result=%s "
+              "superseded=%d",
+              (int)target, esp_err_to_name(result), (int)superseded);
+        if (superseded)
+        {
+            /* A newer target arrived while this attempt was running; do not
+               let the stale failure settle or roll it back. */
+            s_service.bluetooth_transitioning = true;
+            s_service.bluetooth_retry_attempt = 0U;
+            s_service.bluetooth_retry_not_before = 0U;
+        }
+        else
+        {
+            s_service.bluetooth_policy_error = result;
+            if (store != ESP_OK)
+            {
+                /* The policy was never persisted, so the runtime was never
+                   touched; settle immediately. */
+                s_service.bluetooth_desired_enabled =
+                    s_service.bluetooth_enabled;
+                s_service.bluetooth_transitioning = false;
+                s_service.bluetooth_retry_attempt = 0U;
+                s_service.bluetooth_retry_not_before = 0U;
+                s_service.bluetooth_transition_deadline = 0U;
+            }
+            else if (s_service.bluetooth_retry_attempt >=
+                     DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_ATTEMPTS)
+            {
+                s_service.bluetooth_desired_enabled =
+                    s_service.bluetooth_enabled;
+                s_service.bluetooth_transitioning = false;
+                s_service.bluetooth_retry_attempt = 0U;
+                s_service.bluetooth_retry_not_before = 0U;
+                s_service.bluetooth_transition_deadline = 0U;
+                const bool effective = s_service.bluetooth_enabled;
+
+                _device_link_service_refresh_snapshot_locked();
+                s_service.snapshot.generation++;
+                snapshot = s_service.snapshot;
+                xSemaphoreGive(s_service.mutex);
+                _device_link_service_publish_now(&snapshot);
+                LOG_E("bluetooth policy failed; restored effective=%d "
+                      "result=%s",
+                      (int)effective, esp_err_to_name(result));
+                if (_device_link_service_store_bluetooth_policy(effective) !=
+                        ESP_OK)
+                {
+                    LOG_W("bluetooth policy rollback after failure failed");
+                }
+                return;
+            }
+            else
+            {
+                const uint32_t delay =
+                    _device_link_service_bluetooth_retry_delay_ms(
+                        s_service.bluetooth_retry_attempt);
+
+                s_service.bluetooth_retry_attempt++;
+                s_service.bluetooth_retry_not_before =
+                    xTaskGetTickCount() + pdMS_TO_TICKS(delay);
+                s_service.bluetooth_transitioning = true;
+            }
+        }
     }
     _device_link_service_refresh_snapshot_locked();
     s_service.snapshot.generation++;
     snapshot = s_service.snapshot;
     xSemaphoreGive(s_service.mutex);
     _device_link_service_publish_now(&snapshot);
+    if (result == ESP_OK && !superseded)
+    {
+        LOG_I("bluetooth policy applied enabled=%d", (int)target);
+    }
 }
 
 static void _device_link_service_handle_command(
@@ -1071,12 +1180,6 @@ static void _device_link_service_handle_command(
 
         xSemaphoreGive(s_service.mutex);
         _device_link_service_publish_now(&snapshot);
-        return;
-    }
-    if (command->type == DEVICE_LINK_SERVICE_COMMAND_SET_ENABLED)
-    {
-        _device_link_service_apply_bluetooth_policy(
-            command->enabled, command->sequence);
         return;
     }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
@@ -1242,22 +1345,7 @@ static void _device_link_service_worker_tick(void)
 {
     bool publish = false;
     device_link_service_snapshot_t snapshot;
-    bool retry_bluetooth = false;
-    bool retry_target = false;
 
-    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (s_service.bluetooth_transitioning &&
-            _device_link_service_tick_reached(
-                xTaskGetTickCount(), s_service.bluetooth_retry_not_before))
-    {
-        retry_bluetooth = true;
-        retry_target = s_service.bluetooth_target_enabled;
-    }
-    xSemaphoreGive(s_service.mutex);
-    if (retry_bluetooth)
-    {
-        _device_link_service_apply_bluetooth_policy(retry_target, 0U);
-    }
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     const bool runtime_ready = s_service.runtime_started &&
                                s_service.status_publish_ready;
@@ -1476,6 +1564,9 @@ static void _device_link_service_worker(void *arg)
                                    _device_link_service_wait_ticks(
                                        _device_link_service_next_wait_ms()));
         }
+        /* Converge the requested Bluetooth policy after every command/wake
+         * so a superseded target never turns into a queued full cycle. */
+        _device_link_service_bt_power_step();
         /* The deadline and periodic publication tick runs after every
          * command as well, so sustained command traffic cannot starve the
          * window expiry. */
@@ -1630,24 +1721,46 @@ static void _device_link_service_worker(void *arg)
 
 static esp_err_t _device_link_service_runtime_teardown(void)
 {
-    esp_err_t result = s_service.runtime_started ? ble_runtime_stop() : ESP_OK;
+    esp_err_t stop_result = ESP_OK;
 
-    if (result != ESP_OK)
+    if (s_service.runtime_started)
     {
-        return result;
+        stop_result = ble_runtime_stop();
+        if (stop_result == ESP_OK ||
+                stop_result == ESP_ERR_INVALID_STATE)
+        {
+            s_service.runtime_started = false;
+        }
     }
-    s_service.runtime_started = false;
     if (!s_service.runtime_initialized)
     {
-        /* Nothing was ever initialized; deinit would be invalid. */
-        return ESP_OK;
+        if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE)
+        {
+            LOG_W("runtime stop failed without initialized port: %s",
+                  esp_err_to_name(stop_result));
+        }
+        return stop_result == ESP_ERR_INVALID_STATE ? ESP_OK : stop_result;
     }
-    result = ble_runtime_deinit();
-    if (result == ESP_OK)
+    /* A failed stop leaves the runtime FAULTED; deinit still owns the port
+       teardown and must run so the next start does not inherit a half-up
+       controller/host. */
+    const esp_err_t deinit_result = ble_runtime_deinit();
+
+    if (deinit_result != ESP_OK)
     {
-        s_service.runtime_initialized = false;
+        LOG_E("runtime teardown failed: stop=%s deinit=%s",
+              esp_err_to_name(stop_result),
+              esp_err_to_name(deinit_result));
+        return deinit_result;
     }
-    return result;
+    s_service.runtime_started = false;
+    s_service.runtime_initialized = false;
+    if (stop_result != ESP_OK)
+    {
+        LOG_W("runtime stop recovered by deinit: %s",
+              esp_err_to_name(stop_result));
+    }
+    return ESP_OK;
 }
 
 static esp_err_t _device_link_service_acquire_slow_lease(void);
@@ -1690,6 +1803,17 @@ static esp_err_t _device_link_service_runtime_start(void)
     {
         return ESP_OK;
     }
+    if (s_service.runtime_initialized)
+    {
+        /* A previous stop may have left the port initialized but not
+           running; a fresh init/start must begin from a released runtime. */
+        const esp_err_t cleanup = _device_link_service_runtime_teardown();
+
+        if (cleanup != ESP_OK)
+        {
+            return cleanup;
+        }
+    }
     /* The Wi-Fi domain must be frozen into the router before the GATT
      * service initializes the link service (boot_id is still zero). */
     esp_err_t result = _device_link_service_register_wifi_domain();
@@ -1714,6 +1838,19 @@ static esp_err_t _device_link_service_runtime_start(void)
     {
         result = ble_runtime_start();
         s_service.runtime_started = result == ESP_OK;
+    }
+    if (result == ESP_OK)
+    {
+        /* The port starts the host asynchronously. Acquiring the persistent
+           lease before synchronization can make the first advertising start
+           fail and leave the manager in a retry/faulted state. */
+        result = ble_nimble_port_wait_for_host_sync(
+                     DEVICE_LINK_SERVICE_BLE_HOST_SYNC_TIMEOUT_MS);
+        if (result != ESP_OK)
+        {
+            LOG_E("host sync wait after start failed: %s",
+                  esp_err_to_name(result));
+        }
     }
     if (result == ESP_OK)
     {
@@ -1772,52 +1909,63 @@ static esp_err_t _device_link_service_runtime_stop(void)
     {
         return ESP_OK;
     }
-    esp_err_t result = ble_adv_manager_set_pause_reason(
-                           BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN,
-                           true);
+    const esp_err_t pause_result = ble_adv_manager_set_pause_reason(
+                                       BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN,
+                                       true);
 
-    if (result != ESP_OK)
+    if (pause_result != ESP_OK)
     {
-        return result;
+        /* The manager may already be deinitialized; the controller teardown
+           below is still the operation that matters. */
+        LOG_W("advertising shutdown pause failed: %s",
+              esp_err_to_name(pause_result));
     }
-    result = s_service.config.runtime_port->set_pairing_gate(false);
-    if (result != ESP_OK)
-    {
-        return result;
-    }
+    /* Do not close the pairing gate here. The host/controller teardown
+       invalidates SMP, while closing it would wait for the advertising STOP
+       and a NimBLE host event while the runtime is being torn down. The gate
+       state is reset by the next init. */
     ble_link_session_set_pairing_window(false);
     ble_link_service_set_pairing_window(false);
     _device_link_service_clear_link_session();
     if (s_service.client_connected)
     {
-        result = ble_nimble_port_request_disconnect();
-        if (result != ESP_OK)
+        const esp_err_t disconnect = ble_nimble_port_request_disconnect();
+
+        if (disconnect != ESP_OK)
         {
-            return result;
+            LOG_W("disconnect during teardown failed: %s",
+                  esp_err_to_name(disconnect));
         }
     }
     if (s_service.slow_lease_held)
     {
-        result = ble_adv_manager_release_lease(s_service.slow_lease_id);
-        if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
+        const esp_err_t release = ble_adv_manager_release_lease(
+                                      s_service.slow_lease_id);
+
+        if (release != ESP_OK && release != ESP_ERR_NOT_FOUND)
         {
-            return result;
+            LOG_W("lease release during teardown failed: %s",
+                  esp_err_to_name(release));
         }
         s_service.slow_lease_held = false;
         s_service.slow_lease_id = 0U;
     }
-    result = _device_link_service_runtime_teardown();
-    if (result != ESP_OK)
+    const esp_err_t teardown = _device_link_service_runtime_teardown();
+
+    if (teardown != ESP_OK)
     {
-        return result;
+        return teardown;
     }
     if (s_service.router_registered)
     {
-        result = ble_event_router_unregister(_device_link_service_ble_event,
-                                             NULL);
-        if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
+        const esp_err_t unregister = ble_event_router_unregister(
+                                         _device_link_service_ble_event,
+                                         NULL);
+
+        if (unregister != ESP_OK && unregister != ESP_ERR_NOT_FOUND)
         {
-            return result;
+            LOG_W("event router unregister during teardown failed: %s",
+                  esp_err_to_name(unregister));
         }
         s_service.router_registered = false;
     }
@@ -2060,7 +2208,11 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
         policy_result = ESP_OK;
     }
     s_service.bluetooth_enabled = policy_enabled && policy_result == ESP_OK;
-    s_service.bluetooth_target_enabled = s_service.bluetooth_enabled;
+    s_service.bluetooth_desired_enabled = s_service.bluetooth_enabled;
+    s_service.bluetooth_transitioning = false;
+    s_service.bluetooth_retry_attempt = 0U;
+    s_service.bluetooth_retry_not_before = 0U;
+    s_service.bluetooth_transition_deadline = 0U;
     s_service.bluetooth_policy_error = policy_result == ESP_OK ?
                                        ESP_OK : policy_result;
     s_service.mutex = xSemaphoreCreateMutexStatic(&s_service.mutex_control);
@@ -2127,6 +2279,18 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     {
         result = ble_runtime_start();
         s_service.runtime_started = result == ESP_OK;
+    }
+    if (result == ESP_OK && s_service.bluetooth_enabled)
+    {
+        /* Advertising prerequisites are installed below; wait for the host
+           boundary first so the persistent lease cannot race it. */
+        result = ble_nimble_port_wait_for_host_sync(
+                     DEVICE_LINK_SERVICE_BLE_HOST_SYNC_TIMEOUT_MS);
+        if (result != ESP_OK)
+        {
+            LOG_E("host sync wait during init failed: %s",
+                  esp_err_to_name(result));
+        }
     }
     if (result == ESP_OK)
     {
@@ -2735,46 +2899,40 @@ esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t result = _device_link_service_store_bluetooth_policy(enabled);
+    device_link_service_snapshot_t snapshot;
+    bool publish = false;
 
-    if (result != ESP_OK)
-    {
-        _device_link_service_api_release();
-        return result;
-    }
-    uint32_t sequence = 0U;
-    device_link_service_command_t command;
-
-    memset(&command, 0, sizeof(command));
-    command.type = DEVICE_LINK_SERVICE_COMMAND_SET_ENABLED;
-    command.enabled = enabled;
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    if (s_service.bluetooth_request_sequence == UINT32_MAX)
+    const bool already = s_service.bluetooth_desired_enabled == enabled;
+
+    if (!already)
     {
-        result = ESP_ERR_INVALID_STATE;
-    }
-    else
-    {
-        sequence = ++s_service.bluetooth_request_sequence;
-        command.sequence = sequence;
-        result = xQueueSend(s_service.queue, &command, 0U) == pdTRUE ?
-                 ESP_OK : ESP_ERR_NO_MEM;
-        if (result == ESP_OK)
-        {
-            s_service.bluetooth_target_enabled = enabled;
-            s_service.bluetooth_transitioning =
-                s_service.bluetooth_enabled != enabled;
-            s_service.bluetooth_retry_not_before = xTaskGetTickCount();
-            s_service.snapshot.last_error = ESP_OK;
-        }
+        /* Latest target wins: no command is queued per request. The worker
+           converges to this value and skips intermediate targets. */
+        s_service.bluetooth_desired_enabled = enabled;
+        s_service.bluetooth_policy_error = ESP_OK;
+        s_service.bluetooth_transitioning =
+            enabled != s_service.bluetooth_enabled;
+        s_service.bluetooth_retry_attempt = 0U;
+        s_service.bluetooth_retry_not_before = 0U;
+        s_service.bluetooth_transition_deadline = 0U;
+        _device_link_service_refresh_snapshot_locked();
+        s_service.snapshot.generation++;
+        snapshot = s_service.snapshot;
+        publish = true;
     }
     xSemaphoreGive(s_service.mutex);
-    if (result != ESP_OK)
+
+    if (publish)
+    {
+        _device_link_service_publish_now(&snapshot);
+        _device_link_service_wake_worker(NULL);
+    }
+    if (timeout_ms == 0U)
     {
         _device_link_service_api_release();
-        return result;
+        return ESP_OK;
     }
-    _device_link_service_wake_worker(NULL);
 
     const TickType_t started = xTaskGetTickCount();
     const TickType_t timeout = timeout_ms == DEVICE_LINK_SERVICE_WAIT_FOREVER ?
@@ -2782,20 +2940,24 @@ esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms)
 
     for (;;)
     {
-        bool applied = false;
-        esp_err_t applied_result = ESP_ERR_INVALID_STATE;
+        bool settled = false;
+        bool effective = false;
+        esp_err_t policy_error = ESP_OK;
 
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        if (s_service.bluetooth_applied_sequence == sequence)
-        {
-            applied = true;
-            applied_result = s_service.bluetooth_transition_result;
-        }
+        settled = !s_service.bluetooth_transitioning;
+        effective = s_service.bluetooth_enabled;
+        policy_error = s_service.bluetooth_policy_error;
         xSemaphoreGive(s_service.mutex);
-        if (applied)
+        if (settled)
         {
             _device_link_service_api_release();
-            return applied_result;
+            if (effective == enabled)
+            {
+                return ESP_OK;
+            }
+            return policy_error != ESP_OK ? policy_error :
+                   ESP_ERR_INVALID_STATE;
         }
         if (timeout != portMAX_DELAY &&
                 xTaskGetTickCount() - started >= timeout)
