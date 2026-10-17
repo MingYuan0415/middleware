@@ -174,7 +174,7 @@ static void _start(void)
     assert(weather_service_init(&s_config) == ESP_OK);
     assert(host_caps_task_count() == 1U);
     assert(host_last_task_stack_caps() ==
-           (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+           (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 static void _stop(void)

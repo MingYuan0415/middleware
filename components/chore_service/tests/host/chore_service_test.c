@@ -1052,7 +1052,7 @@ static bool _test_task_affinity_and_caps(void)
     TEST_CHECK(host_dynamic_task_count() == baseline_tasks + 1U);
     TEST_CHECK(host_caps_task_count() == baseline_caps + 1U);
     TEST_CHECK(host_last_task_stack_caps() ==
-               (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+               (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     TEST_CHECK(chore_service_deinit(CHORE_SERVICE_WAIT_FOREVER) == ESP_OK);
     const int64_t deadline = _chore_test_real_ms() + 2000;
     while (host_dynamic_task_count() != baseline_tasks &&

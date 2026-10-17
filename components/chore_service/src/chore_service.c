@@ -573,12 +573,15 @@ esp_err_t chore_service_init(const chore_service_config_t *config)
         result = ESP_ERR_NO_MEM;
         goto cleanup;
     }
+    /* Jobs may access NVS or the flash-backed data partition, so the stack
+       stays in internal RAM: flash writes disable the cache and assert when
+       the active stack pointer lives in PSRAM. */
     if (xTaskCreatePinnedToCoreWithCaps(
                 _chore_worker, "chore_worker",
                 CONFIG_CHORE_SERVICE_TASK_STACK_SIZE, NULL,
                 s_chore.task_priority, &s_chore.worker,
                 CONFIG_MAIN_PROJECT_TASK_CORE_ID,
-                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS)
     {
         result = ESP_ERR_NO_MEM;
         goto cleanup;

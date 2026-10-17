@@ -1832,12 +1832,14 @@ esp_err_t weather_service_init(const weather_service_config_t *config)
         }
     }
     s_weather.initialized = true;
+    /* The worker writes the /data cache, so its stack stays in internal RAM:
+       flash writes disable the cache and assert on a PSRAM stack. */
     if (xTaskCreatePinnedToCoreWithCaps(
                 _weather_worker, "weather_worker",
                 CONFIG_WEATHER_SERVICE_TASK_STACK_SIZE, NULL,
                 copied.task_priority, &s_weather.worker,
                 CONFIG_MAIN_PROJECT_TASK_CORE_ID,
-                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS)
     {
         s_weather.initialized = false;
         result = ESP_ERR_NO_MEM;
