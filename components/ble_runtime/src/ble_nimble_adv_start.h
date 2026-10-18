@@ -40,4 +40,8 @@ int ble_nimble_adv_start_execute(
     uint32_t generation, bool bindable,
     const ble_nimble_adv_start_ops_t *ops);
 
+/** @brief Commit an advertising completion, then wake the service owner. */
+void ble_nimble_adv_report_result(
+    ble_port_event_type_t type, int status, uint32_t generation);
+
 #endif /* __BLE_NIMBLE_ADV_START_H__ */

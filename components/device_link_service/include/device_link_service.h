@@ -93,7 +93,9 @@ typedef device_link_service_status_t device_link_service_snapshot_t;
  * The service owns the ble_runtime lifecycle for its whole lifetime: the
  * NimBLE host starts, the persistent connectable advertisement lease is
  * acquired, and the binding window machinery becomes available. A failed
- * start releases everything and returns the error; init may be retried.
+ * start releases resources when teardown succeeds. If teardown fails, the
+ * service retains its dependencies; finish device_link_service_deinit()
+ * before retrying init.
  *
  * Lifecycle admission is exclusive but all init/deinit calls must come
  * from a single owner task (the runtime owner), as with ble_runtime.

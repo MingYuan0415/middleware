@@ -45,7 +45,7 @@ typedef struct ble_gap_manager_event
 typedef struct ble_gap_manager_snapshot
 {
     uint16_t conn_handle;  /**< Current connection, or 0 when disconnected. */
-    uint32_t generation;   /**< Connection generation, 0 before first link. */
+    uint32_t generation;   /**< Boot-unique connection identity; 0 before a link. */
     uint16_t mtu;          /**< Last negotiated ATT MTU, 23 default. */
     bool connected;
     bool encrypted;
@@ -56,7 +56,7 @@ typedef struct ble_gap_manager_snapshot
 typedef bool (*ble_gap_manager_admission_cb_t)(void *arg);
 
 /**
- * @brief Initialize the manager; no connection is active.
+ * @brief Clear connection facts without resetting boot-scoped identity counters.
  */
 void ble_gap_manager_init(void);
 

@@ -32,6 +32,7 @@
 
 #include "ble_adv_manager.h"
 #include "ble_nimble_adv_start.h"
+#include "ble_nimble_host.h"
 #include "ble_nimble_peer_identity.h"
 #include "ble_nimble_pairing_gate.h"
 #include "ble_nimble_port_revoke_journal.h"
@@ -165,33 +166,29 @@ typedef struct ble_nimble_port_adv_cmd
 typedef struct ble_nimble_port
 {
     SemaphoreHandle_t sync_semaphore;
-    SemaphoreHandle_t exit_semaphore;
-    SemaphoreHandle_t stop_done_semaphore;
     SemaphoreHandle_t adv_exit_semaphore;
     SemaphoreHandle_t adv_lock;
-    TaskHandle_t host_task;
     TaskHandle_t adv_task;
     QueueHandle_t adv_queue;
     struct ble_gap_event_listener listener;
     bool listener_registered;
     bool link_gatt_initialized;
     const ble_port_ops_t *ops;
-    bool started;
+    atomic_bool started;
     bool deinitialized;
     bool link_security_initialized;
     bool nimble_init_attempted;
-    bool quiescing;
+    atomic_bool quiescing;
+    bool adv_quit_pending;
+    bool owner_quit_pending;
     bool deinit_failed;
     esp_err_t deinit_error;
     ble_nimble_store_guard_t storage_guard;
     ble_nimble_store_callback_guard_t store_write_guard;
-    int stop_result;
 } ble_nimble_port_t;
 
 static ble_nimble_port_t s_port;
-static struct ble_npl_event s_pairing_gate_event;
-static struct ble_npl_event s_terminate_event;
-static struct ble_npl_event s_cleanup_drain_event;
+static ble_nimble_host_t s_host;
 static StaticSemaphore_t s_pairing_gate_ack_control;
 static StaticSemaphore_t s_pairing_gate_lock_control;
 static SemaphoreHandle_t s_pairing_gate_ack;
@@ -200,7 +197,6 @@ static atomic_uint s_pairing_gate_requested_seq = 0U;
 static atomic_uint s_pairing_gate_applied_seq = 0U;
 static ble_nimble_pairing_gate_state_t s_pairing_gate_state;
 static atomic_bool s_pairing_gate_event_queued = false;
-static atomic_uintptr_t s_nimble_host_task = 0U;
 static atomic_bool s_terminate_event_queued = false;
 static atomic_bool s_cleanup_draining = false;
 static atomic_bool s_cleanup_drain_event_queued = false;
@@ -310,22 +306,41 @@ static esp_err_t _ble_nimble_port_apply_pairing_gate_state(void)
                                   memory_order_acq_rel))
     {
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
-                           &s_pairing_gate_event);
+                           &s_host.pairing_gate_event);
     }
     esp_err_t result = ESP_ERR_TIMEOUT;
+    const TickType_t deadline = xTaskGetTickCount() +
+                                pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS);
 
-    while (xSemaphoreTake(s_pairing_gate_ack,
-                          pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) ==
-            pdTRUE)
+    for (;;)
     {
-        if (atomic_load_explicit(&s_pairing_gate_applied_seq,
-                                 memory_order_acquire) == sequence)
+        if (s_port.quiescing)
+        {
+            /* Teardown must be able to retire the adv task even while a
+             * standby START is waiting for its host gate event. */
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        const TickType_t remaining = deadline - xTaskGetTickCount();
+
+        if ((int32_t)remaining <= 0)
+        {
+            break;
+        }
+        const TickType_t slice = remaining < pdMS_TO_TICKS(50U) ?
+                                 remaining : pdMS_TO_TICKS(50U);
+
+        if (xSemaphoreTake(s_pairing_gate_ack, slice) == pdTRUE &&
+                atomic_load_explicit(&s_pairing_gate_applied_seq,
+                                     memory_order_acquire) == sequence)
         {
             result = ESP_OK;
             break;
         }
     }
     (void)xSemaphoreGive(s_pairing_gate_lock);
+    LOG_I("gate apply result=%d seq=%lu", (int)result,
+          (unsigned long)sequence);
     return result;
 }
 
@@ -351,12 +366,7 @@ static esp_err_t _ble_nimble_port_set_pairing_gate(bool open)
 
 static esp_err_t _ble_nimble_port_apply_pairing_gate_context(void)
 {
-    const TaskHandle_t host_task = (TaskHandle_t)(uintptr_t)
-                                   atomic_load_explicit(
-                                       &s_nimble_host_task,
-                                       memory_order_acquire);
-
-    if (host_task != NULL && xTaskGetCurrentTaskHandle() == host_task)
+    if (ble_nimble_host_is_current(&s_host))
     {
         /* GAP admission and terminal callbacks already execute on the
          * persistent NimBLE host queue. Apply directly to avoid waiting on an
@@ -755,8 +765,62 @@ static void _ble_nimble_port_queue_terminate_event(void)
                                   memory_order_acq_rel))
     {
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
-                           &s_terminate_event);
+                           &s_host.terminate_event);
     }
+}
+
+static void _ble_nimble_port_reset_static_host_events(void)
+{
+    /* No producers run before host start. Reset generation-local handshakes
+     * once, alongside the newly allocated NPL events. */
+    if (s_pairing_gate_ack != NULL)
+    {
+        vSemaphoreDelete(s_pairing_gate_ack);
+        s_pairing_gate_ack = NULL;
+    }
+    if (s_pairing_gate_lock != NULL)
+    {
+        vSemaphoreDelete(s_pairing_gate_lock);
+        s_pairing_gate_lock = NULL;
+    }
+    if (s_cleanup_drain_ack != NULL)
+    {
+        vSemaphoreDelete(s_cleanup_drain_ack);
+        s_cleanup_drain_ack = NULL;
+    }
+    if (s_cleanup_drain_lock != NULL)
+    {
+        vSemaphoreDelete(s_cleanup_drain_lock);
+        s_cleanup_drain_lock = NULL;
+    }
+    s_pairing_gate_ack = xSemaphoreCreateBinaryStatic(
+                             &s_pairing_gate_ack_control);
+    s_pairing_gate_lock = xSemaphoreCreateMutexStatic(
+                              &s_pairing_gate_lock_control);
+    s_cleanup_drain_ack = xSemaphoreCreateBinaryStatic(
+                              &s_cleanup_drain_ack_control);
+    s_cleanup_drain_lock = xSemaphoreCreateMutexStatic(
+                               &s_cleanup_drain_lock_control);
+    atomic_store_explicit(&s_pairing_gate_requested_seq, 0U,
+                          memory_order_release);
+    atomic_store_explicit(&s_pairing_gate_applied_seq, 0U,
+                          memory_order_release);
+    ble_nimble_pairing_gate_reset(&s_pairing_gate_state);
+    atomic_store_explicit(&s_pairing_gate_event_queued, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_terminate_event_queued, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_cleanup_draining, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_cleanup_drain_event_queued, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_cleanup_drain_requested_seq, 0U,
+                          memory_order_release);
+    atomic_store_explicit(&s_cleanup_drain_applied_seq, 0U,
+                          memory_order_release);
+    ble_nimble_host_init_events(&s_host, _ble_nimble_port_pairing_gate_event,
+                                _ble_nimble_port_terminate_event,
+                                _ble_nimble_port_cleanup_drain_event);
 }
 
 static esp_err_t _ble_nimble_port_tx_tracker_retain(
@@ -1868,13 +1932,13 @@ static void _ble_nimble_port_timer_owner(void *arg)
 {
     (void)arg;
     ble_nimble_port_timer_command_t command;
+    bool quit = false;
 
     for (;;)
     {
         const bool command_received =
             xQueueReceive(s_timer_command_queue, &command, 0U) == pdTRUE;
         uint64_t remaining_us = _ble_nimble_port_timer_owner_sweep();
-        bool quit = false;
 
         _ble_nimble_port_execute_terminate_obligation();
         _ble_nimble_port_execute_cleanup_obligation();
@@ -1921,7 +1985,7 @@ static void _ble_nimble_port_timer_owner(void *arg)
              * skipped by an early continue. */
             remaining_us = _ble_nimble_port_timer_owner_sweep();
         }
-        if (quit)
+        if (quit && !ble_nimble_port_cleanup_pending())
         {
             break;
         }
@@ -2309,6 +2373,11 @@ static void _ble_nimble_port_adv_consumer(
         s_adv_generation = 0U;
     }
     const esp_err_t result = ble_adv_manager_handle_event(event);
+
+    /* The service may be registered earlier in the router. Wake again after
+     * the manager commits the physical result, so an early snapshot cannot
+     * consume the only notification. */
+    ble_link_service_wake_owner();
 
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
     {
@@ -4283,7 +4352,7 @@ esp_err_t ble_nimble_port_begin_cleanup_drain(void)
             else
             {
                 ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
-                                   &s_cleanup_drain_event);
+                                   &s_host.cleanup_drain_event);
                 while (xSemaphoreTake(
                             s_cleanup_drain_ack,
                             pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) ==
@@ -5470,6 +5539,9 @@ static esp_err_t _ble_nimble_port_production_adv_start(
     if (config == NULL || s_port.adv_queue == NULL ||
             s_port.adv_task == NULL || s_port.quiescing)
     {
+        LOG_I("port adv start invalid queue=%p task=%p quiescing=%d",
+              (void *)s_port.adv_queue, (void *)s_port.adv_task,
+              s_port.quiescing ? 1 : 0);
         return ESP_ERR_INVALID_STATE;
     }
     if (_ble_nimble_port_storage_error_load() != ESP_OK)
@@ -5575,27 +5647,6 @@ static int _ble_nimble_port_adv_stop_stale(void *arg)
     return result == BLE_HS_EALREADY ? 0 : result;
 }
 
-static void _ble_nimble_port_adv_result_event(
-    ble_port_event_type_t type, int status,
-    const ble_port_adv_config_t *config)
-{
-    ble_port_event_t port_event;
-
-    memset(&port_event, 0, sizeof(port_event));
-    port_event.type = type;
-    port_event.status = status;
-    if (config != NULL)
-    {
-        port_event.generation = config->generation;
-    }
-    const esp_err_t result = ble_adv_manager_handle_event(&port_event);
-
-    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
-    {
-        LOG_E("adv manager result event failed result=%d", result);
-    }
-}
-
 static void _ble_nimble_port_adv_task(void *param)
 {
     (void)param;
@@ -5620,8 +5671,10 @@ static void _ble_nimble_port_adv_task(void *param)
                                        cmd.config.bindable,
                                        &start_ops);
 
-                _ble_nimble_port_adv_result_event(
-                    BLE_PORT_EVENT_ADV_STARTED, result, &cmd.config);
+                LOG_I("adv task start gen=%lu result=%d",
+                      (unsigned long)cmd.config.generation, result);
+                ble_nimble_adv_report_result(
+                    BLE_PORT_EVENT_ADV_STARTED, result, cmd.config.generation);
             }
             else if (cmd.type == BLE_NIMBLE_PORT_ADV_CMD_STOP)
             {
@@ -5643,9 +5696,9 @@ static void _ble_nimble_port_adv_task(void *param)
 
                 if (!command_current || !host_ready)
                 {
-                    _ble_nimble_port_adv_result_event(
+                    ble_nimble_adv_report_result(
                         BLE_PORT_EVENT_ADV_STOPPED,
-                        ESP_ERR_INVALID_STATE, &cmd.config);
+                        ESP_ERR_INVALID_STATE, cmd.config.generation);
                     continue;
                 }
                 const int result = ble_gap_adv_stop();
@@ -5677,9 +5730,9 @@ static void _ble_nimble_port_adv_task(void *param)
                         }
                     }
                 }
-                _ble_nimble_port_adv_result_event(
+                ble_nimble_adv_report_result(
                     BLE_PORT_EVENT_ADV_STOPPED,
-                    completion_result, &cmd.config);
+                    completion_result, cmd.config.generation);
             }
             else if (cmd.type == BLE_NIMBLE_PORT_ADV_CMD_QUIT)
             {
@@ -5806,30 +5859,30 @@ static esp_err_t _ble_nimble_port_quiesce_adv(void)
     {
         return ESP_OK;
     }
-    ble_nimble_port_adv_cmd_t quit;
-
-    memset(&quit, 0, sizeof(quit));
-    quit.type = BLE_NIMBLE_PORT_ADV_CMD_QUIT;
-    if (xQueueSend(s_port.adv_queue, &quit,
-                   pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) !=
-            pdTRUE)
+    if (!s_port.adv_quit_pending)
     {
-        ESP_LOGE(TAG, "adv quit queue timeout");
-        s_port.deinit_failed = true;
-        s_port.deinit_error = ESP_ERR_TIMEOUT;
-        return ESP_ERR_TIMEOUT;
+        const ble_nimble_port_adv_cmd_t quit =
+        {
+            .type = BLE_NIMBLE_PORT_ADV_CMD_QUIT,
+        };
+
+        if (xQueueSend(s_port.adv_queue, &quit,
+                       pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) != pdTRUE)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        s_port.adv_quit_pending = true;
+        xTaskNotifyGive(s_port.adv_task);
     }
-    xTaskNotifyGive(s_port.adv_task);
     if (xSemaphoreTake(s_port.adv_exit_semaphore,
                        pdMS_TO_TICKS(BLE_NIMBLE_PORT_ADV_QUIT_TIMEOUT_MS)) !=
             pdTRUE)
     {
         ESP_LOGE(TAG, "adv task quit timeout");
-        s_port.deinit_failed = true;
-        s_port.deinit_error = ESP_ERR_TIMEOUT;
         return ESP_ERR_TIMEOUT;
     }
     s_port.adv_task = NULL;
+    s_port.adv_quit_pending = false;
     return ESP_OK;
 }
 
@@ -5854,16 +5907,24 @@ static esp_err_t _ble_nimble_port_owner_quit(uint32_t wait_ms)
         s_timer_owner_task = NULL;
         return ESP_ERR_INVALID_STATE;
     }
-    const ble_nimble_port_timer_command_t quit =
+    if (!s_port.owner_quit_pending)
     {
-        .armed = false,
-        .kind = BLE_NIMBLE_PORT_TIMER_KIND_QUIT,
-    };
+        if (ble_nimble_port_cleanup_pending())
+        {
+            return ESP_ERR_NOT_FINISHED;
+        }
+        const ble_nimble_port_timer_command_t quit =
+        {
+            .armed = false,
+            .kind = BLE_NIMBLE_PORT_TIMER_KIND_QUIT,
+        };
 
-    if (!_ble_nimble_port_timer_enqueue_control(
-                &quit, pdMS_TO_TICKS(BLE_NIMBLE_PORT_OWNER_QUIT_SEND_MS)))
-    {
-        return ESP_ERR_TIMEOUT;
+        if (!_ble_nimble_port_timer_enqueue_control(
+                    &quit, pdMS_TO_TICKS(BLE_NIMBLE_PORT_OWNER_QUIT_SEND_MS)))
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        s_port.owner_quit_pending = true;
     }
     if (s_timer_exit == NULL ||
             xSemaphoreTake(s_timer_exit, pdMS_TO_TICKS(wait_ms)) != pdTRUE)
@@ -5871,6 +5932,7 @@ static esp_err_t _ble_nimble_port_owner_quit(uint32_t wait_ms)
         return ESP_ERR_TIMEOUT;
     }
     s_timer_owner_task = NULL;
+    s_port.owner_quit_pending = false;
     return ESP_OK;
 }
 
@@ -5932,6 +5994,12 @@ static esp_err_t _ble_nimble_port_rollback_init(
     {
         vSemaphoreDelete(s_timer_exit);
         s_timer_exit = NULL;
+    }
+    const esp_err_t event_cleanup = ble_nimble_host_release(&s_host);
+
+    if (event_cleanup != ESP_OK)
+    {
+        return event_cleanup;
     }
     _ble_nimble_port_restore_store_write();
     const esp_err_t cleanup = s_port.nimble_init_attempted
@@ -6141,26 +6209,7 @@ static esp_err_t _ble_nimble_port_init(void)
         return _ble_nimble_port_rollback_init(
                    result, false, false, false);
     }
-    if (s_pairing_gate_ack == NULL)
-    {
-        s_pairing_gate_ack = xSemaphoreCreateBinaryStatic(
-                                 &s_pairing_gate_ack_control);
-    }
-    if (s_pairing_gate_lock == NULL)
-    {
-        s_pairing_gate_lock = xSemaphoreCreateMutexStatic(
-                                  &s_pairing_gate_lock_control);
-    }
-    if (s_cleanup_drain_ack == NULL)
-    {
-        s_cleanup_drain_ack = xSemaphoreCreateBinaryStatic(
-                                  &s_cleanup_drain_ack_control);
-    }
-    if (s_cleanup_drain_lock == NULL)
-    {
-        s_cleanup_drain_lock = xSemaphoreCreateMutexStatic(
-                                   &s_cleanup_drain_lock_control);
-    }
+    _ble_nimble_port_reset_static_host_events();
     if (s_passkey_lock == NULL)
     {
         s_passkey_lock = xSemaphoreCreateMutexStatic(
@@ -6175,29 +6224,6 @@ static esp_err_t _ble_nimble_port_init(void)
         return _ble_nimble_port_rollback_init(
                    ESP_ERR_NO_MEM, true, false, false);
     }
-    atomic_store_explicit(&s_pairing_gate_requested_seq, 0U,
-                          memory_order_release);
-    atomic_store_explicit(&s_pairing_gate_applied_seq, 0U,
-                          memory_order_release);
-    ble_nimble_pairing_gate_reset(&s_pairing_gate_state);
-    atomic_store_explicit(&s_pairing_gate_event_queued, false,
-                          memory_order_release);
-    atomic_store_explicit(&s_terminate_event_queued, false,
-                          memory_order_release);
-    atomic_store_explicit(&s_cleanup_draining, false,
-                          memory_order_release);
-    atomic_store_explicit(&s_cleanup_drain_event_queued, false,
-                          memory_order_release);
-    atomic_store_explicit(&s_cleanup_drain_requested_seq, 0U,
-                          memory_order_release);
-    atomic_store_explicit(&s_cleanup_drain_applied_seq, 0U,
-                          memory_order_release);
-    ble_npl_event_init(&s_pairing_gate_event,
-                       _ble_nimble_port_pairing_gate_event, NULL);
-    ble_npl_event_init(&s_terminate_event,
-                       _ble_nimble_port_terminate_event, NULL);
-    ble_npl_event_init(&s_cleanup_drain_event,
-                       _ble_nimble_port_cleanup_drain_event, NULL);
     ble_hs_cfg.reset_cb = _ble_nimble_port_on_reset;
     ble_hs_cfg.sync_cb = _ble_nimble_port_on_sync;
     ble_hs_cfg.gatts_register_cb = _ble_nimble_port_gatts_register;
@@ -6277,18 +6303,6 @@ static esp_err_t _ble_nimble_port_init(void)
     return ESP_OK;
 }
 
-static void _ble_nimble_port_host_task(void *param)
-{
-    (void)param;
-    atomic_store_explicit(&s_nimble_host_task,
-                          (uintptr_t)xTaskGetCurrentTaskHandle(),
-                          memory_order_release);
-    nimble_port_run();
-    atomic_store_explicit(&s_nimble_host_task, 0U, memory_order_release);
-    xSemaphoreGive(s_port.exit_semaphore);
-    vTaskDelete(NULL);
-}
-
 static void _ble_nimble_port_drain_sync(void)
 {
     while (xSemaphoreTake(s_port.sync_semaphore, 0U) == pdTRUE)
@@ -6303,24 +6317,26 @@ static esp_err_t _ble_nimble_port_start(void)
     {
         s_port.sync_semaphore = xSemaphoreCreateBinary();
     }
-    if (s_port.exit_semaphore == NULL)
-    {
-        s_port.exit_semaphore = xSemaphoreCreateBinary();
-    }
-    if (s_port.sync_semaphore == NULL || s_port.exit_semaphore == NULL)
+    if (s_port.sync_semaphore == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
     _ble_nimble_port_drain_sync();
-    if (xTaskCreatePinnedToCore(_ble_nimble_port_host_task, "nimble_host",
-                                CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE, NULL,
-                                (configMAX_PRIORITIES - 4),
-                                &s_port.host_task,
-                                BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
+    if (s_pairing_gate_ack == NULL || s_pairing_gate_lock == NULL ||
+            s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
     s_port.started = true;
+    const esp_err_t enable_result =
+        ble_nimble_host_start(&s_host, CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
+                              BLE_NIMBLE_PORT_HOST_CORE);
+
+    if (enable_result != ESP_OK)
+    {
+        s_port.started = false;
+        return enable_result;
+    }
     if (xSemaphoreTake(s_port.sync_semaphore,
                        pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
             pdTRUE)
@@ -6334,19 +6350,16 @@ static esp_err_t _ble_nimble_port_start(void)
     return ESP_OK;
 }
 
-static void _ble_nimble_port_stop_worker(void *param)
-{
-    (void)param;
-    s_port.stop_result = nimble_port_stop();
-    xSemaphoreGive(s_port.stop_done_semaphore);
-    vTaskDelete(NULL);
-}
-
 static esp_err_t _ble_nimble_port_stop(void)
 {
     if (s_port.deinit_failed)
     {
         return s_port.deinit_error;
+    }
+    /* The live cleanup owner must finish before QUIT can discard its state. */
+    if (ble_nimble_port_cleanup_pending())
+    {
+        return ESP_ERR_NOT_FINISHED;
     }
     const esp_err_t quiesce = _ble_nimble_port_quiesce_adv();
 
@@ -6354,57 +6367,22 @@ static esp_err_t _ble_nimble_port_stop(void)
     {
         return quiesce;
     }
-    if (s_port.started)
-    {
-        TaskHandle_t stop_task;
+    const esp_err_t owner_quit =
+        _ble_nimble_port_owner_quit(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS);
 
-        if (s_port.stop_done_semaphore == NULL)
-        {
-            s_port.stop_done_semaphore = xSemaphoreCreateBinary();
-            if (s_port.stop_done_semaphore == NULL)
-            {
-                return ESP_ERR_NO_MEM;
-            }
-        }
-        s_port.stop_result = 0;
-        if (xTaskCreatePinnedToCore(
-                    _ble_nimble_port_stop_worker, "ble_stop",
-                    BLE_NIMBLE_PORT_ADV_TASK_STACK, NULL,
-                    BLE_NIMBLE_PORT_ADV_TASK_PRIORITY,
-                    &stop_task,
-                    BLE_NIMBLE_PORT_HOST_CORE) != pdPASS)
-        {
-            return ESP_ERR_NO_MEM;
-        }
-        if (xSemaphoreTake(s_port.stop_done_semaphore,
-                           pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
-                pdTRUE)
-        {
-            ESP_LOGE(TAG, "nimble_port_stop did not complete");
-            s_port.deinit_failed = true;
-            s_port.deinit_error = ESP_ERR_TIMEOUT;
-            return ESP_ERR_TIMEOUT;
-        }
-        if (s_port.stop_result != 0 && s_port.stop_result != BLE_HS_EALREADY)
-        {
-            /* nimble_port_stop() rejected the stop: report the real host
-             * error and stay retryable (do not latch the teardown as a
-             * generic timeout). */
-            ESP_LOGE(TAG, "nimble_port_stop failed result=%d",
-                     s_port.stop_result);
-            return ESP_FAIL;
-        }
-        if (xSemaphoreTake(s_port.exit_semaphore,
-                           pdMS_TO_TICKS(BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS)) !=
-                pdTRUE)
-        {
-            ESP_LOGE(TAG, "nimble host task did not exit");
-            s_port.deinit_failed = true;
-            s_port.deinit_error = ESP_ERR_TIMEOUT;
-            return ESP_ERR_TIMEOUT;
-        }
-        s_port.started = false;
+    if (owner_quit != ESP_OK)
+    {
+        return owner_quit;
     }
+    const esp_err_t result = ble_nimble_host_stop(
+                                 &s_host, BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS,
+                                 BLE_NIMBLE_PORT_HOST_CORE);
+
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    s_port.started = false;
     return ESP_OK;
 }
 
@@ -6413,6 +6391,10 @@ static esp_err_t _ble_nimble_port_deinit(void)
     if (s_port.deinit_failed)
     {
         return s_port.deinit_error;
+    }
+    if (ble_nimble_port_cleanup_pending())
+    {
+        return ESP_ERR_NOT_FINISHED;
     }
     const esp_err_t quiesce = _ble_nimble_port_quiesce_adv();
 
@@ -6455,6 +6437,12 @@ static esp_err_t _ble_nimble_port_deinit(void)
     _ble_nimble_port_timer_teardown();
     if (!s_port.deinitialized)
     {
+        const esp_err_t event_cleanup = ble_nimble_host_release(&s_host);
+
+        if (event_cleanup != ESP_OK)
+        {
+            return event_cleanup;
+        }
         _ble_nimble_port_restore_store_write();
         const esp_err_t result = s_port.nimble_init_attempted
                                  ? nimble_port_deinit()
@@ -6473,16 +6461,6 @@ static esp_err_t _ble_nimble_port_deinit(void)
     {
         vSemaphoreDelete(s_port.sync_semaphore);
         s_port.sync_semaphore = NULL;
-    }
-    if (s_port.exit_semaphore != NULL)
-    {
-        vSemaphoreDelete(s_port.exit_semaphore);
-        s_port.exit_semaphore = NULL;
-    }
-    if (s_port.stop_done_semaphore != NULL)
-    {
-        vSemaphoreDelete(s_port.stop_done_semaphore);
-        s_port.stop_done_semaphore = NULL;
     }
     /* Runtime restart: clear per-connection transport state (partial
      * frames, subscriptions, transactions, feed generation) while keeping

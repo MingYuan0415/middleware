@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 
 #include "ble_link_service.h"
+#include "ble_gap_manager.h"
 #include "device_link_v1.h"
 
 #define TEST_ASSERT_TRUE(condition) \
@@ -578,8 +579,43 @@ static void test_execute_does_not_overwrite_in_flight_tx(void)
     ble_link_service_release_work(work);
 }
 
+static void test_restart_drops_old_connection_work(void)
+{
+    _reset();
+    ble_gap_manager_init();
+    ble_gap_manager_test_set_generation(0U);
+    const ble_gap_manager_event_t connect =
+    {
+        .type = BLE_GAP_MANAGER_EVENT_CONNECT,
+        .conn_handle = 7U,
+    };
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_handle_event(&connect));
+    ble_link_work_t *work = NULL;
+    const uint8_t request[] = { DEVICE_LINK_V1_SCAN, 0x02U };
+    const ble_link_service_facts_t facts = _facts();
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_accept(
+                          &facts, BLE_LINK_SERVICE_RX_SESSION,
+                          request, sizeof(request), &work));
+    ble_link_service_reset();
+    ble_gap_manager_init();
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_handle_event(&connect));
+    ble_gap_manager_snapshot_t snapshot;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    TEST_ASSERT_EQUAL(2U, snapshot.generation);
+    ble_link_service_on_connect(snapshot.generation, snapshot.conn_handle);
+    ble_link_service_set_transport_admitted(
+        snapshot.generation, snapshot.conn_handle, true);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_service_execute(work));
+    TEST_ASSERT_EQUAL(0U, s_submit_calls);
+    ble_link_service_release_work(work);
+}
+
 int main(void)
 {
+    test_restart_drops_old_connection_work();
     test_get_info_response();
     test_scan_occupies_slot_until_ack();
     test_numeric_comparison_offer();

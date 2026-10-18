@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -6,6 +7,8 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "connectivity_manager.h"
 #include "device_link_v1.h"
@@ -18,6 +21,8 @@ extern void connectivity_manager_fake_set_status(
 extern void connectivity_manager_fake_set_scan(
     const connectivity_manager_scan_snapshot_t *snapshot);
 extern void connectivity_manager_fake_set_request_result(esp_err_t result);
+extern void connectivity_manager_fake_set_request_hook(
+    void (*hook)(connectivity_manager_operation_id_t, void *), void *arg);
 extern const connectivity_manager_credentials_t *
 connectivity_manager_fake_last_saved(void);
 extern void event_bus_fake_publish(event_bus_msg_id_t msg_id,
@@ -30,6 +35,178 @@ extern unsigned ble_link_service_fake_observe_count(void);
 extern const device_link_v1_snapshot_t *ble_link_service_fake_last_snapshot(void);
 extern device_link_v1_wifi_failure_t ble_link_service_fake_last_failure(void);
 extern void ble_link_service_fake_set_complete_result(esp_err_t result);
+
+typedef struct early_result
+{
+    pthread_barrier_t barrier;
+    pthread_t publisher;
+    bool blocked;
+    bool joined;
+    device_link_v1_operation_t operation;
+    connectivity_manager_operation_id_t manager_id;
+} early_result_t;
+
+static _Thread_local early_result_t *s_lock_probe;
+
+BaseType_t __real_xSemaphoreTakeRecursive(SemaphoreHandle_t semaphore,
+        TickType_t timeout);
+
+BaseType_t __wrap_xSemaphoreTakeRecursive(SemaphoreHandle_t semaphore,
+        TickType_t timeout)
+{
+    early_result_t *probe = s_lock_probe;
+
+    if (probe == NULL)
+    {
+        return __real_xSemaphoreTakeRecursive(semaphore, timeout);
+    }
+    s_lock_probe = NULL;
+    const BaseType_t acquired = __real_xSemaphoreTakeRecursive(semaphore, 0U);
+
+    probe->blocked = acquired != pdTRUE;
+    const int result = pthread_barrier_wait(&probe->barrier);
+
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    return acquired == pdTRUE ? acquired :
+           __real_xSemaphoreTakeRecursive(semaphore, timeout);
+}
+
+static void _publish_terminal(device_link_v1_operation_t operation,
+                              connectivity_manager_operation_id_t manager_id,
+                              uint64_t generation)
+{
+    if (operation == DEVICE_LINK_V1_OPERATION_SCAN)
+    {
+        const connectivity_manager_scan_snapshot_t scan =
+        {
+            .generation = generation,
+            .operation_id = manager_id,
+        };
+
+        event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                               CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+                               &scan, sizeof(scan));
+    }
+    else
+    {
+        const connectivity_manager_status_snapshot_t status =
+        {
+            .generation = generation,
+            .operation_id = manager_id,
+            .operation_complete = true,
+            .state = CONNECTIVITY_MANAGER_STATE_IDLE,
+            .available = true,
+            .radio_available = true,
+        };
+
+        event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                               CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                               &status, sizeof(status));
+    }
+}
+
+static void *_early_publisher(void *arg)
+{
+    early_result_t *probe = arg;
+
+    s_lock_probe = probe;
+    _publish_terminal(probe->operation, probe->manager_id, 10U);
+    return NULL;
+}
+
+static void _publish_before_request_returns(
+    connectivity_manager_operation_id_t manager_id, void *arg)
+{
+    early_result_t *probe = arg;
+
+    probe->manager_id = manager_id;
+    assert(pthread_create(&probe->publisher, NULL, _early_publisher, probe) == 0);
+    const int result = pthread_barrier_wait(&probe->barrier);
+
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    if (!probe->blocked)
+    {
+        /* Without the submit lock, force publication to finish before the
+         * request returns. This deterministically reproduces the lost ID. */
+        assert(pthread_join(probe->publisher, NULL) == 0);
+        probe->joined = true;
+    }
+}
+
+static void test_request_mapping_is_atomic_for_all_operations(void)
+{
+    const device_link_v1_operation_t operations[] =
+    {
+        DEVICE_LINK_V1_OPERATION_SCAN,
+        DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS,
+        DEVICE_LINK_V1_OPERATION_CONNECT,
+        DEVICE_LINK_V1_OPERATION_DISCONNECT,
+        DEVICE_LINK_V1_OPERATION_FORGET,
+    };
+    const device_link_v1_credentials_t credentials =
+    {
+        .ssid = "cafe",
+        .ssid_length = 4U,
+        .security = DEVICE_LINK_V1_WIFI_OPEN,
+    };
+
+    for (size_t i = 0U; i < sizeof(operations) / sizeof(operations[0]); ++i)
+    {
+        early_result_t probe = {.operation = operations[i]};
+
+        connectivity_manager_fake_reset();
+        ble_link_service_fake_reset();
+        assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+        assert(pthread_barrier_init(&probe.barrier, NULL, 2U) == 0);
+        connectivity_manager_fake_set_request_hook(
+            _publish_before_request_returns, &probe);
+        assert(device_link_wifi_adapter_submit(operations[i], &credentials,
+                                               42U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+        if (!probe.joined)
+        {
+            assert(pthread_join(probe.publisher, NULL) == 0);
+        }
+        assert(ble_link_service_fake_complete_count() == 1U);
+        assert(ble_link_service_fake_last_complete_id() == 42U);
+        assert(probe.blocked);
+        connectivity_manager_fake_set_request_hook(NULL, NULL);
+        _publish_terminal(operations[i], probe.manager_id, 11U);
+        assert(ble_link_service_fake_complete_count() == 1U);
+        assert(pthread_barrier_destroy(&probe.barrier) == 0);
+        device_link_wifi_adapter_bridge_stop();
+    }
+}
+
+static void test_failed_and_retired_requests_do_not_replace_mapping(void)
+{
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
+                                           NULL, 31U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    connectivity_manager_fake_set_request_result(ESP_FAIL);
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_DISCONNECT,
+                                           NULL, 32U, NULL) == DEVICE_LINK_V1_STATUS_INTERNAL);
+    _publish_terminal(DEVICE_LINK_V1_OPERATION_DISCONNECT, 2U, 10U);
+    assert(ble_link_service_fake_complete_count() == 0U);
+    _publish_terminal(DEVICE_LINK_V1_OPERATION_SCAN, 1U, 10U);
+    assert(ble_link_service_fake_complete_count() == 1U);
+    assert(ble_link_service_fake_last_complete_id() == 31U);
+
+    connectivity_manager_fake_set_request_result(ESP_OK);
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
+                                           NULL, 33U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    device_link_wifi_adapter_clear_pending();
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
+                                           NULL, 34U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    _publish_terminal(DEVICE_LINK_V1_OPERATION_SCAN, 2U, 11U);
+    assert(ble_link_service_fake_complete_count() == 1U);
+    _publish_terminal(DEVICE_LINK_V1_OPERATION_SCAN, 3U, 12U);
+    _publish_terminal(DEVICE_LINK_V1_OPERATION_SCAN, 3U, 13U);
+    assert(ble_link_service_fake_complete_count() == 2U);
+    assert(ble_link_service_fake_last_complete_id() == 34U);
+    device_link_wifi_adapter_bridge_stop();
+}
 
 static void test_fill_info(void)
 {
@@ -486,6 +663,8 @@ static void test_radio_unavailable_keeps_saved_profile(void)
 
 int main(void)
 {
+    test_request_mapping_is_atomic_for_all_operations();
+    test_failed_and_retired_requests_do_not_replace_mapping();
     test_fill_info();
     test_submit_scan();
     test_submit_save_credentials();

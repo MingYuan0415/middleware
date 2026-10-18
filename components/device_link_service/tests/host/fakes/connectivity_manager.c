@@ -25,6 +25,15 @@ static esp_err_t s_request_result = ESP_OK;
 static char s_saved_ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U];
 static char s_saved_password[CONNECTIVITY_MANAGER_PASSWORD_MAX_BYTES + 1U];
 static connectivity_manager_credentials_t s_last_saved;
+static void (*s_request_hook)(connectivity_manager_operation_id_t, void *);
+static void *s_request_hook_arg;
+
+void connectivity_manager_fake_set_request_hook(
+    void (*hook)(connectivity_manager_operation_id_t, void *), void *arg)
+{
+    s_request_hook = hook;
+    s_request_hook_arg = arg;
+}
 
 void connectivity_manager_fake_set_request_result(esp_err_t result)
 {
@@ -35,6 +44,8 @@ void connectivity_manager_fake_reset(void)
 {
     s_next_operation = 1U;
     s_request_result = ESP_OK;
+    s_request_hook = NULL;
+    s_request_hook_arg = NULL;
     memset(&s_last_saved, 0, sizeof(s_last_saved));
     memset(s_saved_ssid, 0, sizeof(s_saved_ssid));
     memset(s_saved_password, 0, sizeof(s_saved_password));
@@ -77,6 +88,10 @@ static esp_err_t _admit(connectivity_manager_operation_id_t *operation_id)
     if (*operation_id == 0U)
     {
         *operation_id = s_next_operation++;
+    }
+    if (s_request_hook != NULL)
+    {
+        s_request_hook(*operation_id, s_request_hook_arg);
     }
     return ESP_OK;
 }

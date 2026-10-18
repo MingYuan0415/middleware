@@ -219,3 +219,24 @@ set_tests_properties(ble_runtime_gap_event_routing_static PROPERTIES TIMEOUT 10)
 add_test(NAME ble_runtime_transport_admission_static COMMAND
     sh "${COMPONENT}/scripts/check_transport_admission.sh")
 set_tests_properties(ble_runtime_transport_admission_static PROPERTIES TIMEOUT 10)
+
+add_executable(test_ble_nimble_host
+    test_ble_nimble_host.c
+    "${COMPONENT}/src/ble_nimble_host.c"
+    "${HOST_CONNECTIVITY}/freertos_host.c")
+target_compile_features(test_ble_nimble_host PRIVATE c_std_11)
+target_compile_definitions(test_ble_nimble_host PRIVATE _POSIX_C_SOURCE=200809L)
+target_compile_options(test_ble_nimble_host PRIVATE
+    -include "${PROJECT_ROOT}/tests/host/sdkconfig.h"
+    -Wall -Wextra -Werror -Wpedantic -UNDEBUG)
+target_include_directories(test_ble_nimble_host PRIVATE
+    fakes/nimble_host "${COMPONENT}/src" "${HOST_CONNECTIVITY}/include")
+target_link_libraries(test_ble_nimble_host PRIVATE Threads::Threads)
+if(BLE_RUNTIME_SANITIZER STREQUAL "address")
+    target_compile_options(test_ble_nimble_host PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+    target_link_options(test_ble_nimble_host PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+endif()
+add_test(NAME ble_nimble_host COMMAND test_ble_nimble_host)
+set_tests_properties(ble_nimble_host PROPERTIES TIMEOUT 10)

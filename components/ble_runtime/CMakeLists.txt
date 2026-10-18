@@ -3,6 +3,7 @@ idf_component_register(
         "src/ble_runtime.c"
         "src/ble_gatt_registry.c"
         "src/ble_nimble_port.c"
+        "src/ble_nimble_host.c"
         "src/ble_nimble_adv_start.c"
         "src/ble_nimble_peer_identity.c"
         "src/ble_nimble_pairing_gate.c"

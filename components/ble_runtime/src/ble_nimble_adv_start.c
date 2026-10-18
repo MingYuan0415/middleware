@@ -6,12 +6,35 @@
 #include "esp_err.h"
 
 #include "ble_adv_manager.h"
+#include "ble_link_service.h"
 #include "ble_nimble_adv_start.h"
+
+#define DBG_TAG "ble_nimble_adv_start"
+#include "mt_log.h"
 
 #define BLE_NIMBLE_ADV_TYPE_FLAGS 0x01U
 #define BLE_NIMBLE_ADV_TYPE_COMPLETE_UUIDS128 0x07U
 #define BLE_NIMBLE_ADV_TYPE_SHORT_NAME 0x08U
 #define BLE_NIMBLE_ADV_FLAGS 0x06U
+
+void ble_nimble_adv_report_result(
+    ble_port_event_type_t type, int status, uint32_t generation)
+{
+    const ble_port_event_t event =
+    {
+        .type = type,
+        .status = status,
+        .generation = generation,
+    };
+    const esp_err_t result = ble_adv_manager_handle_event(&event);
+
+    /* The owner may otherwise sleep indefinitely after publishing STARTING. */
+    ble_link_service_wake_owner();
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+    {
+        LOG_E("adv manager result event failed result=%d", result);
+    }
+}
 
 esp_err_t ble_nimble_adv_encode(
     const ble_port_adv_config_t *config,
@@ -80,13 +103,28 @@ int ble_nimble_adv_start_execute(
     {
         return (int)ESP_ERR_INVALID_ARG;
     }
-    if (!_ble_nimble_adv_start_current(generation, bindable, ops))
+    if (!ops->host_ready(ops->arg))
     {
+        LOG_I("start blocked: host not ready gen=%lu",
+              (unsigned long)generation);
+        return (int)ESP_ERR_INVALID_STATE;
+    }
+    if (!ble_adv_manager_start_command_current(generation))
+    {
+        LOG_I("start blocked: manager not current gen=%lu",
+              (unsigned long)generation);
+        return (int)ESP_ERR_INVALID_STATE;
+    }
+    if (bindable && !ble_adv_manager_bindable_requested())
+    {
+        LOG_I("start blocked: bindable not requested");
         return (int)ESP_ERR_INVALID_STATE;
     }
     const esp_err_t gate_result =
         ops->set_pairing_gate(bindable, ops->arg);
 
+    LOG_I("gate result=%d bindable=%d", (int)gate_result,
+          bindable ? 1 : 0);
     if (gate_result != ESP_OK)
     {
         /* A timed-out host event may still have applied the open request. */
@@ -104,6 +142,8 @@ int ble_nimble_adv_start_execute(
     }
     const int result = ops->start(ops->arg);
 
+    LOG_I("host start result=%d gen=%lu", result,
+          (unsigned long)generation);
     if (result != 0)
     {
         _ble_nimble_adv_start_rollback_gate(bindable, ops);

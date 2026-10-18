@@ -44,6 +44,14 @@
         } \
     } while (0)
 
+static void _reset_manager(void)
+{
+    ble_gap_manager_init();
+    /* Independent test cases start a new simulated device boot. */
+    ble_gap_manager_test_set_generation(0U);
+    ble_gap_manager_test_set_admission_token(0U);
+}
+
 static void _feed(ble_gap_manager_event_t *event)
 {
     ble_gap_manager_snapshot_t snapshot;
@@ -93,7 +101,7 @@ static void test_connect_disconnect_cycle(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -132,7 +140,7 @@ static void test_second_connection_rejected(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -150,7 +158,7 @@ static void test_second_connection_after_disconnect_admitted(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -171,7 +179,7 @@ static void test_late_callbacks_from_stale_generation_ignored(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -197,7 +205,7 @@ static void test_connect_failure_ignored(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -223,7 +231,7 @@ static void test_admission_callback_consulted(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     s_admit_calls = 0U;
     s_admit_result = false;
     ble_gap_manager_set_admission_cb(_admission_cb, NULL);
@@ -276,7 +284,7 @@ static void test_retained_cleanup_rejects_new_connection(void)
     ble_link_cleanup_reset(&cleanup);
     TEST_ASSERT_TRUE(ble_link_cleanup_retain(
                          &cleanup, &request, 0U));
-    ble_gap_manager_init();
+    _reset_manager();
     ble_gap_manager_set_admission_cb(_cleanup_admission_cb, &cleanup);
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
@@ -320,7 +328,7 @@ static void test_admission_cancelled_during_callback(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     s_disconnect_in_callback = true;
     ble_gap_manager_set_admission_cb(_admission_cb_aborting, NULL);
     memset(&event, 0, sizeof(event));
@@ -348,7 +356,7 @@ static void test_admission_token_exhaustion_fails_closed(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     s_disconnect_in_callback = false;
     ble_gap_manager_set_admission_cb(_admission_cb_aborting, NULL);
     ble_gap_manager_test_set_admission_token(UINT32_MAX);
@@ -364,7 +372,7 @@ static void test_admission_token_exhaustion_fails_closed(void)
 
 static void test_invalid_arguments_rejected(void)
 {
-    ble_gap_manager_init();
+    _reset_manager();
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
                       ble_gap_manager_handle_event(NULL));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
@@ -381,7 +389,7 @@ static void test_multi_characteristic_subscription(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -421,7 +429,7 @@ static void test_events_ignored_while_disconnected(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_MTU;
     event.conn_handle = 1U;
@@ -442,7 +450,7 @@ static void test_encrypt_failure_keeps_state(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 1U;
@@ -463,7 +471,7 @@ static void test_handle_reuse_after_reconnect(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 5U;
@@ -496,7 +504,7 @@ static void test_same_handle_stale_generation_ignored(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 5U;
@@ -539,7 +547,7 @@ static void test_reset_retires_connection(void)
     ble_gap_manager_snapshot_t snapshot;
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
     event.conn_handle = 5U;
@@ -567,7 +575,7 @@ static void test_generation_exhaustion_rejects_connection(void)
 {
     ble_gap_manager_event_t event;
 
-    ble_gap_manager_init();
+    _reset_manager();
     ble_gap_manager_test_set_generation(UINT32_MAX);
     memset(&event, 0, sizeof(event));
     event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
@@ -576,8 +584,47 @@ static void test_generation_exhaustion_rejects_connection(void)
                       ble_gap_manager_handle_event(&event));
 }
 
+static void test_restart_preserves_identity_allocators(void)
+{
+    _reset_manager();
+    ble_gap_manager_event_t event =
+    {
+        .type = BLE_GAP_MANAGER_EVENT_CONNECT,
+        .conn_handle = 5U,
+    };
+
+    _feed(&event);
+    ble_gap_manager_init();
+    _feed(&event);
+    ble_gap_manager_snapshot_t snapshot;
+
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    TEST_ASSERT_EQUAL(2U, snapshot.generation);
+    event.type = BLE_GAP_MANAGER_EVENT_DISCONNECT;
+    event.identity = (ble_link_operation_identity_t)
+    {
+        .kind = BLE_LINK_OPERATION_DISCONNECT,
+        .generation = 1U,
+        .conn_handle = 5U,
+    };
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_handle_event(&event));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_gap_manager_get_snapshot(&snapshot));
+    TEST_ASSERT_TRUE(snapshot.connected);
+
+    ble_gap_manager_test_set_generation(UINT32_MAX);
+    ble_gap_manager_init();
+    event.type = BLE_GAP_MANAGER_EVENT_CONNECT;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_gap_manager_handle_event(&event));
+    ble_gap_manager_test_set_generation(0U);
+    ble_gap_manager_test_set_admission_token(UINT32_MAX);
+    ble_gap_manager_init();
+    ble_gap_manager_set_admission_cb(_cleanup_admission_cb, NULL);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, ble_gap_manager_handle_event(&event));
+}
+
 int main(void)
 {
+    test_restart_preserves_identity_allocators();
     test_connect_disconnect_cycle();
     test_second_connection_rejected();
     test_second_connection_after_disconnect_admitted();

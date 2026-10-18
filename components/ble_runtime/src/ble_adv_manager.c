@@ -229,6 +229,13 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
     s_manager.adv_config.short_name_len = config->short_name_len;
     s_manager.adv_config.service_uuid = config->service_uuid;
     s_manager.adv_config.bindable = _ble_adv_manager_effective_bindable();
+    LOG_I("start req mode=%d state=%d lease=%u sync=%d pause=%d conn=%d stop=%d gen=%lu",
+          (int)mode, (int)s_manager.state,
+          (unsigned)s_manager.lease_count, s_manager.synced ? 1 : 0,
+          _ble_adv_manager_paused() ? 1 : 0,
+          s_manager.connected ? 1 : 0,
+          s_manager.stop_outstanding ? 1 : 0,
+          (unsigned long)s_manager.start_generation);
     if (s_manager.start_generation == UINT32_MAX)
     {
         s_manager.state = BLE_ADV_MANAGER_STATE_FAULTED;
@@ -239,6 +246,8 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
     s_manager.started_mode = mode;
     s_manager.state = BLE_ADV_MANAGER_STATE_STARTING;
     result = config->ops->adv_start(&s_manager.adv_config);
+    LOG_I("start result=%d state=%d gen=%lu", (int)result,
+          (int)s_manager.state, (unsigned long)s_manager.start_generation);
     if (result != ESP_OK)
     {
         s_manager.state = BLE_ADV_MANAGER_STATE_FAULTED;
@@ -254,6 +263,9 @@ static esp_err_t _ble_adv_manager_start(ble_adv_manager_mode_t mode)
 
 static esp_err_t _ble_adv_manager_stop(void)
 {
+    LOG_I("stop req state=%d out=%d gen=%lu", (int)s_manager.state,
+          s_manager.stop_outstanding ? 1 : 0,
+          (unsigned long)s_manager.stop_generation);
     if (!s_manager.stop_outstanding)
     {
         if (s_manager.stop_generation == UINT32_MAX)
@@ -268,6 +280,8 @@ static esp_err_t _ble_adv_manager_stop(void)
     const esp_err_t result =
         s_manager.config->ops->adv_stop(s_manager.stop_generation);
 
+    LOG_I("stop result=%d state=%d out=%d", (int)result,
+          (int)s_manager.state, s_manager.stop_outstanding ? 1 : 0);
     if (result == ESP_OK)
     {
         if (s_manager.retry_action == BLE_ADV_MANAGER_RETRY_STOP)
@@ -288,12 +302,20 @@ static esp_err_t _ble_adv_manager_stop(void)
 
 static esp_err_t _ble_adv_manager_stop_completed(void)
 {
+    LOG_I("stop done lease=%u pause=%d state=%d",
+          (unsigned)s_manager.lease_count,
+          _ble_adv_manager_paused() ? 1 : 0, (int)s_manager.state);
     s_manager.stop_outstanding = false;
     _ble_adv_manager_clear_retry();
     if (s_manager.lease_count > 0U && !s_manager.connected &&
             s_manager.synced && !_ble_adv_manager_paused())
     {
-        return _ble_adv_manager_start(_ble_adv_manager_effective_mode());
+        const esp_err_t result =
+            _ble_adv_manager_start(_ble_adv_manager_effective_mode());
+
+        LOG_I("stop done restart=%d state=%d", (int)result,
+              (int)s_manager.state);
+        return result;
     }
     s_manager.state = BLE_ADV_MANAGER_STATE_STOPPED;
     return ESP_OK;
@@ -498,6 +520,8 @@ esp_err_t ble_adv_manager_acquire_lease(
     }
     const esp_err_t result = _ble_adv_manager_converge();
 
+    LOG_I("lease acquire result=%d count=%u", (int)result,
+          (unsigned)s_manager.lease_count);
     _ble_adv_manager_unlock();
     return result;
 }
@@ -733,6 +757,9 @@ static esp_err_t _ble_adv_manager_set_pause_reason(
     }
     const esp_err_t result = _ble_adv_manager_converge();
 
+    LOG_I("pause reason=%lu active=%d reasons=0x%lx result=%d",
+          (unsigned long)reason, active ? 1 : 0,
+          (unsigned long)s_manager.pause_reasons, (int)result);
     _ble_adv_manager_unlock();
     return result;
 }

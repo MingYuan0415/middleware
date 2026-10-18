@@ -33,10 +33,12 @@ typedef struct ble_gap_manager
      * already-gone ACL could be committed as connected. */
     bool admission_pending;
     uint16_t admission_conn_handle;
-    uint32_t admission_token; /**< Monotonic reservation identity. */
 } ble_gap_manager_t;
 
 static ble_gap_manager_t s_manager;
+/* SDK restarts retire connection facts, never previously issued identities. */
+static uint32_t s_generation;
+static uint32_t s_admission_token;
 static SemaphoreHandle_t s_mutex;
 static StaticSemaphore_t s_mutex_control;
 
@@ -75,6 +77,7 @@ void ble_gap_manager_init(void)
 void ble_gap_manager_test_set_generation(uint32_t generation)
 {
     _ble_gap_manager_lock();
+    s_generation = generation;
     s_manager.snapshot.generation = generation;
     _ble_gap_manager_unlock();
 }
@@ -82,7 +85,7 @@ void ble_gap_manager_test_set_generation(uint32_t generation)
 void ble_gap_manager_test_set_admission_token(uint32_t token)
 {
     _ble_gap_manager_lock();
-    s_manager.admission_token = token;
+    s_admission_token = token;
     _ble_gap_manager_unlock();
 }
 #endif
@@ -181,7 +184,7 @@ esp_err_t ble_gap_manager_handle_event(
     case BLE_GAP_MANAGER_EVENT_CONNECT:
         if (event->status == 0)
         {
-            if (s_manager.snapshot.generation == UINT32_MAX)
+            if (s_generation == UINT32_MAX)
             {
                 /* Generation zero is reserved for "no connection" and the
                  * allocator must never wrap into a stale callback's
@@ -202,7 +205,7 @@ esp_err_t ble_gap_manager_handle_event(
                  * cancelled (DISCONNECT/RESET) and a NEW reservation for
                  * the same handle was created while the callback ran, only
                  * the matching token may commit or clear it. */
-                if (s_manager.admission_token == UINT32_MAX)
+                if (s_admission_token == UINT32_MAX)
                 {
                     /* The reservation space is exhausted: fail closed. */
                     result = ESP_ERR_INVALID_STATE;
@@ -212,7 +215,7 @@ esp_err_t ble_gap_manager_handle_event(
                     ble_gap_manager_admission_cb_t callback =
                         s_manager.admission_cb;
                     void *callback_arg = s_manager.admission_arg;
-                    const uint32_t token = ++s_manager.admission_token;
+                    const uint32_t token = ++s_admission_token;
                     bool admit;
 
                     s_manager.admission_pending = true;
@@ -223,7 +226,7 @@ esp_err_t ble_gap_manager_handle_event(
                     const bool token_matches =
                         s_manager.admission_pending &&
                         s_manager.admission_conn_handle == event->conn_handle &&
-                        s_manager.admission_token == token;
+                        s_admission_token == token;
 
                     if (token_matches)
                     {
@@ -237,7 +240,7 @@ esp_err_t ble_gap_manager_handle_event(
                     else
                     {
                         s_manager.snapshot.conn_handle = event->conn_handle;
-                        s_manager.snapshot.generation++;
+                        s_manager.snapshot.generation = ++s_generation;
                         s_manager.snapshot.connected = true;
                         s_manager.snapshot.encrypted = false;
                         _ble_gap_manager_reset_subscriptions();
@@ -248,7 +251,7 @@ esp_err_t ble_gap_manager_handle_event(
             else
             {
                 s_manager.snapshot.conn_handle = event->conn_handle;
-                s_manager.snapshot.generation++;
+                s_manager.snapshot.generation = ++s_generation;
                 s_manager.snapshot.connected = true;
                 s_manager.snapshot.encrypted = false;
                 _ble_gap_manager_reset_subscriptions();

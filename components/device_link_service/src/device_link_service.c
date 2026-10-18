@@ -85,6 +85,14 @@ typedef struct device_link_service_command
     ble_link_work_t *link_work; /**< Owned completed Link message. */
 } device_link_service_command_t;
 
+typedef enum
+{
+    DEVICE_LINK_SERVICE_STOP_NONE = 0,
+    DEVICE_LINK_SERVICE_STOP_QUIESCING,
+    DEVICE_LINK_SERVICE_STOP_DRAINING,
+    DEVICE_LINK_SERVICE_STOP_READY,
+} device_link_service_stop_phase_t;
+
 typedef struct device_link_service
 {
     device_link_service_config_t config;
@@ -104,9 +112,14 @@ typedef struct device_link_service
     StaticTask_t task_control;
     bool runtime_started;
     bool runtime_initialized;
+    device_link_service_stop_phase_t stop_phase;
     bool bluetooth_enabled;
     bool bluetooth_desired_enabled;
     bool bluetooth_transitioning;
+    bool bluetooth_operation_in_flight;
+    bool bluetooth_cleanup_pending;
+    bool bluetooth_policy_dirty;
+    uint32_t bluetooth_request_revision;
     uint8_t bluetooth_retry_attempt;
     TickType_t bluetooth_retry_not_before;
     TickType_t bluetooth_transition_deadline;
@@ -124,6 +137,7 @@ typedef struct device_link_service
     bool client_connected;
     uint16_t client_conn_handle; /**< Accepted ACL handle, 0 when idle. */
     uint32_t client_generation; /**< Accepted ACL generation, 0 when idle. */
+    uint32_t link_revision; /**< Connection/reset boundary during window waits. */
     bool status_dirty; /**< External state awaits owner publication. */
     bool status_publish_ready; /**< Initial status is already published. */
     bool window_open_pending; /**< Window deferred until the ACL is gone. */
@@ -192,6 +206,7 @@ EVENT_BUS_DEFINE_ID(DEVICE_LINK_SERVICE_MSG);
 static void _device_link_service_wake_worker(void *arg);
 static esp_err_t _device_link_service_runtime_start(void);
 static esp_err_t _device_link_service_runtime_stop(void);
+static esp_err_t _device_link_service_prepare_stop(void);
 
 static void _device_link_service_zeroize(void *data, size_t size)
 {
@@ -546,25 +561,44 @@ static uint32_t _device_link_service_next_wait_ms(void)
     return wait_ms;
 }
 
-static device_link_service_state_t _device_link_service_derive_state(void)
+static device_link_service_state_t _device_link_service_derive_state(
+    ble_adv_manager_state_t adv)
 {
-    if (!s_service.bluetooth_enabled && !s_service.bluetooth_transitioning)
+    if (s_service.bluetooth_policy_error != ESP_OK)
+    {
+        return DEVICE_LINK_SERVICE_STATE_ERROR;
+    }
+    if (s_service.bluetooth_transitioning)
+    {
+        return DEVICE_LINK_SERVICE_STATE_STARTING;
+    }
+    if (s_service.bluetooth_cleanup_pending)
+    {
+        return DEVICE_LINK_SERVICE_STATE_ERROR;
+    }
+    if (!s_service.bluetooth_enabled)
     {
         return DEVICE_LINK_SERVICE_STATE_DISABLED;
-    }
-    if (s_service.window_open || s_service.window_open_pending)
-    {
-        return DEVICE_LINK_SERVICE_STATE_WINDOW;
     }
     if (s_service.client_connected)
     {
         return DEVICE_LINK_SERVICE_STATE_CONNECTED;
     }
-    if (s_service.suspended)
+    if (s_service.suspended || !s_service.startup_gate_released)
     {
         return DEVICE_LINK_SERVICE_STATE_SUSPENDED;
     }
-    return DEVICE_LINK_SERVICE_STATE_ADVERTISING;
+    if (adv == BLE_ADV_MANAGER_STATE_FAULTED)
+    {
+        return DEVICE_LINK_SERVICE_STATE_ERROR;
+    }
+    if (s_service.window_open || s_service.window_open_pending)
+    {
+        return DEVICE_LINK_SERVICE_STATE_WINDOW;
+    }
+    return adv == BLE_ADV_MANAGER_STATE_FAST || adv == BLE_ADV_MANAGER_STATE_SLOW
+           ? DEVICE_LINK_SERVICE_STATE_ADVERTISING
+           : DEVICE_LINK_SERVICE_STATE_STARTING;
 }
 
 static bool _device_link_service_sync_confirmation_locked(void)
@@ -585,15 +619,19 @@ static bool _device_link_service_sync_confirmation_locked(void)
 
 static void _device_link_service_refresh_snapshot_locked(void)
 {
-    s_service.snapshot.state = _device_link_service_derive_state();
+    const ble_adv_manager_state_t adv = ble_adv_manager_get_state();
+
+    s_service.snapshot.state = _device_link_service_derive_state(adv);
     s_service.snapshot.enabled = s_service.bluetooth_enabled;
     s_service.snapshot.desired_enabled = s_service.bluetooth_desired_enabled;
     s_service.snapshot.policy_error = s_service.bluetooth_policy_error;
     s_service.snapshot.transitioning = s_service.bluetooth_transitioning;
-    s_service.snapshot.public_discovery = s_service.bluetooth_enabled &&
-                                          s_service.slow_lease_held &&
-                                          !s_service.window_open &&
-                                          !s_service.client_connected;
+    s_service.snapshot.public_discovery =
+        (adv == BLE_ADV_MANAGER_STATE_FAST || adv == BLE_ADV_MANAGER_STATE_SLOW) &&
+        s_service.bluetooth_enabled &&
+        s_service.slow_lease_held &&
+        !s_service.window_open &&
+        !s_service.client_connected;
     s_service.snapshot.active = s_service.window_open ||
                                 s_service.window_open_pending;
     (void)_device_link_service_sync_confirmation_locked();
@@ -628,7 +666,8 @@ static esp_err_t _device_link_service_close_window_locked(void);
 
 static esp_err_t _device_link_service_open_window_locked(void)
 {
-    if (!s_service.startup_gate_released)
+    if (!s_service.startup_gate_released || !s_service.bluetooth_desired_enabled ||
+            s_service.bluetooth_transitioning || s_service.bluetooth_cleanup_pending)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -673,8 +712,11 @@ static esp_err_t _device_link_service_open_window_locked(void)
          * and defer the open to the worker tick, which retries the request
          * until the ACL is gone. */
         s_service.window_open_pending = true;
+        xSemaphoreGive(s_service.mutex);
         const esp_err_t disconnect_result =
             ble_nimble_port_request_disconnect();
+
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
 
         if (disconnect_result != ESP_OK)
         {
@@ -683,59 +725,67 @@ static esp_err_t _device_link_service_open_window_locked(void)
         }
         return ESP_OK;
     }
-    ble_adv_lease_t lease;
-    bool cleanup_started = false;
-    esp_err_t result = ESP_OK;
+    const uint32_t revision = s_service.link_revision;
+    ble_adv_lease_t lease = {0};
 
-    memset(&lease, 0, sizeof(lease));
-    cleanup_started = true;
-    result = ble_adv_manager_set_pause_reason(
-                 BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, true);
-    if (result != ESP_OK)
+    /* The worker owns window/lease mutations. Host callbacks and target
+     * requests remain free to acquire the service mutex during every wait. */
+    xSemaphoreGive(s_service.mutex);
+    esp_err_t result = ble_adv_manager_set_pause_reason(
+                           BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, true);
+
+    if (result == ESP_OK)
     {
-        goto exit;
+        ble_link_session_set_pairing_window(true);
+        ble_link_service_set_pairing_window(true);
+        result = ble_adv_manager_acquire_lease(&lease, BLE_ADV_MANAGER_MODE_FAST, true);
     }
-    ble_link_session_set_pairing_window(true);
-    ble_link_service_set_pairing_window(true);
-    result = ble_adv_manager_acquire_lease(
-                 &lease, BLE_ADV_MANAGER_MODE_FAST, true);
+    if (result == ESP_OK)
+    {
+        result = s_service.config.runtime_port->set_pairing_gate(true);
+    }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (lease.lease_id != 0U)
     {
         s_service.bindable_lease_held = true;
         s_service.bindable_lease_id = lease.lease_id;
     }
-    if (result != ESP_OK)
+    if (result == ESP_OK &&
+            (!s_service.bluetooth_desired_enabled || s_service.client_connected ||
+             s_service.link_revision != revision ||
+             _device_link_service_lifecycle() != DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING))
     {
-        goto exit;
+        result = ESP_ERR_INVALID_STATE;
     }
-    result = s_service.config.runtime_port->set_pairing_gate(true);
-    if (result != ESP_OK)
+    if (result == ESP_OK)
     {
-        goto exit;
+        xSemaphoreGive(s_service.mutex);
+        result = ble_adv_manager_set_pause_reason(
+                     BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, false);
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        if (result == ESP_OK && (!s_service.bluetooth_desired_enabled ||
+                                 s_service.link_revision != revision))
+        {
+            result = ESP_ERR_INVALID_STATE;
+        }
     }
-    result = ble_adv_manager_set_pause_reason(
-                 BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, false);
-    if (result != ESP_OK)
+    if (result == ESP_OK)
     {
-        goto exit;
+        s_service.window_open = true;
+        s_service.suspended = false;
+        s_service.window_deadline = xTaskGetTickCount() +
+                                    pdMS_TO_TICKS(s_service.config.window_ms);
+        s_service.last_remaining_publish = xTaskGetTickCount();
+        s_service.snapshot.last_error = ESP_OK;
     }
-    s_service.window_open = true;
-    s_service.suspended = false;
-    s_service.window_deadline =
-        xTaskGetTickCount() + pdMS_TO_TICKS(s_service.config.window_ms);
-    s_service.last_remaining_publish = xTaskGetTickCount();
-    s_service.snapshot.last_error = ESP_OK;
-
-exit:
-    if (result != ESP_OK && cleanup_started)
+    else
     {
         s_service.close_pending = true;
-        const esp_err_t cleanup_result =
-            _device_link_service_close_window_locked();
+        const esp_err_t cleanup = _device_link_service_close_window_locked();
 
-        if (cleanup_result != ESP_OK)
+        if (cleanup != ESP_OK)
         {
-            LOG_W("window open cleanup pending result=%d", cleanup_result);
+            LOG_W("window open cleanup pending result=%d", cleanup);
         }
     }
     _device_link_service_zeroize(&lease, sizeof(lease));
@@ -809,98 +859,79 @@ static esp_err_t _device_link_service_close_window_locked(void)
     {
         return ESP_OK;
     }
-    /* Stop every advertisement before changing the lease or SMP gate. A
-     * failed stop keeps the bindable lease and gate intact and is retried by
-     * the owner; no slow advertisement can become visible while the pairing
-     * gate is still open. */
-    const esp_err_t pause_result = ble_adv_manager_set_pause_reason(
-                                       BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION,
-                                       true);
+    const bool held = s_service.bindable_lease_held;
+    const uint8_t lease_id = s_service.bindable_lease_id;
+    bool released = !held;
 
-    if (pause_result != ESP_OK)
+    s_service.close_pending = true;
+    xSemaphoreGive(s_service.mutex);
+    result = ble_adv_manager_set_pause_reason(
+                 BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, true);
+    if (result == ESP_OK && held)
     {
-        s_service.close_pending = true;
-        return pause_result;
-    }
-    if (s_service.bindable_lease_held)
-    {
-        const esp_err_t release_result = ble_adv_manager_release_lease(
-                                             s_service.bindable_lease_id);
-
-        if (release_result == ESP_OK || release_result == ESP_ERR_NOT_FOUND)
+        result = ble_adv_manager_release_lease(lease_id);
+        if (result == ESP_OK || result == ESP_ERR_NOT_FOUND)
         {
-            /* The lease is gone (released or already missing): the
-             * ownership is relinquished and NOT_FOUND is not an error. */
-            s_service.bindable_lease_held = false;
-        }
-        else
-        {
-            /* The lease stayed installed (the manager restores it on a
-             * failed stop): keep the window state and mark the close for
-             * the worker-tick retry; a new OPEN is refused while the old
-             * bindable advertisement is still live. */
-            LOG_W("bindable lease release failed result=%d", release_result);
-            s_service.close_pending = true;
-            return release_result;
+            released = true;
+            result = ESP_OK;
         }
     }
-    s_service.close_pending = false;
-    const esp_err_t gate_result =
-        s_service.config.runtime_port->set_pairing_gate(false);
-
-    if (gate_result != ESP_OK)
+    if (result == ESP_OK)
     {
-        s_service.close_pending = true;
-        return gate_result;
+        result = s_service.config.runtime_port->set_pairing_gate(false);
     }
-    ble_link_session_set_pairing_window(false);
-    ble_link_service_set_pairing_window(false);
+    if (result == ESP_OK)
+    {
+        ble_link_session_set_pairing_window(false);
+        ble_link_service_set_pairing_window(false);
+    }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (released)
+    {
+        s_service.bindable_lease_held = false;
+        s_service.bindable_lease_id = 0U;
+    }
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     s_service.window_open = false;
-    s_service.window_open_pending = false;
     s_service.window_deadline = 0U;
-    const uint32_t session_flags = ble_link_session_get_state_flags();
-    const bool verified_bound =
-        ((session_flags & BLE_LINK_STATE_FLAG_BOUND) != 0U) &&
-        ((session_flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U);
+    const uint32_t flags = ble_link_session_get_state_flags();
+    const bool verified_bound = (flags & BLE_LINK_STATE_FLAG_BOUND) != 0U &&
+                                (flags & BLE_LINK_STATE_FLAG_AUTHENTICATED) != 0U;
     const ble_link_confirmation_snapshot_t confirmation =
         ble_link_service_get_confirmation();
-    const bool drop_acl = s_service.client_connected &&
-                          (confirmation.pending || !verified_bound);
+    const bool retire_session = !verified_bound || confirmation.pending;
+    const bool drop_acl = s_service.client_connected && retire_session;
+    const ble_link_operation_identity_t identity =
+    {
+        .generation = s_service.client_generation,
+        .conn_handle = s_service.client_conn_handle,
+    };
 
+    xSemaphoreGive(s_service.mutex);
     if (drop_acl)
     {
-        /* Closing a pairing window is an ACL boundary for pairing
-         * sessions. A verified bound peer may keep the connection. */
-        const esp_err_t disconnect_result =
-            ble_nimble_port_request_disconnect();
-
-        if (disconnect_result != ESP_OK)
-        {
-            s_service.close_pending = true;
-            return disconnect_result;
-        }
+        result = ble_nimble_port_request_disconnect();
     }
-    /* A closed window invalidates any prepared pairing transaction. A
-     * verified bound session is left intact so the peer can keep using
-     * the existing ACL outside the window. */
-    if (!verified_bound || confirmation.pending)
+    if (retire_session)
     {
-        _device_link_service_clear_link_session();
+        if (identity.generation != 0U)
+        {
+            (void)ble_link_service_clear_session_state_if_current(&identity);
+        }
+        ble_nimble_port_numeric_comparison_cancel();
+        device_link_wifi_adapter_clear_pending();
     }
     if (result == ESP_OK)
     {
         result = ble_adv_manager_set_pause_reason(
                      BLE_ADV_MANAGER_PAUSE_REASON_WINDOW_TRANSITION, false);
     }
-    if (result != ESP_OK)
-    {
-        /* The window flags are already cleared, but teardown is incomplete:
-         * keep the close pending so the worker tick retries the cleanup. */
-        s_service.close_pending = true;
-        return result;
-    }
-    s_service.close_pending = false;
-    return ESP_OK;
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    s_service.close_pending = result != ESP_OK;
+    return result;
 }
 
 static void _device_link_service_ble_event(
@@ -912,7 +943,9 @@ static void _device_link_service_ble_event(
 
     if (event->type != BLE_PORT_EVENT_CONNECT &&
             event->type != BLE_PORT_EVENT_DISCONNECT &&
-            event->type != BLE_PORT_EVENT_RESET)
+            event->type != BLE_PORT_EVENT_RESET &&
+            event->type != BLE_PORT_EVENT_ADV_STARTED &&
+            event->type != BLE_PORT_EVENT_ADV_STOPPED)
     {
         return;
     }
@@ -961,6 +994,16 @@ static void _device_link_service_ble_event(
     }
     if (state_changed)
     {
+        s_service.link_revision++;
+    }
+    if (event->type == BLE_PORT_EVENT_ADV_STARTED ||
+            event->type == BLE_PORT_EVENT_ADV_STOPPED)
+    {
+        state_changed = true;
+        s_service.snapshot.last_error = event->status;
+    }
+    if (state_changed)
+    {
         s_service.status_dirty = true;
     }
     xSemaphoreGive(s_service.mutex);
@@ -989,10 +1032,18 @@ static uint32_t _device_link_service_bluetooth_retry_delay_ms(
            DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_MS : delay;
 }
 
+static bool _device_link_service_bluetooth_settled_locked(void)
+{
+    return s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE &&
+           !s_service.bluetooth_operation_in_flight &&
+           !s_service.bluetooth_cleanup_pending &&
+           !s_service.bluetooth_policy_dirty &&
+           s_service.bluetooth_desired_enabled == s_service.bluetooth_enabled;
+}
+
 static void _device_link_service_bt_power_step(void)
 {
     device_link_service_snapshot_t snapshot;
-    bool target = false;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     if (!s_service.bluetooth_transitioning)
@@ -1000,7 +1051,7 @@ static void _device_link_service_bt_power_step(void)
         xSemaphoreGive(s_service.mutex);
         return;
     }
-    if (s_service.bluetooth_desired_enabled == s_service.bluetooth_enabled)
+    if (_device_link_service_bluetooth_settled_locked())
     {
         s_service.bluetooth_transitioning = false;
         s_service.bluetooth_retry_attempt = 0U;
@@ -1023,127 +1074,122 @@ static void _device_link_service_bt_power_step(void)
     }
     if (s_service.bluetooth_transition_deadline == 0U)
     {
-        s_service.bluetooth_transition_deadline =
-            now + pdMS_TO_TICKS(
-                DEVICE_LINK_SERVICE_BLUETOOTH_TRANSITION_TIMEOUT_MS);
+        s_service.bluetooth_transition_deadline = now +
+            pdMS_TO_TICKS(DEVICE_LINK_SERVICE_BLUETOOTH_TRANSITION_TIMEOUT_MS);
     }
-    if ((int32_t)(now - s_service.bluetooth_transition_deadline) >= 0)
-    {
-        const bool effective = s_service.bluetooth_enabled;
+    const bool target = s_service.bluetooth_desired_enabled;
+    const bool stopping = s_service.stop_phase != DEVICE_LINK_SERVICE_STOP_NONE;
+    const bool persist_policy = s_service.bluetooth_policy_dirty;
+    const uint32_t request_revision = s_service.bluetooth_request_revision;
+    const TickType_t deadline = s_service.bluetooth_transition_deadline;
 
-        s_service.bluetooth_policy_error = ESP_ERR_TIMEOUT;
-        s_service.snapshot.last_error = ESP_ERR_TIMEOUT;
-        s_service.bluetooth_desired_enabled = s_service.bluetooth_enabled;
-        s_service.bluetooth_transitioning = false;
-        s_service.bluetooth_retry_attempt = 0U;
-        s_service.bluetooth_retry_not_before = 0U;
-        s_service.bluetooth_transition_deadline = 0U;
-        _device_link_service_refresh_snapshot_locked();
-        s_service.snapshot.generation++;
-        snapshot = s_service.snapshot;
-        xSemaphoreGive(s_service.mutex);
-        _device_link_service_publish_now(&snapshot);
-        LOG_E("bluetooth policy transition timed out; effective=%d",
-              (int)effective);
-        if (_device_link_service_store_bluetooth_policy(effective) != ESP_OK)
-        {
-            LOG_W("bluetooth policy rollback after timeout failed");
-        }
-        return;
-    }
-    target = s_service.bluetooth_desired_enabled;
+    s_service.bluetooth_operation_in_flight = true;
     xSemaphoreGive(s_service.mutex);
 
-    const esp_err_t store = _device_link_service_store_bluetooth_policy(target);
-    esp_err_t result = store;
-
-    if (store == ESP_OK)
-    {
-        result = target ? _device_link_service_runtime_start() :
-                 _device_link_service_runtime_stop();
-    }
+    const esp_err_t store = persist_policy ?
+                            _device_link_service_store_bluetooth_policy(target) : ESP_OK;
+    const esp_err_t result = store == ESP_OK
+                             ? (target && !stopping ? _device_link_service_runtime_start()
+                                : _device_link_service_runtime_stop())
+                             : store;
+    const bool running = s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE &&
+                         s_service.runtime_started &&
+                         ble_runtime_get_state() == BLE_RUNTIME_STATE_RUNNING;
+    const bool cleanup_pending = s_service.stop_phase != DEVICE_LINK_SERVICE_STOP_NONE ||
+                                 (s_service.runtime_initialized && !running);
+    const bool expired = (int32_t)(xTaskGetTickCount() -
+                                   deadline) >= 0;
+    const bool waiting = result == ESP_ERR_NOT_FINISHED;
+    const esp_err_t operation_error = waiting ? ESP_ERR_TIMEOUT : result;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    const bool superseded = s_service.bluetooth_desired_enabled != target;
+    s_service.bluetooth_operation_in_flight = false;
+    s_service.bluetooth_cleanup_pending = cleanup_pending;
+    s_service.bluetooth_enabled = running;
+    const bool superseded = s_service.bluetooth_request_revision != request_revision;
+    bool restore_policy = false;
 
-    if (result == ESP_OK)
+    s_service.bluetooth_policy_dirty = superseded || store != ESP_OK;
+    if (superseded)
     {
-        s_service.bluetooth_enabled = target;
+        /* A completed older operation updates resource facts only. The latest
+         * request owns its error and retry budget. */
         s_service.bluetooth_retry_attempt = 0U;
         s_service.bluetooth_retry_not_before = 0U;
         s_service.bluetooth_transition_deadline = 0U;
         s_service.bluetooth_transitioning =
-            s_service.bluetooth_desired_enabled != s_service.bluetooth_enabled;
-        if (!superseded)
-        {
-            s_service.bluetooth_policy_error = ESP_OK;
-        }
+            !_device_link_service_bluetooth_settled_locked();
+        /* A new target still owns a pending NVS write, even when it equals
+         * the state reached by this older operation. */
+    }
+    else if (waiting && !expired)
+    {
+        /* Retained cleanup is progress, not a failed start/stop attempt. */
+        s_service.bluetooth_policy_error = ESP_OK;
+        s_service.snapshot.last_error = ESP_OK;
+        s_service.bluetooth_retry_not_before = xTaskGetTickCount() +
+                                               pdMS_TO_TICKS(DEVICE_LINK_SERVICE_RETRY_MS);
+        s_service.bluetooth_transitioning = true;
+    }
+    else if (result == ESP_OK)
+    {
+        s_service.bluetooth_policy_error = ESP_OK;
+        s_service.snapshot.last_error = ESP_OK;
+        s_service.bluetooth_retry_attempt = 0U;
+        s_service.bluetooth_retry_not_before = 0U;
+        s_service.bluetooth_transition_deadline = 0U;
+        s_service.bluetooth_transitioning =
+            !_device_link_service_bluetooth_settled_locked();
     }
     else
     {
-        s_service.snapshot.last_error = result;
-        LOG_W("bluetooth policy attempt failed target=%d result=%s "
-              "superseded=%d",
-              (int)target, esp_err_to_name(result), (int)superseded);
-        if (superseded)
+        s_service.bluetooth_policy_error = operation_error;
+        s_service.snapshot.last_error = operation_error;
+
+        if (store != ESP_OK || expired ||
+                s_service.bluetooth_retry_attempt >=
+                DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_ATTEMPTS)
         {
-            /* A newer target arrived while this attempt was running; do not
-               let the stale failure settle or roll it back. */
-            s_service.bluetooth_transitioning = true;
-            s_service.bluetooth_retry_attempt = 0U;
+            /* Terminal error is not successful convergence. Retain cleanup
+             * ownership and allow a later request/deinit to finish it. */
+            s_service.bluetooth_desired_enabled = running;
+            s_service.bluetooth_transitioning = false;
             s_service.bluetooth_retry_not_before = 0U;
+            s_service.bluetooth_transition_deadline = 0U;
+            restore_policy = store == ESP_OK;
         }
         else
         {
-            s_service.bluetooth_policy_error = result;
-            if (store != ESP_OK)
-            {
-                /* The policy was never persisted, so the runtime was never
-                   touched; settle immediately. */
-                s_service.bluetooth_desired_enabled =
-                    s_service.bluetooth_enabled;
-                s_service.bluetooth_transitioning = false;
-                s_service.bluetooth_retry_attempt = 0U;
-                s_service.bluetooth_retry_not_before = 0U;
-                s_service.bluetooth_transition_deadline = 0U;
-            }
-            else if (s_service.bluetooth_retry_attempt >=
-                     DEVICE_LINK_SERVICE_BLUETOOTH_RETRY_MAX_ATTEMPTS)
-            {
-                s_service.bluetooth_desired_enabled =
-                    s_service.bluetooth_enabled;
-                s_service.bluetooth_transitioning = false;
-                s_service.bluetooth_retry_attempt = 0U;
-                s_service.bluetooth_retry_not_before = 0U;
-                s_service.bluetooth_transition_deadline = 0U;
-                const bool effective = s_service.bluetooth_enabled;
+            s_service.bluetooth_retry_not_before = xTaskGetTickCount() +
+                                                   pdMS_TO_TICKS(_device_link_service_bluetooth_retry_delay_ms(
+                                                           s_service.bluetooth_retry_attempt++));
+            s_service.bluetooth_transitioning = true;
+        }
+    }
+    if (restore_policy)
+    {
+        const bool effective = s_service.bluetooth_enabled;
+        const uint32_t revision = s_service.bluetooth_request_revision;
 
-                _device_link_service_refresh_snapshot_locked();
-                s_service.snapshot.generation++;
-                snapshot = s_service.snapshot;
-                xSemaphoreGive(s_service.mutex);
-                _device_link_service_publish_now(&snapshot);
-                LOG_E("bluetooth policy failed; restored effective=%d "
-                      "result=%s",
-                      (int)effective, esp_err_to_name(result));
-                if (_device_link_service_store_bluetooth_policy(effective) !=
-                        ESP_OK)
-                {
-                    LOG_W("bluetooth policy rollback after failure failed");
-                }
-                return;
-            }
-            else
-            {
-                const uint32_t delay =
-                    _device_link_service_bluetooth_retry_delay_ms(
-                        s_service.bluetooth_retry_attempt);
+        /* Requests may arrive during NVS I/O. Keep the operation visible and
+         * never overwrite the target installed by those requests. */
+        s_service.bluetooth_operation_in_flight = true;
+        s_service.bluetooth_transitioning = true;
+        xSemaphoreGive(s_service.mutex);
+        const esp_err_t persist = _device_link_service_store_bluetooth_policy(effective);
 
-                s_service.bluetooth_retry_attempt++;
-                s_service.bluetooth_retry_not_before =
-                    xTaskGetTickCount() + pdMS_TO_TICKS(delay);
-                s_service.bluetooth_transitioning = true;
-            }
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.bluetooth_operation_in_flight = false;
+        s_service.bluetooth_policy_dirty = persist != ESP_OK ||
+                                           s_service.bluetooth_desired_enabled != effective;
+        s_service.bluetooth_transitioning =
+            s_service.bluetooth_desired_enabled != effective ||
+            (s_service.bluetooth_request_revision != revision &&
+             !_device_link_service_bluetooth_settled_locked());
+        if (persist != ESP_OK)
+        {
+            s_service.bluetooth_policy_error = persist;
+            s_service.snapshot.last_error = persist;
         }
     }
     _device_link_service_refresh_snapshot_locked();
@@ -1151,10 +1197,6 @@ static void _device_link_service_bt_power_step(void)
     snapshot = s_service.snapshot;
     xSemaphoreGive(s_service.mutex);
     _device_link_service_publish_now(&snapshot);
-    if (result == ESP_OK && !superseded)
-    {
-        LOG_I("bluetooth policy applied enabled=%d", (int)target);
-    }
 }
 
 static void _device_link_service_handle_command(
@@ -1215,16 +1257,18 @@ static void _device_link_service_handle_command(
             s_service.snapshot.last_error = ESP_ERR_INVALID_STATE;
             break;
         }
-        s_service.snapshot.last_error =
+        xSemaphoreGive(s_service.mutex);
+        esp_err_t confirm_result =
             ble_nimble_port_numeric_comparison_reply(
                 command->confirmation_token, command->accept_binding);
-        if (s_service.snapshot.last_error == ESP_OK)
+        if (confirm_result == ESP_OK)
         {
-            s_service.snapshot.last_error =
-                ble_link_service_confirm_binding(
-                    command->confirmation_token,
-                    command->accept_binding);
+            confirm_result = ble_link_service_confirm_binding(
+                                 command->confirmation_token,
+                                 command->accept_binding);
         }
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.snapshot.last_error = confirm_result;
         _device_link_service_refresh_snapshot_locked();
         break;
     }
@@ -1285,7 +1329,9 @@ static void _device_link_service_handle_command(
 
         if (!journal_written)
         {
+            xSemaphoreGive(s_service.mutex);
             revoke_result = ble_nimble_port_revoke_journal_begin();
+            xSemaphoreTake(s_service.mutex, portMAX_DELAY);
             journal_written = revoke_result == ESP_OK;
         }
         if (revoke_result == ESP_OK && journal_written)
@@ -1320,8 +1366,10 @@ static void _device_link_service_handle_command(
         }
         /* A revoke request is a local security boundary even when a storage
          * step failed. Retire the live application session immediately. */
+        xSemaphoreGive(s_service.mutex);
         (void)ble_link_session_set_authorization(false, 0U);
         _device_link_service_clear_link_session();
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         s_service.snapshot.last_error = revoke_result;
         break;
     }
@@ -1348,6 +1396,7 @@ static void _device_link_service_worker_tick(void)
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     const bool runtime_ready = s_service.runtime_started &&
+                               s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE &&
                                s_service.status_publish_ready;
     xSemaphoreGive(s_service.mutex);
     if (!runtime_ready)
@@ -1363,7 +1412,9 @@ static void _device_link_service_worker_tick(void)
     ble_link_service_tick(
         (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-    publish = s_service.status_dirty;
+    publish = s_service.status_dirty ||
+              s_service.snapshot.state != _device_link_service_derive_state(
+                  ble_adv_manager_get_state());
     publish = _device_link_service_sync_confirmation_locked() || publish;
     if (s_service.window_open_pending)
     {
@@ -1371,7 +1422,9 @@ static void _device_link_service_worker_tick(void)
          * disconnect request while connected, then open once clear. */
         if (s_service.client_connected)
         {
+            xSemaphoreGive(s_service.mutex);
             (void)ble_nimble_port_request_disconnect();
+            xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         }
         else if (!s_service.suspended &&
                  _device_link_service_open_window_locked() == ESP_OK)
@@ -1576,115 +1629,8 @@ static void _device_link_service_worker(void *arg)
      * teardown. A bounded caller may time out while this owner keeps
      * working; a WAIT_FOREVER caller observes the eventual convergence. */
     esp_err_t worker_result = ESP_OK;
-    bool drain_started = false;
-    bool session_retired = false;
-
-    for (;;)
+    while ((worker_result = _device_link_service_prepare_stop()) != ESP_OK)
     {
-        if (!s_service.runtime_initialized && !s_service.runtime_started)
-        {
-            worker_result = ESP_OK;
-            break;
-        }
-        worker_result = ble_adv_manager_set_pause_reason(
-                            BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN,
-                            true);
-        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        if (worker_result == ESP_OK)
-        {
-            worker_result = _device_link_service_close_window_locked();
-        }
-        if (worker_result == ESP_OK && s_service.slow_lease_held)
-        {
-            worker_result = ble_adv_manager_release_lease(
-                                s_service.slow_lease_id);
-            if (worker_result == ESP_OK ||
-                    worker_result == ESP_ERR_NOT_FOUND)
-            {
-                s_service.slow_lease_held = false;
-                worker_result = ESP_OK;
-            }
-        }
-        xSemaphoreGive(s_service.mutex);
-        if (worker_result == ESP_OK && !drain_started)
-        {
-            /* Close admission and wait behind all already-queued host
-             * callbacks before retiring logical TX/session state. */
-            worker_result = ble_nimble_port_begin_cleanup_drain();
-            drain_started = worker_result == ESP_OK;
-        }
-        if (worker_result == ESP_OK && drain_started && !session_retired)
-        {
-            _device_link_service_clear_link_session();
-            session_retired = true;
-        }
-        bool revoke_pending = false;
-
-        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-        revoke_pending = s_service.revoke_in_progress;
-        xSemaphoreGive(s_service.mutex);
-        if (worker_result == ESP_OK && drain_started && session_retired &&
-                revoke_pending)
-        {
-            /* Continue outside the service mutex. The port serializes the
-             * durable store transaction and may call back into service state
-             * while terminating the current ACL. */
-            const esp_err_t revoke_result =
-                _device_link_service_continue_revoke();
-
-            if (revoke_result == ESP_OK)
-            {
-                xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-                s_service.revoke_in_progress = false;
-                revoke_pending = false;
-                xSemaphoreGive(s_service.mutex);
-                const esp_err_t resume_result =
-                    ble_adv_manager_set_pause_reason(
-                        BLE_ADV_MANAGER_PAUSE_REASON_REVOKE, false);
-
-                if (resume_result != ESP_OK)
-                {
-                    LOG_W("revoke advertising deferred result=%d",
-                          resume_result);
-                }
-            }
-            else if (revoke_result != ESP_ERR_NOT_FINISHED)
-            {
-                worker_result = revoke_result;
-            }
-        }
-        if (session_retired)
-        {
-            /* clear_session_state retired the protocol response flow first,
-             * so no post-terminal frame can be submitted. */
-            (void)ble_link_service_pump_tx();
-        }
-        const bool port_cleanup_pending =
-            ble_nimble_port_cleanup_pending();
-
-        if (worker_result == ESP_OK && !revoke_pending &&
-                !port_cleanup_pending)
-        {
-            /* A fresh host-queue barrier closes the last producer/check race.
-             * With admission and advertising already closed, a second empty
-             * observation after this barrier is a stable fixed point. */
-            worker_result = ble_nimble_port_begin_cleanup_drain();
-            if (worker_result == ESP_OK)
-            {
-                (void)ble_link_service_pump_tx();
-                xSemaphoreTake(s_service.mutex, portMAX_DELAY);
-                revoke_pending = s_service.revoke_in_progress;
-                xSemaphoreGive(s_service.mutex);
-                if (!revoke_pending &&
-                        !ble_nimble_port_cleanup_pending())
-                {
-                    break;
-                }
-            }
-        }
-        /* The production ADV owner also polls its absolute retry deadline;
-         * polling here makes shutdown independent of that task's wake and
-         * gives host fakes the same retained-obligation behavior. */
         ble_adv_manager_poll();
         vTaskDelay(pdMS_TO_TICKS(DEVICE_LINK_SERVICE_RETRY_MS));
     }
@@ -1755,6 +1701,22 @@ static esp_err_t _device_link_service_runtime_teardown(void)
     }
     s_service.runtime_started = false;
     s_service.runtime_initialized = false;
+    /* Successful SDK teardown retires every lease/window obligation from
+     * that host generation, including a previously failed window close. */
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    s_service.stop_phase = DEVICE_LINK_SERVICE_STOP_NONE;
+    s_service.slow_lease_held = false;
+    s_service.slow_lease_id = 0U;
+    s_service.bindable_lease_held = false;
+    s_service.bindable_lease_id = 0U;
+    s_service.window_open = false;
+    s_service.window_open_pending = false;
+    s_service.close_pending = false;
+    s_service.window_deadline = 0U;
+    s_service.client_connected = false;
+    s_service.client_conn_handle = 0U;
+    s_service.client_generation = 0U;
+    xSemaphoreGive(s_service.mutex);
     if (stop_result != ESP_OK)
     {
         LOG_W("runtime stop recovered by deinit: %s",
@@ -1799,7 +1761,17 @@ static esp_err_t _device_link_service_register_wifi_domain(void)
 
 static esp_err_t _device_link_service_runtime_start(void)
 {
-    if (s_service.runtime_started)
+    if (s_service.stop_phase != DEVICE_LINK_SERVICE_STOP_NONE)
+    {
+        const esp_err_t cleanup = _device_link_service_runtime_stop();
+
+        if (cleanup != ESP_OK)
+        {
+            return cleanup;
+        }
+    }
+    if (s_service.runtime_started &&
+            ble_runtime_get_state() == BLE_RUNTIME_STATE_RUNNING)
     {
         return ESP_OK;
     }
@@ -1881,15 +1853,11 @@ static esp_err_t _device_link_service_runtime_start(void)
     }
 
     const esp_err_t primary = result;
-    if (s_service.runtime_started)
+    const esp_err_t cleanup = _device_link_service_runtime_teardown();
+
+    if (cleanup != ESP_OK)
     {
-        (void)ble_runtime_stop();
-        s_service.runtime_started = false;
-    }
-    if (s_service.runtime_initialized)
-    {
-        (void)ble_runtime_deinit();
-        s_service.runtime_initialized = false;
+        return cleanup;
     }
     if (s_service.router_registered)
     {
@@ -1898,57 +1866,116 @@ static esp_err_t _device_link_service_runtime_start(void)
         s_service.router_registered = false;
     }
     ble_link_gatt_set_work_submit(NULL, NULL);
-    s_service.slow_lease_held = false;
-    s_service.slow_lease_id = 0U;
     return primary;
+}
+
+static esp_err_t _device_link_service_prepare_stop(void)
+{
+    /* A failed/partially initialized host has no active service generation.
+     * Its SDK teardown must not wait for a barrier on a host that never ran. */
+    if (!s_service.runtime_started ||
+            ble_runtime_get_state() != BLE_RUNTIME_STATE_RUNNING)
+    {
+        return ESP_OK;
+    }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    if (s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE)
+    {
+        s_service.stop_phase = DEVICE_LINK_SERVICE_STOP_QUIESCING;
+        s_service.bluetooth_cleanup_pending = true;
+    }
+    const device_link_service_stop_phase_t phase = s_service.stop_phase;
+
+    xSemaphoreGive(s_service.mutex);
+    if (phase == DEVICE_LINK_SERVICE_STOP_READY)
+    {
+        return ESP_OK;
+    }
+    if (phase == DEVICE_LINK_SERVICE_STOP_QUIESCING)
+    {
+        esp_err_t result = ble_adv_manager_set_pause_reason(
+                               BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN, true);
+
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        if (result == ESP_OK)
+        {
+            result = _device_link_service_close_window_locked();
+        }
+        if (result == ESP_OK && s_service.slow_lease_held)
+        {
+            result = ble_adv_manager_release_lease(s_service.slow_lease_id);
+            if (result == ESP_OK || result == ESP_ERR_NOT_FOUND)
+            {
+                s_service.slow_lease_held = false;
+                s_service.slow_lease_id = 0U;
+                result = ESP_OK;
+            }
+        }
+        xSemaphoreGive(s_service.mutex);
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+        result = ble_nimble_port_begin_cleanup_drain();
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+        _device_link_service_clear_link_session();
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.stop_phase = DEVICE_LINK_SERVICE_STOP_DRAINING;
+        xSemaphoreGive(s_service.mutex);
+    }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    const bool revoke_pending = s_service.revoke_in_progress;
+
+    xSemaphoreGive(s_service.mutex);
+    if (revoke_pending)
+    {
+        const esp_err_t result = _device_link_service_continue_revoke();
+
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+        xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+        s_service.revoke_in_progress = false;
+        xSemaphoreGive(s_service.mutex);
+        /* SERVICE_SHUTDOWN still suppresses visibility throughout teardown. */
+        (void)ble_adv_manager_set_pause_reason(
+            BLE_ADV_MANAGER_PAUSE_REASON_REVOKE, false);
+    }
+    (void)ble_link_service_pump_tx();
+    if (ble_nimble_port_cleanup_pending())
+    {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    /* New admission is closed. A second host barrier and empty observation
+     * account for DISCONNECT callbacks that retained fresh cleanup. */
+    const esp_err_t barrier = ble_nimble_port_begin_cleanup_drain();
+
+    if (barrier != ESP_OK)
+    {
+        return barrier;
+    }
+    (void)ble_link_service_pump_tx();
+    if (ble_nimble_port_cleanup_pending())
+    {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    s_service.stop_phase = DEVICE_LINK_SERVICE_STOP_READY;
+    xSemaphoreGive(s_service.mutex);
+    return ESP_OK;
 }
 
 static esp_err_t _device_link_service_runtime_stop(void)
 {
-    if (!s_service.runtime_initialized && !s_service.runtime_started)
-    {
-        return ESP_OK;
-    }
-    const esp_err_t pause_result = ble_adv_manager_set_pause_reason(
-                                       BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN,
-                                       true);
+    const esp_err_t prepare = _device_link_service_prepare_stop();
 
-    if (pause_result != ESP_OK)
+    if (prepare != ESP_OK)
     {
-        /* The manager may already be deinitialized; the controller teardown
-           below is still the operation that matters. */
-        LOG_W("advertising shutdown pause failed: %s",
-              esp_err_to_name(pause_result));
-    }
-    /* Do not close the pairing gate here. The host/controller teardown
-       invalidates SMP, while closing it would wait for the advertising STOP
-       and a NimBLE host event while the runtime is being torn down. The gate
-       state is reset by the next init. */
-    ble_link_session_set_pairing_window(false);
-    ble_link_service_set_pairing_window(false);
-    _device_link_service_clear_link_session();
-    if (s_service.client_connected)
-    {
-        const esp_err_t disconnect = ble_nimble_port_request_disconnect();
-
-        if (disconnect != ESP_OK)
-        {
-            LOG_W("disconnect during teardown failed: %s",
-                  esp_err_to_name(disconnect));
-        }
-    }
-    if (s_service.slow_lease_held)
-    {
-        const esp_err_t release = ble_adv_manager_release_lease(
-                                      s_service.slow_lease_id);
-
-        if (release != ESP_OK && release != ESP_ERR_NOT_FOUND)
-        {
-            LOG_W("lease release during teardown failed: %s",
-                  esp_err_to_name(release));
-        }
-        s_service.slow_lease_held = false;
-        s_service.slow_lease_id = 0U;
+        return prepare;
     }
     const esp_err_t teardown = _device_link_service_runtime_teardown();
 
@@ -1970,13 +1997,6 @@ static esp_err_t _device_link_service_runtime_stop(void)
         s_service.router_registered = false;
     }
     ble_link_gatt_set_work_submit(NULL, NULL);
-    s_service.client_connected = false;
-    s_service.client_conn_handle = 0U;
-    s_service.client_generation = 0U;
-    s_service.window_open = false;
-    s_service.window_open_pending = false;
-    s_service.bindable_lease_held = false;
-    s_service.bindable_lease_id = 0U;
     return ESP_OK;
 }
 
@@ -1994,6 +2014,7 @@ static esp_err_t _device_link_service_acquire_slow_lease(void)
         s_service.slow_lease_held = true;
         s_service.slow_lease_id = lease.lease_id;
     }
+    LOG_I("slow lease result=%d id=%u", (int)result, lease.lease_id);
     _device_link_service_zeroize(&lease, sizeof(lease));
     return result;
 }
@@ -2057,9 +2078,8 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
 
     /* STOPPING rejects any new early admission; the drain then waits for
      * in-flight callbacks that were already admitted, so the mutex can
-     * never be released underneath one. Every cleanup step runs
-     * unconditionally afterwards so a failed step cannot abandon a live
-     * runtime, callback registration, or resources. */
+     * never be released underneath one. Runtime teardown must complete
+     * before callback dependencies can be released. */
     while (atomic_flag_test_and_set_explicit(
                 &s_deinit_guard, memory_order_acquire))
     {
@@ -2077,7 +2097,11 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
     {
         step_result = ble_adv_manager_release_lease(
                           s_service.slow_lease_id);
-        s_service.slow_lease_held = false;
+        if (step_result == ESP_OK || step_result == ESP_ERR_NOT_FOUND)
+        {
+            s_service.slow_lease_held = false;
+            step_result = ESP_OK;
+        }
         if (first_error == ESP_OK && step_result != ESP_OK)
         {
             first_error = step_result;
@@ -2115,9 +2139,9 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
          * deletes the task afterwards. */
     }
     step_result = _device_link_service_runtime_teardown();
-    if (first_error == ESP_OK && step_result != ESP_OK)
+    if (step_result != ESP_OK)
     {
-        first_error = step_result;
+        return _device_link_service_deinit_return(step_result);
     }
     if (s_service.router_registered)
     {
@@ -2134,15 +2158,14 @@ static esp_err_t _device_link_service_rollback_init(esp_err_t primary_error)
             first_error = step_result;
         }
     }
-    _device_link_service_release_resources();
-    if (first_error == ESP_OK)
+    if (s_service.router_registered)
     {
-        (void)_device_link_service_transition(
-            DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
-            DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED);
+        return _device_link_service_deinit_return(first_error);
     }
-    /* On incomplete cleanup the lifecycle stays STOPPING so deinit can
-     * retry the outstanding teardown; the caller must not re-init. */
+    _device_link_service_release_resources();
+    (void)_device_link_service_transition(
+        DEVICE_LINK_SERVICE_LIFECYCLE_STOPPING,
+        DEVICE_LINK_SERVICE_LIFECYCLE_STOPPED);
     return _device_link_service_deinit_return(
                first_error != ESP_OK ? first_error : primary_error);
 }
@@ -2213,6 +2236,7 @@ esp_err_t device_link_service_init(const device_link_service_config_t *config)
     s_service.bluetooth_retry_attempt = 0U;
     s_service.bluetooth_retry_not_before = 0U;
     s_service.bluetooth_transition_deadline = 0U;
+    s_service.bluetooth_policy_dirty = policy_result != ESP_OK;
     s_service.bluetooth_policy_error = policy_result == ESP_OK ?
                                        ESP_OK : policy_result;
     s_service.mutex = xSemaphoreCreateMutexStatic(&s_service.mutex_control);
@@ -2563,10 +2587,8 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
      * a task that is concurrently notified is unsafe. The runtime teardown
      * below stops the host first; release_resources deletes the task
      * afterwards. */
-    /* A window-close failure recorded by the worker is the first reported
-     * error, but it must never block the teardown: every cleanup step
-     * still runs. Only a genuine runtime teardown failure keeps STOPPING
-     * (so a retry can finish it); the worker error is returned once. */
+    /* The worker confirmed the shared cleanup fixed point. A runtime
+     * teardown failure keeps STOPPING and every remaining dependency. */
     esp_err_t result = (esp_err_t)atomic_load_explicit(&s_worker_result,
                        memory_order_acquire);
     esp_err_t teardown_result = _device_link_service_runtime_teardown();
@@ -2905,14 +2927,18 @@ esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms)
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     const bool already = s_service.bluetooth_desired_enabled == enabled;
 
-    if (!already)
+    if (!already || s_service.bluetooth_policy_error != ESP_OK ||
+            (!s_service.bluetooth_transitioning &&
+             (s_service.bluetooth_cleanup_pending || s_service.bluetooth_policy_dirty)))
     {
         /* Latest target wins: no command is queued per request. The worker
            converges to this value and skips intermediate targets. */
         s_service.bluetooth_desired_enabled = enabled;
+        s_service.bluetooth_request_revision++;
+        s_service.bluetooth_policy_dirty = true;
         s_service.bluetooth_policy_error = ESP_OK;
         s_service.bluetooth_transitioning =
-            enabled != s_service.bluetooth_enabled;
+            !_device_link_service_bluetooth_settled_locked();
         s_service.bluetooth_retry_attempt = 0U;
         s_service.bluetooth_retry_not_before = 0U;
         s_service.bluetooth_transition_deadline = 0U;
@@ -2946,13 +2972,14 @@ esp_err_t device_link_service_set_enabled(bool enabled, uint32_t timeout_ms)
 
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         settled = !s_service.bluetooth_transitioning;
+        const bool complete = _device_link_service_bluetooth_settled_locked();
         effective = s_service.bluetooth_enabled;
         policy_error = s_service.bluetooth_policy_error;
         xSemaphoreGive(s_service.mutex);
         if (settled)
         {
             _device_link_service_api_release();
-            if (effective == enabled)
+            if (complete && effective == enabled && policy_error == ESP_OK)
             {
                 return ESP_OK;
             }

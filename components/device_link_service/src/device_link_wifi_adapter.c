@@ -3,10 +3,8 @@
 #include <string.h>
 
 #include "esp_err.h"
-#ifndef UNIT_TEST_HOST
-    #include "freertos/FreeRTOS.h"
-    #include "freertos/semphr.h"
-#endif
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "ble_link_service.h"
 #include "connectivity_manager.h"
@@ -44,29 +42,23 @@ typedef struct device_link_wifi_bridge
 } device_link_wifi_bridge_t;
 
 static device_link_wifi_bridge_t s_bridge;
-#ifndef UNIT_TEST_HOST
-    static SemaphoreHandle_t s_bridge_lock;
-    static StaticSemaphore_t s_bridge_lock_control;
-#endif
+static SemaphoreHandle_t s_bridge_lock;
+static StaticSemaphore_t s_bridge_lock_control;
 
 static void _device_link_wifi_lock(void)
 {
-#ifndef UNIT_TEST_HOST
     if (s_bridge_lock != NULL)
     {
         (void)xSemaphoreTakeRecursive(s_bridge_lock, portMAX_DELAY);
     }
-#endif
 }
 
 static void _device_link_wifi_unlock(void)
 {
-#ifndef UNIT_TEST_HOST
     if (s_bridge_lock != NULL)
     {
         (void)xSemaphoreGiveRecursive(s_bridge_lock);
     }
-#endif
 }
 
 static device_link_v1_wifi_failure_t _device_link_wifi_map_failure(
@@ -433,6 +425,9 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
     esp_err_t result = ESP_ERR_INVALID_ARG;
 
     (void)arg;
+    /* Manager request APIs only copy/enqueue; publisher callbacks run on
+     * another task and must observe the mapping installed below. */
+    _device_link_wifi_lock();
     switch (operation)
     {
     case DEVICE_LINK_V1_OPERATION_SCAN:
@@ -441,6 +436,7 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
     case DEVICE_LINK_V1_OPERATION_SET_CREDENTIALS:
         if (credentials == NULL)
         {
+            _device_link_wifi_unlock();
             return DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT;
         }
         {
@@ -469,13 +465,14 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
         result = connectivity_manager_request_forget(&manager_id);
         break;
     default:
+        _device_link_wifi_unlock();
         return DEVICE_LINK_V1_STATUS_INVALID_ARGUMENT;
     }
     if (result != ESP_OK)
     {
+        _device_link_wifi_unlock();
         return DEVICE_LINK_V1_STATUS_INTERNAL;
     }
-    _device_link_wifi_lock();
     s_bridge.terminal_pending = false;
     s_bridge.terminal_completing = false;
     s_bridge.terminal_warning_logged = false;
@@ -516,7 +513,6 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
     {
         return ESP_OK;
     }
-#ifndef UNIT_TEST_HOST
     if (s_bridge_lock == NULL)
     {
         s_bridge_lock = xSemaphoreCreateRecursiveMutexStatic(
@@ -526,7 +522,6 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
-#endif
     ble_link_service_set_v1_ops(&ops, NULL);
     const esp_err_t result = event_bus_subscribe(
                                  CONNECTIVITY_MANAGER_MSG, EVENT_BUS_SUB_TYPE_ANY,

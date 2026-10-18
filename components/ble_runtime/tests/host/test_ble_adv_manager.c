@@ -6,6 +6,7 @@
 #include "esp_err.h"
 
 #include "ble_adv_manager.h"
+#include "ble_link_service.h"
 #include "ble_nimble_adv_start.h"
 #include "ble_port_ops.h"
 
@@ -1500,8 +1501,52 @@ static void test_pause_reason_active_accessor(void)
                          BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN));
 }
 
+static void _completion_wake(void *arg)
+{
+    ble_adv_manager_state_t *observed = arg;
+
+    *observed = ble_adv_manager_get_state();
+}
+
+static void test_completion_wakes_after_commit(void)
+{
+    ble_adv_lease_t lease;
+    ble_adv_manager_state_t observed = BLE_ADV_MANAGER_STATE_STOPPED;
+
+    _reset_harness();
+    _init_manager();
+    ble_link_service_set_worker_wake(_completion_wake, &observed);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_acquire_lease(
+                          &lease, BLE_ADV_MANAGER_MODE_SLOW, false));
+    ble_nimble_adv_report_result(BLE_PORT_EVENT_ADV_STARTED, ESP_FAIL,
+                                 s_last_config.generation);
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED, observed);
+    const uint32_t retired = s_last_config.generation;
+
+    s_now_ms += 100U;
+    ble_adv_manager_poll();
+    ble_nimble_adv_report_result(BLE_PORT_EVENT_ADV_STARTED, 0, retired);
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STARTING, observed);
+    ble_nimble_adv_report_result(BLE_PORT_EVENT_ADV_STARTED, 0,
+                                 s_last_config.generation);
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_SLOW, observed);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_adv_manager_release_lease(lease.lease_id));
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPING,
+                      ble_adv_manager_get_state());
+    ble_nimble_adv_report_result(BLE_PORT_EVENT_ADV_STOPPED, ESP_FAIL,
+                                 s_last_stop_generation);
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_FAULTED, observed);
+    s_now_ms += 100U;
+    ble_adv_manager_poll();
+    ble_nimble_adv_report_result(BLE_PORT_EVENT_ADV_STOPPED, 0,
+                                 s_last_stop_generation);
+    TEST_ASSERT_EQUAL(BLE_ADV_MANAGER_STATE_STOPPED, observed);
+    ble_link_service_set_worker_wake(NULL, NULL);
+}
+
 int main(void)
 {
+    test_completion_wakes_after_commit();
     test_acquire_fast_starts_fast_adv();
     test_fast_window_expires_falls_back_to_slow();
     test_release_last_lease_stops();

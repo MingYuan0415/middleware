@@ -16,8 +16,9 @@ that owner; they do not update LVGL or publish application events directly.
 `ble_runtime_host_port_t` injects init/start, pairing-gate synchronization,
 peer-store reset, stop, and deinit. Host synchronization audits restored NVS
 records before advertising or pairing is enabled. Stop runs on a dedicated
-worker with bounded acknowledgement; a timeout or terminal deinit error remains
-latched until reboot so resources cannot be freed under a live host task.
+worker with bounded acknowledgement. A timeout keeps the same worker and every
+resource until its result and host exit are confirmed. A partial SDK deinit
+failure remains latched until reboot because SDK teardown cannot be retried.
 
 The `ble_link_timer` task owns the indication deadline, retained peer cleanup,
 local revoke, and accepted/rejected ACL termination. Absolute obligations are
@@ -38,6 +39,10 @@ and cleanup paths validate the applicable fields. A stale generation or reused
 connection handle cannot retire a newer ACL. The CONNECT and final ENC_CHANGE
 paths both read the current NimBLE descriptor so identity resolution and
 encryption events converge regardless of callback order.
+
+Connection generations and admission reservation tokens increase across SDK
+restarts for the entire device boot. Zero is reserved; exhausted counters reject
+new connections instead of reusing an identity.
 
 The security reducer distinguishes a restored bond from a bond created by the
 current ACL. A new pairing becomes an uncommitted candidate when Numeric
@@ -105,6 +110,8 @@ discriminator, instance ID, or address-rotation metadata.
 
 START and STOP operations carry nonzero generations. Only the completion for
 the current transition may mutate manager state; stale completions are no-ops.
+The advertising task commits each result before waking the service owner, so
+an idle owner publishes the completed physical state without another GAP event.
 Failures retain the exact action and generation with bounded exponential retry,
 and the owner waits on the nearest absolute deadline rather than periodic
 polling.
