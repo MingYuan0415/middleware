@@ -88,5 +88,26 @@ int main(void)
     assert(timer_service_focus_reset() == ESP_OK);
     assert(timer_service_deinit() == ESP_OK);
     assert(timer_service_get_snapshot(&snapshot) == ESP_ERR_INVALID_STATE);
+
+    /* Zero-length inputs are rejected instead of arming an instantly complete
+     * or endlessly looping interval. */
+    assert(timer_service_init(&config) == ESP_OK);
+    assert(timer_service_countdown_start(0U) == ESP_ERR_INVALID_ARG);
+    assert(timer_service_focus_start(0U, 2000U) == ESP_ERR_INVALID_ARG);
+    assert(timer_service_focus_start(5000U, 0U) == ESP_ERR_INVALID_ARG);
+    assert(timer_service_focus_start(5000U, 2000U) == ESP_OK);
+    assert(timer_service_focus_reset() == ESP_OK);
+
+    /* A paused countdown still owns the timer: starting another one must not
+     * silently replace the remaining time. */
+    assert(timer_service_countdown_start(8000U) == ESP_OK);
+    s_now_us = 91000000 + 2000000;
+    assert(timer_service_countdown_pause() == ESP_OK);
+    assert(timer_service_countdown_start(3000U) == ESP_ERR_INVALID_STATE);
+    assert(timer_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(snapshot.countdown_remaining_ms == 6000U);
+    assert(snapshot.countdown_state == TIMER_SERVICE_PAUSED);
+    assert(timer_service_countdown_reset() == ESP_OK);
+    assert(timer_service_deinit() == ESP_OK);
     return 0;
 }
