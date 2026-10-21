@@ -27,6 +27,7 @@ function(add_device_link_v1_test target source)
     )
     target_include_directories(${target} PRIVATE
         "${COMPONENT}/include"
+        "${COMPONENT}/src"
     )
     target_compile_options(${target} PRIVATE
         -Wall

@@ -13,6 +13,7 @@
 #include "connectivity_manager.h"
 #include "device_link_v1.h"
 #include "device_link_wifi_adapter.h"
+#include "device_link_service_test_hooks.h"
 #include "event_bus.h"
 
 extern void connectivity_manager_fake_reset(void);

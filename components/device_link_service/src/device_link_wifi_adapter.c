@@ -9,6 +9,8 @@
 #include "ble_link_service.h"
 #include "connectivity_manager.h"
 #include "device_link_wifi_adapter.h"
+
+#include "device_link_service_test_hooks.h"
 #include "event_bus.h"
 
 #define DBG_TAG "dl_wifi"

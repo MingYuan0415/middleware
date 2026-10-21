@@ -167,15 +167,6 @@ const device_link_v1_snapshot_t *device_link_v1_engine_snapshot(
 const device_link_v1_operation_record_t *device_link_v1_engine_record(
     const device_link_v1_engine_t *engine);
 
-#ifdef UNIT_TEST_HOST
-device_link_v1_status_t device_link_v1_engine_start_with_id(
-    device_link_v1_engine_t *engine, device_link_v1_operation_t operation,
-    uint8_t request_id, const device_link_v1_credentials_t *credentials,
-    uint32_t operation_id);
-void device_link_v1_engine_test_exhaust_ids(device_link_v1_engine_t *engine);
-void device_link_v1_engine_test_reboot(device_link_v1_engine_t *engine);
-#endif
-
 #ifdef __cplusplus
 }
 #endif

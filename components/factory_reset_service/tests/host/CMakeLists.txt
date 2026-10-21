@@ -31,6 +31,7 @@ target_include_directories(test_factory_reset_service PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/fakes"
     "${HOST_CONNECTIVITY}/include"
     "${COMPONENT}/include"
+    "${COMPONENT}/src"
 )
 target_compile_options(test_factory_reset_service PRIVATE
     -Wall

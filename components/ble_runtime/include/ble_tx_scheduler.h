@@ -10,10 +10,6 @@
 #include "ble_link_operation.h"
 #include "ble_port_ops.h"
 
-#ifdef UNIT_TEST_HOST
-    void ble_tx_scheduler_test_set_token(uint32_t value);
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif

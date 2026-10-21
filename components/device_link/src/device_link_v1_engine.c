@@ -2,6 +2,8 @@
 
 #include "device_link_v1_engine.h"
 
+#include "device_link_test_hooks.h"
+
 static bool _device_link_v1_engine_ready(const device_link_v1_engine_t *engine)
 {
     return engine != NULL;

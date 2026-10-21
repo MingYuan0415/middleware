@@ -33,6 +33,7 @@ target_compile_definitions(test_device_link_wifi_adapter PRIVATE
 target_include_directories(test_device_link_wifi_adapter PRIVATE
                            "${CMAKE_CURRENT_LIST_DIR}/fakes"
                            "${COMPONENT}/include"
+                           "${COMPONENT}/src"
                            "${BLE_RUNTIME}/include"
                            "${DEVICE_LINK}/include"
                            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
@@ -60,6 +61,7 @@ target_compile_definitions(test_device_link_status_helpers PRIVATE
     CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
     CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144)
 target_include_directories(test_device_link_status_helpers PRIVATE
+                           "${COMPONENT}/src"
                            "${COMPONENT}/include"
                            "${COMPONENT}/src"
                            "${BLE_RUNTIME}/include"

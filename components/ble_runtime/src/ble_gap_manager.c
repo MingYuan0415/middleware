@@ -10,6 +10,8 @@
 
 #include "ble_gap_manager.h"
 
+#include "ble_runtime_test_hooks.h"
+
 #define DBG_TAG "ble_gap_manager"
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"

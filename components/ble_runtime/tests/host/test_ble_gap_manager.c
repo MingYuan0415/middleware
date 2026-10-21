@@ -6,6 +6,7 @@
 #include "esp_err.h"
 
 #include "ble_gap_manager.h"
+#include "ble_runtime_test_hooks.h"
 #include "ble_link_cleanup_obligation.h"
 
 #define TEST_ASSERT_TRUE(condition) \

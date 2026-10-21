@@ -3,6 +3,8 @@
 
 #include "factory_reset_service.h"
 
+#include "factory_reset_service_test_hooks.h"
+
 #include "nv_storage.h"
 
 #include "nvs.h"

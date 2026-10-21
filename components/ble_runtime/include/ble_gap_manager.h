@@ -135,14 +135,6 @@ bool ble_gap_manager_is_subscribed_kind(
  */
 esp_err_t ble_gap_manager_get_snapshot(ble_gap_manager_snapshot_t *out);
 
-#ifdef UNIT_TEST_HOST
-/** @brief Test-only setter for exercising generation exhaustion. */
-void ble_gap_manager_test_set_generation(uint32_t generation);
-
-/** @brief Test-only setter for exercising admission-token exhaustion. */
-void ble_gap_manager_test_set_admission_token(uint32_t token);
-#endif
-
 #ifdef __cplusplus
 }
 #endif

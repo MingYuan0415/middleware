@@ -8,6 +8,7 @@
 
 #include "ble_port_ops.h"
 #include "ble_tx_scheduler.h"
+#include "ble_runtime_test_hooks.h"
 
 #define TEST_ASSERT_TRUE(condition) \
     do \

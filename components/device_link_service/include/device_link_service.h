@@ -254,15 +254,6 @@ bool device_link_service_is_active(void);
  */
 bool device_link_service_is_busy(void);
 
-#ifdef UNIT_TEST_HOST
-/** @brief Test-only barrier invoked after API admission samples its state. */
-typedef void (*device_link_service_test_api_acquire_hook_t)(void *arg);
-
-/** @brief Install a test-only API admission barrier. */
-void device_link_service_test_set_api_acquire_hook(
-    device_link_service_test_api_acquire_hook_t hook, void *arg);
-#endif
-
 #ifdef __cplusplus
 }
 #endif

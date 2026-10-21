@@ -11,6 +11,8 @@
 
 #include "ble_tx_scheduler.h"
 
+#include "ble_runtime_test_hooks.h"
+
 #define DBG_TAG "ble_tx_scheduler"
 #define DBG_LVL DBG_WARN
 #include "mt_log.h"

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "device_link_v1_engine.h"
+#include "device_link_test_hooks.h"
 
 static device_link_v1_snapshot_t _idle(void)
 {

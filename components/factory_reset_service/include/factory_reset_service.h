@@ -64,15 +64,6 @@ esp_err_t factory_reset_service_recovery_pending(bool *pending);
  */
 esp_err_t factory_reset_service_complete_recovery(void);
 
-#ifdef UNIT_TEST_HOST
-/** @brief Test-only barrier invoked after API admission samples its state. */
-typedef void (*factory_reset_service_test_api_acquire_hook_t)(void *arg);
-
-/** @brief Install a test-only API admission barrier. */
-void factory_reset_service_test_set_api_acquire_hook(
-    factory_reset_service_test_api_acquire_hook_t hook, void *arg);
-#endif
-
 #ifdef __cplusplus
 }
 #endif

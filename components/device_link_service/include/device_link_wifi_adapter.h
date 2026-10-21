@@ -25,10 +25,6 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
     const device_link_v1_credentials_t *credentials,
     uint32_t operation_id, void *arg);
 
-#ifdef UNIT_TEST_HOST
-void device_link_wifi_adapter_test_set_descriptor_result(esp_err_t result);
-#endif
-
 esp_err_t device_link_wifi_adapter_get_descriptor(const void **descriptor);
 
 esp_err_t device_link_wifi_adapter_bridge_start(void);

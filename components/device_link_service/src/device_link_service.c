@@ -27,6 +27,8 @@
 #include "ble_runtime.h"
 
 #include "device_link_service.h"
+
+#include "device_link_service_test_hooks.h"
 #include "device_link_confirmation.h"
 #include "device_link_revoke_progress.h"
 #include "device_link_wifi_adapter.h"
