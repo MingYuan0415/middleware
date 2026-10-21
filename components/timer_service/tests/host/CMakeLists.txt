@@ -30,3 +30,4 @@ elseif(NOT TIMER_SERVICE_SANITIZER STREQUAL "none")
 endif()
 
 add_test(NAME timer_service COMMAND timer_service_test)
+set_tests_properties(timer_service PROPERTIES TIMEOUT 10)

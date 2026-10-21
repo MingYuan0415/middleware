@@ -20,6 +20,7 @@ function(configure_time_service_test target)
         -Wextra
         -Werror
         -Wpedantic
+        -UNDEBUG
     )
     target_link_libraries(${target} PRIVATE Threads::Threads)
 

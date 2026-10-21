@@ -125,6 +125,15 @@ cmake --build /tmp/mt-power
 ctest --test-dir /tmp/mt-power --output-on-failure
 ```
 
+运行 system PM 套件（配置校验、初始化回滚、standby 周期、唤醒原因分类、钩子失败、取消恢复、CPU 频率锁引用计数、deinit 重试）：
+
+```sh
+cmake -S components/system_pm/tests/host -B /tmp/mt-system-pm -G Ninja \
+    -DSYSTEM_PM_SANITIZER=none
+cmake --build /tmp/mt-system-pm
+ctest --test-dir /tmp/mt-system-pm --output-on-failure
+```
+
 运行 chore worker 套件（一次性/延时/周期调度、池满、协作取消、挂起无追补与超时回滚、deinit 释放、自调用拒绝、并发取消）：
 
 ```sh
@@ -185,7 +194,7 @@ cmake --build /tmp/mt-sd
 ctest --test-dir /tmp/mt-sd --output-on-failure
 ```
 
-所有列出的 `*_SANITIZER` 选项支持 `none`、`address` 和 `thread`；切换 sanitizer 时使用独立构建目录。x86_64 上若存在 `setarch`，CTest 会为 TSan 测试自动关闭 ASLR。QMI8658C、SDSPI partial rollback、ES8311 板级生命周期、PCF85063 alarm 和 AXP2101 profile 由 `layers/bsp/tests/host` 覆盖；`layers/app_manager/app_core/tests/host` 校验 BSP TE 参数到 adapter TE sync 的映射。所有硬件行为仍需随整机工程构建并按风险上板验证。
+所有列出的 `*_SANITIZER` 选项（含 `BSP_SANITIZER`、`AUDIO_SERVICE_SANITIZER`、`SD_STORAGE_SERVICE_SANITIZER`、`SYSTEM_PM_SANITIZER`）支持 `none`、`address` 和 `thread`；切换 sanitizer 时使用独立构建目录。x86_64 上若存在 `setarch`，CTest 会为 TSan 测试自动关闭 ASLR。QMI8658C、SDSPI partial rollback、ES8311 板级生命周期、PCF85063 alarm 和 AXP2101 profile 由 `layers/bsp/tests/host` 覆盖；`layers/app_manager/app_core/tests/host` 校验 BSP TE 参数到 adapter TE sync 的映射。所有硬件行为仍需随整机工程构建并按风险上板验证。
 
 ## 许可证
 

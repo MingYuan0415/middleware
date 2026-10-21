@@ -34,6 +34,7 @@ target_compile_options(power_service_irq_test PRIVATE
     -Wextra
     -Werror
     -Wpedantic
+    -UNDEBUG
 )
 target_link_libraries(power_service_irq_test PRIVATE Threads::Threads)
 
