@@ -27,6 +27,8 @@ typedef struct recorder_service_config
     uint64_t minimum_free_bytes;
 } recorder_service_config_t;
 
+/** @brief Maximum full recorder path bytes, including its terminating NUL. */
+#define RECORDER_SERVICE_PATH_MAX 128U
 typedef struct recorder_service_snapshot
 {
     uint32_t generation;
@@ -38,7 +40,7 @@ typedef struct recorder_service_snapshot
     uint32_t playback_duration_ms;
     uint64_t bytes;
     uint64_t free_bytes;
-    char name[64];
+    char name[RECORDER_SERVICE_PATH_MAX];
     esp_err_t last_error;
 } recorder_service_snapshot_t;
 
@@ -47,7 +49,7 @@ typedef struct recorder_service_snapshot
 /** @brief Bounded metadata for one completed WAV recording. */
 typedef struct recorder_service_file
 {
-    char name[64];
+    char name[RECORDER_SERVICE_PATH_MAX];
     uint32_t duration_ms;
     uint64_t bytes;
 } recorder_service_file_t;

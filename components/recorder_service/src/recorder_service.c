@@ -39,7 +39,7 @@ typedef struct recorder_command
 {
     recorder_command_type_t type;
     uint32_t operation_id;
-    char name[64];
+    char name[RECORDER_SERVICE_PATH_MAX];
 } recorder_command_t;
 #endif
 

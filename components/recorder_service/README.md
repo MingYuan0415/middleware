@@ -12,6 +12,10 @@
 - `recorder_service_list()` / `delete()`：枚举已完成 WAV 与删除文件，不暴露目录句柄。
 - `recorder_service_get_snapshot()` / `is_busy()`：状态快照与忙碌查询。
 
+`recorder_service_snapshot_t.name`、`recorder_service_file_t.name` 和播放/删除命令均保存
+完整文件路径，容量为 `RECORDER_SERVICE_PATH_MAX` 字节（含结尾 NUL）；路径拼接超出该容量的
+录音文件不进入服务索引。
+
 ## 配置与依赖
 
 - CMake：`PRIV_REQUIRES audio_service sd_storage_service esp_timer fatfs freertos mt_log`。
