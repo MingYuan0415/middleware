@@ -126,12 +126,19 @@ typedef struct wifi_service_scan_record
     wifi_service_security_t security;             /**< Advertised security. */
 } wifi_service_scan_record_t;
 
-/** @brief Immutable connection-state snapshot published and cached by Wi-Fi. */
+/**
+ * @brief Immutable operation result and independent current link facts.
+ *
+ * session_id/operation_id identify the CONNECT/DISCONNECT operation fields.
+ * A completed operation's result, failure and cancellation flag remain unchanged
+ * until the next CONNECT/DISCONNECT begins or the low-level runtime is initialized.
+ * Link changes, IP renewal and scans do not retire or replace that terminal.
+ */
 typedef struct wifi_service_status_snapshot
 {
     uint64_t generation;                       /**< Snapshot generation. */
-    wifi_service_session_id_t session_id;      /**< Related session or zero. */
-    wifi_service_operation_id_t operation_id;  /**< Related operation or zero. */
+    wifi_service_session_id_t session_id;      /**< Operation session or zero. */
+    wifi_service_operation_id_t operation_id;  /**< CONNECT/DISCONNECT ID or zero. */
     wifi_service_state_t state;                /**< Current connection state. */
     wifi_service_failure_t failure;            /**< Classified last failure. */
     int32_t last_error;                        /**< Last ESP-IDF error value. */
@@ -141,6 +148,9 @@ typedef struct wifi_service_status_snapshot
     bool available;                            /**< Radio service is usable. */
     bool desired_connected;                    /**< Reconnect policy is active. */
     bool operation_canceled;                   /**< Lower layer confirmed cancel. */
+    bool operation_complete;                   /**< Sticky CONNECT/DISCONNECT terminal. */
+    esp_err_t operation_result;                 /**< Immutable terminal result. */
+    wifi_service_failure_t operation_failure;   /**< Immutable terminal classification. */
     char ssid[WIFI_SERVICE_SSID_MAX_BYTES + 1U]; /**< Target SSID. */
 } wifi_service_status_snapshot_t;
 

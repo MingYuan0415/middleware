@@ -198,8 +198,7 @@ typedef struct manager_worker
     bool radio_initialized;
     bool suspended;
     bool retry_pending;
-    bool resume_connect_pending;
-    connectivity_manager_operation_id_t resume_operation_id;
+    bool connect_resume_pending;
     bool pending_command_valid;
     bool resume_auto_after_scan;
     manager_command_t pending_command;
@@ -1141,6 +1140,7 @@ static void _manager_clear_active_operation(manager_worker_t *worker)
     worker->operation_id = 0U;
     worker->service_operation_id = 0U;
     worker->active_cancel_requested = false;
+    worker->connect_resume_pending = false;
     worker->active_sync = false;
     worker->active_sync_auto_connect = false;
     worker->active_client_sync_id = 0U;
@@ -1186,13 +1186,16 @@ static unsigned _manager_command_priority(manager_command_type_t type)
 }
 
 static void _manager_run_pending(manager_worker_t *worker);
-static void _manager_continue_policy(manager_worker_t *worker,
-                                     bool schedule_retry);
+static void _manager_process_command(manager_worker_t *worker,
+                                     const manager_command_t *command,
+                                     bool *stop);
+static void _manager_continue_policy(manager_worker_t *worker);
+static void _manager_start_due_retry(manager_worker_t *worker);
 
 static manager_defer_result_t _manager_defer_foreground(
     manager_worker_t *worker, const manager_command_t *command)
 {
-    if (worker->operation_kind == MANAGER_OPERATION_NONE)
+    if (worker->operation_kind == MANAGER_OPERATION_NONE && !worker->suspended)
     {
         return MANAGER_DEFER_NONE;
     }
@@ -1221,23 +1224,37 @@ static manager_defer_result_t _manager_defer_foreground(
 
     worker->pending_command = *command;
     worker->pending_command_valid = true;
+    if (command->type == MANAGER_COMMAND_DISCONNECT || command->type == MANAGER_COMMAND_FORGET)
+    {
+        worker->status.manual_hold = true;
+        worker->resume_auto_after_scan = false;
+        if (!worker->target_candidate)
+        {
+            worker->retry_pending = false;
+        }
+    }
+    if (worker->operation_kind == MANAGER_OPERATION_NONE)
+    {
+        return MANAGER_DEFER_QUEUED;
+    }
     if (command->type == MANAGER_COMMAND_SCAN &&
             worker->active_command == MANAGER_COMMAND_AUTO)
     {
         worker->resume_auto_after_scan = true;
     }
-    if (worker->retry_pending &&
-            worker->operation_kind == MANAGER_OPERATION_CONNECT)
+    if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+            (worker->connect_resume_pending ||
+             (worker->retry_pending && worker->service_operation_id == 0U)))
     {
         worker->retry_pending = false;
-        worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+        worker->status.state = worker->suspended ? CONNECTIVITY_MANAGER_STATE_SUSPENDED :
+                               CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.ipv4_address = 0U;
         _manager_clear_candidate(worker);
         _manager_set_target_status(worker);
         _manager_complete_status_operation(
             worker, ESP_ERR_NOT_FINISHED,
             CONNECTIVITY_MANAGER_FAILURE_NONE);
-        _manager_continue_policy(worker, false);
         return MANAGER_DEFER_QUEUED;
     }
     if (worker->active_cancel_requested)
@@ -1307,6 +1324,8 @@ static esp_err_t _manager_open_session(manager_worker_t *worker)
     if (result == ESP_OK)
     {
         worker->service_operation_id = 0U;
+        worker->service_status_generation = 0U;
+        worker->service_scan_generation = 0U;
     }
     return result;
 }
@@ -1434,7 +1453,6 @@ static esp_err_t _manager_start_connect(manager_worker_t *worker,
         worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
         worker->status.last_error = ESP_OK;
         worker->status.retry_delay_ms = 0U;
-        worker->status.manual_hold = false;
         _manager_set_target_status(worker);
         _manager_cache_status(worker);
     }
@@ -1470,7 +1488,6 @@ static void _manager_handle_connected(manager_worker_t *worker,
         _manager_complete_status_operation(
             worker, ESP_ERR_NOT_FINISHED,
             CONNECTIVITY_MANAGER_FAILURE_NONE);
-        _manager_continue_policy(worker, false);
         return;
     }
     if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
@@ -1539,21 +1556,30 @@ static void _manager_handle_connected(manager_worker_t *worker,
     {
         _manager_complete_status_operation(
             worker, worker->status.last_error, worker->status.failure);
-        _manager_continue_policy(worker, false);
     }
 }
 
 static void _manager_handle_connect_terminal(manager_worker_t *worker,
         const wifi_service_status_snapshot_t *status)
 {
+    const bool succeeded = status->operation_result == ESP_OK &&
+                           status->operation_failure == WIFI_SERVICE_FAILURE_NONE;
+    if (succeeded && status->state == WIFI_SERVICE_STATE_IP_READY &&
+            status->ipv4_address != 0U)
+    {
+        _manager_handle_connected(worker, status);
+        return;
+    }
     const bool canceled = worker->active_cancel_requested &&
                           status->operation_canceled;
     const bool candidate = worker->target_candidate;
     const connectivity_manager_failure_t failure = canceled ?
-        CONNECTIVITY_MANAGER_FAILURE_NONE :
-        _manager_map_failure(status->failure);
+        CONNECTIVITY_MANAGER_FAILURE_NONE : succeeded ?
+        CONNECTIVITY_MANAGER_FAILURE_INTERNAL :
+        _manager_map_failure(status->operation_failure);
     const esp_err_t result = canceled ? ESP_ERR_NOT_FINISHED :
-                             status->last_error;
+                             succeeded ? ESP_ERR_INVALID_STATE :
+                             status->operation_result;
     worker->status.state = status->state == WIFI_SERVICE_STATE_OFFLINE ?
                            CONNECTIVITY_MANAGER_STATE_OFFLINE :
                            CONNECTIVITY_MANAGER_STATE_IDLE;
@@ -1586,7 +1612,7 @@ static void _manager_handle_connect_terminal(manager_worker_t *worker,
     {
         _manager_set_target_status(worker);
     }
-    const bool should_retry = !canceled && !candidate &&
+    const bool should_retry = !worker->active_cancel_requested && !canceled && !candidate &&
                               (_manager_failure_retryable(failure) ||
                                failure ==
                                CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE) &&
@@ -1594,10 +1620,20 @@ static void _manager_handle_connect_terminal(manager_worker_t *worker,
                               !worker->resume_auto_after_scan;
     if (should_retry)
     {
+        if (failure == CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE)
+        {
+            _manager_schedule_retry(worker);
+            _manager_complete_status_operation(worker, result, failure);
+            return;
+        }
+        worker->service_operation_id = 0U;
+        worker->status.failure = failure;
+        worker->status.last_error = result;
+        _manager_set_target_status(worker);
         _manager_schedule_retry(worker);
+        return;
     }
     _manager_complete_status_operation(worker, result, failure);
-    _manager_continue_policy(worker, false);
 }
 
 static void _manager_poll_status(manager_worker_t *worker)
@@ -1642,40 +1678,31 @@ static void _manager_poll_status(manager_worker_t *worker)
             worker->active_cancel_requested = false;
         }
     }
+    const bool matching_terminal = worker->service_operation_id != 0U &&
+                                   status.session_id == worker->session_id &&
+                                   status.operation_id == worker->service_operation_id &&
+                                   status.operation_complete;
     if (status.state == WIFI_SERVICE_STATE_IP_READY &&
-            (worker->operation_kind == MANAGER_OPERATION_NONE ||
-             (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
-              status.operation_id == worker->service_operation_id)))
+            worker->operation_kind == MANAGER_OPERATION_NONE)
     {
-        const bool active_connect =
-            worker->operation_kind == MANAGER_OPERATION_CONNECT;
         _manager_handle_connected(worker, &status);
-        if (active_connect)
-        {
-            return;
-        }
     }
     else if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
-             status.operation_id == worker->service_operation_id &&
-             ((status.state == WIFI_SERVICE_STATE_IDLE &&
-               !status.desired_connected) ||
-              status.state == WIFI_SERVICE_STATE_OFFLINE))
+             matching_terminal)
     {
         _manager_handle_connect_terminal(worker, &status);
         return;
     }
     else if (worker->operation_kind == MANAGER_OPERATION_DISCONNECT &&
-             status.operation_id == worker->service_operation_id &&
-             (status.state == WIFI_SERVICE_STATE_IDLE ||
-              status.state == WIFI_SERVICE_STATE_OFFLINE))
+             matching_terminal)
     {
         const bool canceled = worker->active_cancel_requested &&
                               status.operation_canceled;
         esp_err_t result = canceled ? ESP_ERR_NOT_FINISHED :
-                           status.last_error;
+                           status.operation_result;
         connectivity_manager_failure_t failure = canceled ?
             CONNECTIVITY_MANAGER_FAILURE_NONE :
-            _manager_map_failure(status.failure);
+            _manager_map_failure(status.operation_failure);
 
         if (result == ESP_OK &&
                 worker->active_command == MANAGER_COMMAND_FORGET)
@@ -1706,7 +1733,6 @@ static void _manager_poll_status(manager_worker_t *worker)
         worker->status.ipv4_address = 0U;
         _manager_set_target_status(worker);
         _manager_complete_status_operation(worker, result, failure);
-        _manager_continue_policy(worker, false);
         return;
     }
     else if (worker->operation_kind == MANAGER_OPERATION_NONE &&
@@ -1715,6 +1741,13 @@ static void _manager_poll_status(manager_worker_t *worker)
              status.failure != WIFI_SERVICE_FAILURE_NONE)
     {
         _manager_schedule_retry(worker);
+    }
+    else if (worker->operation_kind == MANAGER_OPERATION_SCAN &&
+             status.state == WIFI_SERVICE_STATE_IDLE &&
+             status.failure != WIFI_SERVICE_FAILURE_NONE &&
+             _manager_auto_connect_eligible(worker))
+    {
+        worker->resume_auto_after_scan = true;
     }
     _manager_set_target_status(worker);
     _manager_cache_status(worker);
@@ -1770,7 +1803,6 @@ static void _manager_poll_scan(manager_worker_t *worker)
         _manager_clear_active_operation(worker);
         _manager_cache_status(worker);
         _manager_cache_scan(worker);
-        _manager_continue_policy(worker, false);
         return;
     }
     _manager_cache_scan(worker);
@@ -1811,7 +1843,6 @@ static void _manager_command_scan(manager_worker_t *worker,
     else
     {
         _manager_publish_scan_terminal(worker, command->operation_id, result);
-        _manager_continue_policy(worker, false);
     }
 }
 
@@ -2116,25 +2147,32 @@ static void _manager_command_set_auto(manager_worker_t *worker,
     if (result == ESP_OK)
     {
         worker->profile = changed;
-        worker->retry_pending = false;
-        if (command->enabled)
+        if (!worker->target_candidate)
         {
-            worker->status.manual_hold = false;
+            worker->retry_pending = false;
         }
-        else
+        if (!command->enabled)
         {
             worker->resume_auto_after_scan = false;
             if (worker->active_command == MANAGER_COMMAND_AUTO)
             {
-                wifi_service_cancel_disposition_t disposition =
-                    WIFI_SERVICE_CANCEL_FAILURE;
-                const esp_err_t cancel_result = wifi_service_cancel(
-                                                    worker->session_id,
-                                                    worker->service_operation_id,
-                                                    &disposition);
+                if (worker->connect_resume_pending || worker->service_operation_id == 0U)
+                {
+                    worker->retry_pending = false;
+                    _manager_clear_active_operation(worker);
+                }
+                else
+                {
+                    wifi_service_cancel_disposition_t disposition =
+                        WIFI_SERVICE_CANCEL_FAILURE;
+                    const esp_err_t cancel_result = wifi_service_cancel(
+                                                        worker->session_id,
+                                                        worker->service_operation_id,
+                                                        &disposition);
 
-                worker->active_cancel_requested = cancel_result == ESP_OK &&
-                                                  disposition == WIFI_SERVICE_CANCEL_ACCEPTED;
+                    worker->active_cancel_requested = cancel_result == ESP_OK &&
+                                                      disposition == WIFI_SERVICE_CANCEL_ACCEPTED;
+                }
             }
         }
     }
@@ -2149,7 +2187,7 @@ static void _manager_command_set_auto(manager_worker_t *worker,
         if (worker->operation_kind == MANAGER_OPERATION_NONE)
         {
             _manager_set_saved_target(worker);
-            (void)_manager_start_connect(worker, 0U, MANAGER_COMMAND_AUTO);
+            worker->resume_auto_after_scan = true;
         }
         else if (worker->operation_kind == MANAGER_OPERATION_SCAN)
         {
@@ -2175,7 +2213,6 @@ static void _manager_complete_cancel_failure(manager_worker_t *worker,
         _manager_complete_status_operation(
             worker, result, CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE);
     }
-    _manager_continue_policy(worker, false);
 }
 
 static void _manager_command_cancel(manager_worker_t *worker,
@@ -2198,18 +2235,19 @@ static void _manager_command_cancel(manager_worker_t *worker,
     {
         return;
     }
-    if (worker->retry_pending &&
-            worker->operation_kind == MANAGER_OPERATION_CONNECT)
+    if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+            (worker->connect_resume_pending ||
+             (worker->retry_pending && worker->service_operation_id == 0U)))
     {
         worker->retry_pending = false;
-        worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+        worker->status.state = worker->suspended ? CONNECTIVITY_MANAGER_STATE_SUSPENDED :
+                               CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.ipv4_address = 0U;
         _manager_clear_candidate(worker);
         _manager_set_target_status(worker);
         _manager_complete_status_operation(
             worker, ESP_ERR_NOT_FINISHED,
             CONNECTIVITY_MANAGER_FAILURE_NONE);
-        _manager_continue_policy(worker, false);
         return;
     }
     if (worker->service_operation_id == 0U)
@@ -2250,50 +2288,33 @@ static void _manager_run_pending(manager_worker_t *worker)
     _manager_secure_zero(&worker->pending_command,
                          sizeof(worker->pending_command));
     worker->pending_command_valid = false;
-    switch (command.type)
-    {
-    case MANAGER_COMMAND_SCAN:
-        _manager_command_scan(worker, &command);
-        break;
-    case MANAGER_COMMAND_CONNECT:
-        _manager_command_connect(worker, &command);
-        break;
-    case MANAGER_COMMAND_SAVE_PROFILE:
-        _manager_command_save_profile(worker, &command);
-        break;
-    case MANAGER_COMMAND_RECONNECT:
-        _manager_command_reconnect(worker, &command);
-        break;
-    case MANAGER_COMMAND_DISCONNECT:
-        _manager_command_disconnect(worker, &command);
-        break;
-    case MANAGER_COMMAND_FORGET:
-        _manager_command_forget(worker, &command);
-        break;
-    default:
-        break;
-    }
+    bool stop = false;
+    _manager_process_command(worker, &command, &stop);
     _manager_secure_zero(&command, sizeof(command));
 }
 
-static void _manager_continue_policy(manager_worker_t *worker,
-                                     bool schedule_retry)
+static void _manager_continue_policy(manager_worker_t *worker)
 {
-    if (s_manager.terminal_outbox_count > 0U)
+    if (s_manager.terminal_outbox_count > 0U || worker->suspended ||
+            atomic_load_explicit(&s_manager_lifecycle, memory_order_acquire) !=
+            MANAGER_LIFECYCLE_RUNNING)
     {
         return;
     }
-    if (worker->pending_command_valid)
+    if (worker->operation_kind == MANAGER_OPERATION_NONE && worker->pending_command_valid)
     {
         _manager_run_pending(worker);
         return;
     }
-    if (worker->resume_auto_after_scan)
+    if (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+            worker->connect_resume_pending)
     {
-        if (worker->suspended)
-        {
-            return;
-        }
+        worker->connect_resume_pending = false;
+        (void)_manager_start_connect(worker, worker->operation_id, worker->active_command);
+        return;
+    }
+    if (worker->operation_kind == MANAGER_OPERATION_NONE && worker->resume_auto_after_scan)
+    {
         worker->resume_auto_after_scan = false;
         if (_manager_auto_connect_eligible(worker))
         {
@@ -2301,19 +2322,24 @@ static void _manager_continue_policy(manager_worker_t *worker,
         }
         return;
     }
-    if (schedule_retry)
+    if (worker->retry_pending &&
+            (worker->operation_kind == MANAGER_OPERATION_NONE ||
+             (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+              worker->service_operation_id == 0U)) &&
+            _manager_tick_reached(xTaskGetTickCount(), worker->retry_deadline))
     {
-        _manager_schedule_retry(worker);
+        _manager_start_due_retry(worker);
     }
 }
 
 static void _manager_start_due_retry(manager_worker_t *worker)
 {
     worker->retry_pending = false;
-    if (_manager_candidate_retry_eligible(worker))
+    if (_manager_candidate_retry_eligible(worker) ||
+            (worker->operation_kind == MANAGER_OPERATION_CONNECT &&
+             worker->operation_id != 0U && worker->service_operation_id == 0U))
     {
-        const connectivity_manager_operation_id_t operation_id =
-            worker->operation_id;
+        const connectivity_manager_operation_id_t operation_id = worker->operation_id;
         const manager_command_type_t command_type = worker->active_command;
         (void)_manager_start_connect(worker, operation_id, command_type);
     }
@@ -2367,28 +2393,39 @@ static esp_err_t _manager_worker_init(manager_worker_t *worker)
 static esp_err_t _manager_worker_suspend(manager_worker_t *worker,
         uint32_t timeout_ms)
 {
-    const bool reconnect_after_resume = !worker->retry_pending &&
-                                        _manager_auto_connect_eligible(worker);
-    if (worker->operation_kind == MANAGER_OPERATION_SCAN &&
-            reconnect_after_resume)
+    if (worker->suspended)
     {
-        worker->resume_auto_after_scan = true;
+        return ESP_OK;
     }
-    worker->resume_connect_pending = reconnect_after_resume &&
-                                     worker->operation_kind !=
-                                     MANAGER_OPERATION_SCAN;
-    worker->resume_operation_id = worker->resume_connect_pending &&
-                                  worker->operation_kind ==
-                                  MANAGER_OPERATION_CONNECT ?
-                                  worker->operation_id : 0U;
-    esp_err_t result = worker->radio_initialized ?
-                       wifi_service_suspend(timeout_ms) : ESP_OK;
-    if (result == ESP_OK)
+    _manager_poll_status(worker);
+    const bool resume_auto = !worker->retry_pending &&
+                             _manager_auto_connect_eligible(worker);
+    const esp_err_t result = worker->radio_initialized ?
+                             wifi_service_suspend(timeout_ms) : ESP_OK;
+    wifi_service_status_snapshot_t radio = { 0 };
+    const bool have_radio = worker->radio_initialized &&
+                            wifi_service_get_status(&radio) == ESP_OK;
+    if ((!worker->radio_initialized && result == ESP_OK) ||
+            (have_radio && radio.state == WIFI_SERVICE_STATE_SUSPENDED))
     {
         worker->suspended = true;
+        if (worker->operation_kind == MANAGER_OPERATION_CONNECT && !worker->retry_pending)
+        {
+            worker->connect_resume_pending = true;
+            worker->service_operation_id = 0U;
+        }
+        if (resume_auto && worker->operation_kind != MANAGER_OPERATION_CONNECT)
+        {
+            worker->resume_auto_after_scan = true;
+        }
         worker->status.state = CONNECTIVITY_MANAGER_STATE_SUSPENDED;
         worker->status.ipv4_address = 0U;
+        _manager_poll_scan(worker);
         _manager_cache_status(worker);
+    }
+    else if (have_radio && radio.state == WIFI_SERVICE_STATE_OFFLINE)
+    {
+        _manager_poll_status(worker);
     }
     return result;
 }
@@ -2396,37 +2433,22 @@ static esp_err_t _manager_worker_suspend(manager_worker_t *worker,
 static esp_err_t _manager_worker_resume(manager_worker_t *worker,
                                         uint32_t timeout_ms)
 {
-    esp_err_t result = worker->radio_initialized ?
-                       wifi_service_resume(timeout_ms) :
-                       _manager_radio_start(worker);
+    if (!worker->suspended)
+    {
+        return ESP_OK;
+    }
+    wifi_service_status_snapshot_t radio;
+    const bool suspended_radio = worker->radio_initialized &&
+                                 wifi_service_get_status(&radio) == ESP_OK &&
+                                 radio.state == WIFI_SERVICE_STATE_SUSPENDED;
+    const esp_err_t result = suspended_radio ? wifi_service_resume(timeout_ms) :
+                             _manager_radio_start(worker);
     if (result == ESP_OK)
     {
         worker->suspended = false;
         worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
         worker->status.radio_available = true;
         _manager_cache_status(worker);
-        if (worker->retry_pending &&
-                _manager_tick_reached(xTaskGetTickCount(),
-                                      worker->retry_deadline))
-        {
-            _manager_start_due_retry(worker);
-        }
-        else if (worker->resume_connect_pending)
-        {
-            worker->resume_connect_pending = false;
-            const connectivity_manager_operation_id_t operation_id =
-                worker->resume_operation_id;
-            worker->resume_operation_id = 0U;
-            const manager_command_type_t command_type = operation_id == 0U ?
-                MANAGER_COMMAND_AUTO : worker->active_command;
-            _manager_clear_active_operation(worker);
-            (void)_manager_start_connect(worker, operation_id, command_type);
-        }
-        else if (worker->operation_kind == MANAGER_OPERATION_NONE &&
-                 worker->resume_auto_after_scan)
-        {
-            _manager_continue_policy(worker, false);
-        }
     }
     return result;
 }
@@ -2436,6 +2458,8 @@ static esp_err_t _manager_worker_deinit(manager_worker_t *worker,
 {
     const manager_deadline_t deadline = _manager_deadline(timeout_ms);
     worker->retry_pending = false;
+    worker->resume_auto_after_scan = false;
+    worker->connect_resume_pending = false;
     if (worker->operation_kind != MANAGER_OPERATION_NONE)
     {
         _manager_clear_candidate(worker);
@@ -2596,6 +2620,11 @@ static void _manager_worker_run(void *argument)
             vTaskDelay(1U);
             continue;
         }
+        _manager_continue_policy(&worker);
+        if (s_manager.terminal_outbox_count > 0U)
+        {
+            continue;
+        }
         manager_command_t *queued_command = NULL;
         if (xQueueReceive(s_manager.queue, &queued_command,
                           pdMS_TO_TICKS(CONNECTIVITY_MANAGER_POLL_MS)) == pdTRUE)
@@ -2623,12 +2652,7 @@ static void _manager_worker_run(void *argument)
         {
             continue;
         }
-        if (!worker.suspended && worker.retry_pending &&
-                _manager_tick_reached(xTaskGetTickCount(),
-                                      worker.retry_deadline))
-        {
-            _manager_start_due_retry(&worker);
-        }
+        _manager_continue_policy(&worker);
     }
     _manager_secure_zero(&worker, sizeof(worker));
     vTaskSuspend(NULL);

@@ -65,228 +65,92 @@ static esp_err_t _wifi_service_worker_init_runtime(
     return result;
 }
 
-static void _wifi_service_finish_suspended_scan(
-    wifi_worker_context_t *context, esp_err_t result, bool restore_status)
-{
-    if (!context->scan_active)
-    {
-        return;
-    }
-    context->scan_active = false;
-    context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
-    context->scan.last_error = result;
-    context->scan.operation_canceled = result == ESP_OK;
-    bool publish_restored_status = false;
-    if (restore_status &&
-            context->status.state == WIFI_SERVICE_STATE_SCANNING)
-    {
-        context->status.state = context->pre_scan_state;
-        context->status.last_error = result;
-        publish_restored_status = true;
-    }
-    wifi_service_worker_complete_operation(context);
-    wifi_service_worker_publish_scan(context);
-    if (publish_restored_status)
-    {
-        wifi_service_worker_publish_status(context);
-    }
-}
-
-static void _wifi_service_recover_clear_failure(
-    wifi_worker_context_t *context, esp_err_t scan_result,
-    esp_err_t clear_result)
-{
-    if (context->scan_active && scan_result == ESP_OK)
-    {
-        esp_err_t boundary_result =
-            wifi_service_worker_restart_radio(context);
-        bool boundary_ready =
-            !wifi_service_port_scan_is_owned() &&
-            (boundary_result == ESP_OK ||
-             wifi_service_port_get_state() == WIFI_SERVICE_PORT_STATE_STARTED);
-        if (!boundary_ready)
-        {
-            wifi_service_worker_enter_cleanup_pending(
-                context, boundary_result != ESP_OK ? boundary_result :
-                ESP_ERR_INVALID_STATE);
-            _wifi_service_finish_suspended_scan(context, clear_result, false);
-            return;
-        }
-        const bool reconnect_after_completion =
-            boundary_result == ESP_OK &&
-            context->status.desired_connected && context->has_credentials;
-        _wifi_service_finish_suspended_scan(
-            context, ESP_OK, !reconnect_after_completion);
-        if (reconnect_after_completion)
-        {
-            esp_err_t reconnect_result =
-                wifi_service_worker_connect_driver(context);
-            if (reconnect_result != ESP_OK)
-            {
-                wifi_service_worker_schedule_retry(
-                    context, 0, reconnect_result,
-                    WIFI_SERVICE_FAILURE_DRIVER);
-            }
-        }
-    }
-    if (context->status.available)
-    {
-        wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
-    }
-}
-
-static esp_err_t _wifi_service_recover_stop_failure(
-    wifi_worker_context_t *context, esp_err_t scan_result,
-    esp_err_t stop_result, wifi_service_port_state_t port_state)
-{
-    esp_err_t transition_error = stop_result != ESP_OK ? stop_result :
-                                 ESP_ERR_INVALID_STATE;
-    if (port_state != WIFI_SERVICE_PORT_STATE_STARTED)
-    {
-        _wifi_service_finish_suspended_scan(context, transition_error, false);
-        wifi_service_worker_enter_cleanup_pending(context, transition_error);
-        return transition_error;
-    }
-    context->radio_ready = true;
-    const bool reconnect_after_completion = scan_result == ESP_OK &&
-                                            context->status.desired_connected &&
-                                            context->has_credentials;
-    if (scan_result == ESP_OK)
-    {
-        _wifi_service_finish_suspended_scan(
-            context, ESP_OK, !reconnect_after_completion);
-    }
-    if (reconnect_after_completion)
-    {
-        esp_err_t rollback = wifi_service_worker_connect_driver(context);
-        if (rollback != ESP_OK)
-        {
-            wifi_service_worker_schedule_retry(
-                context, 0, rollback, WIFI_SERVICE_FAILURE_DRIVER);
-        }
-    }
-    if (context->status.available)
-    {
-        wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
-    }
-    return transition_error;
-}
-
-static esp_err_t _wifi_service_worker_suspend(
-    wifi_worker_context_t *context)
+static esp_err_t _wifi_service_worker_suspend(wifi_worker_context_t *context)
 {
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     wifi_service_internal_clear_slots_locked();
     xSemaphoreGive(g_wifi_service.state_mutex);
-
-    esp_err_t scan_result = ESP_OK;
-    if (context->scan_active)
+    const bool had_scan = context->scan_active;
+    const esp_err_t scan_result = had_scan ? wifi_service_port_scan_abort() : ESP_OK;
+    const wifi_service_radio_transition_t transition =
+        wifi_service_worker_transition_radio(context, WIFI_RADIO_TARGET_STOPPED);
+    const esp_err_t result = scan_result != ESP_OK ? scan_result : transition.result;
+    if (had_scan)
     {
-        scan_result = wifi_service_port_scan_abort();
+        context->scan_active = false;
+        context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
+        context->scan.last_error = result;
+        context->scan.operation_canceled = result == ESP_OK;
+        if (context->operation_kind == WIFI_OPERATION_SCAN)
+        {
+            wifi_service_worker_release_operation(context);
+        }
+        wifi_service_worker_publish_scan(context);
     }
-    esp_err_t result = wifi_service_port_clear_credentials();
-    if (result != ESP_OK)
+    if (transition.state != WIFI_SERVICE_PORT_STATE_STOPPED ||
+            !transition.credentials_cleared || wifi_service_port_scan_is_owned())
     {
-        _wifi_service_recover_clear_failure(context, scan_result, result);
-        return result;
+        const esp_err_t error = result != ESP_OK ? result : ESP_ERR_INVALID_STATE;
+        wifi_service_worker_enter_cleanup_pending(context, error);
+        return error;
     }
-
-    result = wifi_service_port_stop();
-    context->port_epoch = wifi_service_port_get_epoch();
-    wifi_service_port_state_t port_state = wifi_service_port_get_state();
-    if (result != ESP_OK || port_state != WIFI_SERVICE_PORT_STATE_STOPPED)
-    {
-        result = _wifi_service_recover_stop_failure(
-                     context, scan_result, result, port_state);
-        return result;
-    }
-    _wifi_service_finish_suspended_scan(context,
-                                        scan_result == ESP_OK ? ESP_OK :
-                                        scan_result,
-                                        false);
     context->status.desired_connected = false;
     context->retry_pending = false;
     context->phase_deadline_pending = false;
     wifi_service_worker_wipe_secret(context);
-    if (context->operation_kind != WIFI_OPERATION_NONE)
-    {
-        wifi_service_worker_complete_operation(context);
-    }
+    wifi_service_worker_release_operation(context);
     context->radio_ready = false;
     context->suspended = true;
     context->scan_id_known = false;
     atomic_store_explicit(&g_wifi_service.event_overflow, false, memory_order_release);
-    context->retry_pending = false;
-    context->phase_deadline_pending = false;
     context->status.state = WIFI_SERVICE_STATE_SUSPENDED;
     context->status.ipv4_address = 0;
-    context->status.last_error = ESP_OK;
+    context->status.ssid[0] = '\0';
+    context->status.last_error = result;
     wifi_service_worker_set_runtime(WIFI_RUNTIME_SUSPENDED, false);
     wifi_service_worker_publish_status(context);
-    return ESP_OK;
+    return result;
 }
 
-static esp_err_t _wifi_service_worker_resume(
-    wifi_worker_context_t *context)
+static esp_err_t _wifi_service_worker_resume(wifi_worker_context_t *context)
 {
-    wifi_service_worker_cancel_stale_operation(context);
     esp_err_t result = wifi_service_port_start();
     context->port_epoch = wifi_service_port_get_epoch();
-    wifi_service_port_state_t port_state = wifi_service_port_get_state();
-    if (result != ESP_OK || port_state != WIFI_SERVICE_PORT_STATE_STARTED)
+    const wifi_service_port_state_t state = wifi_service_port_get_state();
+    if (result == ESP_OK && state != WIFI_SERVICE_PORT_STATE_STARTED)
     {
-        esp_err_t transition_error = result != ESP_OK ? result :
-                                     ESP_ERR_INVALID_STATE;
-        result = transition_error;
-        if (port_state == WIFI_SERVICE_PORT_STATE_STOPPED)
+        result = ESP_ERR_INVALID_STATE;
+    }
+    if (result != ESP_OK)
+    {
+        const wifi_service_radio_transition_t rollback =
+            wifi_service_worker_transition_radio(context, WIFI_RADIO_TARGET_STOPPED);
+        if (rollback.result == ESP_OK &&
+                rollback.state == WIFI_SERVICE_PORT_STATE_STOPPED &&
+                rollback.credentials_cleared)
         {
+            context->radio_ready = false;
+            context->suspended = true;
+            context->status.state = WIFI_SERVICE_STATE_SUSPENDED;
+            context->status.ipv4_address = 0;
+            context->status.last_error = result;
             wifi_service_worker_set_runtime(WIFI_RUNTIME_SUSPENDED, false);
+            wifi_service_worker_publish_status(context);
         }
         else
         {
             wifi_service_worker_enter_cleanup_pending(context,
-                    transition_error);
+                    rollback.result != ESP_OK ? rollback.result : ESP_ERR_INVALID_STATE);
         }
-        return transition_error;
+        return result;
     }
     context->radio_ready = true;
-    if (context->status.desired_connected && context->has_credentials)
-    {
-        result = wifi_service_worker_connect_driver(context);
-        if (result != ESP_OK)
-        {
-            esp_err_t clear_result =
-                wifi_service_port_clear_credentials();
-            esp_err_t rollback = wifi_service_port_stop();
-            context->port_epoch = wifi_service_port_get_epoch();
-            port_state = wifi_service_port_get_state();
-            if (clear_result == ESP_OK && rollback == ESP_OK &&
-                    port_state == WIFI_SERVICE_PORT_STATE_STOPPED)
-            {
-                context->radio_ready = false;
-                context->port_epoch = wifi_service_port_get_epoch();
-                wifi_service_worker_set_runtime(WIFI_RUNTIME_SUSPENDED, false);
-                context->status.state = WIFI_SERVICE_STATE_SUSPENDED;
-                context->status.last_error = result;
-                wifi_service_worker_publish_status(context);
-                return result;
-            }
-            esp_err_t rollback_error = clear_result != ESP_OK ?
-                                       clear_result :
-                                       (rollback != ESP_OK ? rollback :
-                                        ESP_ERR_INVALID_STATE);
-            wifi_service_worker_enter_cleanup_pending(context, rollback_error);
-            return rollback_error;
-        }
-    }
-    else
-    {
-        context->status.state = WIFI_SERVICE_STATE_IDLE;
-        context->status.last_error = ESP_OK;
-        wifi_service_worker_publish_status(context);
-    }
     context->suspended = false;
+    context->status.state = WIFI_SERVICE_STATE_IDLE;
+    context->status.last_error = ESP_OK;
+    context->status.failure = WIFI_SERVICE_FAILURE_NONE;
     wifi_service_worker_set_runtime(WIFI_RUNTIME_READY, true);
+    wifi_service_worker_publish_status(context);
     return ESP_OK;
 }
 
@@ -385,19 +249,11 @@ static void _wifi_service_process_control(wifi_worker_context_t *context,
             {
                 wifi_service_worker_enter_cleanup_pending(context,
                         ESP_ERR_INVALID_STATE);
-                result = _wifi_service_worker_deinit(context);
+                result = ESP_ERR_INVALID_STATE;
             }
             else
             {
                 result = _wifi_service_worker_resume(context);
-                xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
-                runtime_state = g_wifi_service.runtime_state;
-                xSemaphoreGive(g_wifi_service.state_mutex);
-                if (result != ESP_OK &&
-                        runtime_state == WIFI_RUNTIME_CLEANUP_PENDING)
-                {
-                    result = _wifi_service_worker_deinit(context);
-                }
             }
         }
         else if (runtime_state == WIFI_RUNTIME_DEINITIALIZING ||
@@ -470,26 +326,29 @@ void wifi_service_worker_run(void *argument)
             wifi_service_worker_process_item(&context, &item);
         }
 
+        if (context.operation_kind != WIFI_OPERATION_CONNECT)
+        {
+            context.retry_pending = false;
+            continue;
+        }
         if (!context.suspended && context.retry_pending &&
                 !context.scan_active &&
                 wifi_service_worker_tick_reached(xTaskGetTickCount(),
                         context.retry_deadline))
         {
-            esp_err_t result = wifi_service_worker_restart_radio(&context);
-            if (result == ESP_OK)
+            const wifi_service_radio_transition_t transition =
+                wifi_service_worker_transition_radio(&context, WIFI_RADIO_TARGET_STARTED);
+            if (transition.result != ESP_OK)
             {
-                result = wifi_service_worker_connect_driver(&context);
+                wifi_service_worker_fail_transition(&context, &transition);
             }
-            if (result != ESP_OK)
+            else
             {
-                if (context.status.available)
+                const esp_err_t result = wifi_service_worker_connect_driver(&context);
+                if (result != ESP_OK)
                 {
                     wifi_service_worker_schedule_retry(
                         &context, 0, result, WIFI_SERVICE_FAILURE_DRIVER);
-                }
-                else if (context.operation_kind == WIFI_OPERATION_CONNECT)
-                {
-                    wifi_service_worker_complete_operation(&context);
                 }
             }
         }

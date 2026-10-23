@@ -278,18 +278,33 @@ void wifi_service_worker_set_runtime(wifi_runtime_state_t state,
 void wifi_service_worker_enter_cleanup_pending(
     wifi_worker_context_t *context, esp_err_t error);
 
-/**
- * @brief Release the public operation currently owned by the worker.
- * @param context is the worker-owned runtime state.
- */
-void wifi_service_worker_complete_operation(wifi_worker_context_t *context);
+/** @brief Release shared and worker operation ownership without a terminal. */
+void wifi_service_worker_release_operation(wifi_worker_context_t *context);
 
-/**
- * @brief Restart the radio and refresh the worker's port epoch.
- * @param context is the worker-owned runtime state.
- * @return ESP_OK when restarted, otherwise an ESP-IDF error.
- */
-esp_err_t wifi_service_worker_restart_radio(wifi_worker_context_t *context);
+/** @brief Latch a CONNECT/DISCONNECT terminal, then release its ownership. */
+void wifi_service_worker_complete_operation(wifi_worker_context_t *context,
+        esp_err_t result, wifi_service_failure_t failure, bool canceled);
+
+typedef enum
+{
+    WIFI_RADIO_TARGET_STOPPED = 0,
+    WIFI_RADIO_TARGET_STARTED,
+} wifi_radio_target_t;
+
+typedef struct wifi_service_radio_transition
+{
+    esp_err_t result;
+    wifi_service_port_state_t state;
+    bool credentials_cleared;
+} wifi_service_radio_transition_t;
+
+/** @brief Stop, verify STOPPED, clear credentials, and optionally start. */
+wifi_service_radio_transition_t wifi_service_worker_transition_radio(
+    wifi_worker_context_t *context, wifi_radio_target_t target);
+
+/** @brief Publish a failed transition according to its final physical state. */
+void wifi_service_worker_fail_transition(wifi_worker_context_t *context,
+        const wifi_service_radio_transition_t *transition);
 
 /**
  * @brief Submit the worker's credential copy to the Wi-Fi port.

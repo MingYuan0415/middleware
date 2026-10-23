@@ -24,6 +24,11 @@ Wi-Fi 连接策略 owner：策略 worker 负责扫描、连接、重连、配置
 - 单例；静态分配的策略 worker、低层 Wi-Fi worker、命令队列与信号量。
 - 前台操作以 `operation_id` 世代标识；状态与扫描快照带 `generation`。
 - 连接命令在准入时深拷贝候选凭据，调用返回后可释放调用方缓冲。
+- pending 前台命令与立即执行命令共用唯一 dispatcher；SYNC_PROFILE 的候选凭据和 sync identity 采用相同深拷贝与持久化路径。
+- CONNECT/DISCONNECT 只消费匹配当前 session 和非零 radio operation ID 的显式 terminal；link IP_READY 本身不能证明候选成功。只有成功 terminal 加当前有效 IPv4 才提交候选 profile，地址续租不会重复写 profile。
+- terminal outbox 在每轮策略 phase 前排空；背压期间不消费 pending/retry/恢复意图。排空后由同一 worker 自主推进，不依赖额外驱动事件；STOPPING 不重开连接。
+- 挂起中的显式 CONNECT/SYNC 保留原 manager operation、候选与 sync 元数据；恢复仅重启 executor，由 policy phase 使用新 radio ID/epoch 续接。取消和替代在本地发布一次终态，不对已退休的 radio ID0 发 cancel。
+- retry 的绝对 deadline 跨待机保留；resume 控制失败不自动重试，也不丢弃候选。低层已实际 SUSPENDED 时，即使控制返回原 stop 错误，也保存 parked 意图供显式 resume 回滚。
 
 ## 测试边界
 

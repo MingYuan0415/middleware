@@ -668,17 +668,25 @@ esp_err_t wifi_service_port_scan_abort(void)
 esp_err_t wifi_service_port_deinit(void)
 {
     esp_err_t result = ESP_OK;
-    esp_err_t first_error = ESP_OK;
-    (void)wifi_service_port_scan_abort();
-    (void)wifi_service_port_clear_credentials();
+    esp_err_t first_error = wifi_service_port_scan_abort();
 
     if (s_state.started || s_state.wifi_handler_ready ||
             s_state.ip_handler_ready)
     {
-        esp_err_t stop_result = wifi_service_port_stop();
+        const esp_err_t stop_result = wifi_service_port_stop();
         if (stop_result != ESP_OK)
         {
-            return stop_result;
+            return first_error != ESP_OK ? first_error : stop_result;
+        }
+    }
+
+    if (s_state.wifi_initialized &&
+            wifi_service_port_get_state() == WIFI_SERVICE_PORT_STATE_STOPPED)
+    {
+        const esp_err_t clear_result = wifi_service_port_clear_credentials();
+        if (clear_result != ESP_OK)
+        {
+            return first_error != ESP_OK ? first_error : clear_result;
         }
     }
 
@@ -693,7 +701,7 @@ esp_err_t wifi_service_port_deinit(void)
         }
         else
         {
-            return result;
+            return first_error != ESP_OK ? first_error : result;
         }
     }
 
@@ -871,14 +879,17 @@ esp_err_t wifi_service_port_scan_finish(
 
 esp_err_t wifi_service_port_clear_credentials(void)
 {
-    esp_err_t result = ESP_OK;
     if (!s_state.wifi_initialized)
     {
         return ESP_OK;
     }
+    if (wifi_service_port_get_state() != WIFI_SERVICE_PORT_STATE_STOPPED)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
     wifi_config_t config;
     memset(&config, 0, sizeof(config));
-    result = esp_wifi_set_config(WIFI_IF_STA, &config);
+    esp_err_t result = esp_wifi_set_config(WIFI_IF_STA, &config);
     wifi_service_secure_zero(&config, sizeof(config));
     return result;
 }
