@@ -32,10 +32,8 @@ typedef struct ble_link_service
     void *owner_arg;
     device_link_v1_engine_t engine;
     ble_link_work_t work[BLE_LINK_SERVICE_WORK_SLOTS];
-    uint8_t tx_value[DEVICE_LINK_V1_MAX_ATT_VALUE_BYTES];
-    size_t tx_length;
-    uint32_t tx_flow_id;
-    uint32_t next_flow_id;
+    ble_link_operation_identity_t tx_identity;
+    uint32_t flow_counter;
     uint16_t att_mtu;
     bool rx_reserved;
     ble_link_work_t *rx_owner;
@@ -47,12 +45,13 @@ typedef struct ble_link_service
     uint16_t conn_handle;
     uint64_t confirmation_token;
     uint32_t passkey;
-    uint64_t next_token;
     ble_link_service_wake_fn_t wake;
     void *wake_arg;
 } ble_link_service_t;
 
 static ble_link_service_t s_service;
+/* Boot lifetime: service init/reset and ACL teardown must never reuse tokens. */
+static uint64_t s_confirmation_counter;
 static SemaphoreHandle_t s_lock;
 static StaticSemaphore_t s_lock_control;
 
@@ -91,8 +90,10 @@ static bool _ble_link_service_clear_session_state_locked(void)
     const bool confirmation_changed = s_service.confirmation_pending;
 
     device_link_v1_engine_disconnect(&s_service.engine);
+    memset(&s_service.tx_identity, 0, sizeof(s_service.tx_identity));
     s_service.connection_valid = false;
     s_service.transport_admitted = false;
+    s_service.att_mtu = DEVICE_LINK_V1_MINIMUM_ATT_MTU;
     s_service.connection_generation = 0U;
     s_service.conn_handle = 0U;
     s_service.confirmation_pending = false;
@@ -249,22 +250,51 @@ static size_t _ble_link_service_handle_admitted(
 
 static esp_err_t _ble_link_service_submit_tx(const uint8_t *value, size_t length)
 {
-    if (s_service.output == NULL || length == 0U)
+    esp_err_t result = ESP_OK;
+    const uint16_t att_mtu = s_service.att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
+                             s_service.att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
+
+    if (s_service.tx_identity.flow_id != 0U)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_service.next_flow_id == 0U)
+    if (length == 0U || length > (size_t)att_mtu - 3U)
     {
-        s_service.next_flow_id = 1U;
+        result = ESP_ERR_INVALID_SIZE;
     }
-    s_service.tx_flow_id = s_service.next_flow_id;
-    s_service.next_flow_id++;
-    if (s_service.next_flow_id == 0U)
+    else if (s_service.output == NULL || !s_service.connection_valid ||
+             s_service.flow_counter == UINT32_MAX)
     {
-        s_service.next_flow_id = 1U;
+        result = ESP_ERR_INVALID_STATE;
     }
-    return s_service.output(value, length, BLE_LINK_SERVICE_TX_SESSION, true,
-                            s_service.tx_flow_id, s_service.output_arg);
+    if (result != ESP_OK)
+    {
+        /* No external callback has run: this is still our selected engine TX. */
+        device_link_v1_engine_reject_tx(&s_service.engine);
+        return result;
+    }
+
+    const ble_link_operation_identity_t identity =
+    {
+        .generation = s_service.connection_generation,
+        .conn_handle = s_service.conn_handle,
+        .flow_id = ++s_service.flow_counter,
+        .kind = BLE_LINK_OPERATION_TX_INDICATE,
+        .token = 0U,
+    };
+
+    s_service.tx_identity = identity;
+    result = s_service.output(value, length, BLE_LINK_SERVICE_TX_SESSION, true,
+                              &identity, s_service.output_arg);
+    if (result != ESP_OK &&
+            ble_link_operation_identity_equal(&identity, &s_service.tx_identity))
+    {
+        /* Synchronous completion may already have retired this flow, or even
+         * installed another one. Never undo its confirmation or new state. */
+        device_link_v1_engine_reject_tx(&s_service.engine);
+        memset(&s_service.tx_identity, 0, sizeof(s_service.tx_identity));
+    }
+    return result;
 }
 
 static esp_err_t _ble_link_service_pump_locked(void)
@@ -273,7 +303,7 @@ static esp_err_t _ble_link_service_pump_locked(void)
     size_t length = 0U;
     device_link_v1_tx_kind_t kind;
 
-    if (s_service.rx_reserved)
+    if (s_service.rx_reserved || s_service.tx_identity.flow_id != 0U)
     {
         return ESP_OK;
     }
@@ -299,26 +329,7 @@ static esp_err_t _ble_link_service_pump_locked(void)
     {
         return ESP_OK;
     }
-    const uint16_t att_mtu = s_service.att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
-                             s_service.att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
-    const size_t max_value = (size_t)att_mtu - 3U;
-
-    if (length == 0U || length > max_value)
-    {
-        device_link_v1_engine_reject_tx(&s_service.engine);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    memcpy(s_service.tx_value, value, length);
-    s_service.tx_length = length;
-    {
-        const esp_err_t result = _ble_link_service_submit_tx(value, length);
-
-        if (result != ESP_OK)
-        {
-            device_link_v1_engine_abort_tx(&s_service.engine);
-        }
-        return result;
-    }
+    return _ble_link_service_submit_tx(value, length);
 }
 
 esp_err_t ble_link_service_set_domain_descriptors(
@@ -350,8 +361,6 @@ void ble_link_service_init(
     s_service.boot_id = boot_id;
     s_service.output = output;
     s_service.output_arg = arg;
-    s_service.next_token = 1U;
-    s_service.next_flow_id = 1U;
     s_service.att_mtu = DEVICE_LINK_V1_MINIMUM_ATT_MTU;
     device_link_v1_engine_init(&s_service.engine, &snapshot);
     _ble_link_service_unlock();
@@ -363,8 +372,6 @@ void ble_link_service_reset(void)
 
     _ble_link_service_lock();
     confirmation_changed = _ble_link_service_clear_session_state_locked();
-    s_service.tx_flow_id = 0U;
-    s_service.tx_length = 0U;
     _ble_link_service_unlock();
     if (confirmation_changed)
     {
@@ -538,20 +545,7 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
                                            route.request.request_id, false, false);
     }
     _ble_link_service_clear_reservation(work);
-    if (length == 0U)
-    {
-        device_link_v1_engine_abort_tx(&s_service.engine);
-        _ble_link_service_unlock();
-        return ESP_ERR_INVALID_SIZE;
-    }
-    memcpy(s_service.tx_value, response, length);
-    s_service.tx_length = length;
     const esp_err_t result = _ble_link_service_submit_tx(response, length);
-
-    if (result != ESP_OK)
-    {
-        device_link_v1_engine_abort_tx(&s_service.engine);
-    }
     _ble_link_service_unlock();
     return result;
 }
@@ -616,26 +610,59 @@ uint32_t ble_link_service_operation_timeout_remaining_ms(void)
     return remaining;
 }
 
-void ble_link_service_set_att_mtu(uint16_t att_mtu)
+esp_err_t ble_link_service_set_att_mtu(
+    uint32_t generation, uint16_t conn_handle, uint16_t att_mtu)
 {
+    if (generation == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     _ble_link_service_lock();
-    s_service.att_mtu = att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
-                        att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
-    _ble_link_service_unlock();
-}
-
-esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last)
-{
-    (void)is_last;
-    _ble_link_service_lock();
-    if (flow_id != s_service.tx_flow_id)
+    if (!s_service.connection_valid ||
+            generation != s_service.connection_generation ||
+            conn_handle != s_service.conn_handle)
     {
         _ble_link_service_unlock();
         return ESP_ERR_NOT_FOUND;
     }
-    device_link_v1_engine_confirm_tx(&s_service.engine);
-    s_service.tx_flow_id = 0U;
-    s_service.tx_length = 0U;
+    s_service.att_mtu = att_mtu >= DEVICE_LINK_V1_MINIMUM_ATT_MTU ?
+                        att_mtu : DEVICE_LINK_V1_MINIMUM_ATT_MTU;
+    _ble_link_service_unlock();
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_tx_completed(
+    const ble_link_operation_identity_t *identity, esp_err_t status)
+{
+    _ble_link_service_lock();
+    if (identity == NULL || identity->generation == 0U ||
+            identity->flow_id == 0U || identity->token == 0U ||
+            identity->kind != BLE_LINK_OPERATION_TX_INDICATE)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!_ble_link_service_identity_is_current(identity) ||
+            s_service.tx_identity.flow_id == 0U ||
+            identity->generation != s_service.tx_identity.generation ||
+            identity->conn_handle != s_service.tx_identity.conn_handle ||
+            identity->flow_id != s_service.tx_identity.flow_id)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (status == ESP_OK)
+    {
+        device_link_v1_engine_confirm_tx(&s_service.engine);
+    }
+    else
+    {
+        LOG_W("tx failed gen=%lu conn=%u flow=%lu status=%d",
+              (unsigned long)identity->generation, (unsigned)identity->conn_handle,
+              (unsigned long)identity->flow_id, status);
+        device_link_v1_engine_reject_tx(&s_service.engine);
+    }
+    memset(&s_service.tx_identity, 0, sizeof(s_service.tx_identity));
     _ble_link_service_unlock();
     _ble_link_service_wake();
     return ESP_OK;
@@ -661,35 +688,56 @@ void ble_link_service_abort_transactions(void)
     _ble_link_service_lock();
     device_link_v1_engine_disconnect(&s_service.engine);
     device_link_v1_engine_connect(&s_service.engine);
+    memset(&s_service.tx_identity, 0, sizeof(s_service.tx_identity));
     _ble_link_service_drop_reservation();
     _ble_link_service_unlock();
 }
 
-void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle)
+esp_err_t ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle)
 {
+    ble_link_dispatcher_facts_t facts;
     bool confirmation_changed;
 
-    _ble_link_service_lock();
-    confirmation_changed = s_service.confirmation_pending &&
-                           (!s_service.connection_valid ||
-                            generation != s_service.connection_generation ||
-                            conn_handle != s_service.conn_handle);
-    if (confirmation_changed)
+    if (generation == 0U)
     {
-        s_service.confirmation_pending = false;
-        s_service.confirmation_token = 0U;
-        s_service.passkey = 0U;
+        return ESP_ERR_INVALID_ARG;
     }
+    _ble_link_service_lock();
+    if (ble_link_session_get_facts(generation, &facts) != ESP_OK ||
+            (s_service.connection_valid &&
+             (generation < s_service.connection_generation ||
+              (generation == s_service.connection_generation &&
+               conn_handle != s_service.conn_handle))))
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (s_service.connection_valid &&
+            generation == s_service.connection_generation &&
+            conn_handle == s_service.conn_handle)
+    {
+        _ble_link_service_unlock();
+        return ESP_OK;
+    }
+    confirmation_changed = s_service.confirmation_pending;
+    s_service.confirmation_pending = false;
+    s_service.confirmation_token = 0U;
+    s_service.passkey = 0U;
+    device_link_v1_engine_disconnect(&s_service.engine);
+    memset(&s_service.tx_identity, 0, sizeof(s_service.tx_identity));
+    _ble_link_service_drop_reservation();
     s_service.connection_generation = generation;
     s_service.conn_handle = conn_handle;
-    s_service.connection_valid = generation != 0U;
+    s_service.connection_valid = true;
     s_service.transport_admitted = false;
+    s_service.att_mtu = DEVICE_LINK_V1_MINIMUM_ATT_MTU;
     device_link_v1_engine_connect(&s_service.engine);
     _ble_link_service_unlock();
     if (confirmation_changed)
     {
         _ble_link_service_wake();
     }
+    return ESP_OK;
 }
 
 void ble_link_service_set_transport_admitted(
@@ -738,20 +786,6 @@ esp_err_t ble_link_service_clear_session_state_if_current(
     return ESP_OK;
 }
 
-esp_err_t ble_link_service_abort_tx_if_current(
-    const ble_link_operation_identity_t *identity)
-{
-    _ble_link_service_lock();
-    if (!_ble_link_service_identity_is_current(identity))
-    {
-        _ble_link_service_unlock();
-        return ESP_ERR_NOT_FOUND;
-    }
-    device_link_v1_engine_abort_tx(&s_service.engine);
-    _ble_link_service_drop_reservation();
-    _ble_link_service_unlock();
-    return ESP_OK;
-}
 
 esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept)
 {
@@ -783,24 +817,68 @@ ble_link_confirmation_snapshot_t ble_link_service_get_confirmation(void)
     return snapshot;
 }
 
-esp_err_t ble_link_service_offer_numeric_comparison(
-    uint32_t passkey, uint64_t *out_token)
+esp_err_t ble_link_service_allocate_confirmation_token(uint64_t *out_token)
 {
     if (out_token == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    *out_token = 0U;
     _ble_link_service_lock();
+    if (!s_service.initialized || s_confirmation_counter == UINT64_MAX)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_token = ++s_confirmation_counter;
+    _ble_link_service_unlock();
+    return ESP_OK;
+}
+
+esp_err_t ble_link_service_publish_numeric_comparison(uint32_t passkey,
+        uint64_t token)
+{
+    if (token == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    _ble_link_service_lock();
+    if (!s_service.initialized)
+    {
+        _ble_link_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     s_service.passkey = passkey;
     s_service.confirmation_pending = true;
-    if (s_service.next_token == 0U)
-    {
-        s_service.next_token = 1U;
-    }
-    s_service.confirmation_token = s_service.next_token;
-    ++s_service.next_token;
-    *out_token = s_service.confirmation_token;
+    s_service.confirmation_token = token;
     _ble_link_service_unlock();
     _ble_link_service_wake();
     return ESP_OK;
 }
+
+#ifdef UNIT_TEST_HOST
+void ble_link_service_test_set_flow_counter(uint32_t value)
+{
+    _ble_link_service_lock();
+    s_service.flow_counter = value;
+    _ble_link_service_unlock();
+}
+
+void ble_link_service_test_set_confirmation_counter(uint64_t value)
+{
+    _ble_link_service_lock();
+    s_confirmation_counter = value;
+    _ble_link_service_unlock();
+}
+
+bool ble_link_service_test_operation_present(uint32_t operation_id)
+{
+    device_link_v1_operation_record_t record;
+    _ble_link_service_lock();
+    const bool present = device_link_v1_engine_get_operation(
+                             &s_service.engine, &record) == DEVICE_LINK_V1_STATUS_OK &&
+                         record.operation_id == operation_id;
+    _ble_link_service_unlock();
+    return present;
+}
+#endif

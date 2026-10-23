@@ -30,8 +30,8 @@ typedef enum
 
 typedef esp_err_t (*ble_link_service_output_t)(
     const uint8_t *value, size_t len,
-    ble_link_service_tx_channel_t channel, bool is_last, uint32_t flow_id,
-    void *arg);
+    ble_link_service_tx_channel_t channel, bool is_last,
+    const ble_link_operation_identity_t *identity, void *arg);
 
 typedef struct ble_link_service_facts
 {
@@ -124,12 +124,21 @@ void ble_link_service_tick(uint32_t now_ms);
 uint32_t ble_link_service_operation_timeout_remaining_ms(void);
 
 /**
- * @brief Record the negotiated ATT MTU used to size indications.
+ * @brief Record negotiated ATT MTU for the current connection only.
  *
- * @param[in] att_mtu Negotiated ATT MTU, clamped to at least 23.
+ * Zero generation is INVALID_ARG; a retired connection is NOT_FOUND.
+ * The MTU is clamped to at least 23.
  */
-void ble_link_service_set_att_mtu(uint16_t att_mtu);
-esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
+esp_err_t ble_link_service_set_att_mtu(
+    uint32_t generation, uint16_t conn_handle, uint16_t att_mtu);
+/**
+ * @brief Retire one scheduler-qualified indication, waking the owner once.
+ *
+ * The scheduler owns token validation. The service matches the connection and
+ * flow; malformed identities fail with INVALID_ARG and stale ones with NOT_FOUND.
+ */
+esp_err_t ble_link_service_tx_completed(
+    const ble_link_operation_identity_t *identity, esp_err_t status);
 
 /**
  * @brief True while a Write is reserved or a `server_tx` indication is
@@ -140,11 +149,15 @@ esp_err_t ble_link_service_response_completed(uint32_t flow_id, bool is_last);
 bool ble_link_service_write_blocked(void);
 bool ble_link_service_response_in_flight(void);
 void ble_link_service_abort_transactions(void);
-void ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle);
+/**
+ * @brief Install an active session ACL, preserving duplicate connection state.
+ *
+ * Zero generation is INVALID_ARG; inactive or older ACLs are NOT_FOUND.
+ * This fence does not require encryption or a committed bond.
+ */
+esp_err_t ble_link_service_on_connect(uint32_t generation, uint16_t conn_handle);
 void ble_link_service_clear_session_state(void);
 esp_err_t ble_link_service_clear_session_state_if_current(
-    const ble_link_operation_identity_t *identity);
-esp_err_t ble_link_service_abort_tx_if_current(
     const ble_link_operation_identity_t *identity);
 
 esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept);
@@ -152,8 +165,17 @@ esp_err_t ble_link_service_confirm_binding(uint64_t token, bool accept);
 /** @brief Return the current confirmation tuple from one locked read. */
 ble_link_confirmation_snapshot_t ble_link_service_get_confirmation(void);
 
-esp_err_t ble_link_service_offer_numeric_comparison(
-    uint32_t passkey, uint64_t *out_token);
+/** @brief Allocate a boot-unique token without publishing or waking the owner.
+ * @return ESP_ERR_INVALID_ARG for NULL; ESP_ERR_INVALID_STATE if uninitialized
+ * or exhausted (with output zero); otherwise ESP_OK.
+ */
+esp_err_t ble_link_service_allocate_confirmation_token(uint64_t *out_token);
+
+/** @brief Publish an already-installed host offer and wake the product owner.
+ * @return ESP_ERR_INVALID_ARG for zero token; ESP_ERR_INVALID_STATE before init.
+ */
+esp_err_t ble_link_service_publish_numeric_comparison(uint32_t passkey,
+        uint64_t token);
 
 
 #ifdef __cplusplus

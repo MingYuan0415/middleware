@@ -845,7 +845,6 @@ static void _device_link_service_clear_link_session(void)
 {
     ble_nimble_port_numeric_comparison_cancel();
     ble_link_service_clear_session_state();
-    device_link_wifi_adapter_clear_pending();
 }
 
 static esp_err_t _device_link_service_close_window_locked(void)
@@ -924,7 +923,6 @@ static esp_err_t _device_link_service_close_window_locked(void)
             (void)ble_link_service_clear_session_state_if_current(&identity);
         }
         ble_nimble_port_numeric_comparison_cancel();
-        device_link_wifi_adapter_clear_pending();
     }
     if (result == ESP_OK)
     {
@@ -941,7 +939,6 @@ static void _device_link_service_ble_event(
 {
     (void)arg;
     bool state_changed = false;
-    bool retire_wifi_operation = false;
 
     if (event->type != BLE_PORT_EVENT_CONNECT &&
             event->type != BLE_PORT_EVENT_DISCONNECT &&
@@ -984,7 +981,6 @@ static void _device_link_service_ble_event(
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
         state_changed = true;
-        retire_wifi_operation = true;
     }
     else if (event->type == BLE_PORT_EVENT_RESET)
     {
@@ -992,7 +988,6 @@ static void _device_link_service_ble_event(
         s_service.client_conn_handle = 0U;
         s_service.client_generation = 0U;
         state_changed = true;
-        retire_wifi_operation = true;
     }
     if (state_changed)
     {
@@ -1009,10 +1004,6 @@ static void _device_link_service_ble_event(
         s_service.status_dirty = true;
     }
     xSemaphoreGive(s_service.mutex);
-    if (retire_wifi_operation)
-    {
-        device_link_wifi_adapter_clear_pending();
-    }
     if (state_changed)
     {
         _device_link_service_wake_worker(NULL);
@@ -1260,15 +1251,9 @@ static void _device_link_service_handle_command(
             break;
         }
         xSemaphoreGive(s_service.mutex);
-        esp_err_t confirm_result =
+        const esp_err_t confirm_result =
             ble_nimble_port_numeric_comparison_reply(
                 command->confirmation_token, command->accept_binding);
-        if (confirm_result == ESP_OK)
-        {
-            confirm_result = ble_link_service_confirm_binding(
-                                 command->confirmation_token,
-                                 command->accept_binding);
-        }
         xSemaphoreTake(s_service.mutex, portMAX_DELAY);
         s_service.snapshot.last_error = confirm_result;
         _device_link_service_refresh_snapshot_locked();
@@ -1397,22 +1382,25 @@ static void _device_link_service_worker_tick(void)
     device_link_service_snapshot_t snapshot;
 
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
+    const bool owner_ready = s_service.status_publish_ready &&
+                             _device_link_service_lifecycle() == DEVICE_LINK_SERVICE_LIFECYCLE_RUNNING;
     const bool runtime_ready = s_service.runtime_started &&
-                               s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE &&
-                               s_service.status_publish_ready;
+                               s_service.stop_phase == DEVICE_LINK_SERVICE_STOP_NONE;
     xSemaphoreGive(s_service.mutex);
+    if (!owner_ready)
+    {
+        return;
+    }
+    device_link_wifi_adapter_tick();
+    ble_link_service_tick((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
     if (!runtime_ready)
     {
         return;
     }
 
-    /* TX confirmations only mark the response stream from the transport
-     * callback. Continue it from this owner task so no GATT submit is
-     * re-entered from NimBLE's completion stack. */
+    /* Transport work requires a live radio; backend results and their original
+     * logical deadlines remain owned while Bluetooth is disabled. */
     (void)ble_link_service_pump_tx();
-    device_link_wifi_adapter_tick();
-    ble_link_service_tick(
-        (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
     xSemaphoreTake(s_service.mutex, portMAX_DELAY);
     publish = s_service.status_dirty ||
               s_service.snapshot.state != _device_link_service_derive_state(

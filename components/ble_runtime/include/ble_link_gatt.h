@@ -77,8 +77,12 @@ void ble_link_gatt_update_handles(void);
  *
  * @param[in] generation New connection generation.
  * @param[in] conn_handle New connection handle.
+ * @param[in] peer_addr_type Normalized peer identity address type.
+ * @param[in] peer_addr Required six-byte peer identity address.
+ * @return ESP_OK (including duplicate current ACL), ESP_ERR_INVALID_ARG,
+ * or ESP_ERR_NOT_FOUND for inactive/stale ACL.
  */
-void ble_link_gatt_set_connection(
+esp_err_t ble_link_gatt_set_connection(
     uint32_t generation, uint16_t conn_handle,
     uint8_t peer_addr_type, const uint8_t peer_addr[6]);
 
@@ -102,8 +106,12 @@ esp_err_t ble_link_gatt_update_identity(
  * @brief Update the negotiated ATT MTU.
  *
  * @param[in] mtu Negotiated ATT MTU, at least 23.
+ * @param[in] generation Current connection generation.
+ * @param[in] conn_handle Current connection handle.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_NOT_FOUND for stale ACL.
  */
-void ble_link_gatt_set_att_mtu(uint16_t mtu);
+esp_err_t ble_link_gatt_set_att_mtu(
+    uint32_t generation, uint16_t conn_handle, uint16_t mtu);
 
 /**
  * @brief Read the current ATT MTU.

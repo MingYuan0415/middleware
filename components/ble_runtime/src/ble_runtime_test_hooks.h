@@ -21,6 +21,13 @@
     /** @brief Setter for exercising scheduler-token exhaustion. */
     void ble_tx_scheduler_test_set_token(uint32_t value);
 
+    /** @brief Setter for exercising service flow exhaustion. */
+    void ble_link_service_test_set_flow_counter(uint32_t value);
+
+    /** @brief Setter for exercising boot confirmation-token exhaustion. */
+    void ble_link_service_test_set_confirmation_counter(uint64_t value);
+    bool ble_link_service_test_operation_present(uint32_t operation_id);
+
 #endif /* UNIT_TEST_HOST */
 
 #endif /* __BLE_RUNTIME_TEST_HOOKS_H__ */

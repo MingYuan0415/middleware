@@ -281,7 +281,7 @@ static void _test_scan_payload_correlation(void)
     _ack_ok(&engine, 7U);
 }
 
-static void _test_abort_tx_keeps_record(void)
+static void _test_reject_response_keeps_record(void)
 {
     device_link_v1_engine_t engine;
     const device_link_v1_snapshot_t idle = _idle();
@@ -293,7 +293,7 @@ static void _test_abort_tx_keeps_record(void)
                &operation_id) == DEVICE_LINK_V1_STATUS_ACCEPTED);
     device_link_v1_engine_arm_response(&engine, 1U, true, false);
     assert(device_link_v1_engine_write_blocked(&engine));
-    device_link_v1_engine_abort_tx(&engine);
+    device_link_v1_engine_reject_tx(&engine);
     assert(!device_link_v1_engine_write_blocked(&engine));
     assert(device_link_v1_engine_slot_occupied(&engine));
     assert(engine.connected);
@@ -500,6 +500,38 @@ static void _test_reject_tx_drops_ordinary_and_omits_terminal(void)
     _ack_ok(&engine, 36U);
 }
 
+static void _test_pending_state_survives_selected_completion(void)
+{
+    for (unsigned reject = 0U; reject < 2U; ++reject)
+    {
+        device_link_v1_engine_t engine;
+        const device_link_v1_snapshot_t idle = _idle();
+        device_link_v1_snapshot_t state = _home_connected();
+        _boot(&engine, &idle);
+        device_link_v1_engine_arm_response(&engine, 1U, false, false);
+        assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
+        device_link_v1_engine_confirm_tx(&engine);
+        device_link_v1_engine_observe_snapshot(&engine, &state);
+        assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_ORDINARY_STATUS);
+        assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
+        state.state = DEVICE_LINK_V1_WIFI_CONNECTING;
+        device_link_v1_engine_observe_snapshot(&engine, &state);
+        device_link_v1_engine_observe_snapshot(&engine, &idle);
+        if (reject)
+        {
+            device_link_v1_engine_reject_tx(&engine);
+        }
+        else
+        {
+            device_link_v1_engine_confirm_tx(&engine);
+        }
+        assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_ORDINARY_STATUS);
+        assert(engine.ordinary_snapshot.state == DEVICE_LINK_V1_WIFI_IDLE);
+        device_link_v1_engine_confirm_tx(&engine);
+        assert(device_link_v1_engine_next_tx(&engine) == DEVICE_LINK_V1_TX_NONE);
+    }
+}
+
 int main(void)
 {
     _test_connected_terminal_and_ack_order();
@@ -509,7 +541,7 @@ int main(void)
     _test_ordinary_coalesce_and_id_exhaustion();
     _test_scan_payload_correlation();
     _test_connect_authentication();
-    _test_abort_tx_keeps_record();
+    _test_reject_response_keeps_record();
     _test_scan_rebuilds_unchanged_snapshot();
     _test_set_credentials_keeps_prior_failure();
     _test_set_credentials_uses_admitted_ssid();
@@ -518,5 +550,6 @@ int main(void)
     _test_tick_completes_timeout();
     _test_init_disconnected();
     _test_reject_tx_drops_ordinary_and_omits_terminal();
+    _test_pending_state_survives_selected_completion();
     return 0;
 }

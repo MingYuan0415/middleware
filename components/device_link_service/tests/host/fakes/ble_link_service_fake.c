@@ -13,6 +13,8 @@ static device_link_v1_wifi_failure_t s_last_failure;
 static unsigned s_observe_count;
 static device_link_v1_snapshot_t s_last_snapshot;
 static esp_err_t s_complete_result = ESP_OK;
+static uint8_t s_last_network_count;
+static device_link_v1_network_t s_last_networks[DEVICE_LINK_V1_MAX_SCAN_NETWORKS];
 
 void ble_link_service_fake_reset(void)
 {
@@ -24,6 +26,8 @@ void ble_link_service_fake_reset(void)
     s_observe_count = 0U;
     memset(&s_last_snapshot, 0, sizeof(s_last_snapshot));
     s_complete_result = ESP_OK;
+    s_last_network_count = 0U;
+    memset(s_last_networks, 0, sizeof(s_last_networks));
 }
 
 void ble_link_service_fake_set_complete_result(esp_err_t result)
@@ -56,6 +60,16 @@ const device_link_v1_snapshot_t *ble_link_service_fake_last_snapshot(void)
     return &s_last_snapshot;
 }
 
+uint8_t ble_link_service_fake_last_network_count(void)
+{
+    return s_last_network_count;
+}
+
+const device_link_v1_network_t *ble_link_service_fake_last_networks(void)
+{
+    return s_last_networks;
+}
+
 void ble_link_service_set_v1_ops(const ble_link_v1_owner_ops_t *ops, void *arg)
 {
     if (ops == NULL)
@@ -82,8 +96,11 @@ esp_err_t ble_link_service_complete_operation(
     const device_link_v1_network_t *networks, uint8_t count,
     const device_link_v1_snapshot_t *snapshot)
 {
-    (void)networks;
-    (void)count;
+    s_last_network_count = count;
+    if (count > 0U)
+    {
+        memcpy(s_last_networks, networks, (size_t)count * sizeof(networks[0]));
+    }
     s_complete_count++;
     s_last_complete_id = operation_id;
     s_last_failure = failure;

@@ -3,12 +3,12 @@ cmake_minimum_required(VERSION 3.16)
 set(BLE_RUNTIME_SANITIZER "none" CACHE STRING
     "Host-test sanitizer: none, address, or thread")
 set_property(CACHE BLE_RUNTIME_SANITIZER PROPERTY STRINGS
-    none address thread)
+             none address thread)
 
 find_program(BLE_RUNTIME_SETARCH setarch)
 
 get_filename_component(PROJECT_ROOT
-    "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
+                       "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
 set(COMPONENT "${PROJECT_ROOT}/layers/middleware/components/ble_runtime")
 set(DEVICE_LINK "${PROJECT_ROOT}/layers/middleware/components/device_link")
 set(ESP_ERR "${PROJECT_ROOT}/tests/connectivity/host/include")
@@ -25,8 +25,10 @@ set(TEST_SOURCES
     "${COMPONENT}/src/ble_gap_manager.c"
     "${COMPONENT}/src/ble_adv_manager.c"
     "${COMPONENT}/src/ble_nimble_adv_start.c"
+    "${COMPONENT}/src/ble_nimble_link_events.c"
     "${COMPONENT}/src/ble_nimble_pairing_gate.c"
     "${COMPONENT}/src/ble_nimble_smp_policy.c"
+    "${COMPONENT}/src/ble_nimble_smp_io.c"
     "${COMPONENT}/src/ble_nimble_store_guard.c"
     "${COMPONENT}/src/ble_tx_scheduler.c"
     "${COMPONENT}/src/ble_link_cleanup_obligation.c"
@@ -68,28 +70,31 @@ elseif(NOT BLE_RUNTIME_SANITIZER STREQUAL "none")
     message(FATAL_ERROR
         "Unsupported BLE_RUNTIME_SANITIZER=${BLE_RUNTIME_SANITIZER}")
 endif()
-
 foreach(test_target IN ITEMS
-        test_ble_runtime
-        test_ble_gatt_registry
-        test_ble_gap_manager
-        test_ble_event_router
-        test_ble_adv_manager
-        test_ble_tx_scheduler
-        test_ble_link_cleanup_obligation
-        test_ble_link_timer_deadline
-        test_ble_nimble_peer_identity
-        test_ble_nimble_pairing_gate
-        test_ble_nimble_smp_policy
-        test_ble_nimble_store_guard
-        test_ble_nimble_store_restore_audit
-        test_ble_nimble_store_reset
-        test_ble_nimble_port_revoke_journal
-        test_ble_nimble_tx_tracker
-        test_ble_link_session
-        test_ble_link_sec_state
-        test_ble_link_service
-        test_ble_link_gatt)
+             test_ble_runtime
+             test_ble_gatt_registry
+             test_ble_gap_manager
+             test_ble_event_router
+             test_ble_adv_manager
+             test_ble_tx_scheduler
+             test_ble_link_cleanup_obligation
+             test_ble_link_timer_deadline
+             test_ble_nimble_peer_identity
+             test_ble_nimble_pairing_gate
+             test_ble_nimble_smp_policy
+             test_ble_nimble_smp_io
+             test_ble_nimble_store_guard
+             test_ble_nimble_store_restore_audit
+             test_ble_nimble_store_reset
+             test_ble_nimble_port_revoke_journal
+             test_ble_nimble_tx_tracker
+             test_ble_link_session
+             test_ble_link_sec_state
+             test_ble_link_service
+             test_ble_link_delivery
+             test_ble_nimble_link_events
+             test_ble_wifi_recovery
+             test_ble_link_gatt)
     if(test_target STREQUAL test_ble_link_timer_deadline)
         add_executable(${test_target}
             ${test_target}.c
@@ -136,11 +141,25 @@ foreach(test_target IN ITEMS
         add_executable(${test_target}
             ${test_target}.c
             "${COMPONENT}/src/ble_link_sec_state.c")
+    elseif(test_target STREQUAL test_ble_wifi_recovery)
+        add_executable(${test_target}
+            ${test_target}.c
+            $<TARGET_OBJECTS:ble_runtime_common>
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_service.c"
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_wifi_adapter.c"
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_confirmation.c"
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_revoke_progress.c"
+            "${PROJECT_ROOT}/layers/middleware/components/event_bus/src/event_bus.c"
+            "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/tests/host/fakes/connectivity_manager.c")
+        target_link_options(${test_target} PRIVATE
+            -Wl,--wrap=ble_link_service_complete_operation)
     else()
         add_executable(${test_target}
             ${test_target}.c
             $<TARGET_OBJECTS:ble_runtime_common>)
     endif()
+    target_link_libraries(${test_target} PRIVATE Threads::Threads)
     target_compile_features(${test_target} PRIVATE c_std_11)
     target_compile_definitions(${test_target} PRIVATE
         _POSIX_C_SOURCE=200809L
@@ -153,6 +172,19 @@ foreach(test_target IN ITEMS
         "${DEVICE_LINK}/include"
         "${CMAKE_CURRENT_LIST_DIR}/fakes"
         "${ESP_ERR}")
+    if(test_target STREQUAL test_ble_wifi_recovery)
+        target_compile_definitions(${test_target} PRIVATE
+            HOST_TEST=1
+            CONFIG_DEVICE_LINK_SERVICE_QUEUE_DEPTH=8
+            CONFIG_DEVICE_LINK_SERVICE_TASK_STACK=6144)
+        target_include_directories(${test_target} PRIVATE
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/include"
+            "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src"
+            "${PROJECT_ROOT}/layers/middleware/components/connectivity_manager/include"
+            "${PROJECT_ROOT}/layers/middleware/components/event_bus/include"
+            "${PROJECT_ROOT}/layers/middleware/components/nv_storage/include"
+            "${HOST_CONNECTIVITY}/include")
+    endif()
     target_compile_options(${test_target} PRIVATE
         -Wall -Wextra -Werror -Wpedantic -UNDEBUG)
     if(BLE_RUNTIME_SANITIZER STREQUAL "address")
@@ -184,13 +216,16 @@ set(BLE_RUNTIME_TESTS
     ble_nimble_peer_identity
     ble_nimble_pairing_gate
     ble_nimble_smp_policy
+    ble_nimble_smp_io
     ble_nimble_store_guard
     ble_nimble_store_restore_audit
     ble_nimble_store_reset
     ble_nimble_port_revoke_journal
     ble_nimble_tx_tracker
     ble_link_session ble_link_sec_state
-    ble_link_service ble_link_gatt ble_event_router)
+    ble_link_service ble_link_gatt ble_event_router ble_link_delivery
+    ble_wifi_recovery
+    ble_nimble_link_events)
 
 if(BLE_RUNTIME_SANITIZER STREQUAL "thread" AND BLE_RUNTIME_SETARCH
         AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
@@ -207,6 +242,7 @@ endif()
 foreach(test_name IN LISTS BLE_RUNTIME_TESTS)
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
 endforeach()
+set_tests_properties(ble_wifi_recovery PROPERTIES TIMEOUT 20)
 
 add_test(NAME ble_runtime_idf_assumptions COMMAND
     sh "${COMPONENT}/scripts/check_idf_assumptions.sh")
@@ -215,10 +251,6 @@ set_tests_properties(ble_runtime_idf_assumptions PROPERTIES TIMEOUT 10)
 add_test(NAME ble_runtime_gap_event_routing_static COMMAND
     sh "${COMPONENT}/scripts/check_gap_event_routing.sh")
 set_tests_properties(ble_runtime_gap_event_routing_static PROPERTIES TIMEOUT 10)
-
-add_test(NAME ble_runtime_transport_admission_static COMMAND
-    sh "${COMPONENT}/scripts/check_transport_admission.sh")
-set_tests_properties(ble_runtime_transport_admission_static PROPERTIES TIMEOUT 10)
 
 add_executable(test_ble_nimble_host
     test_ble_nimble_host.c

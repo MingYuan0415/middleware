@@ -307,9 +307,7 @@ bool ble_nimble_port_cleanup_pending(void)
 void ble_nimble_port_numeric_comparison_cancel(void) {}
 esp_err_t ble_nimble_port_numeric_comparison_reply(uint64_t token, bool accept)
 {
-    (void)token;
-    (void)accept;
-    return ESP_OK;
+    return ble_link_service_confirm_binding(token, accept);
 }
 esp_err_t ble_nimble_port_request_disconnect(void)
 {
@@ -346,4 +344,3 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
 }
 void device_link_wifi_adapter_bridge_stop(void) {}
 void device_link_wifi_adapter_tick(void) {}
-void device_link_wifi_adapter_clear_pending(void) {}

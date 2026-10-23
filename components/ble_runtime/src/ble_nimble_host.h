@@ -17,6 +17,7 @@ typedef struct ble_nimble_host
     struct ble_npl_event pairing_gate_event;
     struct ble_npl_event terminate_event;
     struct ble_npl_event cleanup_drain_event;
+    struct ble_npl_event smp_io_event;
     atomic_uintptr_t task;
     TaskHandle_t host_task;
     SemaphoreHandle_t exited;
@@ -34,11 +35,13 @@ typedef struct ble_nimble_host
  * @param pairing Pairing gate event callback.
  * @param terminate Connection termination event callback.
  * @param cleanup Cleanup drain event callback.
+ * @param smp_io Numeric Comparison reply/cancel dispatch callback.
  */
 void ble_nimble_host_init_events(ble_nimble_host_t *host,
                                  ble_npl_event_fn *pairing,
                                  ble_npl_event_fn *terminate,
-                                 ble_npl_event_fn *cleanup);
+                                 ble_npl_event_fn *cleanup,
+                                 ble_npl_event_fn *smp_io);
 /**
  * @brief Create the host task, reporting allocation failure to the owner.
  * @param host Runtime-owned lifecycle state with initialized events.

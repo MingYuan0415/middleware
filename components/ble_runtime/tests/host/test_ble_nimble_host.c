@@ -90,8 +90,8 @@ static void _event(struct ble_npl_event *event)
 }
 static void _init(ble_nimble_host_t *host)
 {
-    ble_nimble_host_init_events(host, _event, _event, _event);
-    assert(atomic_load(&s_blocks) == 3U);
+    ble_nimble_host_init_events(host, _event, _event, _event, _event);
+    assert(atomic_load(&s_blocks) == 4U);
     assert(ble_nimble_host_start(host, 4096U, 0) == ESP_OK);
 }
 static void _release(ble_nimble_host_t *host)
@@ -111,11 +111,11 @@ static void test_restart_and_partial_init(void)
         assert(ble_nimble_host_stop(&host, 1000U, 0) == ESP_OK);
         _release(&host);
     }
-    ble_nimble_host_init_events(&host, _event, _event, _event);
+    ble_nimble_host_init_events(&host, _event, _event, _event, _event);
     _release(&host); /* Failure before host creation still balances events. */
 
-    ble_nimble_host_init_events(&host, _event, _event, _event);
     host_freertos_fail_next_task_creates(1U);
+    ble_nimble_host_init_events(&host, _event, _event, _event, _event);
     assert(ble_nimble_host_start(&host, 4096U, 0) == ESP_ERR_NO_MEM);
     assert(!host.started);
     _release(&host);

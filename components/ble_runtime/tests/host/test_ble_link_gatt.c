@@ -89,6 +89,10 @@ static void _reset(void)
     s_config.tx_queue_depth = 32U;
     TEST_ASSERT_EQUAL(ESP_OK, ble_tx_scheduler_init(&s_scheduler_config));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_init(&s_config));
+    const uint8_t addr[6] = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          GEN, BLE_LINK_SESSION_EVENT_ACL_CONNECTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_connection(GEN, 7U, 0U, addr));
 }
 
 static void test_registers_two_characteristics(void)
@@ -125,10 +129,10 @@ static void test_att_mtu_clamps_to_profile(void)
     uint32_t mtu = 0U;
 
     _reset();
-    ble_link_gatt_set_att_mtu(23U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_att_mtu(GEN, 7U, 23U));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&mtu));
     TEST_ASSERT_EQUAL(23U, mtu);
-    ble_link_gatt_set_att_mtu(1024U);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_att_mtu(GEN, 7U, 1024U));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&mtu));
     TEST_ASSERT_EQUAL(BLE_LINK_GATT_ATT_MTU_MAX, mtu);
 }
@@ -139,7 +143,16 @@ static void test_connection_updates_generation(void)
 
     _reset();
     ble_link_session_init(BOOT_ID);
-    ble_link_gatt_set_connection(2U, 9U, 1U, addr);
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_session_handle_event(
+                          2U, BLE_LINK_SESSION_EVENT_ACL_CONNECTED));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_connection(2U, 9U, 1U, addr));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_att_mtu(2U, 9U, 498U));
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_set_connection(2U, 9U, 1U, addr));
+    uint32_t mtu = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_get_att_mtu(&mtu));
+    TEST_ASSERT_EQUAL(498U, mtu);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, ble_link_gatt_set_att_mtu(1U, 9U, 23U));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, ble_link_gatt_set_connection(1U, 9U, 1U, addr));
     TEST_ASSERT_EQUAL(ESP_OK, ble_link_gatt_update_identity(
                           2U, 9U, 1U, addr));
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, ble_link_gatt_update_identity(

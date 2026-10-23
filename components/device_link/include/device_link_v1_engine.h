@@ -124,8 +124,8 @@ uint32_t device_link_v1_engine_deadline_remaining_ms(
 /**
  * @brief Drop the in-flight indication as undeliverable.
  *
- * Ordinary events are discarded. A terminal event is omitted; the record
- * remains for GET_OPERATION. A response is aborted without confirm.
+ * Selected ordinary events are discarded, newer pending state is retained.
+ * A terminal is omitted but retained for GET_OPERATION; responses are not confirmed.
  */
 void device_link_v1_engine_reject_tx(device_link_v1_engine_t *engine);
 
@@ -139,19 +139,13 @@ void device_link_v1_engine_arm_response(
     device_link_v1_engine_t *engine, uint8_t request_id,
     bool accepted, bool ack);
 
-/** @brief Return the next indication that may be submitted. */
+/** @brief Claim a new indication, or NONE while another TX is in flight. */
 device_link_v1_tx_kind_t device_link_v1_engine_next_tx(
     device_link_v1_engine_t *engine);
 
 /** @brief Confirm the in-flight indication. */
 void device_link_v1_engine_confirm_tx(device_link_v1_engine_t *engine);
 
-/**
- * @brief Drop the in-flight indication without applying confirm side effects.
- *
- * Keeps the slot and connection so the client can recover with GET_OPERATION.
- */
-void device_link_v1_engine_abort_tx(device_link_v1_engine_t *engine);
 
 /** @brief Apply BLE disconnect: keep the record, drop unconfirmed TX. */
 void device_link_v1_engine_disconnect(device_link_v1_engine_t *engine);

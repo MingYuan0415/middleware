@@ -33,9 +33,12 @@
 #include "ble_adv_manager.h"
 #include "ble_nimble_adv_start.h"
 #include "ble_nimble_host.h"
+#include "ble_nimble_link_events.h"
 #include "ble_nimble_peer_identity.h"
 #include "ble_nimble_pairing_gate.h"
 #include "ble_nimble_port_revoke_journal.h"
+/* Internal host-owned Numeric Comparison state machine. */
+#include "ble_nimble_smp_io.h"
 #include "ble_nimble_smp_policy.h"
 #include "ble_nimble_store_guard.h"
 #include "ble_nimble_store_restore_audit.h"
@@ -44,6 +47,7 @@
 #include "ble_gatt_registry.h"
 #include "ble_nimble_port.h"
 #include "ble_nimble_port_task_config.h"
+
 #include "ble_port_ops.h"
 
 #include "ble_link_service.h"
@@ -55,6 +59,10 @@
 #include "ble_link_timer_deadline.h"
 #include "ble_runtime.h"
 #include "ble_tx_scheduler.h"
+static ble_nimble_smp_io_t s_smp_io;
+static bool s_smp_io_initialized;
+static atomic_bool s_acl_pairing_attempted = false;
+static void _ble_nimble_port_smp_wake_owner(void *arg);
 
 static const char *const TAG = "ble_nimble_port";
 
@@ -262,6 +270,11 @@ static void _ble_nimble_port_cleanup_drain_event(
     ble_nimble_pairing_gate_request(&s_pairing_gate_state, false);
     (void)ble_nimble_pairing_gate_set_hold(
         &s_pairing_gate_state, BLE_NIMBLE_PAIRING_GATE_HOLD_DRAIN, true);
+    if (s_smp_io_initialized)
+    {
+        ble_nimble_smp_io_close(&s_smp_io);
+        _ble_nimble_port_smp_wake_owner(NULL);
+    }
     ble_hs_cfg.sm_sec_lvl = 1;
     const uint32_t sequence = atomic_load_explicit(
                                   &s_cleanup_drain_requested_seq,
@@ -469,10 +482,10 @@ static void _ble_nimble_port_tx_completed(
     /* Only a tracked indication response belongs to the link service. The
      * completion callback records the fact; the Device Link worker performs
      * the next submit outside this host callback. */
-    if (result->status == ESP_OK && result->flow_id != 0U)
+    if (result->kind == BLE_TX_SCHEDULER_KIND_INDICATE &&
+            result->flow_id != 0U)
     {
-        (void)ble_link_service_response_completed(
-            result->flow_id, result->is_last);
+        (void)ble_link_service_tx_completed(&result->identity, result->status);
     }
 }
 
@@ -594,8 +607,7 @@ static atomic_uint s_timer_callbacks_active = 0U;
 static SemaphoreHandle_t s_timer_exit;
 static uint32_t s_timer_generation;
 static uint16_t s_link_conn_handle;
-static uint16_t s_adv_conn_handle;
-static uint32_t s_adv_generation;
+static ble_nimble_adv_event_state_t s_adv_event_state;
 
 static ble_link_timer_terminate_state_t s_terminate_obligation;
 static ble_link_rejected_terminate_state_t s_rejected_terminate_obligation;
@@ -644,6 +656,116 @@ static ble_nimble_tx_tracker_t s_tx_tracker;
  * host task (on_sync resume + reconcile) and the timer owner task. */
 static SemaphoreHandle_t s_storage_lock;
 
+
+static bool _ble_nimble_port_smp_host_current(void *arg)
+{
+    (void)arg;
+    return ble_nimble_host_is_current(&s_host);
+}
+
+static void _ble_nimble_port_smp_wake_owner(void *arg)
+{
+    (void)arg;
+    const TaskHandle_t owner = (TaskHandle_t)(uintptr_t)
+                               atomic_load_explicit(&s_timer_wake_task,
+                                   memory_order_acquire);
+    if (owner != NULL)
+    {
+        xTaskNotifyGive(owner);
+    }
+}
+
+static uint64_t _ble_nimble_port_smp_now_us(void *arg)
+{
+    (void)arg;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static esp_err_t _ble_nimble_port_smp_current_connection(
+    uint32_t *generation, uint16_t *conn_handle, void *arg)
+{
+    (void)arg;
+    ble_gap_manager_snapshot_t snapshot;
+    const esp_err_t result = _ble_nimble_port_gap_snapshot(&snapshot);
+    if (result != ESP_OK || !snapshot.connected)
+    {
+        return result == ESP_OK ? ESP_ERR_NOT_FOUND : result;
+    }
+    *generation = snapshot.generation;
+    *conn_handle = snapshot.conn_handle;
+    return ESP_OK;
+}
+
+static bool _ble_nimble_port_smp_host_ready(void *arg)
+{
+    (void)arg;
+    return atomic_load_explicit(&s_port.started, memory_order_acquire) &&
+           !atomic_load_explicit(&s_port.quiescing, memory_order_acquire) &&
+           atomic_load_explicit(&s_adv_host_ready, memory_order_acquire) &&
+           ble_hs_synced();
+}
+
+static int _ble_nimble_port_smp_inject(uint16_t conn_handle, bool accept,
+                                       void *arg)
+{
+    (void)arg;
+#ifndef UNIT_TEST_HOST
+    struct ble_sm_io io;
+    memset(&io, 0, sizeof(io));
+    io.action = BLE_SM_IOACT_NUMCMP;
+    io.numcmp_accept = accept ? 1 : 0;
+    return ble_sm_inject_io(conn_handle, &io);
+#else
+    (void)conn_handle;
+    (void)accept;
+    return 0;
+#endif
+}
+
+static esp_err_t _ble_nimble_port_smp_publish(uint32_t passkey,
+        uint64_t token, void *arg)
+{
+    (void)arg;
+    return ble_link_service_publish_numeric_comparison(passkey, token);
+}
+
+static void _ble_nimble_port_smp_retire(uint64_t token, bool accept,
+                                        void *arg)
+{
+    (void)arg;
+    (void)ble_link_service_confirm_binding(token, accept);
+}
+
+static const ble_nimble_smp_io_ops_t s_smp_io_ops =
+{
+    .is_host_current = _ble_nimble_port_smp_host_current,
+    .wake_owner = _ble_nimble_port_smp_wake_owner,
+    .now_us = _ble_nimble_port_smp_now_us,
+    .current_connection = _ble_nimble_port_smp_current_connection,
+    .host_ready = _ble_nimble_port_smp_host_ready,
+    .inject = _ble_nimble_port_smp_inject,
+    .publish_confirmation = _ble_nimble_port_smp_publish,
+    .retire_confirmation = _ble_nimble_port_smp_retire,
+    .arg = NULL,
+};
+
+static void _ble_nimble_port_smp_io_event(struct ble_npl_event *event)
+{
+    (void)event;
+    ble_nimble_smp_io_run_host(&s_smp_io);
+    if (ble_nimble_smp_io_pending(&s_smp_io))
+    {
+        _ble_nimble_port_smp_wake_owner(NULL);
+    }
+}
+
+static void _ble_nimble_port_smp_owner_dispatch(void)
+{
+    if (ble_nimble_smp_io_claim_event(&s_smp_io))
+    {
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_host.smp_io_event);
+    }
+}
 static bool _ble_nimble_port_terminate_submitted(int result)
 {
     return result == 0 || result == BLE_HS_EALREADY;
@@ -820,7 +942,8 @@ static void _ble_nimble_port_reset_static_host_events(void)
                           memory_order_release);
     ble_nimble_host_init_events(&s_host, _ble_nimble_port_pairing_gate_event,
                                 _ble_nimble_port_terminate_event,
-                                _ble_nimble_port_cleanup_drain_event);
+                                _ble_nimble_port_cleanup_drain_event,
+                                _ble_nimble_port_smp_io_event);
 }
 
 static esp_err_t _ble_nimble_port_tx_tracker_retain(
@@ -1516,12 +1639,9 @@ static void _ble_nimble_port_timer_fail_closed(
         ble_tx_scheduler_get_in_flight_identity(&in_flight) == ESP_OK &&
         ble_link_operation_identity_equal(&in_flight, identity);
 
-    if (current &&
-            _ble_nimble_port_tx_tracker_retire_identity(identity) &&
-            ble_tx_scheduler_handle_indication_timeout(
-                identity->token) == ESP_OK)
+    if (current && _ble_nimble_port_tx_tracker_retire_identity(identity))
     {
-        (void)ble_link_service_abort_tx_if_current(identity);
+        (void)ble_tx_scheduler_handle_indication_timeout(identity->token);
     }
 }
 
@@ -1942,6 +2062,7 @@ static void _ble_nimble_port_timer_owner(void *arg)
 
         _ble_nimble_port_execute_terminate_obligation();
         _ble_nimble_port_execute_cleanup_obligation();
+        _ble_nimble_port_smp_owner_dispatch();
         remaining_us = _ble_nimble_port_timer_owner_sweep();
 
         if (command_received)
@@ -2107,29 +2228,117 @@ static bool _ble_nimble_port_arm_indication_timeout(
                armed, BLE_NIMBLE_PORT_TIMER_KIND_INDICATION, identity);
 }
 
+static esp_err_t _ble_nimble_port_link_update_lock(void *arg)
+{
+    (void)arg;
+    return s_link_state_lock != NULL &&
+           xSemaphoreTakeRecursive(s_link_state_lock, portMAX_DELAY) == pdTRUE ?
+           ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static void _ble_nimble_port_link_update_unlock(void *arg)
+{
+    (void)arg;
+    (void)xSemaphoreGiveRecursive(s_link_state_lock);
+}
+
+/* Called only by the handoff helper while P is held. No service calls here. */
+static esp_err_t _ble_nimble_port_prepare_link_update(
+    const ble_port_event_t *event, ble_nimble_link_update_t *update, void *arg)
+{
+    (void)arg;
+    update->type = event->type;
+    update->identity = event->identity;
+    if (event->type == BLE_PORT_EVENT_CONNECT)
+    {
+        ble_gap_manager_snapshot_t snapshot;
+        if (_ble_nimble_port_gap_snapshot(&snapshot) != ESP_OK ||
+                !snapshot.connected || !event->accepted ||
+                !_ble_nimble_port_connection_identity_matches(
+                    event, BLE_LINK_OPERATION_CONNECT,
+                    snapshot.generation, snapshot.conn_handle))
+        {
+            return ESP_ERR_NOT_FOUND;
+        }
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->conn_handle, &desc) == 0)
+        {
+            update->peer_addr_type = desc.peer_id_addr.type;
+            memcpy(update->peer_addr, desc.peer_id_addr.val, 6U);
+        }
+        esp_err_t result = ble_link_session_handle_event(
+                               snapshot.generation, BLE_LINK_SESSION_EVENT_ACL_CONNECTED);
+        if (result != ESP_OK)
+        {
+            return result;
+        }
+        (void)ble_link_session_set_connection_pairing_window(
+            snapshot.generation, _ble_nimble_port_pairing_window_open());
+        s_link_conn_handle = event->conn_handle;
+        s_timer_generation = snapshot.generation;
+        return ESP_OK;
+    }
+    const ble_link_operation_kind_t kind = event->type == BLE_PORT_EVENT_MTU ?
+                                           BLE_LINK_OPERATION_MTU : BLE_LINK_OPERATION_SUBSCRIBE;
+    if (!_ble_nimble_port_connection_identity_matches(
+                event, kind, s_timer_generation, s_link_conn_handle) ||
+            (event->type == BLE_PORT_EVENT_SUBSCRIBE &&
+             event->attr_handle != ble_link_gatt_session_tx_handle()))
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    update->mtu = event->mtu;
+    update->indicate = event->indicate;
+    return ESP_OK;
+}
+
+static const ble_nimble_link_events_ops_t s_link_update_ops =
+{
+    .lock = _ble_nimble_port_link_update_lock,
+    .unlock = _ble_nimble_port_link_update_unlock,
+    .prepare = _ble_nimble_port_prepare_link_update,
+};
+
 static void _ble_nimble_port_link_gatt_consumer(
     const ble_port_event_t *event, void *arg)
 {
     (void)arg;
-    ble_gap_manager_snapshot_t snapshot;
+    if (event->type == BLE_PORT_EVENT_CONNECT ||
+            event->type == BLE_PORT_EVENT_MTU ||
+            event->type == BLE_PORT_EVENT_SUBSCRIBE)
+    {
+        const esp_err_t result = ble_nimble_link_events_handle_update(event, &s_link_update_ops);
+        if (result == ESP_OK && event->type == BLE_PORT_EVENT_MTU)
+        {
+            LOG_I("mtu gen=%lu conn=%u value=%u",
+                  (unsigned long)event->identity.generation,
+                  (unsigned)event->conn_handle, (unsigned)event->mtu);
+        }
+        else if (result == ESP_OK && event->type == BLE_PORT_EVENT_SUBSCRIBE)
+        {
+            LOG_I("subscribe gen=%lu conn=%u attr=%u indicate=%u",
+                  (unsigned long)event->identity.generation,
+                  (unsigned)event->conn_handle, (unsigned)event->attr_handle,
+                  (unsigned)event->indicate);
+        }
+        else if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
+        {
+            LOG_E("link update failed type=%d gen=%lu conn=%u result=%d",
+                  event->type, (unsigned long)event->identity.generation,
+                  (unsigned)event->conn_handle, result);
+        }
+        return;
+    }
     ble_link_operation_identity_t teardown_identity;
-    uint32_t generation = 0U;
     bool teardown = false;
     bool apply_rejected_gate = false;
 
     memset(&teardown_identity, 0, sizeof(teardown_identity));
 
-    if (_ble_nimble_port_gap_snapshot(&snapshot) == ESP_OK)
-    {
-        generation = snapshot.generation;
-    }
     switch (event->type)
     {
-    case BLE_PORT_EVENT_CONNECT:
     case BLE_PORT_EVENT_DISCONNECT:
     case BLE_PORT_EVENT_ENC_CHANGE:
-    case BLE_PORT_EVENT_MTU:
-    case BLE_PORT_EVENT_SUBSCRIBE:
     case BLE_PORT_EVENT_RESET:
         break;
     default:
@@ -2144,33 +2353,6 @@ static void _ble_nimble_port_link_gatt_consumer(
     }
     switch (event->type)
     {
-    case BLE_PORT_EVENT_CONNECT:
-        if (snapshot.connected && event->accepted &&
-                _ble_nimble_port_connection_identity_matches(
-                    event, BLE_LINK_OPERATION_CONNECT,
-                    snapshot.generation, snapshot.conn_handle))
-        {
-            struct ble_gap_conn_desc desc;
-            uint8_t peer_type = 0U;
-            uint8_t peer_addr[6] = {0};
-
-            if (ble_gap_conn_find(event->conn_handle, &desc) == 0)
-            {
-                peer_type = desc.peer_id_addr.type;
-                memcpy(peer_addr, desc.peer_id_addr.val, 6U);
-            }
-            ble_link_gatt_set_connection(generation, event->conn_handle,
-                                         peer_type, peer_addr);
-            (void)ble_link_session_handle_event(
-                generation, BLE_LINK_SESSION_EVENT_ACL_CONNECTED);
-            (void)ble_link_session_set_connection_pairing_window(
-                generation, _ble_nimble_port_pairing_window_open());
-            /* Remember the connection identity and generation for terminal
-             * events and indication timeout ownership. */
-            s_link_conn_handle = event->conn_handle;
-            s_timer_generation = generation;
-        }
-        break;
     case BLE_PORT_EVENT_DISCONNECT:
         /* The gap consumer runs first and already cleared the snapshot;
          * compare against the remembered connection identity. */
@@ -2264,33 +2446,12 @@ static void _ble_nimble_port_link_gatt_consumer(
              * reducer; nothing admission-related runs here. */
             break;
         }
-        /* Encryption dropped: tear the session-level link security down.
-         * The admission reducer holds its own facts until the next
-         * encryption establishes. */
-        (void)ble_link_session_clear_link_security(
-            event->identity.generation);
+        /* Retire the ACL fence before service teardown; a delayed CONNECT
+         * must not reopen this invalidated session. */
+        (void)ble_link_session_handle_event(
+            event->identity.generation, BLE_LINK_SESSION_EVENT_ACL_DISCONNECTED);
         teardown_identity = event->identity;
         teardown = true;
-        break;
-    case BLE_PORT_EVENT_MTU:
-        if (!_ble_nimble_port_connection_identity_matches(
-                    event, BLE_LINK_OPERATION_MTU,
-                    s_timer_generation, s_link_conn_handle))
-        {
-            break;
-        }
-        ble_link_gatt_set_att_mtu(event->mtu);
-        break;
-    case BLE_PORT_EVENT_SUBSCRIBE:
-        if (_ble_nimble_port_connection_identity_matches(
-                    event, BLE_LINK_OPERATION_SUBSCRIBE,
-                    s_timer_generation, s_link_conn_handle) &&
-                event->attr_handle == ble_link_gatt_session_tx_handle())
-        {
-            ble_link_service_set_transport_admitted(
-                event->identity.generation, event->conn_handle,
-                event->indicate);
-        }
         break;
     default:
         break;
@@ -2337,53 +2498,6 @@ static void _ble_nimble_port_link_gatt_consumer(
     }
 }
 
-static void _ble_nimble_port_adv_consumer(
-    const ble_port_event_t *event, void *arg)
-{
-    (void)arg;
-    /* A CONNECT dispatched with accepted=false was rejected by the
-     * connection admission: it must never register as the advertising
-     * connection (its disconnect would otherwise retire the real ACL's
-     * state and restart advertising while the accepted ACL is live). */
-    if (event->type == BLE_PORT_EVENT_CONNECT && event->status == 0 &&
-            event->accepted && event->identity.generation != 0U &&
-            event->identity.kind == BLE_LINK_OPERATION_CONNECT &&
-            event->identity.conn_handle == event->conn_handle)
-    {
-        s_adv_conn_handle = event->conn_handle;
-        s_adv_generation = event->identity.generation;
-    }
-    if (event->type == BLE_PORT_EVENT_DISCONNECT)
-    {
-        /* GAP runs first and clears its snapshot. Keep an independent
-         * pre-clear identity so a stale disconnect cannot retire a newer
-         * connection and the accepted disconnect still reaches advertising. */
-        if (!_ble_nimble_port_connection_identity_matches(
-                    event, BLE_LINK_OPERATION_DISCONNECT,
-                    s_adv_generation, s_adv_conn_handle))
-        {
-            return;
-        }
-        s_adv_conn_handle = 0U;
-        s_adv_generation = 0U;
-    }
-    else if (event->type == BLE_PORT_EVENT_RESET)
-    {
-        s_adv_conn_handle = 0U;
-        s_adv_generation = 0U;
-    }
-    const esp_err_t result = ble_adv_manager_handle_event(event);
-
-    /* The service may be registered earlier in the router. Wake again after
-     * the manager commits the physical result, so an early snapshot cannot
-     * consume the only notification. */
-    ble_link_service_wake_owner();
-
-    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
-    {
-        LOG_E("adv manager event failed result=%d", result);
-    }
-}
 
 static void _ble_nimble_port_tx_consumer(
     const ble_port_event_t *event, void *arg)
@@ -2401,19 +2515,9 @@ static void _ble_nimble_port_tx_consumer(
          * scheduler (production_indicate) takes the lock itself. */
         const esp_err_t result = ble_tx_scheduler_handle_notify_tx(event);
 
-        if (result == ESP_OK && event->indication &&
-                (event->tx_result == BLE_PORT_TX_TIMEOUT ||
-                 event->tx_result == BLE_PORT_TX_ERROR))
+        if (result != ESP_OK && result != ESP_ERR_NOT_FOUND &&
+                result != ESP_ERR_INVALID_STATE)
         {
-            (void)ble_link_service_abort_tx_if_current(&event->identity);
-        }
-        else if (result != ESP_OK && result != ESP_ERR_NOT_FOUND &&
-                 result != ESP_ERR_INVALID_STATE)
-        {
-            if (event->indication)
-            {
-                (void)ble_link_service_abort_tx_if_current(&event->identity);
-            }
             LOG_E("tx scheduler event failed result=%d", result);
         }
         break;
@@ -4124,6 +4228,8 @@ static esp_err_t _ble_nimble_port_execute_revoke_locked(void)
             .conn_handle = snapshot.conn_handle,
         };
 
+        (void)ble_link_session_handle_event(
+            identity.generation, BLE_LINK_SESSION_EVENT_ACL_DISCONNECTED);
         _ble_nimble_port_link_abort(&identity);
         if (!_ble_nimble_port_retain_terminate(&identity))
         {
@@ -4294,6 +4400,12 @@ esp_err_t ble_nimble_port_begin_cleanup_drain(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_smp_io_initialized)
+    {
+        ble_nimble_smp_io_close(&s_smp_io);
+        _ble_nimble_port_smp_wake_owner(NULL);
+    }
+    atomic_store_explicit(&s_cleanup_draining, true, memory_order_release);
     const esp_err_t stop_result = _ble_nimble_port_wait_for_adv_stopped(
                                       BLE_ADV_MANAGER_PAUSE_REASON_SERVICE_SHUTDOWN);
 
@@ -4403,20 +4515,20 @@ esp_err_t ble_nimble_port_begin_cleanup_drain(void)
 
 bool ble_nimble_port_cleanup_pending(void)
 {
-    if (s_link_state_lock == NULL ||
+    bool pending = false;
+    if (s_link_state_lock != NULL &&
             xSemaphoreTakeRecursive(s_link_state_lock,
-                                    portMAX_DELAY) != pdTRUE)
+                                    portMAX_DELAY) == pdTRUE)
     {
-        return false;
+        pending = ble_link_cleanup_pending(&s_cleanup_obligations) ||
+                  s_cleanup_obligations.terminal_fence_active ||
+                  s_terminate_obligation.pending ||
+                  s_rejected_terminate_obligation.pending ||
+                  s_rejected_terminate_exhausted;
+        xSemaphoreGiveRecursive(s_link_state_lock);
     }
-    const bool pending = ble_link_cleanup_pending(&s_cleanup_obligations) ||
-                         s_cleanup_obligations.terminal_fence_active ||
-                         s_terminate_obligation.pending ||
-                         s_rejected_terminate_obligation.pending ||
-                         s_rejected_terminate_exhausted;
-
-    xSemaphoreGiveRecursive(s_link_state_lock);
-    return pending;
+    return pending || (s_smp_io_initialized &&
+                       ble_nimble_smp_io_pending(&s_smp_io));
 }
 
 esp_err_t ble_nimble_port_set_pairing_window(bool open)
@@ -4569,133 +4681,27 @@ static bool _ble_nimble_port_store_object_is_bond(int object_type)
     }
 }
 
-static uint16_t s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
-static bool s_passkey_pending;
-static uint32_t s_passkey_epoch;
-static uint64_t s_passkey_confirmation_token;
-static SemaphoreHandle_t s_passkey_lock;
-static StaticSemaphore_t s_passkey_lock_control;
-static atomic_bool s_acl_pairing_attempted = false;
-
-static void _ble_nimble_port_passkey_lock(void)
-{
-    if (s_passkey_lock == NULL)
-    {
-        s_passkey_lock = xSemaphoreCreateMutexStatic(&s_passkey_lock_control);
-    }
-    if (s_passkey_lock != NULL)
-    {
-        (void)xSemaphoreTake(s_passkey_lock, portMAX_DELAY);
-    }
-}
-
-static void _ble_nimble_port_passkey_unlock(void)
-{
-    if (s_passkey_lock != NULL)
-    {
-        (void)xSemaphoreGive(s_passkey_lock);
-    }
-}
-
 void ble_nimble_port_numeric_comparison_cancel(void)
 {
-    uint16_t conn_handle;
-    bool pending;
-    uint32_t epoch;
-    uint64_t token;
-    int result = 0;
-
-    _ble_nimble_port_passkey_lock();
-    conn_handle = s_passkey_conn_handle;
-    pending = s_passkey_pending;
-    token = s_passkey_confirmation_token;
-    s_passkey_pending = false;
-    s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
-    s_passkey_confirmation_token = 0U;
-    s_passkey_epoch++;
-    epoch = s_passkey_epoch;
-    _ble_nimble_port_passkey_unlock();
-    if (token != 0U)
+    if (s_smp_io_initialized)
     {
-        (void)ble_link_service_confirm_binding(token, false);
+        ble_nimble_smp_io_cancel(&s_smp_io);
     }
-    if (!ble_nimble_smp_numeric_comparison_inject_required(
-                pending, conn_handle))
-    {
-        if (pending)
-        {
-            LOG_I("numeric comparison cancelled handle=%u epoch=%" PRIu32
-                  " result=%d",
-                  conn_handle, epoch, (int)ESP_ERR_INVALID_STATE);
-        }
-        return;
-    }
-#ifndef UNIT_TEST_HOST
-    {
-        struct ble_sm_io io;
-
-        memset(&io, 0, sizeof(io));
-        io.action = BLE_SM_IOACT_NUMCMP;
-        io.numcmp_accept = 0;
-        result = ble_sm_inject_io(conn_handle, &io);
-    }
-#endif
-    LOG_I("numeric comparison cancelled handle=%u epoch=%" PRIu32
-          " result=%d", conn_handle, epoch, result);
 }
 
 esp_err_t ble_nimble_port_numeric_comparison_reply(
     uint64_t token, bool accept)
 {
-    uint16_t conn_handle;
-    uint32_t epoch;
-    int result;
-
-    _ble_nimble_port_passkey_lock();
-    if (!s_passkey_pending || token == 0U ||
-            token != s_passkey_confirmation_token)
+    if (token == 0U)
     {
-        _ble_nimble_port_passkey_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_smp_io_initialized)
+    {
         return ESP_ERR_INVALID_STATE;
     }
-    s_passkey_pending = false;
-    conn_handle = s_passkey_conn_handle;
-    epoch = s_passkey_epoch;
-    _ble_nimble_port_passkey_unlock();
-#ifndef UNIT_TEST_HOST
-    {
-        struct ble_sm_io io;
-
-        memset(&io, 0, sizeof(io));
-        io.action = BLE_SM_IOACT_NUMCMP;
-        io.numcmp_accept = accept ? 1 : 0;
-        result = ble_sm_inject_io(conn_handle, &io);
-    }
-#else
-    (void)accept;
-    result = 0;
-#endif
-    const bool committed =
-        ble_nimble_smp_numeric_comparison_reply_committed(result);
-
-    _ble_nimble_port_passkey_lock();
-    if (ble_nimble_smp_numeric_comparison_restore_pending(
-                committed, epoch, s_passkey_epoch, conn_handle,
-                s_passkey_conn_handle))
-    {
-        s_passkey_pending = true;
-    }
-    else if (ble_nimble_smp_numeric_comparison_clear_committed(
-                 committed, epoch, s_passkey_epoch, conn_handle,
-                 s_passkey_conn_handle, s_passkey_pending))
-    {
-        s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
-        s_passkey_confirmation_token = 0U;
-    }
-    _ble_nimble_port_passkey_unlock();
-    LOG_I("numeric comparison reply handle=%u accept=%u epoch=%" PRIu32
-          " result=%d", conn_handle, accept, epoch, result);
-    return committed ? ESP_OK : ESP_FAIL;
+    return ble_nimble_smp_io_reply(&s_smp_io, token, accept,
+                                   BLE_NIMBLE_PORT_SYNC_TIMEOUT_MS);
 }
 
 static int _ble_nimble_port_gap_event(
@@ -4716,6 +4722,8 @@ static int _ble_nimble_port_gap_event(
             /* Admission runs before any per-connection state is touched: a
              * rejected ACL must never reset the security reducer or the
              * connection identity of the active connection. */
+            const uint32_t prior_generation = s_timer_generation;
+            const uint16_t prior_conn_handle = s_link_conn_handle;
             ble_gap_manager_event_t manager_event;
 
             memset(&manager_event, 0, sizeof(manager_event));
@@ -4752,6 +4760,12 @@ static int _ble_nimble_port_gap_event(
                     }
                 }
                 return 0;
+            }
+            if (s_smp_io_initialized && prior_generation != 0U)
+            {
+                ble_nimble_smp_io_forget_connection(
+                    &s_smp_io, prior_generation, prior_conn_handle);
+                _ble_nimble_port_smp_wake_owner(NULL);
             }
             (void)_ble_nimble_port_capture_connection_identity(
                 &port_event, BLE_LINK_OPERATION_CONNECT);
@@ -4853,9 +4867,12 @@ static int _ble_nimble_port_gap_event(
               event->disconnect.conn.conn_handle,
               event->disconnect.reason, disconnect_current);
 
-        if (disconnect_current)
+        if (disconnect_current && s_smp_io_initialized)
         {
-            ble_nimble_port_numeric_comparison_cancel();
+            ble_nimble_smp_io_forget_connection(
+                &s_smp_io, port_event.identity.generation,
+                port_event.conn_handle);
+            _ble_nimble_port_smp_wake_owner(NULL);
         }
         if (disconnect_current &&
                 s_link_sec_conn == event->disconnect.conn.conn_handle)
@@ -4888,9 +4905,12 @@ static int _ble_nimble_port_gap_event(
         {
             return 0;
         }
-        if (event->enc_change.status != 0)
+        if (event->enc_change.status != 0 && s_smp_io_initialized)
         {
-            ble_nimble_port_numeric_comparison_cancel();
+            ble_nimble_smp_io_forget_connection(
+                &s_smp_io, port_event.identity.generation,
+                port_event.conn_handle);
+            _ble_nimble_port_smp_wake_owner(NULL);
         }
         {
             struct ble_gap_conn_desc description;
@@ -5097,38 +5117,36 @@ static int _ble_nimble_port_gap_event(
         if (ble_nimble_smp_passkey_decide(event->passkey.params.action) ==
                 BLE_NIMBLE_SMP_PASSKEY_ACCEPT_NUMCMP)
         {
-            uint32_t epoch;
             uint64_t token = 0U;
-
             _ble_nimble_port_mark_provisional_pairing(
                 event->passkey.conn_handle, false);
-            _ble_nimble_port_passkey_lock();
-            s_passkey_conn_handle = event->passkey.conn_handle;
-            s_passkey_pending = true;
-            s_passkey_confirmation_token = 0U;
-            s_passkey_epoch++;
-            epoch = s_passkey_epoch;
-            const esp_err_t offer_result =
-                ble_link_service_offer_numeric_comparison(
-                    event->passkey.params.numcmp, &token);
-
+            esp_err_t offer_result =
+                ble_link_service_allocate_confirmation_token(&token);
             if (offer_result == ESP_OK)
             {
-                s_passkey_confirmation_token = token;
+                offer_result = ble_nimble_smp_io_offer(
+                                   &s_smp_io, snapshot.generation,
+                                   event->passkey.conn_handle, token,
+                                   event->passkey.params.numcmp);
             }
-            else
+            if (offer_result != ESP_OK)
             {
-                s_passkey_pending = false;
-                s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
+#ifndef UNIT_TEST_HOST
+                (void)ble_gap_terminate(event->passkey.conn_handle,
+                                        BLE_ERR_CONN_TERM_LOCAL);
+#endif
             }
-            _ble_nimble_port_passkey_unlock();
-
-            LOG_I("numeric comparison offered handle=%u epoch=%" PRIu32
-                  " result=%d", event->passkey.conn_handle, epoch,
-                  offer_result);
+            LOG_I("numeric comparison offer handle=%u result=%d",
+                  event->passkey.conn_handle, offer_result);
             return 0;
         }
-        ble_nimble_port_numeric_comparison_cancel();
+        if (s_smp_io_initialized)
+        {
+            ble_nimble_smp_io_forget_connection(
+                &s_smp_io, snapshot.generation,
+                event->passkey.conn_handle);
+            _ble_nimble_port_smp_wake_owner(NULL);
+        }
 #ifndef UNIT_TEST_HOST
         (void)ble_gap_terminate(event->passkey.conn_handle,
                                 BLE_ERR_CONN_TERM_LOCAL);
@@ -5251,6 +5269,14 @@ static void _ble_nimble_port_on_sync(void)
          * validates its manager generation, so work retained across RESET
          * cannot become current merely because the host synchronized again. */
         atomic_store_explicit(&s_adv_host_ready, true, memory_order_release);
+        if (s_smp_io_initialized &&
+                !atomic_load_explicit(&s_cleanup_draining,
+                                      memory_order_acquire) &&
+                !atomic_load_explicit(&s_port.quiescing,
+                                      memory_order_acquire))
+        {
+            ble_nimble_smp_io_open(&s_smp_io);
+        }
         xSemaphoreGive(s_port.sync_semaphore);
         memset(&event, 0, sizeof(event));
         event.type = BLE_PORT_EVENT_SYNC;
@@ -5263,11 +5289,15 @@ static void _ble_nimble_port_on_reset(int reason)
     ble_port_event_t event;
 
     atomic_store_explicit(&s_adv_host_ready, false, memory_order_release);
+    if (s_smp_io_initialized)
+    {
+        ble_nimble_smp_io_close(&s_smp_io);
+        _ble_nimble_port_smp_wake_owner(NULL);
+    }
     ble_hs_cfg.sm_sc_only = 1;
     ble_nimble_pairing_gate_request(&s_pairing_gate_state, false);
     ble_hs_cfg.sm_sec_lvl = 1;
     LOG_E("host reset reason=%d", reason);
-    ble_nimble_port_numeric_comparison_cancel();
     memset(&event, 0, sizeof(event));
     event.type = BLE_PORT_EVENT_RESET;
     event.status = reason;
@@ -6036,15 +6066,14 @@ static esp_err_t _ble_nimble_port_init(void)
     s_port.quiescing = false;
     atomic_store_explicit(&s_adv_host_ready, false, memory_order_release);
     ble_nimble_store_guard_reset(&s_port.storage_guard);
-    s_adv_conn_handle = 0U;
-    s_adv_generation = 0U;
+    memset(&s_adv_event_state, 0, sizeof(s_adv_event_state));
     _ble_nimble_port_clear_provisional_tracking();
     result = ble_event_router_register(_ble_nimble_port_gap_consumer, NULL);
     if (result != ESP_OK)
     {
         return _ble_nimble_port_rollback_init(result, false, false, false);
     }
-    result = ble_event_router_register(_ble_nimble_port_adv_consumer, NULL);
+    result = ble_event_router_register(ble_nimble_link_events_adv_consumer, &s_adv_event_state);
     if (result != ESP_OK)
     {
         return _ble_nimble_port_rollback_init(result, false, false, false);
@@ -6209,17 +6238,16 @@ static esp_err_t _ble_nimble_port_init(void)
         return _ble_nimble_port_rollback_init(
                    result, false, false, false);
     }
-    _ble_nimble_port_reset_static_host_events();
-    if (s_passkey_lock == NULL)
+    result = ble_nimble_smp_io_init(&s_smp_io, &s_smp_io_ops);
+    if (result != ESP_OK)
     {
-        s_passkey_lock = xSemaphoreCreateMutexStatic(
-                             &s_passkey_lock_control);
+        return _ble_nimble_port_rollback_init(
+                   result, true, false, false);
     }
-    s_passkey_pending = false;
-    s_passkey_conn_handle = BLE_NIMBLE_SMP_CONN_HANDLE_NONE;
+    s_smp_io_initialized = true;
+    _ble_nimble_port_reset_static_host_events();
     if (s_pairing_gate_ack == NULL || s_pairing_gate_lock == NULL ||
-            s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL ||
-            s_passkey_lock == NULL)
+            s_cleanup_drain_ack == NULL || s_cleanup_drain_lock == NULL)
     {
         return _ble_nimble_port_rollback_init(
                    ESP_ERR_NO_MEM, true, false, false);
@@ -6327,6 +6355,8 @@ static esp_err_t _ble_nimble_port_start(void)
     {
         return ESP_ERR_NO_MEM;
     }
+    s_port.quiescing = false;
+    atomic_store_explicit(&s_adv_host_ready, false, memory_order_release);
     s_port.started = true;
     const esp_err_t enable_result =
         ble_nimble_host_start(&s_host, CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
@@ -6356,6 +6386,11 @@ static esp_err_t _ble_nimble_port_stop(void)
     {
         return s_port.deinit_error;
     }
+    if (s_smp_io_initialized)
+    {
+        ble_nimble_smp_io_close(&s_smp_io);
+        _ble_nimble_port_smp_wake_owner(NULL);
+    }
     /* The live cleanup owner must finish before QUIT can discard its state. */
     if (ble_nimble_port_cleanup_pending())
     {
@@ -6381,6 +6416,10 @@ static esp_err_t _ble_nimble_port_stop(void)
     if (result != ESP_OK)
     {
         return result;
+    }
+    if (s_smp_io_initialized)
+    {
+        ble_nimble_smp_io_host_exited(&s_smp_io);
     }
     s_port.started = false;
     return ESP_OK;
@@ -6468,8 +6507,7 @@ static esp_err_t _ble_nimble_port_deinit(void)
     ble_link_gatt_reset();
     ble_link_session_reset();
     s_port.link_security_initialized = false;
-    s_adv_conn_handle = 0U;
-    s_adv_generation = 0U;
+    memset(&s_adv_event_state, 0, sizeof(s_adv_event_state));
     _ble_nimble_port_clear_provisional_tracking();
     if (s_link_state_lock != NULL)
     {

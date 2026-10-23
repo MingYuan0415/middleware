@@ -33,9 +33,6 @@ void device_link_wifi_adapter_bridge_stop(void);
 /** @brief Retry a retained Wi-Fi terminal completion from the owner task. */
 void device_link_wifi_adapter_tick(void);
 
-/** @brief Drop operation completion state when the BLE session is retired. */
-void device_link_wifi_adapter_clear_pending(void);
-
 #ifdef __cplusplus
 }
 #endif

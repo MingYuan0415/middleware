@@ -423,7 +423,6 @@ void device_link_v1_engine_reject_tx(device_link_v1_engine_t *engine)
         engine->pending_ack = false;
         break;
     case DEVICE_LINK_V1_TX_ORDINARY_STATUS:
-        engine->ordinary_present = false;
         break;
     case DEVICE_LINK_V1_TX_TERMINAL:
         engine->terminal_omitted = true;
@@ -477,12 +476,13 @@ device_link_v1_tx_kind_t device_link_v1_engine_next_tx(
             engine->in_flight != DEVICE_LINK_V1_TX_NONE ||
             !engine->connected)
     {
-        return engine != NULL ? engine->in_flight : DEVICE_LINK_V1_TX_NONE;
+        return DEVICE_LINK_V1_TX_NONE;
     }
     if (engine->ordinary_present &&
             device_link_v1_snapshot_equal(&engine->ordinary_snapshot,
                                           &engine->current_snapshot))
     {
+        engine->ordinary_present = false;
         engine->in_flight = DEVICE_LINK_V1_TX_ORDINARY_STATUS;
         return DEVICE_LINK_V1_TX_ORDINARY_STATUS;
     }
@@ -516,7 +516,6 @@ void device_link_v1_engine_confirm_tx(device_link_v1_engine_t *engine)
         engine->pending_ack = false;
         break;
     case DEVICE_LINK_V1_TX_ORDINARY_STATUS:
-        engine->ordinary_present = false;
         break;
     case DEVICE_LINK_V1_TX_TERMINAL:
         engine->terminal_emitted = true;
@@ -528,17 +527,6 @@ void device_link_v1_engine_confirm_tx(device_link_v1_engine_t *engine)
     engine->in_flight = DEVICE_LINK_V1_TX_NONE;
 }
 
-void device_link_v1_engine_abort_tx(device_link_v1_engine_t *engine)
-{
-    if (!_device_link_v1_engine_ready(engine) ||
-            engine->in_flight == DEVICE_LINK_V1_TX_NONE)
-    {
-        return;
-    }
-    engine->pending_accepted = false;
-    engine->pending_ack = false;
-    engine->in_flight = DEVICE_LINK_V1_TX_NONE;
-}
 
 void device_link_v1_engine_disconnect(device_link_v1_engine_t *engine)
 {

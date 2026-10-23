@@ -9,11 +9,13 @@
 void ble_nimble_host_init_events(ble_nimble_host_t *host,
                                  ble_npl_event_fn *pairing,
                                  ble_npl_event_fn *terminate,
-                                 ble_npl_event_fn *cleanup)
+                                 ble_npl_event_fn *cleanup,
+                                 ble_npl_event_fn *smp_io)
 {
     ble_npl_event_init(&host->pairing_gate_event, pairing, NULL);
     ble_npl_event_init(&host->terminate_event, terminate, NULL);
     ble_npl_event_init(&host->cleanup_drain_event, cleanup, NULL);
+    ble_npl_event_init(&host->smp_io_event, smp_io, NULL);
     host->events_initialized = true;
 }
 
@@ -137,6 +139,7 @@ esp_err_t ble_nimble_host_release(ble_nimble_host_t *host)
         ble_npl_event_deinit(&host->pairing_gate_event);
         ble_npl_event_deinit(&host->terminate_event);
         ble_npl_event_deinit(&host->cleanup_drain_event);
+        ble_npl_event_deinit(&host->smp_io_event);
         host->events_initialized = false;
     }
     if (host->exited != NULL)

@@ -75,11 +75,19 @@ const ble_runtime_host_port_t *ble_nimble_port_get(void);
  */
 esp_err_t ble_nimble_port_revoke_binding(void);
 
-/** @brief Complete the exact Numeric Comparison with the local decision. */
+/**
+ * @brief Submit a token-qualified Numeric Comparison decision.
+ *
+ * The total reply budget is 10000 ms. A queued timeout cancels the exact
+ * decision; an already executing timeout returns ESP_ERR_NOT_FINISHED because
+ * the SDK call cannot be withdrawn.
+ */
 esp_err_t ble_nimble_port_numeric_comparison_reply(
     uint64_t token, bool accept);
 
-/** @brief Drop a pending Numeric Comparison without injecting a reply. */
+/**
+ * @brief Immediately retire the local prompt and retain an async exact reject.
+ */
 void ble_nimble_port_numeric_comparison_cancel(void);
 
 /**

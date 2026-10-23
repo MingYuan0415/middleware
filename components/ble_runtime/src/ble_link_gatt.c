@@ -159,8 +159,8 @@ static esp_err_t _ble_link_gatt_service_facts(ble_link_service_facts_t *out)
 
 static esp_err_t _ble_link_gatt_output(
     const uint8_t *value, size_t len,
-    ble_link_service_tx_channel_t channel, bool is_last, uint32_t flow_id,
-    void *arg)
+    ble_link_service_tx_channel_t channel, bool is_last,
+    const ble_link_operation_identity_t *identity, void *arg)
 {
     (void)channel;
     (void)arg;
@@ -176,7 +176,9 @@ static esp_err_t _ble_link_gatt_output(
     config = s_gatt.config;
     handle = s_gatt.handles[1];
     _ble_link_gatt_unlock();
-    if (handle == 0U)
+    if (identity == NULL || handle == 0U ||
+            identity->generation != config.connection_generation ||
+            identity->conn_handle != config.conn_handle)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -184,16 +186,9 @@ static esp_err_t _ble_link_gatt_output(
     {
         return ESP_ERR_INVALID_STATE;
     }
-    const ble_link_operation_identity_t identity =
-    {
-        .generation = config.connection_generation,
-        .flow_id = flow_id,
-        .kind = BLE_LINK_OPERATION_TX_INDICATE,
-        .conn_handle = config.conn_handle,
-    };
 
     return ble_tx_scheduler_submit(
-               BLE_TX_SCHEDULER_KIND_INDICATE, &identity, handle, value, len,
+               BLE_TX_SCHEDULER_KIND_INDICATE, identity, handle, value, len,
                is_last);
 }
 
@@ -357,7 +352,6 @@ esp_err_t ble_link_gatt_restart(void)
     s_gatt.config.att_mtu = 23U;
     _ble_link_gatt_unlock();
     ble_link_service_reset();
-    ble_link_service_set_att_mtu(23U);
     return ESP_OK;
 }
 
@@ -377,23 +371,37 @@ void ble_link_gatt_update_handles(void)
     _ble_link_gatt_unlock();
 }
 
-void ble_link_gatt_set_connection(
+esp_err_t ble_link_gatt_set_connection(
     uint32_t generation, uint16_t conn_handle,
     uint8_t peer_addr_type, const uint8_t peer_addr[6])
 {
+    if (generation == 0U || peer_addr == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = ble_link_service_on_connect(generation, conn_handle);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     _ble_link_gatt_lock();
-    if (s_gatt.configured)
+    if (!s_gatt.configured || generation < s_gatt.config.connection_generation ||
+            (generation == s_gatt.config.connection_generation &&
+             conn_handle != s_gatt.config.conn_handle))
+    {
+        _ble_link_gatt_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (generation != s_gatt.config.connection_generation)
     {
         s_gatt.config.connection_generation = generation;
         s_gatt.config.conn_handle = conn_handle;
         s_gatt.config.peer_addr_type = peer_addr_type;
-        if (peer_addr != NULL)
-        {
-            memcpy(s_gatt.config.peer_addr, peer_addr, 6U);
-        }
+        memcpy(s_gatt.config.peer_addr, peer_addr, 6U);
+        s_gatt.config.att_mtu = 23U;
     }
     _ble_link_gatt_unlock();
-    ble_link_service_on_connect(generation, conn_handle);
+    return ESP_OK;
 }
 
 esp_err_t ble_link_gatt_update_identity(
@@ -417,25 +425,36 @@ esp_err_t ble_link_gatt_update_identity(
     return ESP_OK;
 }
 
-void ble_link_gatt_set_att_mtu(uint16_t mtu)
+esp_err_t ble_link_gatt_set_att_mtu(
+    uint32_t generation, uint16_t conn_handle, uint16_t mtu)
 {
-    uint16_t applied = 0U;
-
+    if (generation == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (mtu > BLE_LINK_GATT_ATT_MTU_MAX)
+    {
+        mtu = BLE_LINK_GATT_ATT_MTU_MAX;
+    }
+    if (mtu < 23U)
+    {
+        mtu = 23U;
+    }
+    esp_err_t result = ble_link_service_set_att_mtu(generation, conn_handle, mtu);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
     _ble_link_gatt_lock();
-    if (s_gatt.configured)
+    if (!s_gatt.configured || s_gatt.config.connection_generation != generation ||
+            s_gatt.config.conn_handle != conn_handle)
     {
-        if (mtu > BLE_LINK_GATT_ATT_MTU_MAX)
-        {
-            mtu = BLE_LINK_GATT_ATT_MTU_MAX;
-        }
-        s_gatt.config.att_mtu = (mtu >= 23U) ? mtu : 23U;
-        applied = s_gatt.config.att_mtu;
+        _ble_link_gatt_unlock();
+        return ESP_ERR_NOT_FOUND;
     }
+    s_gatt.config.att_mtu = mtu;
     _ble_link_gatt_unlock();
-    if (applied != 0U)
-    {
-        ble_link_service_set_att_mtu(applied);
-    }
+    return ESP_OK;
 }
 
 esp_err_t ble_link_gatt_get_att_mtu(uint32_t *out_mtu)

@@ -36,6 +36,8 @@ extern unsigned ble_link_service_fake_observe_count(void);
 extern const device_link_v1_snapshot_t *ble_link_service_fake_last_snapshot(void);
 extern device_link_v1_wifi_failure_t ble_link_service_fake_last_failure(void);
 extern void ble_link_service_fake_set_complete_result(esp_err_t result);
+extern uint8_t ble_link_service_fake_last_network_count(void);
+extern const device_link_v1_network_t *ble_link_service_fake_last_networks(void);
 
 typedef struct early_result
 {
@@ -197,7 +199,6 @@ static void test_failed_and_retired_requests_do_not_replace_mapping(void)
     connectivity_manager_fake_set_request_result(ESP_OK);
     assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
                                            NULL, 33U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
-    device_link_wifi_adapter_clear_pending();
     assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
                                            NULL, 34U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
     _publish_terminal(DEVICE_LINK_V1_OPERATION_SCAN, 2U, 11U);
@@ -308,6 +309,29 @@ static void test_scan_event_completes_operation(void)
                            &scan, sizeof(scan));
     assert(ble_link_service_fake_complete_count() == 1U);
     assert(ble_link_service_fake_last_complete_id() == 11U);
+    device_link_wifi_adapter_bridge_stop();
+
+    /* A failed delivery retains the first terminal payload, even if a later
+     * backend snapshot reports another outcome for the same operation. */
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_SCAN,
+                                           NULL, 12U, NULL) == DEVICE_LINK_V1_STATUS_ACCEPTED);
+    scan.operation_id = 2U;
+    scan.generation = 3U;
+    ble_link_service_fake_set_complete_result(ESP_FAIL);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT, &scan, sizeof(scan));
+    ble_link_service_fake_set_complete_result(ESP_OK);
+    scan.generation = 4U;
+    scan.last_error = ESP_ERR_TIMEOUT;
+    memcpy(scan.records[0].ssid, "evil", 4U);
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT, &scan, sizeof(scan));
+    assert(ble_link_service_fake_last_complete_id() == 12U);
+    assert(ble_link_service_fake_last_failure() == DEVICE_LINK_V1_WIFI_FAILURE_NONE);
+    assert(ble_link_service_fake_last_network_count() == 1U);
+    const device_link_v1_network_t *network = ble_link_service_fake_last_networks();
+    assert(network[0].ssid_length == 4U && memcmp(network[0].ssid, "cafe", 4U) == 0);
     device_link_wifi_adapter_bridge_stop();
 }
 
@@ -501,15 +525,24 @@ static void test_nonterminal_status_keeps_pending_terminal(void)
     assert(ble_link_service_fake_complete_count() == 2U);
     assert(ble_link_service_fake_last_failure() ==
            DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    status.generation = 9U;
+    status.operation_complete = true;
+    status.state = CONNECTIVITY_MANAGER_STATE_IP_READY;
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(ble_link_service_fake_complete_count() == 3U);
+    assert(ble_link_service_fake_last_failure() == DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
+    assert(ble_link_service_fake_last_snapshot()->state == DEVICE_LINK_V1_WIFI_IDLE);
     ble_link_service_fake_set_complete_result(ESP_OK);
     device_link_wifi_adapter_tick();
-    assert(ble_link_service_fake_complete_count() == 3U);
+    assert(ble_link_service_fake_complete_count() == 4U);
     assert(ble_link_service_fake_last_failure() ==
            DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT);
     device_link_wifi_adapter_bridge_stop();
 }
 
-static void test_clear_pending_drops_terminal_retry(void)
+static void test_bridge_stop_drops_terminal_retry(void)
 {
     connectivity_manager_status_snapshot_t status;
 
@@ -531,7 +564,7 @@ static void test_clear_pending_drops_terminal_retry(void)
                            CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
                            &status, sizeof(status));
     assert(ble_link_service_fake_complete_count() == 1U);
-    device_link_wifi_adapter_clear_pending();
+    device_link_wifi_adapter_bridge_stop();
     ble_link_service_fake_set_complete_result(ESP_OK);
     device_link_wifi_adapter_tick();
     assert(ble_link_service_fake_complete_count() == 1U);
@@ -677,10 +710,11 @@ int main(void)
     test_complete_failure_keeps_bridge_id();
     test_terminal_completion_retries_on_owner_tick();
     test_nonterminal_status_keeps_pending_terminal();
-    test_clear_pending_drops_terminal_retry();
+    test_bridge_stop_drops_terminal_retry();
     test_missing_engine_operation_drops_terminal();
     test_bridge_start_seeds_saved_profile();
     test_bridge_start_seeds_generation_zero();
     test_radio_unavailable_keeps_saved_profile();
+    puts("adapter recovery: immutable status/scan retry, new-slot isolation, bridge retirement passed");
     return 0;
 }

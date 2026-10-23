@@ -44,6 +44,19 @@ Connection generations and admission reservation tokens increase across SDK
 restarts for the entire device boot. Zero is reserved; exhausted counters reject
 new connections instead of reusing an identity.
 
+Numeric Comparison confirmation tokens also increase for the whole boot, across
+service initialization, reset, and ACL changes. Allocation does not publish a
+prompt or wake its owner; publication is separate so the host can install the
+exact offer before exposing it. Exhaustion rejects a new allocation without
+overwriting a pending confirmation.
+
+CONNECT, MTU, and subscription callbacks capture qualified facts under the port
+lock and synchronously apply them after releasing it. Service submission may
+take the port lock, but host callbacks never enter the service while holding
+that lock. Early MTU/CCCD facts do not require encryption; command admission
+still requires the existing bonded transport security. Duplicate CONNECT keeps
+the negotiated MTU, CCCD admission, and active TX; a new ACL starts at MTU 23.
+
 The security reducer distinguishes a restored bond from a bond created by the
 current ACL. A new pairing becomes an uncommitted candidate when Numeric
 Comparison starts. A verified Secure Connections, MITM, 16-byte bond is the v1
@@ -78,6 +91,18 @@ tombstone until a late NimBLE completion or ACL teardown consumes it. This
 prevents a completion without an application token from confirming a newer
 indication that reused the same handle tuple.
 
+The service freezes generation, handle, and non-recycling flow before output;
+the scheduler assigns the completion token. SENT is not a terminal result.
+Matching confirmation, error, timeout, or teardown retires the flow exactly
+once. Synchronous submission failure rejects only its still-owned selected TX,
+including failures before output and reentrant completion during output.
+
+Selecting an ordinary status consumes the pending slot, not subsequent updates.
+Repeated pumps while a frame is in flight submit nothing; newer observations
+coalesce into the latest pending state and survive confirmation or rejection of
+the older frame. Failed terminal/ACK indications retain the operation record
+for GET_OPERATION/ACK recovery; failed ACCEPTED never enables a terminal event.
+
 ## Numeric Comparison
 
 NimBLE is configured for DisplayYesNo, bonding, MITM, Secure Connections only,
@@ -87,8 +112,11 @@ an epoch, obtains a service token, and wakes the Device Link owner without
 logging the six-digit value.
 
 Local accept/reject validates the exact token and calls `ble_sm_inject_io()`.
-Success consumes the pending action; failure restores it only if the handle and
-epoch are unchanged. Disconnect, reset, window close, unsupported passkey
+The host owns one offer/reply slot: a new passkey offer is rejected while the
+existing offer or its reply tombstone is live, rather than replacing the tuple.
+Queued timeout and invalidation retire the old service prompt exactly once.
+Success consumes the pending action; failure restores it only if the handle
+and epoch are unchanged. Disconnect, reset, window close, unsupported passkey
 action, and SMP failure clear the local pending state and wake the owner so the
 Setup page hides or restores its controls from a new status generation.
 
@@ -115,6 +143,10 @@ an idle owner publishes the completed physical state without another GAP event.
 Failures retain the exact action and generation with bounded exponential retry,
 and the owner waits on the nearest absolute deadline rather than periodic
 polling.
+
+Only CONNECT, DISCONNECT, SYNC, RESET, and advertising lifecycle events enter
+the advertising consumer and wake the owner after manager application. TX,
+MTU, security, and subscription events do not generate advertising wake hints.
 
 ## Pairing Gate And Store
 
@@ -153,8 +185,19 @@ ctest --test-dir /tmp/mt-ble-runtime --output-on-failure
 lifecycle, GATT registry and gate behavior, GAP admission, advertising payload
 and convergence, TX credit/completion/tombstones, indication deadlines, cleanup
 capacity and fences, Numeric Comparison policy, sticky store guards, session
-security state, and pinned IDF assumptions. On x86_64, CTest disables ASLR for
-TSan when `setarch` is available.
+security state, and pinned IDF assumptions. `test_ble_link_delivery` exercises
+real GATT/service/engine/scheduler scan delivery and retained-result recovery;
+`test_ble_nimble_link_events` exercises capture/apply lock barriers, stale ACLs,
+early MTU/CCCD, and advertising feedback/recovery with real production helpers.
+`test_ble_wifi_recovery` runs the product event consumer, adapter, event bus,
+GATT, service, engine, and scheduler together. It covers disconnect/reset with
+same-handle reconnect, stale disconnect isolation, complete retained scan results
+and ACK retirement, immutable terminal retries, Bluetooth-off worker deadlines,
+and bridge retirement at product deinit. Its fake host closes the ACL on stop
+and retains GATT registration across Bluetooth restarts; SDK callbacks and radio
+hardware remain outside this harness.
+These helpers do not simulate all of `ble_nimble_port.c` or the SDK. On x86_64,
+CTest disables ASLR for TSan when `setarch` is available.
 
 Host tests do not prove ESP32-S3 NimBLE callback timing, NVS persistence, radio
 behavior, reset/cold-start behavior, or interoperability with Android.

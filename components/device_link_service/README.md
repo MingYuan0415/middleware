@@ -27,6 +27,9 @@ Device Link v1 产品策略 owner：持有 `ble_runtime` 生命周期，管理�
 - GATT/SMP 事实由 NimBLE 回调保留并唤醒本 owner；回调不直接更新 LVGL 或发布应用事件。
 - Bluetooth 关闭与完整 deinit 共用停机阶段：关闭广播与窗口、host 屏障关闭连接入口、清除逻辑会话、等待断连及撤销清理、第二次屏障确认后释放 runtime。正常清理等待不消耗失败次数；超时保留阶段和资源，后续请求或 deinit 可继续推进。反向开启先完成本轮释放，成功后没有固定冷却。
 - Wi-Fi 请求入队与 BLE/manager 操作 ID 登记在同一 bridge 锁内完成；发布线程读取完整映射，并在调用 link-service 完成接口前释放该锁。
+- 普通断连、host RESET、窗口关闭、revoke 与 Bluetooth 开关不清除已接受的 Wi-Fi 操作关联；engine 继续保留 device-scoped record，断连后不自动重放 indication，客户端回连可按原 ID 查询/ACK。
+- status 与 scan 共用固定大小的不可变 terminal slot；完成接口的瞬态失败保留首次结果与扫描列表，重复/更新事件只触发重试，不能改写该终态。新请求仅在 manager 成功准入后替换旧映射；完整 service deinit 才退休 bridge。
+- Bluetooth 关闭仍推进原 operation deadline 和既有唤醒触发的完成重试；TX/广播/窗口处理仍要求 runtime ready，操作期限不会因开关重置。
 
 ## 测试边界
 
