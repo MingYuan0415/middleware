@@ -31,7 +31,7 @@ wifi_service_shared_t g_wifi_service =
 uint64_t wifi_service_internal_next_generation(void)
 {
     uint64_t value = atomic_fetch_add_explicit(&g_wifi_service.generation, 1U,
-                     memory_order_relaxed) + 1U;
+        memory_order_relaxed) + 1U;
     if (value == 0)
     {
         value = atomic_fetch_add_explicit(&g_wifi_service.generation, 1U,
@@ -392,7 +392,7 @@ static esp_err_t _wifi_service_submit_control(
         return ESP_FAIL;
     }
     result = (esp_err_t)atomic_load_explicit(&g_wifi_service.control_result,
-             memory_order_acquire);
+        memory_order_acquire);
     atomic_store(&g_wifi_service.control_inflight, false);
     atomic_store(&g_wifi_service.control_type, WIFI_CONTROL_NONE);
     return result;
@@ -460,7 +460,7 @@ esp_err_t wifi_service_init(const wifi_service_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t result = _wifi_service_control(WIFI_CONTROL_INIT,
-                       WIFI_SERVICE_WAIT_FOREVER, config);
+        WIFI_SERVICE_WAIT_FOREVER, config);
     if (result == ESP_OK)
     {
         LOG_I("ready: scan=%u, queue=%u, credentials=RAM-only",

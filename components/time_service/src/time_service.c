@@ -441,7 +441,7 @@ static bool _worker_pause(uint32_t *notifications)
 static void _worker_apply_network_ready(void)
 {
     const bool ready = (atomic_load_explicit(&s_network_state,
-                        memory_order_acquire) &
+        memory_order_acquire) &
                         TIME_SERVICE_NETWORK_READY_BIT) != 0U;
     esp_err_t result = ready ? _request_sync(false) :
                        time_service_cancel_sync();
@@ -1383,7 +1383,7 @@ esp_err_t time_service_set_network_ready(bool ready)
 #endif
 
     uint_fast32_t current = atomic_load_explicit(&s_network_state,
-                            memory_order_acquire);
+        memory_order_acquire);
     uint_fast32_t desired;
     for (;;)
     {

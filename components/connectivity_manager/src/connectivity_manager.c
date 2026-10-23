@@ -3003,7 +3003,7 @@ esp_err_t connectivity_manager_suspend(uint32_t timeout_ms)
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t result = _manager_control(MANAGER_COMMAND_SUSPEND,
-                             timeout_ms);
+        timeout_ms);
     _manager_api_release();
     return result;
 }
@@ -3020,7 +3020,7 @@ esp_err_t connectivity_manager_resume(uint32_t timeout_ms)
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t result = _manager_control(MANAGER_COMMAND_RESUME,
-                             timeout_ms);
+        timeout_ms);
     _manager_api_release();
     return result;
 }

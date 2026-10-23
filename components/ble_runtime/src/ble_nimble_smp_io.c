@@ -142,7 +142,7 @@ esp_err_t ble_nimble_smp_io_offer(ble_nimble_smp_io_t *io,
     /* Publication may wake another task, which must wait for this commit lock.
      * Its service callback cannot enter the helper synchronously. */
     const esp_err_t result = io->ops.publish_confirmation(passkey, token,
-                             io->ops.arg);
+        io->ops.arg);
     if (result != ESP_OK)
     {
         io->offer_pending = false;

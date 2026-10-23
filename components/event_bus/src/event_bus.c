@@ -762,7 +762,7 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         bool current = _event_bus_subscription_is_current(entry->slot,
-                       entry->generation);
+            entry->generation);
         xSemaphoreGive(s_mutex);
         if (current)
         {

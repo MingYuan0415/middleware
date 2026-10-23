@@ -652,9 +652,9 @@ esp_err_t weather_service_cache_load(const char *directory,
     uint64_t first_sequence = 0U;
     uint64_t second_sequence = 0U;
     esp_err_t first_result = _weather_cache_read_slot(path_a, first,
-                             &first_sequence);
+        &first_sequence);
     esp_err_t second_result = _weather_cache_read_slot(path_b, second,
-                              &second_sequence);
+        &second_sequence);
     esp_err_t result = ESP_ERR_NOT_FOUND;
     if (first_result == ESP_OK || second_result == ESP_OK)
     {

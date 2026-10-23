@@ -532,12 +532,12 @@ esp_err_t ble_link_service_execute(ble_link_work_t *work)
     if (route.kind == DEVICE_LINK_V1_ROUTE_APP)
     {
         length = _ble_link_service_encode_app_error(&route, response,
-                 sizeof(response));
+            sizeof(response));
     }
     else
     {
         length = _ble_link_service_handle_admitted(&route.request, response,
-                 sizeof(response));
+            sizeof(response));
     }
     if (!device_link_v1_engine_write_blocked(&s_service.engine))
     {
@@ -589,7 +589,7 @@ void ble_link_service_tick(uint32_t now_ms)
 {
     _ble_link_service_lock();
     const bool timed_out = device_link_v1_engine_tick(&s_service.engine,
-                           now_ms);
+        now_ms);
 
     _ble_link_service_unlock();
     if (timed_out)

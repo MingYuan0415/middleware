@@ -642,7 +642,7 @@ static esp_err_t _weather_locate(uint64_t session,
     *failure = WEATHER_SERVICE_FAILURE_LOCATION;
     char url[256];
     esp_err_t result = _weather_endpoint_url(url, sizeof(url),
-                       "/api/v1/location");
+        "/api/v1/location");
     if (result != ESP_OK)
     {
         return result;
@@ -951,7 +951,7 @@ static weather_service_fetch_result_t _weather_fetch_once(
     weather_service_fetch_result_t fetch = {0};
     char url[256];
     esp_err_t result = _weather_endpoint_url(url, sizeof(url),
-                       _weather_kind_path(kind));
+        _weather_kind_path(kind));
     if (result != ESP_OK)
     {
         fetch.error = result;
@@ -1245,7 +1245,7 @@ static void _weather_run_cycle(bool force)
         return;
     }
     uint32_t metadata_changed = _weather_mark_expired(&staging->snapshot,
-                                wall_now);
+        wall_now);
     bool new_location = false;
     bool location_changed = false;
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);

@@ -2580,7 +2580,7 @@ esp_err_t device_link_service_deinit(uint32_t timeout_ms)
     /* The worker confirmed the shared cleanup fixed point. A runtime
      * teardown failure keeps STOPPING and every remaining dependency. */
     esp_err_t result = (esp_err_t)atomic_load_explicit(&s_worker_result,
-                       memory_order_acquire);
+        memory_order_acquire);
     esp_err_t teardown_result = _device_link_service_runtime_teardown();
 
     if (result == ESP_OK)

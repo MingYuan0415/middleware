@@ -244,7 +244,7 @@ static void _publish_snapshot(uint32_t subtype,
                               uint32_t flags)
 {
     const esp_err_t result = event_bus_publish(IMU_SERVICE_MSG, subtype,
-                             snapshot, sizeof(*snapshot), flags);
+        snapshot, sizeof(*snapshot), flags);
     if (result != ESP_OK)
     {
         LOG_W("snapshot publish failed: 0x%x", result);
@@ -418,7 +418,7 @@ static void _imu_worker(void *argument)
         memset(&sample, 0, sizeof(sample));
         const bool available = _hardware_available();
         const esp_err_t result = available ? _read_hardware(&sample,
-                                 io_mutex) :
+            io_mutex) :
                                  ESP_ERR_NOT_FOUND;
         _update_snapshot(available, result == ESP_OK, &sample);
         if (result != ESP_OK && available)

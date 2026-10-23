@@ -465,7 +465,7 @@ static bool _weather_parse_location_object(const cJSON *object,
     char location_key[17];
     const cJSON *source = cJSON_GetObjectItemCaseSensitive(object, "source");
     const cJSON *precision = cJSON_GetObjectItemCaseSensitive(object,
-                             "precision");
+        "precision");
     if (!cJSON_IsObject(object) || !cJSON_IsString(source) ||
             source->valuestring == NULL ||
             (strcmp(source->valuestring, "ip") != 0 &&

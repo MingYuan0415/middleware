@@ -337,7 +337,7 @@ static bool _test_periodic_and_cancel(void)
     TEST_CHECK(chore_service_init(&config) == ESP_OK);
     TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
     TEST_CHECK(_chore_test_wait_int_at_least(&arg.runs, 3,
-               CHORE_TEST_TIMEOUT_MS));
+            CHORE_TEST_TIMEOUT_MS));
     TEST_CHECK(chore_service_cancel(&handle, CHORE_TEST_TIMEOUT_MS) ==
                ESP_OK);
     /* Cancellation quiescence includes the release callback: it must have
@@ -695,7 +695,7 @@ static bool _test_suspend_no_catch_up(void)
     TEST_CHECK(chore_service_init(&config) == ESP_OK);
     TEST_CHECK(chore_service_submit(&job, &handle) == ESP_OK);
     TEST_CHECK(_chore_test_wait_int_at_least(&arg.runs, 2,
-               CHORE_TEST_TIMEOUT_MS));
+            CHORE_TEST_TIMEOUT_MS));
     TEST_CHECK(chore_service_suspend(CHORE_TEST_TIMEOUT_MS) == ESP_OK);
     const int runs_suspended =
         atomic_load_explicit(&arg.runs, memory_order_acquire);
@@ -705,7 +705,7 @@ static bool _test_suspend_no_catch_up(void)
     _chore_test_clock_advance_ms(10000);
     TEST_CHECK(chore_service_resume(CHORE_TEST_TIMEOUT_MS) == ESP_OK);
     TEST_CHECK(_chore_test_wait_int_at_least(&arg.runs, runs_suspended + 1,
-               CHORE_TEST_TIMEOUT_MS));
+            CHORE_TEST_TIMEOUT_MS));
     usleep(80000);
     const int runs_resumed =
         atomic_load_explicit(&arg.runs, memory_order_acquire);

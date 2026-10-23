@@ -49,7 +49,7 @@ static atomic_bool s_events_enabled;
 static uint32_t _wifi_service_port_next_epoch(void)
 {
     uint32_t epoch = atomic_fetch_add_explicit(&s_event_epoch, 1U,
-                     memory_order_acq_rel) + 1U;
+        memory_order_acq_rel) + 1U;
     if (epoch == 0)
     {
         epoch = atomic_fetch_add_explicit(&s_event_epoch, 1U,
@@ -339,7 +339,7 @@ static void _wifi_service_port_event_handler(void *argument,
 {
     const uint32_t handler_epoch = (uint32_t)(uintptr_t)argument;
     const uint32_t epoch = atomic_load_explicit(&s_event_epoch,
-                           memory_order_acquire);
+        memory_order_acquire);
     wifi_service_port_event_t event;
     memset(&event, 0, sizeof(event));
     event.epoch = epoch;

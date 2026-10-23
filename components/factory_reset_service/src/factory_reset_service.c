@@ -156,7 +156,7 @@ esp_err_t factory_reset_service_init(
         return ESP_ERR_INVALID_ARG;
     }
     unsigned expected = atomic_load_explicit(&s_api_state,
-                        memory_order_acquire);
+        memory_order_acquire);
 
     if ((expected & FACTORY_RESET_SERVICE_LIFECYCLE_MASK) !=
             FACTORY_RESET_SERVICE_STOPPED ||
@@ -190,7 +190,7 @@ esp_err_t factory_reset_service_init(
 esp_err_t factory_reset_service_deinit(void)
 {
     unsigned expected = atomic_load_explicit(&s_api_state,
-                        memory_order_acquire);
+        memory_order_acquire);
 
     if ((expected & FACTORY_RESET_SERVICE_LIFECYCLE_MASK) ==
             FACTORY_RESET_SERVICE_STOPPED)

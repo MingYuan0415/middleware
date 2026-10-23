@@ -236,7 +236,7 @@ static void test_partial_registration_rolls_back(void)
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
                       ble_gatt_registry_get_service(1U, &found_svc));
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_get_characteristic(1U,
-                      &found_chr));
+            &found_chr));
     TEST_ASSERT_TRUE(found_chr == &s_link_chrs[1]);
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
                       ble_gatt_registry_get_characteristic(2U, &found_chr));
@@ -353,10 +353,10 @@ static void test_iteration_ordering(void)
     ble_gatt_registry_init();
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_register(&s_link_service));
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_get_characteristic(0U,
-                      &found_chr));
+            &found_chr));
     TEST_ASSERT_TRUE(found_chr == &s_link_chrs[0]);
     TEST_ASSERT_EQUAL(ESP_OK, ble_gatt_registry_get_characteristic(1U,
-                      &found_chr));
+            &found_chr));
     TEST_ASSERT_TRUE(found_chr == &s_link_chrs[1]);
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND,
                       ble_gatt_registry_get_characteristic(2U, &found_chr));

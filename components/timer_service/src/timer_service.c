@@ -60,7 +60,7 @@ static void _timer_update_locked(int64_t now_us)
     if (s_timer.snapshot.countdown_state == TIMER_SERVICE_RUNNING)
     {
         const uint32_t elapsed = _timer_elapsed_ms(s_timer.countdown_started_us,
-                                 now_us);
+            now_us);
         if (elapsed >= s_timer.snapshot.countdown_remaining_ms)
         {
             s_timer.snapshot.countdown_remaining_ms = 0U;

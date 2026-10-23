@@ -117,7 +117,7 @@ static esp_err_t _chore_api_enter(void)
     for (;;)
     {
         const uint32_t value = atomic_load_explicit(&s_chore_admission,
-                               memory_order_relaxed);
+            memory_order_relaxed);
         if ((value & CHORE_API_CLOSING) != 0U)
         {
             return ESP_ERR_INVALID_STATE;
@@ -164,7 +164,7 @@ static void _chore_admission_open(void)
     for (;;)
     {
         const uint32_t value = atomic_load_explicit(&s_chore_admission,
-                               memory_order_relaxed);
+            memory_order_relaxed);
         const uint32_t epoch = (value >> CHORE_API_EPOCH_SHIFT) &
                                CHORE_API_EPOCH_VALUE;
         const uint32_t next = (value & CHORE_API_COUNT_MASK) |
@@ -366,7 +366,7 @@ static void _chore_dispatch_job(chore_slot_t *slot, uint32_t slot_index)
     }
     xSemaphoreTake(s_chore.mutex, portMAX_DELAY);
     const bool cancelled = atomic_load_explicit(&slot->cancel_requested,
-                           memory_order_acquire);
+        memory_order_acquire);
     if (cancelled)
     {
         ++s_chore.cancelled_count;

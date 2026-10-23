@@ -61,7 +61,7 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
         atomic_fetch_add_explicit(&s_irq_event_attempts, 1U,
                                   memory_order_release);
         unsigned failures = atomic_load_explicit(&s_irq_publish_failures,
-                            memory_order_acquire);
+            memory_order_acquire);
         if (failures != 0U && atomic_compare_exchange_strong_explicit(
                     &s_irq_publish_failures, &failures, failures - 1U,
                     memory_order_acq_rel, memory_order_acquire))

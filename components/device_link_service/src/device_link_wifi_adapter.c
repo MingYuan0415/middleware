@@ -481,7 +481,7 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
             };
 
             result = connectivity_manager_request_save_profile(&saved,
-                     &manager_id);
+                &manager_id);
         }
         break;
     case DEVICE_LINK_V1_OPERATION_CONNECT:
