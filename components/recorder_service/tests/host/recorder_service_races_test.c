@@ -38,8 +38,9 @@ static bool s_fail_scan_allocation;
 
 static void *_test_calloc(size_t count, size_t size)
 {
-    if (s_fail_scan_allocation && count == RECORDER_SERVICE_MAX_FILES &&
-            size == sizeof(recorder_service_file_t))
+    /* The scan allocates one bundle per refresh; fail exactly that request. */
+    if (s_fail_scan_allocation && count == 1U &&
+            size == sizeof(recorder_scan_t))
     {
         return NULL;
     }
@@ -79,9 +80,9 @@ static void _test_unlock(volatile atomic_flag *flag, memory_order order)
          * captured. A split freshness/copy path would copy this other index. */
         s_replace_on_unlock = false;
         ++s_recorder.index_revision;
-        s_recorder.files[0].target.revision = s_recorder.index_revision;
-        (void)snprintf(s_recorder.files[0].target.name,
-                       sizeof(s_recorder.files[0].target.name), "wrong-publication");
+        s_index_files[0].target.revision = s_recorder.index_revision;
+        (void)snprintf(s_index_files[0].target.name,
+                       sizeof(s_index_files[0].target.name), "wrong-publication");
     }
     atomic_flag_clear(flag);
 }
@@ -175,7 +176,7 @@ int main(void)
     _recorder_finish(false, ESP_OK, false);
     assert(s_recorder.file_count == 1U);
     /* A valid same-path replacement must not even be opened for an old row. */
-    const recorder_service_target_t stale = s_recorder.files[0].target;
+    const recorder_service_target_t stale = s_index_files[0].target;
     assert(remove(stale.name) == 0);
     FILE *replacement = fopen(stale.name, "wb+");
     assert(replacement != NULL);

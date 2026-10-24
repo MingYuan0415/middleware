@@ -348,6 +348,87 @@ static void _maximum_duration(void)
     (void)_wav();
 }
 
+
+/* A failed take must not leave its working file: .part names are invisible to
+ * the library and can never be deleted from the UI. */
+static size_t _part_files(void)
+{
+    char path[sizeof(s_root) + 16U];
+    assert(snprintf(path, sizeof(path), "%s/Recordings", s_root) > 0);
+    DIR *directory = opendir(path);
+    assert(directory != NULL);
+    size_t parts = 0U;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL)
+    {
+        const size_t length = strlen(entry->d_name);
+        if (length > 5U && strcmp(entry->d_name + length - 5U, ".part") == 0)
+        {
+            ++parts;
+        }
+    }
+    assert(closedir(directory) == 0);
+    return parts;
+}
+
+static void _failed_take_leaves_no_part(void)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    _io_error(false, NULL);
+    assert(_part_files() == 0U);
+    assert(_snapshot().state == RECORDER_SERVICE_ERROR);
+    (void)owners;
+}
+
+/* Pausing must not queue capture for later: the file would grow with audio the
+ * user never recorded while the reported duration stayed paused. The drain is
+ * observable as I/O continuing while the state is PAUSED. */
+static void _pause_discards_capture(void)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    _start_record();
+    assert(recorder_service_pause() == ESP_OK);
+    for (unsigned attempt = 0U; attempt < 5000U; ++attempt)
+    {
+        if (_snapshot().state == RECORDER_SERVICE_PAUSED)
+        {
+            break;
+        }
+        usleep(1000U);
+    }
+    assert(_snapshot().state == RECORDER_SERVICE_PAUSED);
+    const uint64_t paused_bytes = _snapshot().bytes;
+    assert(pthread_mutex_lock(&s_io_lock) == 0);
+    const unsigned entered_before = s_entered;
+    assert(pthread_mutex_unlock(&s_io_lock) == 0);
+    /* Grant several reads; the paused loop must consume them by discarding. */
+    for (unsigned i = 0U; i < 4U; ++i)
+    {
+        _io_release();
+        usleep(5000U);
+    }
+    assert(pthread_mutex_lock(&s_io_lock) == 0);
+    const unsigned entered_after = s_entered;
+    assert(pthread_mutex_unlock(&s_io_lock) == 0);
+    assert(entered_after > entered_before);
+    assert(_snapshot().bytes == paused_bytes);
+    assert(_snapshot().state == RECORDER_SERVICE_PAUSED);
+    assert(recorder_service_resume() == ESP_OK);
+    for (unsigned attempt = 0U; attempt < 5000U; ++attempt)
+    {
+        if (_snapshot().state == RECORDER_SERVICE_RECORDING)
+        {
+            break;
+        }
+        usleep(1000U);
+    }
+    assert(_snapshot().state == RECORDER_SERVICE_RECORDING);
+    _io_release();
+    _stop_blocked(false);
+    assert(_snapshot().state == RECORDER_SERVICE_IDLE);
+    _reaped(owners);
+}
+
 int main(void)
 {
     assert(mkdtemp(s_root) != NULL);
@@ -370,6 +451,10 @@ int main(void)
     _io_error(true, &target);
     target = _record_stop();
     _io_error(false, NULL);
+    target = _record_stop();
+    _failed_take_leaves_no_part();
+    target = _record_stop();
+    _pause_discards_capture();
     target = _record_stop();
     _maximum_duration();
     target = _record_stop();

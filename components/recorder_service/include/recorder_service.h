@@ -63,11 +63,15 @@ typedef struct recorder_service_snapshot
     uint32_t index_generation; /**< Published index mount generation. */
     uint32_t index_revision; /**< Published index content revision. */
     bool index_valid; /**< Whether a complete index has been published. */
+    size_t file_count; /**< Recordings published in the current index. */
+    bool library_truncated; /**< The medium holds more recordings than the index. */
+    uint32_t max_duration_ms; /**< Configured recording limit. */
     char name[RECORDER_SERVICE_PATH_BYTES]; /**< Full backend path of the file. */
     esp_err_t last_error;
 } recorder_service_snapshot_t;
 
-#define RECORDER_SERVICE_MAX_FILES 8U
+/** @brief Recordings retained by one published index, newest first. */
+#define RECORDER_SERVICE_MAX_FILES 32U
 
 /** @brief Bounded metadata for one completed WAV recording. */
 typedef struct recorder_service_file
@@ -75,6 +79,8 @@ typedef struct recorder_service_file
     recorder_service_target_t target; /**< Target captured with this metadata. */
     uint32_t duration_ms;
     uint64_t bytes;
+    bool has_mtime;                     /**< Whether modified time is known. */
+    uint32_t modified_epoch_s;          /**< UTC modified time when known. */
 } recorder_service_file_t;
 
 /**
@@ -95,6 +101,14 @@ esp_err_t recorder_service_get_snapshot(recorder_service_snapshot_t *snapshot);
  */
 esp_err_t recorder_service_list(recorder_service_file_t *files,
                                 size_t capacity, size_t *count);
+/**
+ * @brief Ask the worker to republish a stale index.
+ *
+ * Non-consuming counterpart of recorder_service_list() for callers that only
+ * read snapshot counters. Requests coalesce; a fresh index returns ESP_OK
+ * without queueing work.
+ */
+esp_err_t recorder_service_refresh(void);
 bool recorder_service_is_busy(void);
 /** @brief Queue a recording command; completion is reported in the snapshot. */
 esp_err_t recorder_service_start(void);

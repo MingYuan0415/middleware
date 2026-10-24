@@ -18,6 +18,10 @@ add_executable(recorder_service_test
 add_executable(recorder_service_races_test
     recorder_service_races_test.c
     recorder_service_fakes.c)
+add_executable(recorder_service_library_test
+    recorder_service_library_test.c
+    recorder_service_fakes.c
+    "${RECORDER_DIR}/src/recorder_service.c")
 add_executable(recorder_service_stream_test
     recorder_service_stream_test.c
     recorder_service_fakes.c
@@ -29,7 +33,8 @@ target_compile_definitions(recorder_service_stream_test PRIVATE
     portEXIT_CRITICAL=taskEXIT_CRITICAL)
 target_link_options(recorder_service_stream_test PRIVATE
     -Wl,--wrap=xTaskCreatePinnedToCoreWithCaps)
-foreach(target recorder_service_test recorder_service_races_test recorder_service_stream_test)
+foreach(target recorder_service_test recorder_service_races_test
+        recorder_service_library_test recorder_service_stream_test)
 target_include_directories(${target} PRIVATE
     include
     "${RECORDER_DIR}/include"
@@ -59,6 +64,8 @@ endforeach()
 
 add_test(NAME recorder_service COMMAND recorder_service_test)
 add_test(NAME recorder_service_races COMMAND recorder_service_races_test)
-set_tests_properties(recorder_service recorder_service_races PROPERTIES TIMEOUT 10)
+add_test(NAME recorder_service_library COMMAND recorder_service_library_test)
+set_tests_properties(recorder_service recorder_service_races
+    recorder_service_library PROPERTIES TIMEOUT 10)
 add_test(NAME recorder_service_stream COMMAND recorder_service_stream_test)
 set_tests_properties(recorder_service_stream PROPERTIES TIMEOUT 20)

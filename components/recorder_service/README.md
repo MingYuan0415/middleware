@@ -12,18 +12,37 @@
 - `recorder_service_start()` / `pause()` / `resume()` / `stop()`：录音命令，完成通过快照报告。
 - `recorder_service_play()` / `stop_playback()`：播放指定 WAV 并停止播放。
 - `recorder_service_list()` / `delete()`：枚举已完成 WAV 与删除文件，不暴露目录句柄。
+  列表按修改时间倒序（`has_mtime` 为假的行排在已知时间之后，同时间按文件名倒序），
+  最多保留最新的 `RECORDER_SERVICE_MAX_FILES` 条；超出时快照的 `library_truncated`
+  为真，UI 据此提示「仅显示最新 N 个」。
   列表每行的 `target` 保留完整 UTF-8 后端路径（192 字节，含终止符）及该次
   索引发布的挂载 generation / 内容 revision；播放与删除接收该 target 的指针，
-  队列复制完整 target，不按同名路径重新选择文件。
+  队列复制完整 target，不按同名路径重新选择文件。每行另带 `has_mtime` 与
+  `modified_epoch_s`（来自 `stat`），供 UI 显示录制时间。
+- `recorder_service_refresh()`：只读快照计数的调用方用它请求重新发布过期索引；
+  与 `list()` 的隐式请求同样合并，索引新鲜时不排队。
 - `recorder_service_get_snapshot()` / `is_busy()`：状态快照与忙碌查询。快照
   区分 `free_bytes`（`space_valid` 为真时才有效）、`space_error` 与
   `storage_ready`；容量查询失败不会被当作空间不足。当前 SD 的
   `storage_generation` / `content_revision` 在 recorder 锁外读取；
-  `index_generation` / `index_revision` / `index_valid` 在锁内与索引一同复制。
+  `index_generation` / `index_revision` / `index_valid` / `file_count` /
+  `library_truncated` 在锁内与索引一同复制；`max_duration_ms` 来自初始化配置，
+  UI 用它显示上限与剩余录音时间。
 
 `recorder_service_snapshot_t.name`、`recorder_service_file_t.target.name` 和播放/删除命令均保存
 完整文件路径，容量为 `RECORDER_SERVICE_PATH_BYTES` 字节（含结尾 NUL）；路径拼接超出该容量的
 录音文件不进入服务索引。
+
+## 文件命名
+
+新录音以 `REC_YYYYMMDD_HHMMSS` 命名（本地时间，系统时钟不早于 2020 时才采用）；
+时钟未校准时回退为 `REC_<esp_timer 微秒>`，保持单调可排序。同一秒内的第二次录音
+追加 `-2`、`-3` 后缀：创建用 `open(O_CREAT|O_EXCL)` 占位，并额外探测对应的
+`.wav` 是否已存在，因此重启或在同一秒内连续录音都不会覆盖既有文件。
+
+名字中出现连续两点（如 `REC_..a.wav`）不影响播放与删除：路径归属检查只要求文件名是
+录音目录的直接子项且不含分隔符，`.`/`..` 条目本身仍被拒绝。此前按“含 `..` 即拒绝”
+判定，会让扫描列出的这类录音长期可见却无法操作。
 
 ## 配置与依赖
 
@@ -35,12 +54,20 @@
 
 - 单例；命令经有界队列交给 pinned worker 任务，录音与播放共用一个流任务。
   设备流任务的 4096 字节栈以 `SPIRAM | 8BIT` 显式分配，不回退内部 RAM；
-  共用 4096 字节 PCM 位于外部 BSS。TCB、队列、锁和普通 4096 字节命令栈仍在内部。
+  共用 4096 字节 PCM 位于外部 BSS。TCB、队列、锁和 6144 字节命令栈仍在内部。
+  命令栈承载每次索引扫描向下的 VFS → FATFS → diskio → SDSPI 调用链；按 `-O2`
+  实测该链（扫描 304、`vfs_fat_stat` 336、`f_stat` 96、`sdspi_host_start_command`
+  272、`start_command_default` 96，未计 newlib printf 与扇区缓冲）约需 1.8 KB，
+  加上命令任务自身 576 字节与打断余量，4096 不足，6144 留出约 3 KB 裕量。
   普通宿主与模拟器只运行命令 worker，不模拟音频流，SESSION 保留至显式停止；
   独立的设备分支宿主目标执行真实流任务以验证生命周期。
 - 状态以 `generation` / `operation_id` 标识，命令异步完成；临界区与原子量保护共享字段。
   所有跨服务调用（包括 SD 状态、revision、租约和计时）均在 recorder 临界区之外执行。
 - 状态机：IDLE / RECORDING / PAUSED / PLAYING / ERROR。
+- 暂停期间采集设备仍在运行，流任务继续读取并丢弃输入；不读会让暂停区间积存在 I2S
+  环形缓冲里，恢复后写入文件，产生用户没录过的音频且数据长度超出上报时长。
+- 失败的录音（IO 错误、时长上限、写头失败）在关闭后删除 `.part` 工作文件；否则库永远
+  不列出这些名字，用户也无法删除，只会缓慢占满存储卡。
 - 占用：目录准备、文件创建、录制、暂停、关闭、WAV finalize 与索引刷新，以及
   播放从打开到关闭，全程持有 `sd_storage_service` 的业务使用权（SESSION）；
   删除取独占维护权。因此录音/播放期间可以浏览，但删除、卸载与格式化会被拒绝。
@@ -54,8 +81,14 @@
   过期列表返回空并请求异步刷新，设备与宿主均不在查询中做文件/容量 I/O。
   失败或中断的目录扫描不发布有效索引；并发扫描用 publication version 防止旧结果覆盖
   新索引。有效索引变化递增快照 generation，列表验证与复制在同一临界区完成。
-  每次扫描的八条临时元数据独立分配在堆上，发布后或扫描失败时释放，不放在
-  `recorder_cmd` 的 4096 字节任务栈上，也不与并发收尾扫描共用 scratch。
+  录音目录由首次录音惰性创建，未录制过的卡上目录不存在属于空库而非扫描失败，
+  `opendir()` 返回 `ENOENT`/`ENOTDIR` 时照常发布空索引（否则首次开机将永久停在读取中）。
+  索引只在内容真正变化时按实际条数复制进运行时缓存；无条件复制 7 KB 会在关中断临界区里
+  付出几十微秒的中断延迟，而读到的字节对任何读者都不可见。
+  每次扫描的完整工作集（`RECORDER_SERVICE_MAX_FILES` 条元数据加两个路径缓冲，
+  约 7.3 KB，类型 `recorder_scan_t`）独立分配在堆上，发布后或扫描失败时释放，不放在
+  `recorder_cmd` 的任务栈上，也不与并发收尾扫描共用 scratch。扫描按字段
+  （文件名、mtime、epoch）比较并直接写入目标槽位，不在栈上构造候选记录。
   分配失败使索引无效并释放本次 ACCESS；不会上报介质故障，后续 list 可请求重扫。
 - 内容 revision 由 `sd_storage_service` 统一维护，无 `file_service` 依赖。
   录音先关闭并 finalize WAV，再通知内容变更、刷新索引并释放 SESSION，最后发布
@@ -71,6 +104,13 @@
   这些外部栈路径仅访问 SD/SDSPI 与 I2S，不执行 NVS、flash 文件系统、OTA 或显式 sleep。
   SDSPI 复用 SDK slot 的 516 字节内部 DMA staging；外移量不等于净 DMA 空闲增量。
 
+## 内存归属
+
+索引缓存（`RECORDER_SERVICE_MAX_FILES` × 每条元数据，32 条共 7,168 B）放在 PSRAM。
+内部 DRAM 同时承担显示 SPI bounce 缓冲（10 行 × 368 × 2 B × 队列 2 = 14,720 B 连续块）
+与 I2S 全双工 DMA 环（每方向 5,760 B）；索引若留在内部 DRAM，录音启动后单个显示分块
+就会 `ESP_ERR_NO_MEM`，界面停止刷新。
+
 ## 测试边界
 
 - `tests/host` 使用真实 pthread 命令 worker 与 audio/SD fake，覆盖异步状态迁移、
@@ -83,6 +123,8 @@
   原目标终态失败、替换文件逐字节保留、不启动音频且释放 SESSION / MAINTENANCE；
   同时覆盖当前目标的成功播放/删除及索引元数据与快照 epoch 对应。
   扫描缓冲 OOM 回归检查索引失效、ACCESS 释放、介质保持可用与后续恢复。
+  `recorder_service_library_test` 覆盖上限截断标记、按修改时间倒序发布、
+  删除至上限后清除截断标记，以及同一秒内两次录音仍取得不同文件名。
   `recorder_service_stream_test` 单独定义 `ESP_PLATFORM`，使用真实 pthread-backed
   FreeRTOS 流任务与条件变量控制音频读写。覆盖 WAV 长度/头、显式停止、最大时长、
   无命令的播放 EOF、读写错误、创建失败补偿、完成早于创建返回、立即 start/play、

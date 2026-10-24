@@ -14,6 +14,9 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifdef ESP_PLATFORM
     #include "freertos/FreeRTOS.h"
@@ -26,6 +29,16 @@
 #else
     #include "recorder_host_worker.h"
 #endif
+
+/*
+ * The command worker runs every index scan, and each scan enters
+ * VFS -> FATFS -> diskio -> SDSPI from that stack. Measured frames on the chain
+ * (O2, xtensa-esp32s3): refresh_index 304, vfs_fat_stat 336, f_stat 96,
+ * sdspi_host_start_command 272, start_command_default 96, plus newlib printf and
+ * the per-call sector buffers. 4096 left too little margin, so the limit is
+ * stated here instead of being rediscovered by an overflow.
+ */
+#define RECORDER_COMMAND_STACK 6144
 
 typedef enum recorder_command_type
 {
@@ -64,6 +77,21 @@ typedef struct recorder_wav_header
     uint32_t data_size;
 } recorder_wav_header_t;
 
+/**
+ * @brief One scan's working set, allocated per scan for one reason.
+ *
+ * The command worker runs every scan, and its stack must stay small enough for
+ * the FATFS/VFS/SDSPI call chain it enters from here. Two 192-byte path buffers
+ * plus a 216-byte record on that stack were enough to overflow it on the first
+ * boot-time index refresh, so the whole working set lives in this bundle.
+ */
+typedef struct recorder_scan
+{
+    recorder_service_file_t files[RECORDER_SERVICE_MAX_FILES];
+    char directory_path[RECORDER_SERVICE_PATH_BYTES];
+    char path[RECORDER_SERVICE_PATH_BYTES];
+} recorder_scan_t;
+
 typedef struct recorder_runtime
 {
     recorder_service_config_t config;
@@ -76,7 +104,6 @@ typedef struct recorder_runtime
     bool stopping;
     atomic_bool task_running;
     bool playback;
-    recorder_service_file_t files[RECORDER_SERVICE_MAX_FILES];
     size_t file_count;
     bool index_valid;
     bool refresh_requested;
@@ -93,6 +120,22 @@ typedef struct recorder_runtime
 } recorder_runtime_t;
 
 static recorder_runtime_t s_recorder;
+/**
+ * @brief Published index, kept out of internal DRAM on purpose.
+ *
+ * At 32 entries this array is 7 KB. Internal DRAM is also where the display's
+ * SPI bounce buffers and the I2S DMA rings come from; holding the index there
+ * left too little contiguous DMA-capable memory for a single 10-row LCD chunk
+ * once recording started, and every frame then failed with ESP_ERR_NO_MEM.
+ * The index is read by the UI and written once per scan, so PSRAM is the right
+ * home for it.
+ */
+#ifdef ESP_PLATFORM
+    static EXT_RAM_BSS_ATTR recorder_service_file_t
+    s_index_files[RECORDER_SERVICE_MAX_FILES];
+#else
+    static recorder_service_file_t s_index_files[RECORDER_SERVICE_MAX_FILES];
+#endif
 #ifdef ESP_PLATFORM
     static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 #else
@@ -148,21 +191,42 @@ static esp_err_t _recorder_volume_path(const char *relative_path, char *out,
     return ESP_OK;
 }
 
+/**
+ * @brief Whether a target names one direct child of the recording directory.
+ *
+ * The basename must not contain a separator, so nothing can escape the
+ * directory, and "." / ".." are rejected as entries. A filename merely
+ * containing two dots in the middle ("memo..2.wav") is legitimate: scanning
+ * lists it, so play and delete must accept it too. Rejecting it outright left
+ * such rows visible but permanently inoperable.
+ */
+/**
+ * @brief Whether a target names one direct child of the recording directory.
+ *
+ * The basename must contain no separator, so nothing can escape the directory,
+ * and "." / ".." are rejected as entries. A filename with two dots inside it
+ * ("REC_..take.wav") is legitimate: the scan lists it, so play and delete must
+ * accept it too. Rejecting it outright left such rows visible but permanently
+ * inoperable.
+ */
 static bool _recorder_path_is_owned(const char *name)
 {
     const size_t directory_length = strlen(s_recorder.directory_path);
-    const size_t name_length = strlen(name);
-    return directory_length > 0U && name_length > directory_length &&
-           strncmp(name, s_recorder.directory_path, directory_length) == 0 &&
-           name[directory_length] == '/' && strstr(name, "..") == NULL;
+    if (directory_length == 0U || name == NULL ||
+            strncmp(name, s_recorder.directory_path, directory_length) != 0 ||
+            name[directory_length] != '/')
+    {
+        return false;
+    }
+    const char *const base = name + directory_length + 1U;
+    if (base[0] == '\0' || strchr(base, '/') != NULL)
+    {
+        return false;
+    }
+    return !(base[0] == '.' && (base[1] == '\0' ||
+                                (base[1] == '.' && base[2] == '\0')));
 }
 
-/**
- * @brief Resolve the recording directory for the current mount epoch.
- *
- * Called by the worker after a successful mount. The directory is created
- * lazily so a device booted without a card never touches the filesystem.
- */
 static esp_err_t _recorder_prepare_directory(bool create)
 {
     char path[RECORDER_SERVICE_PATH_BYTES];
@@ -296,6 +360,40 @@ static uint32_t _recorder_elapsed_ms(int64_t started_us, int64_t now_us)
 }
 #endif
 
+/** @brief Earliest plausible wall-clock stamp; earlier ones mean no clock. */
+#define RECORDER_MIN_EPOCH_S 1577836800U /* 2020-01-01T00:00:00Z */
+
+/**
+ * @brief Order a scanned candidate against one published record.
+ *
+ * Modified time is authoritative when both sides report one; the file name is
+ * the tie-break because timestamp names sort chronologically. A longer name is
+ * the newer boot-counter name, so length is compared before content.
+ *
+ * The candidate is passed as fields instead of a whole record: the scan runs on
+ * the command worker's stack, where a second 208-byte record is not affordable.
+ */
+static bool _recorder_record_newer(const char *name, bool has_mtime,
+                                   uint32_t epoch_s,
+                                   const recorder_service_file_t *row)
+{
+    if (has_mtime != row->has_mtime)
+    {
+        return has_mtime;
+    }
+    if (has_mtime && epoch_s != row->modified_epoch_s)
+    {
+        return epoch_s > row->modified_epoch_s;
+    }
+    const size_t length = strlen(name);
+    const size_t row_length = strlen(row->target.name);
+    if (length != row_length)
+    {
+        return length > row_length;
+    }
+    return strcmp(name, row->target.name) > 0;
+}
+
 /** @brief Scan under a held lease and publish only a complete, current index. */
 static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage)
 {
@@ -313,9 +411,8 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
     _recorder_lock();
     const uint32_t publish_version = s_recorder.index_publish_version;
     _recorder_unlock();
-    recorder_service_file_t *files = calloc(RECORDER_SERVICE_MAX_FILES,
-                                            sizeof(*files));
-    if (files == NULL)
+    recorder_scan_t *scan = calloc(1U, sizeof(*scan));
+    if (scan == NULL)
     {
         _recorder_lock();
         if (publish_version == s_recorder.index_publish_version)
@@ -323,6 +420,7 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
             ++s_recorder.index_publish_version;
             s_recorder.index_valid = false;
             s_recorder.file_count = 0U;
+            s_recorder.snapshot.library_truncated = false;
             s_recorder.snapshot.space_valid = false;
             s_recorder.snapshot.space_error = ESP_ERR_NO_MEM;
             ++s_recorder.snapshot.generation;
@@ -334,14 +432,15 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
         }
         return;
     }
+    recorder_service_file_t *const files = scan->files;
     size_t file_count = 0U;
     sd_storage_service_snapshot_t before = {0};
     const bool usable = sd_storage_service_get_snapshot(&before) == ESP_OK &&
                         before.mounted && before.generation == usage->generation;
-    char directory_path[RECORDER_SERVICE_PATH_BYTES] = {0};
     const bool resolved = usable &&
-                          _recorder_volume_path(s_recorder.config.directory, directory_path,
-                              sizeof(directory_path)) == ESP_OK;
+                          _recorder_volume_path(s_recorder.config.directory,
+                              scan->directory_path,
+                              sizeof(scan->directory_path)) == ESP_OK;
     uint64_t total_bytes = 0U;
     uint64_t free_bytes = 0U;
     errno = 0;
@@ -350,12 +449,19 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
                                   ESP_ERR_INVALID_STATE;
     bool medium_eio = space_error != ESP_OK && errno == EIO;
     errno = 0;
-    DIR *directory = resolved ? opendir(directory_path) : NULL;
-    bool scan_ok = directory != NULL;
+    DIR *directory = resolved ? opendir(scan->directory_path) : NULL;
+    /* The directory is created lazily by the first recording, so on a fresh
+     * card it is legitimately absent. That is an empty library, not a scan
+     * failure: treating ENOENT as failure would keep index_valid false forever
+     * and leave the list reading the medium it already finished reading. */
+    const bool directory_absent = directory == NULL &&
+                                  (errno == ENOENT || errno == ENOTDIR);
+    bool scan_ok = directory != NULL || directory_absent;
     medium_eio |= resolved && directory == NULL && errno == EIO;
+    bool truncated = false;
     if (directory != NULL)
     {
-        while (file_count < RECORDER_SERVICE_MAX_FILES)
+        for (;;)
         {
             errno = 0;
             struct dirent *entry = readdir(directory);
@@ -371,10 +477,10 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
             {
                 continue;
             }
-            char path[RECORDER_SERVICE_PATH_BYTES];
-            const int length = snprintf(path, sizeof(path), "%s/%s",
-                                        directory_path, entry->d_name);
-            if (length < 0 || (size_t)length >= sizeof(path))
+            char *const path = scan->path;
+            const int length = snprintf(path, sizeof(scan->path), "%s/%s",
+                                        scan->directory_path, entry->d_name);
+            if (length < 0 || (size_t)length >= sizeof(scan->path))
             {
                 continue;
             }
@@ -423,11 +529,48 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
             {
                 continue;
             }
-            recorder_service_file_t *record = &files[file_count++];
-            (void)snprintf(record->target.name, sizeof(record->target.name), "%s", path);
-            record->bytes = (uint64_t)info.st_size;
-            record->duration_ms = (uint32_t)(((uint64_t)header.data_size) *
-                                             1000U / 64000U);
+            /* The record is written straight into its slot: a stack-local
+             * copy would add 216 bytes to the command worker's frame, which
+             * only has room for the FATFS call chain below it. */
+            const bool has_mtime = info.st_mtime > 0;
+            const uint32_t epoch_s = has_mtime ? (uint32_t)info.st_mtime : 0U;
+            /* The bound keeps the newest recordings, so a full medium loses
+             * its oldest entries instead of an arbitrary readdir subset. */
+            if (file_count == RECORDER_SERVICE_MAX_FILES)
+            {
+                truncated = true;
+                if (!_recorder_record_newer(path, has_mtime, epoch_s,
+                                            &files[file_count - 1U]))
+                {
+                    continue;
+                }
+            }
+            const size_t last = file_count < RECORDER_SERVICE_MAX_FILES ?
+                                file_count : RECORDER_SERVICE_MAX_FILES - 1U;
+            size_t position = 0U;
+            /* Skip every row that must stay ahead of the candidate. */
+            while (position < last &&
+                    !_recorder_record_newer(path, has_mtime, epoch_s,
+                                            &files[position]))
+            {
+                ++position;
+            }
+            for (size_t i = last; i > position; --i)
+            {
+                files[i] = files[i - 1U];
+            }
+            recorder_service_file_t *row = &files[position];
+            (void)snprintf(row->target.name, sizeof(row->target.name), "%s",
+                           path);
+            row->bytes = (uint64_t)info.st_size;
+            row->duration_ms = (uint32_t)(((uint64_t)header.data_size) *
+                                          1000U / 64000U);
+            row->has_mtime = has_mtime;
+            row->modified_epoch_s = epoch_s;
+            if (file_count < RECORDER_SERVICE_MAX_FILES)
+            {
+                ++file_count;
+            }
         }
         errno = 0;
         if (closedir(directory) != 0)
@@ -456,25 +599,36 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
             bool changed = !s_recorder.index_valid ||
                            s_recorder.index_generation != before.generation ||
                            s_recorder.index_revision != before.revision ||
-                           s_recorder.file_count != file_count;
+                           s_recorder.file_count != file_count ||
+                           s_recorder.snapshot.library_truncated != truncated;
             for (size_t i = 0U; i < file_count; ++i)
             {
                 files[i].target.generation = before.generation;
                 files[i].target.revision = before.revision;
                 if (!changed)
                 {
-                    changed = strcmp(s_recorder.files[i].target.name,
+                    changed = strcmp(s_index_files[i].target.name,
                                      files[i].target.name) != 0 ||
-                              s_recorder.files[i].bytes != files[i].bytes ||
-                              s_recorder.files[i].duration_ms != files[i].duration_ms;
+                              s_index_files[i].bytes != files[i].bytes ||
+                              s_index_files[i].duration_ms != files[i].duration_ms ||
+                              s_index_files[i].modified_epoch_s !=
+                              files[i].modified_epoch_s ||
+                              s_index_files[i].has_mtime != files[i].has_mtime;
                 }
             }
-            memcpy(s_recorder.files, files,
-                   RECORDER_SERVICE_MAX_FILES * sizeof(*files));
+            /* Copy only the live rows, and only when something changed. The
+             * array is 7 KB; the copy runs with interrupts disabled, so an
+             * unconditional full-array memcpy cost every scan ~100 us of ISR
+             * latency for bytes no reader would observe. */
+            if (changed)
+            {
+                memcpy(s_index_files, files, file_count * sizeof(files[0]));
+            }
             s_recorder.file_count = file_count;
             s_recorder.index_valid = true;
             s_recorder.index_generation = before.generation;
             s_recorder.index_revision = before.revision;
+            s_recorder.snapshot.library_truncated = truncated;
             s_recorder.space_generation = before.generation;
             s_recorder.snapshot.space_valid = space_error == ESP_OK;
             s_recorder.snapshot.space_error = space_error;
@@ -492,13 +646,14 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
             }
             s_recorder.index_valid = false;
             s_recorder.file_count = 0U;
+            s_recorder.snapshot.library_truncated = false;
             s_recorder.snapshot.space_valid = false;
             s_recorder.snapshot.space_error = ESP_ERR_INVALID_STATE;
             s_recorder.snapshot.free_bytes = 0U;
         }
     }
     _recorder_unlock();
-    free(files);
+    free(scan);
     if (held_usage == NULL)
     {
         (void)sd_storage_service_usage_release(&access);
@@ -642,6 +797,16 @@ static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
                 final_error = ESP_FAIL;
             }
         }
+        if (final_error != ESP_OK && !playback && path[0] != '\0')
+        {
+            /* A rejected take is not a recording: keeping the working file
+             * would leave .part names the library never lists and the user can
+             * never delete, slowly consuming the card. */
+            if (remove(path) != 0)
+            {
+                medium_eio |= errno == EIO;
+            }
+        }
         if (final_error == ESP_OK && !playback && path[0] != '\0')
         {
             const size_t length = strlen(path);
@@ -730,7 +895,19 @@ static void _recorder_task(void *argument)
         }
         if (paused && !playback)
         {
-            vTaskDelay(pdMS_TO_TICKS(20U));
+            /* The capture device keeps running while paused. Not reading it
+             * leaves the pre-pause interval queued in the I2S ring, which the
+             * first reads after resume then append to the file: the take would
+             * contain audible paused audio and its data size would exceed the
+             * reported duration. Drain and discard instead. */
+            size_t discarded = 0U;
+            if (audio_service_read(s_recorder_pcm, sizeof(s_recorder_pcm),
+                                   &discarded, 250U) != ESP_OK)
+            {
+                _recorder_finish(true, ESP_ERR_INVALID_RESPONSE, false);
+                _recorder_stream_park();
+                return;
+            }
             continue;
         }
         if (!playback && duration >= s_recorder.config.max_duration_seconds * 1000U)
@@ -880,13 +1057,16 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
     s_recorder.snapshot.state = RECORDER_SERVICE_IDLE;
     s_recorder.snapshot.last_error = ESP_OK;
     s_recorder.snapshot.space_error = ESP_ERR_INVALID_STATE;
+    s_recorder.snapshot.max_duration_ms = config->max_duration_seconds >
+                                          UINT32_MAX / 1000U ? UINT32_MAX :
+                                          config->max_duration_seconds * 1000U;
     s_recorder.stopping = false;
     /* The directory is prepared by the worker after a mount succeeds; a boot
      * without a card must not create filesystem paths. */
     s_recorder.command_queue = xQueueCreate(4U, sizeof(recorder_command_t));
     if (s_recorder.command_queue == NULL ||
             xTaskCreatePinnedToCore(_recorder_command_task, "recorder_cmd",
-                                    4096, NULL, 5,
+                                    RECORDER_COMMAND_STACK, NULL, 5,
                                     &s_recorder.command_task,
                                     RECORDER_TASK_CORE) != pdPASS)
     {
@@ -978,6 +1158,7 @@ esp_err_t recorder_service_get_snapshot(recorder_service_snapshot_t *snapshot)
     snapshot->index_generation = s_recorder.index_generation;
     snapshot->index_revision = s_recorder.index_revision;
     snapshot->index_valid = s_recorder.index_valid;
+    snapshot->file_count = s_recorder.file_count;
     const uint32_t space_generation = s_recorder.space_generation;
     if (snapshot->state == RECORDER_SERVICE_RECORDING)
     {
@@ -1020,7 +1201,7 @@ esp_err_t recorder_service_list(recorder_service_file_t *files,
                        s_recorder.index_revision == storage.revision;
     const size_t available = !fresh ? 0U :
                              (s_recorder.file_count < capacity ? s_recorder.file_count : capacity);
-    memcpy(files, s_recorder.files, available * sizeof(files[0]));
+    memcpy(files, s_index_files, available * sizeof(files[0]));
     const bool request_refresh = !fresh && !s_recorder.refresh_requested;
     if (request_refresh)
     {
@@ -1037,6 +1218,37 @@ esp_err_t recorder_service_list(recorder_service_file_t *files,
     return ESP_OK;
 }
 
+esp_err_t recorder_service_refresh(void)
+{
+    if (!s_initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (_recorder_index_is_fresh())
+    {
+        return ESP_OK;
+    }
+    _recorder_lock();
+    const bool request = !s_recorder.refresh_requested;
+    if (request)
+    {
+        s_recorder.refresh_requested = true;
+    }
+    _recorder_unlock();
+    if (!request)
+    {
+        return ESP_OK;
+    }
+    const esp_err_t result = _recorder_request_refresh();
+    if (result != ESP_OK)
+    {
+        _recorder_lock();
+        s_recorder.refresh_requested = false;
+        _recorder_unlock();
+    }
+    return result;
+}
+
 bool recorder_service_is_busy(void)
 {
     if (!s_initialized)
@@ -1050,6 +1262,81 @@ bool recorder_service_is_busy(void)
                       s_recorder.snapshot.state == RECORDER_SERVICE_PLAYING;
     _recorder_unlock();
     return busy;
+}
+
+/**
+ * @brief Build a human-readable recording stem for the current instant.
+ *
+ * A calibrated clock yields a local timestamp that stays meaningful after the
+ * file leaves this device. An uncalibrated clock (before SNTP) would produce a
+ * 1970 stamp, so the monotonic boot counter is used instead.
+ */
+static void _recorder_name_stem(char *out, size_t out_size)
+{
+    const time_t now = time(NULL);
+    struct tm local_time;
+    if (now >= (time_t)RECORDER_MIN_EPOCH_S &&
+            localtime_r(&now, &local_time) != NULL &&
+            strftime(out, out_size, "REC_%Y%m%d_%H%M%S", &local_time) > 0U)
+    {
+        return;
+    }
+    (void)snprintf(out, out_size, "REC_%lld", (long long)esp_timer_get_time());
+}
+
+/**
+ * @brief Create the working file for a new recording without overwriting.
+ *
+ * The exclusive open both reserves the final stem and proves the name is
+ * free, so a restart inside the same second never truncates an existing
+ * recording. The descriptor is released because the WAV writer needs a stream.
+ */
+static esp_err_t _recorder_create_file(char *out, size_t out_size)
+{
+    char stem[64];
+    _recorder_name_stem(stem, sizeof(stem));
+    for (unsigned attempt = 0U; attempt < 100U; ++attempt)
+    {
+        const int length = attempt == 0U ?
+                           snprintf(out, out_size, "%s/%s.part",
+                                    s_recorder.directory_path, stem) :
+                           snprintf(out, out_size, "%s/%s-%u.part",
+                                    s_recorder.directory_path, stem,
+                                    attempt + 1U);
+        if (length < 0 || (size_t)length >= out_size)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        errno = 0;
+        const int fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0664);
+        if (fd < 0)
+        {
+            if (errno != EEXIST)
+            {
+                return errno == EIO ? ESP_FAIL : ESP_ERR_INVALID_STATE;
+            }
+            continue;
+        }
+        (void)close(fd);
+        /* A finalized sibling in the same second owns this stem; giving it up
+         * keeps the visible name unique too, not just the working file. The
+         * probe rewrites the suffix in place and restores it, because this
+         * runs on the command stack and cannot afford a second path buffer. */
+        char suffix[6];
+        char *const tail = out + (size_t)length - 5U;
+        memcpy(suffix, tail, 5U);
+        suffix[5] = '\0';
+        memcpy(tail, ".wav\0", 5U);
+        const bool taken = access(out, F_OK) == 0;
+        memcpy(tail, suffix, 5U);
+        if (taken)
+        {
+            (void)remove(out);
+            continue;
+        }
+        return ESP_OK;
+    }
+    return ESP_ERR_INVALID_STATE;
 }
 
 static esp_err_t _recorder_start_now(void)
@@ -1106,19 +1393,19 @@ static esp_err_t _recorder_start_now(void)
         return ESP_ERR_INVALID_STATE;
     }
     char path[sizeof(s_recorder.snapshot.name)];
-    const int path_length = snprintf(path, sizeof(path), "%s/REC_%lld.part",
-                                     s_recorder.directory_path,
-                                     (long long)esp_timer_get_time());
-    if (path_length < 0 || (size_t)path_length >= sizeof(path))
+    const esp_err_t create_result = _recorder_create_file(path, sizeof(path));
+    if (create_result != ESP_OK)
     {
-        _recorder_usage_release(false, ESP_OK);
-        return ESP_ERR_INVALID_SIZE;
+        _recorder_usage_release(errno == EIO, create_result);
+        return create_result;
     }
     errno = 0;
     FILE *file = fopen(path, "wb+");
     if (file == NULL)
     {
-        _recorder_usage_release(errno == EIO, ESP_FAIL);
+        const bool medium_eio = errno == EIO;
+        (void)remove(path);
+        _recorder_usage_release(medium_eio, ESP_FAIL);
         return ESP_FAIL;
     }
     const recorder_wav_header_t empty = {0};

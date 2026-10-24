@@ -196,6 +196,24 @@ int main(void)
     recorder_service_file_t files[RECORDER_SERVICE_MAX_FILES];
     _wait_count(files, 1U);
     assert(files[0].bytes == 44U);
+    /* A calibrated clock names the file by local time; the boot counter is a
+     * fallback that only appears before SNTP. */
+    const char *leaf = strrchr(files[0].target.name, '/');
+    assert(leaf != NULL);
+    unsigned year = 0U;
+    unsigned month = 0U;
+    unsigned day = 0U;
+    unsigned hour = 0U;
+    unsigned minute = 0U;
+    unsigned second = 0U;
+    int consumed = 0;
+    assert(sscanf(leaf + 1, "REC_%4u%2u%2u_%2u%2u%2u.wav%n", &year, &month,
+                  &day, &hour, &minute, &second, &consumed) == 6);
+    assert(consumed == (int)strlen(leaf + 1));
+    assert(year >= 2020U && month >= 1U && month <= 12U && day >= 1U &&
+           day <= 31U && hour <= 23U && minute <= 59U && second <= 59U);
+    assert(files[0].has_mtime && files[0].modified_epoch_s > 0U);
+    assert(_settled().max_duration_ms == 60000U);
     /* Retain the real WAV duration regression without synthesizing playback
      * completion on the UI thread. Extend the finalized PCM file to 3 seconds. */
     FILE *wav = fopen(files[0].target.name, "rb+");
