@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(sd_storage_service_host_tests LANGUAGES C)
 
 enable_testing()
+find_package(Threads REQUIRED)
 
 set(SD_STORAGE_SERVICE_SANITIZER "none" CACHE STRING
     "Host-test sanitizer: none, address, or thread")
@@ -17,6 +18,8 @@ target_include_directories(sd_storage_service_test PRIVATE
     fakes
     ../../include
 )
+
+target_link_libraries(sd_storage_service_test PRIVATE Threads::Threads)
 
 target_compile_features(sd_storage_service_test PRIVATE c_std_11)
 target_compile_options(sd_storage_service_test PRIVATE

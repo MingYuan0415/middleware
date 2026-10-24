@@ -11,18 +11,22 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <dirent.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 
 #ifdef ESP_PLATFORM
     #include "freertos/FreeRTOS.h"
     #include "freertos/queue.h"
     #include "freertos/task.h"
+    #include "freertos/idf_additions.h"
+    #include "esp_attr.h"
+    #include "esp_heap_caps.h"
     #define RECORDER_TASK_CORE 1
+#else
+    #include "recorder_host_worker.h"
 #endif
 
-#ifdef ESP_PLATFORM
 typedef enum recorder_command_type
 {
     RECORDER_COMMAND_START = 0,
@@ -32,6 +36,7 @@ typedef enum recorder_command_type
     RECORDER_COMMAND_PLAY,
     RECORDER_COMMAND_STOP_PLAYBACK,
     RECORDER_COMMAND_DELETE,
+    RECORDER_COMMAND_REFRESH_INDEX,
     RECORDER_COMMAND_SHUTDOWN,
 } recorder_command_type_t;
 
@@ -39,9 +44,8 @@ typedef struct recorder_command
 {
     recorder_command_type_t type;
     uint32_t operation_id;
-    char name[RECORDER_SERVICE_PATH_MAX];
+    recorder_service_target_t target;
 } recorder_command_t;
-#endif
 
 typedef struct recorder_wav_header
 {
@@ -74,11 +78,18 @@ typedef struct recorder_runtime
     bool playback;
     recorder_service_file_t files[RECORDER_SERVICE_MAX_FILES];
     size_t file_count;
-#ifdef ESP_PLATFORM
+    bool index_valid;
+    bool refresh_requested;
+    uint32_t index_generation;
+    uint32_t index_revision;
+    uint32_t index_publish_version;
+    uint32_t space_generation;
+    sd_storage_service_usage_t usage;
+    bool usage_held;
+    char directory_path[RECORDER_SERVICE_PATH_BYTES];
     TaskHandle_t task;
     TaskHandle_t command_task;
     QueueHandle_t command_queue;
-#endif
 } recorder_runtime_t;
 
 static recorder_runtime_t s_recorder;
@@ -88,13 +99,9 @@ static recorder_runtime_t s_recorder;
     static atomic_flag s_lock = ATOMIC_FLAG_INIT;
 #endif
 static bool s_initialized;
-#ifdef ESP_PLATFORM
-    static uint32_t s_next_operation_id;
-#endif
+static uint32_t s_next_operation_id;
 
-#ifdef ESP_PLATFORM
-    static void _recorder_command_task(void *argument);
-#endif
+static void _recorder_command_task(void *argument);
 
 static void _recorder_lock(void)
 {
@@ -116,22 +123,61 @@ static void _recorder_unlock(void)
 #endif
 }
 
-static uint64_t _recorder_free_bytes(const char *path)
+/**
+ * @brief Build the absolute backend path from a volume-relative directory.
+ *
+ * The recorder never hard-codes the mount point: it always resolves through
+ * the storage service so a remount to another path keeps working.
+ */
+static esp_err_t _recorder_volume_path(const char *relative_path, char *out,
+                                       size_t out_size)
 {
-    struct statvfs info;
-    return path != NULL && statvfs(path, &info) == 0 ?
-           (uint64_t)info.f_bavail * info.f_frsize : 0U;
+    const char *mount = sd_storage_service_get_mount_path();
+    if (mount == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const int length = relative_path[0] == '\0' ?
+                       snprintf(out, out_size, "%s", mount) :
+                       snprintf(out, out_size, "%s/%s", mount, relative_path);
+    if (length < 0 || (size_t)length >= out_size)
+    {
+        out[0] = '\0';
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
 }
 
-static esp_err_t _recorder_ensure_directory(const char *directory)
+static bool _recorder_path_is_owned(const char *name)
 {
-    char path[128];
-    const size_t length = directory != NULL ? strlen(directory) : 0U;
-    if (length == 0U || length >= sizeof(path))
+    const size_t directory_length = strlen(s_recorder.directory_path);
+    const size_t name_length = strlen(name);
+    return directory_length > 0U && name_length > directory_length &&
+           strncmp(name, s_recorder.directory_path, directory_length) == 0 &&
+           name[directory_length] == '/' && strstr(name, "..") == NULL;
+}
+
+/**
+ * @brief Resolve the recording directory for the current mount epoch.
+ *
+ * Called by the worker after a successful mount. The directory is created
+ * lazily so a device booted without a card never touches the filesystem.
+ */
+static esp_err_t _recorder_prepare_directory(bool create)
+{
+    char path[RECORDER_SERVICE_PATH_BYTES];
+    esp_err_t result = _recorder_volume_path(s_recorder.config.directory,
+        path, sizeof(path));
+    if (result != ESP_OK)
     {
-        return ESP_ERR_INVALID_ARG;
+        return result;
     }
-    (void)snprintf(path, sizeof(path), "%s", directory);
+    if (!create)
+    {
+        (void)snprintf(s_recorder.directory_path,
+                       sizeof(s_recorder.directory_path), "%s", path);
+        return ESP_OK;
+    }
     for (char *cursor = path + 1; *cursor != '\0'; ++cursor)
     {
         if (*cursor == '/')
@@ -141,16 +187,13 @@ static esp_err_t _recorder_ensure_directory(const char *directory)
             *cursor = '/';
         }
     }
-    return mkdir(path, 0775) == 0 || errno == EEXIST ? ESP_OK : ESP_FAIL;
-}
-
-static bool _recorder_path_is_owned(const char *name)
-{
-    const size_t directory_length = strlen(s_recorder.config.directory);
-    const size_t name_length = strlen(name);
-    return name_length > directory_length &&
-           strncmp(name, s_recorder.config.directory, directory_length) == 0 &&
-           name[directory_length] == '/' && strstr(name, "..") == NULL;
+    if (mkdir(path, 0775) != 0 && errno != EEXIST)
+    {
+        return ESP_FAIL;
+    }
+    (void)snprintf(s_recorder.directory_path,
+                   sizeof(s_recorder.directory_path), "%s", path);
+    return ESP_OK;
 }
 
 static esp_err_t _recorder_header_write(FILE *file, uint32_t data_bytes)
@@ -195,19 +238,40 @@ static bool _recorder_header_valid(const recorder_wav_header_t *header,
            (uint64_t)header->data_size + sizeof(*header) <= file_size;
 }
 
+/**
+ * @brief Refresh the cached capacity reading from the storage service.
+ *
+ * Only the recorder worker (and the host test build) runs this. The UI reads
+ * the resulting snapshot without touching the filesystem. A failed query is
+ * cached as invalid instead of being published as "no space left".
+ */
+static esp_err_t _recorder_space_refresh(const sd_storage_service_usage_t *usage)
+{
+    uint64_t total_bytes = 0U;
+    uint64_t free_bytes = 0U;
+    const esp_err_t result = sd_storage_service_get_space(usage, &total_bytes,
+        &free_bytes);
+    _recorder_lock();
+    s_recorder.snapshot.space_valid = result == ESP_OK;
+    s_recorder.snapshot.space_error = result;
+    s_recorder.snapshot.free_bytes = result == ESP_OK ? free_bytes : 0U;
+    s_recorder.space_generation = usage->generation;
+    _recorder_unlock();
+    return result;
+}
+
+#ifdef ESP_PLATFORM
 static void _recorder_snapshot_update(uint32_t duration_ms)
 {
-    const uint64_t free_bytes = _recorder_free_bytes(
-                                    sd_storage_service_get_mount_path());
     _recorder_lock();
     if (!s_recorder.playback)
     {
         s_recorder.snapshot.duration_ms = duration_ms;
         s_recorder.snapshot.bytes = s_recorder.data_bytes;
     }
-    s_recorder.snapshot.free_bytes = free_bytes;
     _recorder_unlock();
 }
+#endif
 
 static uint32_t _recorder_duration_locked(int64_t now_us)
 {
@@ -232,80 +296,320 @@ static uint32_t _recorder_elapsed_ms(int64_t started_us, int64_t now_us)
 }
 #endif
 
-static void _recorder_refresh_index(void)
+/** @brief Scan under a held lease and publish only a complete, current index. */
+static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage)
 {
-    recorder_service_file_t files[RECORDER_SERVICE_MAX_FILES] = {0};
+    sd_storage_service_usage_t access = {0};
+    const sd_storage_service_usage_t *usage = held_usage;
+    if (usage == NULL)
+    {
+        if (sd_storage_service_usage_acquire(SD_STORAGE_SERVICE_USAGE_ACCESS,
+                                             &access) != ESP_OK)
+        {
+            return;
+        }
+        usage = &access;
+    }
+    _recorder_lock();
+    const uint32_t publish_version = s_recorder.index_publish_version;
+    _recorder_unlock();
+    recorder_service_file_t *files = calloc(RECORDER_SERVICE_MAX_FILES,
+                                            sizeof(*files));
+    if (files == NULL)
+    {
+        _recorder_lock();
+        if (publish_version == s_recorder.index_publish_version)
+        {
+            ++s_recorder.index_publish_version;
+            s_recorder.index_valid = false;
+            s_recorder.file_count = 0U;
+            s_recorder.snapshot.space_valid = false;
+            s_recorder.snapshot.space_error = ESP_ERR_NO_MEM;
+            ++s_recorder.snapshot.generation;
+        }
+        _recorder_unlock();
+        if (held_usage == NULL)
+        {
+            (void)sd_storage_service_usage_release(&access);
+        }
+        return;
+    }
     size_t file_count = 0U;
-    DIR *directory = opendir(s_recorder.config.directory);
+    sd_storage_service_snapshot_t before = {0};
+    const bool usable = sd_storage_service_get_snapshot(&before) == ESP_OK &&
+                        before.mounted && before.generation == usage->generation;
+    char directory_path[RECORDER_SERVICE_PATH_BYTES] = {0};
+    const bool resolved = usable &&
+                          _recorder_volume_path(s_recorder.config.directory, directory_path,
+                              sizeof(directory_path)) == ESP_OK;
+    uint64_t total_bytes = 0U;
+    uint64_t free_bytes = 0U;
+    errno = 0;
+    const esp_err_t space_error = resolved ?
+                                  sd_storage_service_get_space(usage, &total_bytes, &free_bytes) :
+                                  ESP_ERR_INVALID_STATE;
+    bool medium_eio = space_error != ESP_OK && errno == EIO;
+    errno = 0;
+    DIR *directory = resolved ? opendir(directory_path) : NULL;
+    bool scan_ok = directory != NULL;
+    medium_eio |= resolved && directory == NULL && errno == EIO;
     if (directory != NULL)
     {
-        struct dirent *entry;
-        while ((entry = readdir(directory)) != NULL &&
-                file_count < RECORDER_SERVICE_MAX_FILES)
+        while (file_count < RECORDER_SERVICE_MAX_FILES)
         {
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL)
+            {
+                scan_ok = errno == 0;
+                medium_eio |= errno == EIO;
+                break;
+            }
             const size_t name_length = strlen(entry->d_name);
             if (name_length <= 4U ||
                     strcmp(entry->d_name + name_length - 4U, ".wav") != 0)
             {
                 continue;
             }
-            char path[sizeof(files[0].name)];
+            char path[RECORDER_SERVICE_PATH_BYTES];
             const int length = snprintf(path, sizeof(path), "%s/%s",
-                                        s_recorder.config.directory,
-                                        entry->d_name);
+                                        directory_path, entry->d_name);
             if (length < 0 || (size_t)length >= sizeof(path))
             {
                 continue;
             }
             struct stat info;
-            if (stat(path, &info) != 0 ||
-                    info.st_size < (off_t)sizeof(recorder_wav_header_t))
+            errno = 0;
+            if (stat(path, &info) != 0)
+            {
+                scan_ok = false;
+                medium_eio |= errno == EIO;
+                break;
+            }
+            if (info.st_size < (off_t)sizeof(recorder_wav_header_t))
             {
                 continue;
             }
+            errno = 0;
             FILE *file = fopen(path, "rb");
+            if (file == NULL)
+            {
+                scan_ok = false;
+                medium_eio |= errno == EIO;
+                break;
+            }
             recorder_wav_header_t header;
-            const bool valid = file != NULL &&
-                               fread(&header, 1U, sizeof(header), file) ==
-                               sizeof(header) &&
+            errno = 0;
+            const size_t read_bytes = fread(&header, 1U, sizeof(header), file);
+            if (ferror(file))
+            {
+                scan_ok = false;
+                medium_eio |= errno == EIO;
+            }
+            const bool valid = read_bytes == sizeof(header) &&
                                _recorder_header_valid(&header,
                                    (uint64_t)info.st_size);
-            if (file != NULL)
+            errno = 0;
+            if (fclose(file) != 0)
             {
-                (void)fclose(file);
+                scan_ok = false;
+                medium_eio |= errno == EIO;
+            }
+            if (!scan_ok)
+            {
+                break;
             }
             if (!valid)
             {
                 continue;
             }
             recorder_service_file_t *record = &files[file_count++];
-            (void)snprintf(record->name, sizeof(record->name), "%s", path);
+            (void)snprintf(record->target.name, sizeof(record->target.name), "%s", path);
             record->bytes = (uint64_t)info.st_size;
             record->duration_ms = (uint32_t)(((uint64_t)header.data_size) *
                                              1000U / 64000U);
         }
-        (void)closedir(directory);
+        errno = 0;
+        if (closedir(directory) != 0)
+        {
+            scan_ok = false;
+            medium_eio |= errno == EIO;
+        }
+    }
+    sd_storage_service_snapshot_t after = {0};
+    const bool fresh = scan_ok && !medium_eio &&
+                       sd_storage_service_get_snapshot(&after) == ESP_OK &&
+                       after.mounted && before.generation == after.generation &&
+                       before.revision == after.revision;
+    if (medium_eio)
+    {
+        (void)sd_storage_service_usage_report_fault(usage, ESP_FAIL);
     }
     _recorder_lock();
-    memcpy(s_recorder.files, files, sizeof(files));
-    s_recorder.file_count = file_count;
+    /* A concurrent finalization/command scan may have published since this
+     * scan began. Losing that race must not overwrite or invalidate its cache. */
+    if (publish_version == s_recorder.index_publish_version)
+    {
+        ++s_recorder.index_publish_version;
+        if (fresh)
+        {
+            bool changed = !s_recorder.index_valid ||
+                           s_recorder.index_generation != before.generation ||
+                           s_recorder.index_revision != before.revision ||
+                           s_recorder.file_count != file_count;
+            for (size_t i = 0U; i < file_count; ++i)
+            {
+                files[i].target.generation = before.generation;
+                files[i].target.revision = before.revision;
+                if (!changed)
+                {
+                    changed = strcmp(s_recorder.files[i].target.name,
+                                     files[i].target.name) != 0 ||
+                              s_recorder.files[i].bytes != files[i].bytes ||
+                              s_recorder.files[i].duration_ms != files[i].duration_ms;
+                }
+            }
+            memcpy(s_recorder.files, files,
+                   RECORDER_SERVICE_MAX_FILES * sizeof(*files));
+            s_recorder.file_count = file_count;
+            s_recorder.index_valid = true;
+            s_recorder.index_generation = before.generation;
+            s_recorder.index_revision = before.revision;
+            s_recorder.space_generation = before.generation;
+            s_recorder.snapshot.space_valid = space_error == ESP_OK;
+            s_recorder.snapshot.space_error = space_error;
+            s_recorder.snapshot.free_bytes = space_error == ESP_OK ? free_bytes : 0U;
+            if (changed)
+            {
+                ++s_recorder.snapshot.generation;
+            }
+        }
+        else
+        {
+            if (s_recorder.index_valid || s_recorder.file_count != 0U)
+            {
+                ++s_recorder.snapshot.generation;
+            }
+            s_recorder.index_valid = false;
+            s_recorder.file_count = 0U;
+            s_recorder.snapshot.space_valid = false;
+            s_recorder.snapshot.space_error = ESP_ERR_INVALID_STATE;
+            s_recorder.snapshot.free_bytes = 0U;
+        }
+    }
     _recorder_unlock();
+    free(files);
+    if (held_usage == NULL)
+    {
+        (void)sd_storage_service_usage_release(&access);
+    }
 }
 
-static void _recorder_finish(bool failed, esp_err_t error)
+/**
+ * @brief Report whether the cached index still matches the medium.
+ *
+ * A remount or a content change made by another owner invalidates the cached
+ * list without any filesystem access at query time.
+ */
+static bool _recorder_index_is_fresh(void)
 {
+    sd_storage_service_snapshot_t storage = {0};
+    const esp_err_t storage_result = sd_storage_service_get_snapshot(&storage);
+    const uint32_t generation = storage_result == ESP_OK ? storage.generation :
+                                0U;
+    const bool mounted = storage_result == ESP_OK && storage.mounted;
+    const uint32_t revision = storage.revision;
+    _recorder_lock();
+    const bool fresh = s_recorder.index_valid && mounted &&
+                       s_recorder.index_generation == generation &&
+                       s_recorder.index_revision == revision;
+    _recorder_unlock();
+    return fresh;
+}
+
+/** @brief Ask the worker for one index refresh, if it can be queued now. */
+static esp_err_t _recorder_request_refresh(void)
+{
+    if (s_recorder.command_queue == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const recorder_command_t refresh =
+    {
+        .type = RECORDER_COMMAND_REFRESH_INDEX,
+    };
+    return xQueueSend(s_recorder.command_queue, &refresh, 0U) == pdTRUE ?
+           ESP_OK : ESP_ERR_NO_MEM;
+}
+
+/**
+ * @brief Rebuild the cached index and capacity reading.
+ *
+ * Runs on the recorder worker only: the UI never performs file I/O. The
+ * directory path is resolved (never created) for the current mount epoch, so a
+ * boot after a successful mount can list existing recordings without starting
+ * a new one.
+ */
+static void _recorder_refresh_from_medium(void)
+{
+    if (!_recorder_index_is_fresh())
+    {
+        _recorder_refresh_index(NULL);
+    }
+}
+
+/** @brief Acquire the business session lease that covers a full operation. */
+static esp_err_t _recorder_usage_acquire(void)
+{
+    sd_storage_service_usage_t usage = {0};
+    const esp_err_t result = sd_storage_service_usage_acquire(
+                                 SD_STORAGE_SERVICE_USAGE_SESSION, &usage);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    _recorder_lock();
+    s_recorder.usage = usage;
+    s_recorder.usage_held = true;
+    _recorder_unlock();
+    return ESP_OK;
+}
+
+/** @brief Release the business session lease after the last handle closed. */
+static void _recorder_usage_release(bool medium_eio, esp_err_t error)
+{
+    _recorder_lock();
+    const sd_storage_service_usage_t usage = s_recorder.usage;
+    const bool held = s_recorder.usage_held;
+    s_recorder.usage_held = false;
+    memset(&s_recorder.usage, 0, sizeof(s_recorder.usage));
+    _recorder_unlock();
+    if (!held)
+    {
+        return;
+    }
+    if (medium_eio)
+    {
+        (void)sd_storage_service_usage_report_fault(&usage, error);
+    }
+    (void)sd_storage_service_usage_release(&usage);
+}
+
+static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
+{
+    const int64_t now_us = esp_timer_get_time();
     _recorder_lock();
     if (!s_recorder.playback)
     {
         s_recorder.snapshot.duration_ms =
-            _recorder_duration_locked(esp_timer_get_time());
+            _recorder_duration_locked(now_us);
     }
     FILE *file = s_recorder.file;
     const bool playback = s_recorder.playback;
     const uint64_t recorded_bytes = s_recorder.data_bytes;
     const uint32_t data_bytes = recorded_bytes > UINT32_MAX ? UINT32_MAX :
                                 (uint32_t)recorded_bytes;
-    char path[sizeof(s_recorder.snapshot.name)];
+    char path[RECORDER_SERVICE_PATH_BYTES];
     (void)snprintf(path, sizeof(path), "%s", s_recorder.snapshot.name);
     s_recorder.file = NULL;
     _recorder_unlock();
@@ -322,23 +626,31 @@ static void _recorder_finish(bool failed, esp_err_t error)
         {
             final_error = ESP_ERR_INVALID_SIZE;
         }
+        errno = 0;
         if (final_error == ESP_OK && !playback &&
                 _recorder_header_write(file, data_bytes) != ESP_OK)
         {
+            medium_eio |= errno == EIO;
             final_error = ESP_FAIL;
         }
-        if (fclose(file) != 0 && final_error == ESP_OK)
+        errno = 0;
+        if (fclose(file) != 0)
         {
-            final_error = ESP_FAIL;
+            medium_eio |= errno == EIO;
+            if (final_error == ESP_OK)
+            {
+                final_error = ESP_FAIL;
+            }
         }
         if (final_error == ESP_OK && !playback && path[0] != '\0')
         {
             const size_t length = strlen(path);
             if (length > 5U && strcmp(path + length - 5U, ".part") == 0)
             {
-                char final_path[sizeof(path)];
+                char final_path[RECORDER_SERVICE_PATH_BYTES];
                 (void)snprintf(final_path, sizeof(final_path), "%.*s.wav",
                                (int)(length - 5U), path);
+                errno = 0;
                 if (rename(path, final_path) == 0)
                 {
                     _recorder_lock();
@@ -349,6 +661,7 @@ static void _recorder_finish(bool failed, esp_err_t error)
                 }
                 else
                 {
+                    medium_eio |= errno == EIO;
                     final_error = ESP_FAIL;
                 }
             }
@@ -358,7 +671,17 @@ static void _recorder_finish(bool failed, esp_err_t error)
             }
         }
     }
-    _recorder_refresh_index();
+    /* Finalize content while SESSION is still held. Readers must never observe
+     * IDLE (or accept another start) before invalidation and lease release. */
+    if (!playback && file != NULL)
+    {
+        (void)sd_storage_service_note_content_change(&s_recorder.usage);
+    }
+    if (final_error == ESP_OK)
+    {
+        _recorder_refresh_index(&s_recorder.usage);
+    }
+    _recorder_usage_release(medium_eio, final_error);
     _recorder_lock();
     s_recorder.snapshot.state = final_error != ESP_OK ? RECORDER_SERVICE_ERROR :
                                 RECORDER_SERVICE_IDLE;
@@ -375,23 +698,34 @@ static void _recorder_finish(bool failed, esp_err_t error)
 }
 
 #ifdef ESP_PLATFORM
+static EXT_RAM_BSS_ATTR uint8_t s_recorder_pcm[4096];
+
+static void _recorder_stream_park(void)
+{
+    for (;;)
+    {
+        vTaskDelay(portMAX_DELAY);
+    }
+}
+
 static void _recorder_task(void *argument)
 {
     (void)argument;
-    static uint8_t buffer[4096];
+    /* One stream at a time; the command owner reaps before reusing PCM. */
     for (;;)
     {
+        const int64_t now_us = esp_timer_get_time();
         _recorder_lock();
         const bool stop = s_recorder.stop_requested;
         const bool paused = s_recorder.snapshot.state == RECORDER_SERVICE_PAUSED;
         const bool playback = s_recorder.playback;
         FILE *file = s_recorder.file;
-        const uint32_t duration = _recorder_duration_locked(esp_timer_get_time());
+        const uint32_t duration = _recorder_duration_locked(now_us);
         _recorder_unlock();
         if (stop || file == NULL)
         {
-            _recorder_finish(false, ESP_OK);
-            vTaskDelete(NULL);
+            _recorder_finish(false, ESP_OK, false);
+            _recorder_stream_park();
             return;
         }
         if (paused && !playback)
@@ -401,49 +735,59 @@ static void _recorder_task(void *argument)
         }
         if (!playback && duration >= s_recorder.config.max_duration_seconds * 1000U)
         {
-            _recorder_finish(false, ESP_OK);
-            vTaskDelete(NULL);
+            _recorder_finish(false, ESP_OK, false);
+            _recorder_stream_park();
             return;
         }
         size_t received = 0U;
         bool io_failed = false;
+        bool medium_eio = false;
         if (playback)
         {
-            received = fread(buffer, 1U, sizeof(buffer), file);
-            if (received == 0U)
+            errno = 0;
+            received = fread(s_recorder_pcm, 1U, sizeof(s_recorder_pcm), file);
+            if (ferror(file))
             {
-                if (ferror(file))
-                {
-                    io_failed = true;
-                }
-                else
-                {
-                    _recorder_finish(false, ESP_OK);
-                    vTaskDelete(NULL);
-                    return;
-                }
+                io_failed = true;
+                medium_eio = errno == EIO;
             }
-            if (!io_failed && audio_service_write(buffer, received, NULL, 250U) != ESP_OK)
+            else if (received == 0U)
+            {
+                _recorder_finish(false, ESP_OK, false);
+                _recorder_stream_park();
+                return;
+            }
+            if (!io_failed && audio_service_write(s_recorder_pcm, received, NULL, 250U) != ESP_OK)
             {
                 io_failed = true;
             }
         }
-        else if (audio_service_read(buffer, sizeof(buffer), &received, 250U) != ESP_OK ||
-                 received == 0U || fwrite(buffer, 1U, received, file) != received)
+        else if (audio_service_read(s_recorder_pcm, sizeof(s_recorder_pcm), &received, 250U) != ESP_OK ||
+                 received == 0U)
         {
             io_failed = true;
         }
+        else
+        {
+            errno = 0;
+            if (fwrite(s_recorder_pcm, 1U, received, file) != received)
+            {
+                io_failed = true;
+                medium_eio = errno == EIO;
+            }
+        }
         if (io_failed)
         {
-            _recorder_finish(true, ESP_ERR_INVALID_RESPONSE);
-            vTaskDelete(NULL);
+            _recorder_finish(true, ESP_ERR_INVALID_RESPONSE, medium_eio);
+            _recorder_stream_park();
             return;
         }
+        const int64_t position_us = esp_timer_get_time();
         _recorder_lock();
         if (playback)
         {
             const uint32_t position = _recorder_elapsed_ms(
-                                          s_recorder.started_us, esp_timer_get_time());
+                                          s_recorder.started_us, position_us);
             s_recorder.snapshot.playback_position_ms =
                 position < s_recorder.snapshot.playback_duration_ms ?
                 position : s_recorder.snapshot.playback_duration_ms;
@@ -456,12 +800,73 @@ static void _recorder_task(void *argument)
         _recorder_snapshot_update(duration);
     }
 }
+
+static esp_err_t _recorder_stream_create(void)
+{
+    TaskHandle_t task = NULL;
+    if (xTaskCreatePinnedToCoreWithCaps(_recorder_task, "recorder", 4096, NULL, 5,
+                                        &task, RECORDER_TASK_CORE,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    /* Only the command task creates/reaps, even if completion preceded return. */
+    _recorder_lock();
+    s_recorder.task = task;
+    _recorder_unlock();
+    return ESP_OK;
+}
+
+static void _recorder_stream_reap(void)
+{
+    TaskHandle_t task = NULL;
+    _recorder_lock();
+    if (s_recorder.task != NULL &&
+            !atomic_load_explicit(&s_recorder.task_running, memory_order_acquire))
+    {
+        task = s_recorder.task;
+        s_recorder.task = NULL;
+    }
+    _recorder_unlock();
+    if (task != NULL)
+    {
+        vTaskDeleteWithCaps(task);
+    }
+}
 #endif
+
+static bool _recorder_relative_path_valid(const char *path)
+{
+    if (path == NULL || path[0] == '\0' || path[0] == '/' ||
+            strlen(path) >= RECORDER_SERVICE_PATH_BYTES)
+    {
+        return false;
+    }
+    const char *cursor = path;
+    while (*cursor != '\0')
+    {
+        const char *end = strchr(cursor, '/');
+        const size_t component = end != NULL ? (size_t)(end - cursor) :
+                                 strlen(cursor);
+        if (component == 0U ||
+                (component == 1U && cursor[0] == '.') ||
+                (component == 2U && cursor[0] == '.' && cursor[1] == '.'))
+        {
+            return false;
+        }
+        if (end == NULL)
+        {
+            break;
+        }
+        cursor = end + 1;
+    }
+    return true;
+}
 
 esp_err_t recorder_service_init(const recorder_service_config_t *config)
 {
-    if (config == NULL || config->directory == NULL ||
-            config->directory[0] != '/' || config->max_duration_seconds == 0U)
+    if (config == NULL || !_recorder_relative_path_valid(config->directory) ||
+            config->max_duration_seconds == 0U)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -474,13 +879,10 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
     s_recorder.config = *config;
     s_recorder.snapshot.state = RECORDER_SERVICE_IDLE;
     s_recorder.snapshot.last_error = ESP_OK;
+    s_recorder.snapshot.space_error = ESP_ERR_INVALID_STATE;
     s_recorder.stopping = false;
-    esp_err_t result = _recorder_ensure_directory(config->directory);
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-#ifdef ESP_PLATFORM
+    /* The directory is prepared by the worker after a mount succeeds; a boot
+     * without a card must not create filesystem paths. */
     s_recorder.command_queue = xQueueCreate(4U, sizeof(recorder_command_t));
     if (s_recorder.command_queue == NULL ||
             xTaskCreatePinnedToCore(_recorder_command_task, "recorder_cmd",
@@ -495,9 +897,14 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
         }
         return ESP_ERR_NO_MEM;
     }
-#endif
     s_initialized = true;
-    _recorder_refresh_index();
+    /* The worker indexes the medium; initialization never touches the card,
+     * so a boot without one stays valid and a later mount is picked up. */
+    const recorder_command_t refresh =
+    {
+        .type = RECORDER_COMMAND_REFRESH_INDEX,
+    };
+    (void)xQueueSend(s_recorder.command_queue, &refresh, 0U);
     return ESP_OK;
 }
 
@@ -510,24 +917,10 @@ esp_err_t recorder_service_deinit(void)
     _recorder_lock();
     s_recorder.stopping = true;
     _recorder_unlock();
-    if (recorder_service_is_busy())
-    {
-        _recorder_lock();
-        s_recorder.stop_requested = true;
-        _recorder_unlock();
-#ifndef ESP_PLATFORM
-        _recorder_finish(false, ESP_OK);
-#endif
-    }
-#ifdef ESP_PLATFORM
     const int64_t deadline = esp_timer_get_time() + 5000000LL;
-    while (atomic_load_explicit(&s_recorder.task_running,
-                                memory_order_acquire) &&
-            esp_timer_get_time() < deadline)
-    {
-        vTaskDelay(pdMS_TO_TICKS(10U));
-    }
-    if (atomic_load_explicit(&s_recorder.task_running, memory_order_acquire))
+    /* Serialize the last close behind any command already running. */
+    const recorder_command_t stop = {.type = RECORDER_COMMAND_STOP};
+    if (xQueueSend(s_recorder.command_queue, &stop, pdMS_TO_TICKS(100U)) != pdTRUE)
     {
         return ESP_ERR_TIMEOUT;
     }
@@ -537,8 +930,11 @@ esp_err_t recorder_service_deinit(void)
         {
             .type = RECORDER_COMMAND_SHUTDOWN,
         };
-        (void)xQueueSend(s_recorder.command_queue, &shutdown,
-                         pdMS_TO_TICKS(100U));
+        if (xQueueSend(s_recorder.command_queue, &shutdown,
+                       pdMS_TO_TICKS(100U)) != pdTRUE)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
         for (;;)
         {
             _recorder_lock();
@@ -560,7 +956,8 @@ esp_err_t recorder_service_deinit(void)
         vQueueDelete(s_recorder.command_queue);
         s_recorder.command_queue = NULL;
     }
-#endif
+    /* A retained session lease would block the following unmount. */
+    _recorder_usage_release(false, ESP_OK);
     s_initialized = false;
     return ESP_OK;
 }
@@ -575,18 +972,29 @@ esp_err_t recorder_service_get_snapshot(recorder_service_snapshot_t *snapshot)
     {
         return ESP_ERR_INVALID_STATE;
     }
-#ifndef ESP_PLATFORM
-    /* The host build has no streaming worker to run periodic snapshot
-     * refreshes, so fold one in at read time. Device builds are unchanged. */
-    _recorder_lock();
-    const uint32_t live_duration = _recorder_duration_locked(
-                                       esp_timer_get_time());
-    _recorder_unlock();
-    _recorder_snapshot_update(live_duration);
-#endif
+    const int64_t now_us = esp_timer_get_time();
     _recorder_lock();
     *snapshot = s_recorder.snapshot;
+    snapshot->index_generation = s_recorder.index_generation;
+    snapshot->index_revision = s_recorder.index_revision;
+    snapshot->index_valid = s_recorder.index_valid;
+    const uint32_t space_generation = s_recorder.space_generation;
+    if (snapshot->state == RECORDER_SERVICE_RECORDING)
+    {
+        snapshot->duration_ms = _recorder_duration_locked(now_us);
+    }
     _recorder_unlock();
+    sd_storage_service_snapshot_t storage = {0};
+    const esp_err_t storage_result = sd_storage_service_get_snapshot(&storage);
+    snapshot->storage_ready = storage_result == ESP_OK && storage.mounted;
+    snapshot->storage_generation = storage_result == ESP_OK ? storage.generation : 0U;
+    snapshot->content_revision = storage_result == ESP_OK ? storage.revision : 0U;
+    if (!snapshot->storage_ready || space_generation != storage.generation)
+    {
+        snapshot->space_valid = false;
+        snapshot->space_error = ESP_ERR_INVALID_STATE;
+        snapshot->free_bytes = 0U;
+    }
     return ESP_OK;
 }
 
@@ -601,11 +1009,30 @@ esp_err_t recorder_service_list(recorder_service_file_t *files,
     {
         return ESP_ERR_INVALID_STATE;
     }
+    /* SD metadata is read outside the recorder lock; validation and copying
+     * then observe one index publication under the same critical section. */
+    sd_storage_service_snapshot_t storage = {0};
+    const bool mounted = sd_storage_service_get_snapshot(&storage) == ESP_OK &&
+                         storage.mounted;
     _recorder_lock();
-    const size_t available = s_recorder.file_count < capacity ?
-                             s_recorder.file_count : capacity;
+    const bool fresh = mounted && s_recorder.index_valid &&
+                       s_recorder.index_generation == storage.generation &&
+                       s_recorder.index_revision == storage.revision;
+    const size_t available = !fresh ? 0U :
+                             (s_recorder.file_count < capacity ? s_recorder.file_count : capacity);
     memcpy(files, s_recorder.files, available * sizeof(files[0]));
+    const bool request_refresh = !fresh && !s_recorder.refresh_requested;
+    if (request_refresh)
+    {
+        s_recorder.refresh_requested = true;
+    }
     _recorder_unlock();
+    if (request_refresh && _recorder_request_refresh() != ESP_OK)
+    {
+        _recorder_lock();
+        s_recorder.refresh_requested = false;
+        _recorder_unlock();
+    }
     *count = available;
     return ESP_OK;
 }
@@ -640,10 +1067,34 @@ static esp_err_t _recorder_start_now(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    const char *mount = sd_storage_service_get_mount_path();
-    if (mount == NULL || _recorder_free_bytes(mount) <
-            s_recorder.config.minimum_free_bytes)
+    /* Occupancy covers directory preparation, file creation, the whole
+     * recording, the WAV finalize and the index refresh. */
+    const esp_err_t usage_result = _recorder_usage_acquire();
+    if (usage_result != ESP_OK)
     {
+        return usage_result;
+    }
+    errno = 0;
+    esp_err_t setup_result = _recorder_prepare_directory(true);
+    if (setup_result != ESP_OK)
+    {
+        _recorder_usage_release(errno == EIO, setup_result);
+        return setup_result;
+    }
+    errno = 0;
+    const esp_err_t space_result = _recorder_space_refresh(&s_recorder.usage);
+    if (space_result != ESP_OK)
+    {
+        /* A failed query is not "the card is full". */
+        _recorder_usage_release(errno == EIO, space_result);
+        return space_result;
+    }
+    _recorder_lock();
+    const uint64_t free_bytes = s_recorder.snapshot.free_bytes;
+    _recorder_unlock();
+    if (free_bytes < s_recorder.config.minimum_free_bytes)
+    {
+        _recorder_usage_release(false, ESP_OK);
         return ESP_ERR_NO_MEM;
     }
     audio_service_config_t audio_config;
@@ -651,39 +1102,62 @@ static esp_err_t _recorder_start_now(void)
             audio_config.sample_rate_hz != 16000U ||
             audio_config.bits_per_sample != 16U || audio_config.channels != 2U)
     {
+        _recorder_usage_release(false, ESP_OK);
         return ESP_ERR_INVALID_STATE;
     }
     char path[sizeof(s_recorder.snapshot.name)];
     const int path_length = snprintf(path, sizeof(path), "%s/REC_%lld.part",
-                                     s_recorder.config.directory,
+                                     s_recorder.directory_path,
                                      (long long)esp_timer_get_time());
     if (path_length < 0 || (size_t)path_length >= sizeof(path))
     {
+        _recorder_usage_release(false, ESP_OK);
         return ESP_ERR_INVALID_SIZE;
     }
+    errno = 0;
     FILE *file = fopen(path, "wb+");
     if (file == NULL)
     {
+        _recorder_usage_release(errno == EIO, ESP_FAIL);
         return ESP_FAIL;
     }
     const recorder_wav_header_t empty = {0};
+    errno = 0;
     if (fwrite(&empty, 1U, sizeof(empty), file) != sizeof(empty) ||
             fflush(file) != 0)
     {
-        (void)fclose(file);
-        (void)remove(path);
+        bool medium_eio = errno == EIO;
+        errno = 0;
+        if (fclose(file) != 0)
+        {
+            medium_eio |= errno == EIO;
+        }
+        errno = 0;
+        if (remove(path) != 0)
+        {
+            medium_eio |= errno == EIO;
+        }
+        _recorder_usage_release(medium_eio, ESP_FAIL);
         return ESP_FAIL;
     }
     if (audio_service_start() != ESP_OK)
     {
-        (void)fclose(file);
-        (void)remove(path);
+        errno = 0;
+        const int close_result = fclose(file);
+        bool medium_eio = close_result != 0 && errno == EIO;
+        errno = 0;
+        if (remove(path) != 0)
+        {
+            medium_eio |= errno == EIO;
+        }
+        _recorder_usage_release(medium_eio, ESP_FAIL);
         return ESP_FAIL;
     }
+    const int64_t started_us = esp_timer_get_time();
     _recorder_lock();
     s_recorder.file = file;
     s_recorder.data_bytes = 0U;
-    s_recorder.started_us = esp_timer_get_time();
+    s_recorder.started_us = started_us;
     s_recorder.accumulated_duration_ms = 0U;
     s_recorder.stop_requested = false;
     s_recorder.playback = false;
@@ -691,16 +1165,13 @@ static esp_err_t _recorder_start_now(void)
     (void)snprintf(s_recorder.snapshot.name,
                    sizeof(s_recorder.snapshot.name), "%s", path);
     ++s_recorder.snapshot.generation;
-#ifdef ESP_PLATFORM
     atomic_store_explicit(&s_recorder.task_running, true,
                           memory_order_release);
-#endif
     _recorder_unlock();
 #ifdef ESP_PLATFORM
-    if (xTaskCreatePinnedToCore(_recorder_task, "recorder", 4096, NULL, 5,
-                                &s_recorder.task, RECORDER_TASK_CORE) != pdPASS)
+    if (_recorder_stream_create() != ESP_OK)
     {
-        _recorder_finish(true, ESP_ERR_NO_MEM);
+        _recorder_finish(true, ESP_ERR_NO_MEM, false);
         return ESP_ERR_NO_MEM;
     }
 #endif
@@ -709,10 +1180,11 @@ static esp_err_t _recorder_start_now(void)
 
 static esp_err_t _recorder_pause_now(void)
 {
-    if (!s_initialized || s_recorder.snapshot.state != RECORDER_SERVICE_RECORDING)
+    if (!s_initialized)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    const int64_t now_us = esp_timer_get_time();
     _recorder_lock();
     if (s_recorder.snapshot.state != RECORDER_SERVICE_RECORDING)
     {
@@ -720,7 +1192,7 @@ static esp_err_t _recorder_pause_now(void)
         return ESP_ERR_INVALID_STATE;
     }
     s_recorder.accumulated_duration_ms =
-        _recorder_duration_locked(esp_timer_get_time());
+        _recorder_duration_locked(now_us);
     s_recorder.started_us = 0;
     s_recorder.snapshot.duration_ms = s_recorder.accumulated_duration_ms;
     s_recorder.snapshot.state = RECORDER_SERVICE_PAUSED;
@@ -731,17 +1203,18 @@ static esp_err_t _recorder_pause_now(void)
 
 static esp_err_t _recorder_resume_now(void)
 {
-    if (!s_initialized || s_recorder.snapshot.state != RECORDER_SERVICE_PAUSED)
+    if (!s_initialized)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    const int64_t now_us = esp_timer_get_time();
     _recorder_lock();
     if (s_recorder.snapshot.state != RECORDER_SERVICE_PAUSED)
     {
         _recorder_unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    s_recorder.started_us = esp_timer_get_time();
+    s_recorder.started_us = now_us;
     s_recorder.snapshot.state = RECORDER_SERVICE_RECORDING;
     ++s_recorder.snapshot.generation;
     _recorder_unlock();
@@ -754,7 +1227,6 @@ static esp_err_t _recorder_stop_now(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
-#ifdef ESP_PLATFORM
     _recorder_lock();
     const bool busy = s_recorder.snapshot.state == RECORDER_SERVICE_RECORDING ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_PAUSED ||
@@ -765,27 +1237,27 @@ static esp_err_t _recorder_stop_now(void)
         return ESP_ERR_INVALID_STATE;
     }
     s_recorder.stop_requested = true;
+#ifndef ESP_PLATFORM
+    _recorder_unlock();
+    _recorder_finish(false, ESP_OK, false);
+    return ESP_OK;
+#else
     _recorder_unlock();
     while (atomic_load_explicit(&s_recorder.task_running,
                                 memory_order_acquire))
     {
         vTaskDelay(pdMS_TO_TICKS(10U));
     }
-#else
-    if (!recorder_service_is_busy())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    _recorder_finish(false, ESP_OK);
 #endif
     return ESP_OK;
 }
 
-static esp_err_t _recorder_play_now(const char *name)
+static esp_err_t _recorder_play_now(const recorder_service_target_t *target)
 {
-    if (!s_initialized || name == NULL)
+    if (!s_initialized || target == NULL ||
+            memchr(target->name, '\0', sizeof(target->name)) == NULL)
     {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_ARG;
     }
     _recorder_lock();
     const bool busy = s_recorder.snapshot.state == RECORDER_SERVICE_RECORDING ||
@@ -796,30 +1268,60 @@ static esp_err_t _recorder_play_now(const char *name)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!_recorder_path_is_owned(name))
+    /* Playback holds the business lease from open to close. */
+    const esp_err_t usage_result = _recorder_usage_acquire();
+    if (usage_result != ESP_OK)
     {
+        return usage_result;
+    }
+    sd_storage_service_snapshot_t storage = {0};
+    const bool target_current = sd_storage_service_get_snapshot(&storage) == ESP_OK &&
+                                storage.mounted &&
+                                target->generation == s_recorder.usage.generation &&
+                                target->generation == storage.generation &&
+                                target->revision == storage.revision;
+    if (!target_current)
+    {
+        _recorder_usage_release(false, ESP_ERR_INVALID_STATE);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (_recorder_prepare_directory(false) != ESP_OK ||
+            !_recorder_path_is_owned(target->name))
+    {
+        _recorder_usage_release(false, ESP_OK);
         return ESP_ERR_INVALID_ARG;
     }
-    FILE *file = fopen(name, "rb");
+    errno = 0;
+    FILE *file = fopen(target->name, "rb");
     if (file == NULL)
     {
-        return ESP_ERR_NOT_FOUND;
+        const bool medium_eio = errno == EIO;
+        _recorder_usage_release(medium_eio, ESP_FAIL);
+        return medium_eio ? ESP_FAIL : ESP_ERR_NOT_FOUND;
     }
     recorder_wav_header_t header;
     struct stat info;
-    if (fread(&header, 1U, sizeof(header), file) != sizeof(header) ||
-            fseek(file, (long)sizeof(recorder_wav_header_t), SEEK_SET) != 0 ||
-            stat(name, &info) != 0 ||
-            !_recorder_header_valid(&header, (uint64_t)info.st_size) ||
-            audio_service_start() != ESP_OK)
+    errno = 0;
+    const bool file_valid = fread(&header, 1U, sizeof(header), file) == sizeof(header) &&
+                            fseek(file, (long)sizeof(recorder_wav_header_t), SEEK_SET) == 0 &&
+                            stat(target->name, &info) == 0 &&
+                            _recorder_header_valid(&header, (uint64_t)info.st_size);
+    bool medium_eio = !file_valid && errno == EIO;
+    if (!file_valid || audio_service_start() != ESP_OK)
     {
-        (void)fclose(file);
+        errno = 0;
+        if (fclose(file) != 0)
+        {
+            medium_eio |= errno == EIO;
+        }
+        _recorder_usage_release(medium_eio, ESP_FAIL);
         return ESP_FAIL;
     }
+    const int64_t started_us = esp_timer_get_time();
     _recorder_lock();
     s_recorder.file = file;
     s_recorder.data_bytes = 0U;
-    s_recorder.started_us = esp_timer_get_time();
+    s_recorder.started_us = started_us;
     s_recorder.accumulated_duration_ms = 0U;
     s_recorder.playback = true;
     s_recorder.stop_requested = false;
@@ -828,20 +1330,17 @@ static esp_err_t _recorder_play_now(const char *name)
     s_recorder.snapshot.playback_duration_ms =
         (uint32_t)(((uint64_t)header.data_size) * 1000U / 64000U);
     (void)snprintf(s_recorder.snapshot.name, sizeof(s_recorder.snapshot.name),
-                   "%s", name);
+                   "%s", target->name);
     ++s_recorder.snapshot.generation;
     atomic_store_explicit(&s_recorder.task_running, true,
                           memory_order_release);
     _recorder_unlock();
 #ifdef ESP_PLATFORM
-    if (xTaskCreatePinnedToCore(_recorder_task, "recorder", 4096, NULL, 5,
-                                &s_recorder.task, RECORDER_TASK_CORE) != pdPASS)
+    if (_recorder_stream_create() != ESP_OK)
     {
-        _recorder_finish(true, ESP_ERR_NO_MEM);
+        _recorder_finish(true, ESP_ERR_NO_MEM, false);
         return ESP_ERR_NO_MEM;
     }
-#else
-    _recorder_finish(false, ESP_OK);
 #endif
     return ESP_OK;
 }
@@ -860,23 +1359,24 @@ static esp_err_t _recorder_stop_playback_now(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
-#ifdef ESP_PLATFORM
+#ifndef ESP_PLATFORM
+    _recorder_finish(false, ESP_OK, false);
+#else
     while (atomic_load_explicit(&s_recorder.task_running,
                                 memory_order_acquire))
     {
         vTaskDelay(pdMS_TO_TICKS(10U));
     }
-#else
-    _recorder_finish(false, ESP_OK);
 #endif
     return ESP_OK;
 }
 
-static esp_err_t _recorder_delete_now(const char *name)
+static esp_err_t _recorder_delete_now(const recorder_service_target_t *target)
 {
-    if (!s_initialized || name == NULL)
+    if (!s_initialized || target == NULL ||
+            memchr(target->name, '\0', sizeof(target->name)) == NULL)
     {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_ARG;
     }
     _recorder_lock();
     const bool busy = s_recorder.snapshot.state == RECORDER_SERVICE_RECORDING ||
@@ -887,15 +1387,39 @@ static esp_err_t _recorder_delete_now(const char *name)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!_recorder_path_is_owned(name))
+    /* Deletion is a maintenance operation: it becomes visible as "busy" to the
+     * storage service so an unmount or format cannot race it. */
+    sd_storage_service_usage_t usage = {0};
+    const esp_err_t usage_result = sd_storage_service_usage_acquire(
+                                       SD_STORAGE_SERVICE_USAGE_MAINTENANCE,
+                                       &usage);
+    if (usage_result != ESP_OK)
     {
+        return usage_result;
+    }
+    sd_storage_service_snapshot_t storage = {0};
+    const bool target_current = sd_storage_service_get_snapshot(&storage) == ESP_OK &&
+                                storage.mounted &&
+                                target->generation == usage.generation &&
+                                target->generation == storage.generation &&
+                                target->revision == storage.revision;
+    if (!target_current)
+    {
+        (void)sd_storage_service_usage_release(&usage);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (_recorder_prepare_directory(false) != ESP_OK ||
+            !_recorder_path_is_owned(target->name))
+    {
+        (void)sd_storage_service_usage_release(&usage);
         return ESP_ERR_INVALID_ARG;
     }
-    const esp_err_t result = remove(name) == 0 ? ESP_OK : ESP_FAIL;
+    errno = 0;
+    const esp_err_t result = remove(target->name) == 0 ? ESP_OK : ESP_FAIL;
     if (result == ESP_OK)
     {
         _recorder_lock();
-        if (strcmp(s_recorder.snapshot.name, name) == 0)
+        if (strcmp(s_recorder.snapshot.name, target->name) == 0)
         {
             s_recorder.snapshot.name[0] = '\0';
             s_recorder.snapshot.duration_ms = 0U;
@@ -903,12 +1427,17 @@ static esp_err_t _recorder_delete_now(const char *name)
             ++s_recorder.snapshot.generation;
         }
         _recorder_unlock();
-        _recorder_refresh_index();
+        (void)sd_storage_service_note_content_change(&usage);
+        _recorder_refresh_index(&usage);
     }
+    else if (errno == EIO)
+    {
+        (void)sd_storage_service_usage_report_fault(&usage, result);
+    }
+    (void)sd_storage_service_usage_release(&usage);
     return result;
 }
 
-#ifdef ESP_PLATFORM
 static void _recorder_command_complete(const recorder_command_t *command,
                                        esp_err_t result)
 {
@@ -929,9 +1458,25 @@ static void _recorder_command_task(void *argument)
 {
     (void)argument;
     recorder_command_t command;
-    while (xQueueReceive(s_recorder.command_queue, &command, portMAX_DELAY) ==
-            pdTRUE)
+    for (;;)
     {
+#ifdef ESP_PLATFORM
+        TickType_t timeout = portMAX_DELAY;
+        _recorder_stream_reap();
+        _recorder_lock();
+        const bool stream_owned = s_recorder.task != NULL;
+        _recorder_unlock();
+        if (stream_owned) timeout = pdMS_TO_TICKS(50U);
+#else
+        const uint32_t timeout = portMAX_DELAY;
+#endif
+        if (xQueueReceive(s_recorder.command_queue, &command, timeout) != pdTRUE)
+        {
+            continue;
+        }
+#ifdef ESP_PLATFORM
+        _recorder_stream_reap();
+#endif
         if (command.type == RECORDER_COMMAND_SHUTDOWN)
         {
             break;
@@ -940,7 +1485,7 @@ static void _recorder_command_task(void *argument)
         _recorder_lock();
         const bool stopping = s_recorder.stopping;
         _recorder_unlock();
-        if (stopping)
+        if (stopping && command.type != RECORDER_COMMAND_STOP)
         {
             result = ESP_ERR_INVALID_STATE;
         }
@@ -961,20 +1506,38 @@ static void _recorder_command_task(void *argument)
                 result = _recorder_stop_now();
                 break;
             case RECORDER_COMMAND_PLAY:
-                result = _recorder_play_now(command.name);
+                result = _recorder_play_now(&command.target);
                 break;
             case RECORDER_COMMAND_STOP_PLAYBACK:
                 result = _recorder_stop_playback_now();
                 break;
             case RECORDER_COMMAND_DELETE:
-                result = _recorder_delete_now(command.name);
+                result = _recorder_delete_now(&command.target);
                 break;
+            case RECORDER_COMMAND_REFRESH_INDEX:
+                /* Housekeeping has no user operation result. Index publication
+                 * itself advances snapshot generation when its content changes.
+                 * Clear the flag so a stale/failed scan remains retryable. */
+                _recorder_lock();
+                s_recorder.refresh_requested = false;
+                _recorder_unlock();
+                _recorder_refresh_from_medium();
+#ifdef ESP_PLATFORM
+                _recorder_stream_reap();
+#endif
+                continue;
             default:
                 break;
             }
         }
+#ifdef ESP_PLATFORM
+        _recorder_stream_reap();
+#endif
         _recorder_command_complete(&command, result);
     }
+#ifdef ESP_PLATFORM
+    _recorder_stream_reap();
+#endif
     _recorder_lock();
     s_recorder.command_task = NULL;
     _recorder_unlock();
@@ -982,11 +1545,17 @@ static void _recorder_command_task(void *argument)
 }
 
 static esp_err_t _recorder_submit_command(recorder_command_type_t type,
-        const char *name)
+        const recorder_service_target_t *target)
 {
     if (!s_initialized || s_recorder.command_queue == NULL)
     {
         return ESP_ERR_INVALID_STATE;
+    }
+    if ((type == RECORDER_COMMAND_PLAY || type == RECORDER_COMMAND_DELETE) &&
+            (target == NULL ||
+             memchr(target->name, '\0', sizeof(target->name)) == NULL))
+    {
+        return ESP_ERR_INVALID_ARG;
     }
     recorder_command_t command =
     {
@@ -994,7 +1563,10 @@ static esp_err_t _recorder_submit_command(recorder_command_type_t type,
     };
     _recorder_lock();
     if (s_recorder.stopping || s_recorder.snapshot.operation_pending ||
-            s_recorder.command_task == NULL)
+            s_recorder.command_task == NULL ||
+            ((type == RECORDER_COMMAND_START || type == RECORDER_COMMAND_PLAY ||
+              type == RECORDER_COMMAND_DELETE) &&
+             atomic_load_explicit(&s_recorder.task_running, memory_order_acquire)))
     {
         _recorder_unlock();
         return ESP_ERR_INVALID_STATE;
@@ -1005,9 +1577,9 @@ static esp_err_t _recorder_submit_command(recorder_command_type_t type,
         ++s_next_operation_id;
     }
     command.operation_id = s_next_operation_id;
-    if (name != NULL)
+    if (target != NULL)
     {
-        (void)snprintf(command.name, sizeof(command.name), "%s", name);
+        command.target = *target;
     }
     s_recorder.snapshot.operation_id = command.operation_id;
     s_recorder.snapshot.operation_pending = true;
@@ -1024,67 +1596,38 @@ static esp_err_t _recorder_submit_command(recorder_command_type_t type,
     }
     return ESP_OK;
 }
-#endif
 
 esp_err_t recorder_service_start(void)
 {
-#ifdef ESP_PLATFORM
     return _recorder_submit_command(RECORDER_COMMAND_START, NULL);
-#else
-    return _recorder_start_now();
-#endif
 }
 
 esp_err_t recorder_service_pause(void)
 {
-#ifdef ESP_PLATFORM
     return _recorder_submit_command(RECORDER_COMMAND_PAUSE, NULL);
-#else
-    return _recorder_pause_now();
-#endif
 }
 
 esp_err_t recorder_service_resume(void)
 {
-#ifdef ESP_PLATFORM
     return _recorder_submit_command(RECORDER_COMMAND_RESUME, NULL);
-#else
-    return _recorder_resume_now();
-#endif
 }
 
 esp_err_t recorder_service_stop(void)
 {
-#ifdef ESP_PLATFORM
     return _recorder_submit_command(RECORDER_COMMAND_STOP, NULL);
-#else
-    return _recorder_stop_now();
-#endif
 }
 
-esp_err_t recorder_service_play(const char *name)
+esp_err_t recorder_service_play(const recorder_service_target_t *target)
 {
-#ifdef ESP_PLATFORM
-    return _recorder_submit_command(RECORDER_COMMAND_PLAY, name);
-#else
-    return _recorder_play_now(name);
-#endif
+    return _recorder_submit_command(RECORDER_COMMAND_PLAY, target);
 }
 
 esp_err_t recorder_service_stop_playback(void)
 {
-#ifdef ESP_PLATFORM
     return _recorder_submit_command(RECORDER_COMMAND_STOP_PLAYBACK, NULL);
-#else
-    return _recorder_stop_playback_now();
-#endif
 }
 
-esp_err_t recorder_service_delete(const char *name)
+esp_err_t recorder_service_delete(const recorder_service_target_t *target)
 {
-#ifdef ESP_PLATFORM
-    return _recorder_submit_command(RECORDER_COMMAND_DELETE, name);
-#else
-    return _recorder_delete_now(name);
-#endif
+    return _recorder_submit_command(RECORDER_COMMAND_DELETE, target);
 }

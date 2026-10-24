@@ -12,9 +12,10 @@
 | `power_service` | 通过板级操作表采样 PMU，并以独立周期消费 latched IRQ；缓存快照并发布状态/IRQ 事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |
 | `imu_service` | 周期采样 QMI8658C 适配器，缓存带 sequence 的三轴快照并发布状态/中断事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |
 | `audio_service` | 管理 BSP ES8311/NS4150B 全双工 PCM、音量、静音和 PA 生命周期 | `bsp`；`freertos`、`mt_log`（私有） |
-| `sd_storage_service` | 通过板级 mount adapter 管理可移除存储生命周期，不绑定 SDSPI/SDMMC 实现 | `freertos`、`mt_log`（私有） |
+| `sd_storage_service` | 通过板级 mount adapter 管理可移除存储生命周期，不绑定 SDSPI/SDMMC 实现；公开阶段/代际快照、容量查询、格式化，并以代际校验的 ACCESS/SESSION/MAINTENANCE 使用权协调消费者 | `freertos`、`mt_log`（私有） |
+| `file_service` | 专属 worker 执行异步存储控制与 UTF-8 文件浏览；4 个会话、16 项批次、初始化时 PSRAM 优先有界池、槽引用队列、复制结果、带代次/修订号的删除与维护确认 | `sd_storage_service`；`fatfs`、`freertos`、`heap`、`mt_log`（私有） |
 | `timer_service` | 以单调时间维护倒计时、秒表和专注阶段，提供线程安全 snapshot、完成回调与命令状态机 | `esp_common`、`freertos` |
-| `recorder_service` | 独占录音音频会话和 SD WAV 文件；通过专属 worker 异步执行录音、播放、删除和 WAV finalize，提供 generation snapshot 与有界完成文件列表 | `audio_service`、`sd_storage_service`；`esp_timer`、`mt_log`（私有） |
+| `recorder_service` | 独占录音音频会话和 SD WAV 文件；专属 worker 执行录音、播放、删除和 finalize；扫描持 ACCESS，录音/播放持 SESSION，容量、代次及内容修订均来自 SD owner，UI 只读缓存 | `audio_service`、`sd_storage_service`；`esp_timer`、`mt_log`（私有） |
 | `system_pm` | 串行执行外设休眠钩子、ESP32 轻睡眠与唤醒恢复，并管理 CPU 最高频率锁 | `mt_log` 和 ESP-IDF PM/GPIO/硬件支持组件（私有） |
 | `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
 | `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |

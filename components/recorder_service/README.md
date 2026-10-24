@@ -6,29 +6,98 @@
 
 公共头 `include/recorder_service.h`：
 
-- `recorder_service_init()` / `deinit()`：初始化或停止服务；配置包含目录、最大时长与最小剩余字节。
+- `recorder_service_init()` / `deinit()`：初始化或停止服务；目录是卷内相对路径
+  （例如 `MicroTech/Recordings`），服务在每次使用时通过 `sd_storage_service`
+  解析当前挂载点，不硬编码挂载路径。无卡时初始化同样成功，录音只是不可开始。
 - `recorder_service_start()` / `pause()` / `resume()` / `stop()`：录音命令，完成通过快照报告。
 - `recorder_service_play()` / `stop_playback()`：播放指定 WAV 并停止播放。
 - `recorder_service_list()` / `delete()`：枚举已完成 WAV 与删除文件，不暴露目录句柄。
-- `recorder_service_get_snapshot()` / `is_busy()`：状态快照与忙碌查询。
+  列表每行的 `target` 保留完整 UTF-8 后端路径（192 字节，含终止符）及该次
+  索引发布的挂载 generation / 内容 revision；播放与删除接收该 target 的指针，
+  队列复制完整 target，不按同名路径重新选择文件。
+- `recorder_service_get_snapshot()` / `is_busy()`：状态快照与忙碌查询。快照
+  区分 `free_bytes`（`space_valid` 为真时才有效）、`space_error` 与
+  `storage_ready`；容量查询失败不会被当作空间不足。当前 SD 的
+  `storage_generation` / `content_revision` 在 recorder 锁外读取；
+  `index_generation` / `index_revision` / `index_valid` 在锁内与索引一同复制。
 
-`recorder_service_snapshot_t.name`、`recorder_service_file_t.name` 和播放/删除命令均保存
-完整文件路径，容量为 `RECORDER_SERVICE_PATH_MAX` 字节（含结尾 NUL）；路径拼接超出该容量的
+`recorder_service_snapshot_t.name`、`recorder_service_file_t.target.name` 和播放/删除命令均保存
+完整文件路径，容量为 `RECORDER_SERVICE_PATH_BYTES` 字节（含结尾 NUL）；路径拼接超出该容量的
 录音文件不进入服务索引。
 
 ## 配置与依赖
 
-- CMake：`PRIV_REQUIRES audio_service sd_storage_service esp_timer fatfs freertos mt_log`。
-- `idf_component.yml`：仅 `idf: ">=5.0"`。
+- CMake：`PRIV_REQUIRES audio_service esp_timer fatfs freertos mt_log sd_storage_service`。
+- `idf_component.yml`：`idf: ">=5.0"`，本地依赖 `audio_service`、`sd_storage_service`、`mt_log`。
 - 无 Kconfig；运行时由 `recorder_service_config_t` 提供目录、最大录音时长与最小剩余空间。
 
 ## 状态与并发
 
-- 单例；命令经队列交给 pinned worker 任务，录音与播放使用独立任务。
+- 单例；命令经有界队列交给 pinned worker 任务，录音与播放共用一个流任务。
+  设备流任务的 4096 字节栈以 `SPIRAM | 8BIT` 显式分配，不回退内部 RAM；
+  共用 4096 字节 PCM 位于外部 BSS。TCB、队列、锁和普通 4096 字节命令栈仍在内部。
+  普通宿主与模拟器只运行命令 worker，不模拟音频流，SESSION 保留至显式停止；
+  独立的设备分支宿主目标执行真实流任务以验证生命周期。
 - 状态以 `generation` / `operation_id` 标识，命令异步完成；临界区与原子量保护共享字段。
+  所有跨服务调用（包括 SD 状态、revision、租约和计时）均在 recorder 临界区之外执行。
 - 状态机：IDLE / RECORDING / PAUSED / PLAYING / ERROR。
+- 占用：目录准备、文件创建、录制、暂停、关闭、WAV finalize 与索引刷新，以及
+  播放从打开到关闭，全程持有 `sd_storage_service` 的业务使用权（SESSION）；
+  删除取独占维护权。因此录音/播放期间可以浏览，但删除、卸载与格式化会被拒绝。
+  播放取得 SESSION、删除取得 MAINTENANCE 后，先核对目标 generation 与租约、
+  当前 SD generation / revision；过期目标在打开或删除之前失败并释放租约，
+  不会触碰同路径的新文件。`ESP_OK` 仅表示命令接受，须等待同一 `operation_id`
+  的 `operation_pending == false` 并检查 `last_error` 后才能判断成功。
+- 索引：worker 在独立扫描前取得 ACCESS，从路径解析、容量查询到目录与每个
+  WAV 头检查、关闭句柄全程持有；录音结束与删除后的刷新复用既有 SESSION / MAINTENANCE。
+  扫描前后核对 SD generation 与内容 revision，变化则丢弃结果；UI 查询只读缓存，
+  过期列表返回空并请求异步刷新，设备与宿主均不在查询中做文件/容量 I/O。
+  失败或中断的目录扫描不发布有效索引；并发扫描用 publication version 防止旧结果覆盖
+  新索引。有效索引变化递增快照 generation，列表验证与复制在同一临界区完成。
+  每次扫描的八条临时元数据独立分配在堆上，发布后或扫描失败时释放，不放在
+  `recorder_cmd` 的 4096 字节任务栈上，也不与并发收尾扫描共用 scratch。
+  分配失败使索引无效并释放本次 ACCESS；不会上报介质故障，后续 list 可请求重扫。
+- 内容 revision 由 `sd_storage_service` 统一维护，无 `file_service` 依赖。
+  录音先关闭并 finalize WAV，再通知内容变更、刷新索引并释放 SESSION，最后发布
+  IDLE / ERROR 和允许下一次开始；播放关闭不修改内容 revision。
+  缓存容量附带挂载 generation，拔卡/重挂载时不会返回旧容量为有效值。
+- 仅文件系统调用确认的 `errno == EIO` 上报介质故障；任务内存不足、音频失败、
+  权限错误或空间不足不会将健康 SD 标记为故障，仍保证文件关闭与租约释放。
+- 流任务先完成音频停止、文件关闭/收尾、索引刷新和 SESSION 释放，最后锁内发布
+  `task_running=false`，随后只循环 delay park，不自删除。命令任务是唯一创建/回收
+  owner，在锁外用非空 handle 调用 `vTaskDeleteWithCaps`；有待回收流任务时以
+  50 ms 周期接收命令，确保自然 EOF/错误无需新用户命令也能回收。STOP 完成和
+  SHUTDOWN 退出前均先回收；deinit 超时不强杀 I/O 或释放仍在使用的资源。
+  这些外部栈路径仅访问 SD/SDSPI 与 I2S，不执行 NVS、flash 文件系统、OTA 或显式 sleep。
+  SDSPI 复用 SDK slot 的 516 字节内部 DMA staging；外移量不等于净 DMA 空闲增量。
 
 ## 测试边界
 
-- `tests/host` 存在，使用 audio/SD fake 覆盖命令队列、状态迁移与文件枚举。
+- `tests/host` 使用真实 pthread 命令 worker 与 audio/SD fake，覆盖异步状态迁移、
+  无卡启动与重挂载、容量查询失败/空间不足、暂停与播放 SESSION、浏览 ACCESS 共存、
+  扫描 ACCESS 阻止维护、扫描中 revision/epoch 变化丢弃、以及关闭/内容失效/租约释放
+  先于 IDLE 发布和下一命令接受的顺序。阻塞容量查询时 UI 快照与列表仍只读缓存。
+  `recorder_service_races_test` 用私有实现测试和确定性 barrier 覆盖通知、目录错误重试、
+  旧/新扫描发布竞争、列表验证/复制交错，以及 EIO 与非存储错误的区分。
+  确定性租约 barrier 覆盖播放/删除接受后发生 revision 变化或同路径重挂载替换：
+  原目标终态失败、替换文件逐字节保留、不启动音频且释放 SESSION / MAINTENANCE；
+  同时覆盖当前目标的成功播放/删除及索引元数据与快照 epoch 对应。
+  扫描缓冲 OOM 回归检查索引失效、ACCESS 释放、介质保持可用与后续恢复。
+  `recorder_service_stream_test` 单独定义 `ESP_PLATFORM`，使用真实 pthread-backed
+  FreeRTOS 流任务与条件变量控制音频读写。覆盖 WAV 长度/头、显式停止、最大时长、
+  无命令的播放 EOF、读写错误、创建失败补偿、完成早于创建返回、立即 start/play、
+  活跃录音 deinit 与 20 次重复录放，并核对 owner 删除和任务/文件句柄/SESSION 无累计。
+  静态栈帧不含完整 libc/VFS/驱动调用链，不能替代真机栈高水位测量。
 - 宿主不覆盖真实 I2S 音频、SD 卡 I/O 与文件系统掉电。
+
+### 设备验证范围
+
+带诊断候选 `095ce70ddb04083a6f95fa25c42ab21032c3846c5e9af8ab8cb827d6b1409ffa`
+已完成天气 HTTPS 更新后的长录音、文件浏览、暂停/继续、停止和播放自然结束；
+用户确认操作正常，并进一步确认 Wi-Fi/BLE 同时开启时连续录音正常。
+串口确认流栈与 PCM 在 PSRAM，命令栈仍在内部 RAM；各次已观察流任务由 owner
+回收，任务数从 28 回到 27，未出现目标 LCD DMA 分配失败或显示提交失败。
+
+这些结果支持当前资源放置方案，不构成所有无线负载的内部堆余量保证，也不替代
+冷启动、待机/唤醒或文件系统掉电验证。清理诊断后的固件与该候选分别保存；
+候选的实机结果不能冒充清理后固件已重新上板验证。
