@@ -11,7 +11,7 @@
 | `nv_storage` | 管理默认 NVS 分区，提供标量 K-V API 和固定池 Blob 注册/校验/默认值回退 | `freertos`、`nvs_flash`、`mt_log`（私有） |
 | `power_service` | 通过板级操作表采样 PMU，并以独立周期消费 latched IRQ；缓存快照并发布状态/IRQ 事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |
 | `imu_service` | 周期采样 QMI8658C 适配器，缓存带 sequence 的三轴快照并发布状态/中断事件 | `event_bus`；`mt_log`、`esp_timer`（私有） |
-| `audio_service` | 管理 BSP ES8311/NS4150B 全双工 PCM、音量、静音和 PA 生命周期 | `bsp`；`freertos`、`mt_log`（私有） |
+| `audio_service` | 以独占租约管理 BSP ES8311/NS4150B 全双工 PCM、音量、静音和 PA 生命周期 | `bsp`；`freertos`、`mt_log`（私有） |
 | `sd_storage_service` | 通过板级 mount adapter 管理可移除存储生命周期，不绑定 SDSPI/SDMMC 实现；公开阶段/代际快照、容量查询、格式化，并以代际校验的 ACCESS/SESSION/MAINTENANCE 使用权协调消费者 | `freertos`、`mt_log`（私有） |
 | `file_service` | 专属 worker 执行异步存储控制与 UTF-8 文件浏览；4 个会话、16 项批次、初始化时 PSRAM 优先有界池、槽引用队列、复制结果、带代次/修订号的删除与维护确认 | `sd_storage_service`；`fatfs`、`freertos`、`heap`、`mt_log`（私有） |
 | `timer_service` | 以单调时间维护倒计时、秒表和专注阶段，提供线程安全 snapshot、完成回调与命令状态机 | `esp_common`、`freertos` |
@@ -52,7 +52,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 ## 新增服务 API 与事件
 
 - `imu_service` 的板级表要求 `read`，并可提供 `is_available`、`configure`、`set_enabled` 和 `poll_interrupt`。初始化会把运行时 `sample_rate_hz` 同时用于硬件 ODR 和 worker 周期。公共 API 支持 init/start、stop/deinit、suspend/resume、缓存 `get_snapshot` 和同步 `read`。
-- `audio_service_init_config_t` 同时提供 PCM、初始音量、mute 和 PA；`audio_service_get_config()` 返回当前有效 PCM 格式。服务支持 configure、start/stop 和全双工 read/write，不发布 event bus 消息。
+- `audio_service_init_config_t` 同时提供 PCM、初始音量、mute 和 PA；`audio_service_get_config()` 返回当前有效 PCM 格式。消费者先 `audio_service_acquire()` 取得 RECORD/PLAYBACK/MAINTENANCE 租约，再用带租约的 read/write；释放只接受当前 token，失配不会停止 DMA。租约跨 suspend 保留，存在租约时 deinit 返回 `ESP_ERR_INVALID_STATE`。服务不发布 event bus 消息。
 - `sd_storage_service` 的 adapter 提供 mount/unmount/is_mounted；普通 `init/start(config)` 从不格式化。破坏性恢复只能由显式 `sd_storage_service_recover_and_mount(config)` 发起。
 - `power_service` 的 `poll_irq` 返回已消费的 AXP2101 latched status。非零状态以 `POWER_SERVICE_MSG_SUB_TYPE_IRQ` 和 `power_service_irq_event_t` 发布；该边沿事件使用 flags `0`，不会被 `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 覆盖。遥测快照仍按独立周期更新。
 - `time_service` 的 RTC 表现在要求 alarm 功能要么全部不提供，要么完整提供 configure/disable/get_status/clear/poll_interrupt。`time_service_alarm_*` 管理重复 UTC 日历 alarm；worker 以固定 100 ms 周期轮询低有效 RTC_INT，并用 flags `0` 发布 `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence 事件。

@@ -11,6 +11,13 @@
 typedef esp_err_t (*audio_service_io_op_t)(void *data, size_t bytes,
         size_t *transferred, uint32_t timeout_ms);
 
+typedef enum audio_quiesce_mode
+{
+    AUDIO_QUIESCE_RELEASE,
+    AUDIO_QUIESCE_SUSPEND,
+    AUDIO_QUIESCE_DEINIT,
+} audio_quiesce_mode_t;
+
 typedef struct audio_service_context
 {
     SemaphoreHandle_t lock;
@@ -26,6 +33,10 @@ typedef struct audio_service_context
     bool io_admitted;
     bool drain_waiting;
     bool stop_required;
+    audio_service_lease_t lease;
+    audio_service_session_kind_t session_kind;
+    uint32_t lease_generation;
+    bool leased;
 } audio_service_context_t;
 
 static audio_service_context_t s_audio_service =
@@ -114,7 +125,14 @@ static bool _ops_available_locked(void)
            s_audio_service.ops.is_available();
 }
 
-static esp_err_t _acquire_io_lease(bool read,
+static bool _lease_valid_locked(const audio_service_lease_t *lease)
+{
+    return lease != NULL && s_audio_service.leased &&
+           lease->token == s_audio_service.lease.token &&
+           lease->generation == s_audio_service.lease.generation;
+}
+
+static esp_err_t _acquire_io_lease(audio_service_lease_t lease, bool read,
                                    audio_service_io_op_t *leased_operation)
 {
     esp_err_t result = _lock_service();
@@ -124,8 +142,10 @@ static esp_err_t _acquire_io_lease(bool read,
     }
     audio_service_io_op_t operation = read ? s_audio_service.ops.read :
                                       s_audio_service.ops.write;
-    if (!s_audio_service.initialized || !s_audio_service.io_admitted ||
+    if (!s_audio_service.initialized || !_lease_valid_locked(&lease) ||
+            !s_audio_service.io_admitted ||
             s_audio_service.state != AUDIO_SERVICE_STATE_RUNNING ||
+            (read && s_audio_service.session_kind == AUDIO_SERVICE_SESSION_PLAYBACK) ||
             operation == NULL)
     {
         result = ESP_ERR_INVALID_STATE;
@@ -153,36 +173,45 @@ static void _release_io_lease(void)
     _unlock_service();
 }
 
-static esp_err_t _quiesce(uint32_t timeout_ms, bool stop_ready,
-                          bool accept_unavailable,
-                          bool *resume_required)
+static esp_err_t _quiesce(audio_quiesce_mode_t mode,
+                          const audio_service_lease_t *lease,
+                          uint32_t timeout_ms, bool *resume_required)
 {
-    audio_service_state_t initial_state = AUDIO_SERVICE_STATE_UNINITIALIZED;
-    bool service_locked = false;
-    bool was_running = false;
-
     if (resume_required != NULL)
     {
         *resume_required = false;
     }
-
+    if (mode == AUDIO_QUIESCE_DEINIT && s_audio_service.lock == NULL)
+    {
+        return ESP_OK;
+    }
     esp_err_t result = _lock_service();
     if (result != ESP_OK)
     {
         return result;
     }
-    service_locked = true;
-    if (!s_audio_service.initialized && !s_audio_service.stop_required)
+    bool service_locked = true;
+    const audio_service_state_t initial_state = s_audio_service.state;
+    const bool initial_admission = s_audio_service.io_admitted;
+    if (initial_state == AUDIO_SERVICE_STATE_SUSPENDING ||
+            (mode == AUDIO_QUIESCE_RELEASE && !_lease_valid_locked(lease)) ||
+            (mode == AUDIO_QUIESCE_DEINIT && s_audio_service.leased))
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit;
     }
-
-    initial_state = s_audio_service.state;
-    if (initial_state == AUDIO_SERVICE_STATE_READY && !stop_ready)
+    if (!s_audio_service.initialized && !s_audio_service.stop_required)
     {
-        result = ESP_OK;
+        if (mode == AUDIO_QUIESCE_DEINIT)
+        {
+            goto commit;
+        }
+        result = ESP_ERR_INVALID_STATE;
         goto exit;
+    }
+    if (initial_state == AUDIO_SERVICE_STATE_READY && mode != AUDIO_QUIESCE_DEINIT)
+    {
+        goto commit;
     }
     if (initial_state != AUDIO_SERVICE_STATE_READY &&
             initial_state != AUDIO_SERVICE_STATE_RUNNING &&
@@ -191,51 +220,68 @@ static esp_err_t _quiesce(uint32_t timeout_ms, bool stop_ready,
         result = ESP_ERR_INVALID_STATE;
         goto exit;
     }
-
-    was_running = initial_state == AUDIO_SERVICE_STATE_RUNNING;
     if (resume_required != NULL)
     {
-        *resume_required = was_running;
+        *resume_required = initial_state == AUDIO_SERVICE_STATE_RUNNING;
     }
-    (void)xSemaphoreTake(s_audio_service.drained, 0U);
     s_audio_service.io_admitted = false;
     s_audio_service.state = AUDIO_SERVICE_STATE_SUSPENDING;
-    const bool drain_required = s_audio_service.active_io != 0U;
-    s_audio_service.drain_waiting = drain_required;
-    _unlock_service();
-    service_locked = false;
-
-    BaseType_t drained = pdTRUE;
-    if (drain_required)
+    if (s_audio_service.active_io != 0U)
     {
-        drained = xSemaphoreTake(s_audio_service.drained,
-                                 _timeout_to_ticks(timeout_ms));
+        (void)xSemaphoreTake(s_audio_service.drained, 0U);
+        s_audio_service.drain_waiting = true;
+        _unlock_service();
+        service_locked = false;
+        const BaseType_t drained = xSemaphoreTake(s_audio_service.drained,
+            _timeout_to_ticks(timeout_ms));
+        result = _lock_service();
+        if (result != ESP_OK)
+        {
+            goto exit;
+        }
+        service_locked = true;
+        s_audio_service.drain_waiting = false;
+        if (drained != pdTRUE && s_audio_service.active_io != 0U)
+        {
+            s_audio_service.state = initial_state;
+            s_audio_service.io_admitted = initial_admission;
+            result = ESP_ERR_TIMEOUT;
+            goto exit;
+        }
     }
-
-    result = _lock_service();
-    if (result != ESP_OK)
-    {
-        goto exit;
-    }
-    service_locked = true;
-    const bool io_quiesced = s_audio_service.active_io == 0U;
-    s_audio_service.drain_waiting = false;
-    if (drained != pdTRUE && !io_quiesced)
-    {
-        s_audio_service.state = initial_state;
-        s_audio_service.io_admitted = was_running;
-        result = ESP_ERR_TIMEOUT;
-        goto exit;
-    }
-
     result = s_audio_service.ops.stop();
-    if (result != ESP_OK && accept_unavailable &&
-            !_ops_available_locked())
+    if (result != ESP_OK && mode == AUDIO_QUIESCE_DEINIT && !_ops_available_locked())
     {
         result = ESP_OK;
     }
     s_audio_service.state = result == ESP_OK ? AUDIO_SERVICE_STATE_READY :
                             AUDIO_SERVICE_STATE_ERROR;
+    if (result != ESP_OK)
+    {
+        goto exit;
+    }
+
+commit:
+    if (mode != AUDIO_QUIESCE_SUSPEND)
+    {
+        s_audio_service.leased = false;
+        memset(&s_audio_service.lease, 0, sizeof(s_audio_service.lease));
+        s_audio_service.session_kind = AUDIO_SERVICE_SESSION_RECORD;
+    }
+    if (mode == AUDIO_QUIESCE_DEINIT)
+    {
+        memset(&s_audio_service.ops, 0, sizeof(s_audio_service.ops));
+        memset(&s_audio_service.init_config, 0, sizeof(s_audio_service.init_config));
+        memset(&s_audio_service.config, 0, sizeof(s_audio_service.config));
+        s_audio_service.initialized = false;
+        s_audio_service.ops_registered = false;
+        s_audio_service.pa_enabled = false;
+        s_audio_service.io_admitted = false;
+        s_audio_service.drain_waiting = false;
+        s_audio_service.stop_required = false;
+        s_audio_service.active_io = 0U;
+        s_audio_service.state = AUDIO_SERVICE_STATE_UNINITIALIZED;
+    }
 
 exit:
     if (service_locked)
@@ -336,6 +382,9 @@ esp_err_t audio_service_init(const audio_service_init_config_t *config)
     s_audio_service.active_io = 0U;
     s_audio_service.io_admitted = false;
     s_audio_service.drain_waiting = false;
+    s_audio_service.leased = false;
+    memset(&s_audio_service.lease, 0, sizeof(s_audio_service.lease));
+    s_audio_service.session_kind = AUDIO_SERVICE_SESSION_RECORD;
 
 exit:
     _unlock_service();
@@ -367,46 +416,8 @@ exit:
 
 esp_err_t audio_service_deinit(void)
 {
-    if (s_audio_service.lock == NULL)
-    {
-        return ESP_OK;
-    }
-    esp_err_t result = _lock_service();
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-    const bool cleanup_required = s_audio_service.initialized ||
-                                  s_audio_service.stop_required;
-    _unlock_service();
-
-    if (cleanup_required)
-    {
-        result = _quiesce(AUDIO_SERVICE_WAIT_FOREVER, true, true, NULL);
-        if (result != ESP_OK)
-        {
-            return result;
-        }
-    }
-
-    result = _lock_service();
-    if (result != ESP_OK)
-    {
-        return result;
-    }
-    memset(&s_audio_service.ops, 0, sizeof(s_audio_service.ops));
-    memset(&s_audio_service.init_config, 0, sizeof(s_audio_service.init_config));
-    memset(&s_audio_service.config, 0, sizeof(s_audio_service.config));
-    s_audio_service.initialized = false;
-    s_audio_service.ops_registered = false;
-    s_audio_service.pa_enabled = false;
-    s_audio_service.io_admitted = false;
-    s_audio_service.drain_waiting = false;
-    s_audio_service.stop_required = false;
-    s_audio_service.active_io = 0U;
-    s_audio_service.state = AUDIO_SERVICE_STATE_UNINITIALIZED;
-    _unlock_service();
-    return ESP_OK;
+    return _quiesce(AUDIO_QUIESCE_DEINIT, NULL,
+                    AUDIO_SERVICE_WAIT_FOREVER, NULL);
 }
 
 bool audio_service_is_available(void)
@@ -443,7 +454,7 @@ esp_err_t audio_service_configure(const audio_service_config_t *config)
     {
         return result;
     }
-    if (!s_audio_service.initialized ||
+    if (!s_audio_service.initialized || s_audio_service.leased ||
             s_audio_service.state != AUDIO_SERVICE_STATE_READY)
     {
         result = ESP_ERR_INVALID_STATE;
@@ -467,14 +478,103 @@ exit:
     return result;
 }
 
-esp_err_t audio_service_start(void)
+esp_err_t audio_service_acquire(audio_service_session_kind_t kind,
+                                audio_service_lease_t *lease)
 {
+    if (lease == NULL ||
+            (unsigned)kind > (unsigned)AUDIO_SERVICE_SESSION_MAINTENANCE)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *lease = (audio_service_lease_t)
+    {
+        0U, 0U
+    };
     esp_err_t result = _lock_service();
     if (result != ESP_OK)
     {
         return result;
     }
-    if (!s_audio_service.initialized)
+    if (!s_audio_service.initialized || s_audio_service.leased ||
+            (s_audio_service.state != AUDIO_SERVICE_STATE_READY &&
+             s_audio_service.state != AUDIO_SERVICE_STATE_ERROR) ||
+            s_audio_service.ops.start == NULL)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    if (s_audio_service.state == AUDIO_SERVICE_STATE_ERROR)
+    {
+        result = s_audio_service.ops.stop();
+        if (result != ESP_OK)
+        {
+            goto exit;
+        }
+        s_audio_service.state = AUDIO_SERVICE_STATE_READY;
+    }
+    result = s_audio_service.ops.start();
+    if (result == ESP_OK)
+    {
+        uint32_t generation = ++s_audio_service.lease_generation;
+        if (generation == 0U)
+        {
+            generation = ++s_audio_service.lease_generation;
+        }
+        s_audio_service.lease.token = generation;
+        s_audio_service.lease.generation = generation;
+        s_audio_service.session_kind = kind;
+        s_audio_service.leased = true;
+        s_audio_service.state = AUDIO_SERVICE_STATE_RUNNING;
+        s_audio_service.io_admitted = true;
+        *lease = s_audio_service.lease;
+    }
+    else
+    {
+        const esp_err_t cleanup = s_audio_service.ops.stop();
+        s_audio_service.state = cleanup == ESP_OK ? AUDIO_SERVICE_STATE_READY :
+                                AUDIO_SERVICE_STATE_ERROR;
+        s_audio_service.io_admitted = false;
+    }
+
+exit:
+    _unlock_service();
+    return result;
+}
+
+esp_err_t audio_service_release(audio_service_lease_t lease)
+{
+    return _quiesce(AUDIO_QUIESCE_RELEASE, &lease,
+                    AUDIO_SERVICE_WAIT_FOREVER, NULL);
+}
+
+esp_err_t audio_service_suspend(uint32_t timeout_ms, bool *resume_required)
+{
+    if (resume_required == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return _quiesce(AUDIO_QUIESCE_SUSPEND, NULL, timeout_ms, resume_required);
+}
+
+esp_err_t audio_service_resume(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    esp_err_t result = _lock_service();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (!s_audio_service.initialized ||
+            s_audio_service.state == AUDIO_SERVICE_STATE_SUSPENDING)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    if (s_audio_service.state == AUDIO_SERVICE_STATE_READY && !s_audio_service.leased)
+    {
+        goto exit;
+    }
+    if (!s_audio_service.leased)
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit;
@@ -485,7 +585,13 @@ esp_err_t audio_service_start(void)
         result = ESP_OK;
         goto exit;
     }
-    if (s_audio_service.state == AUDIO_SERVICE_STATE_SUSPENDING)
+    if (s_audio_service.state != AUDIO_SERVICE_STATE_READY &&
+            s_audio_service.state != AUDIO_SERVICE_STATE_ERROR)
+    {
+        result = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    if (s_audio_service.ops.start == NULL)
     {
         result = ESP_ERR_INVALID_STATE;
         goto exit;
@@ -500,65 +606,82 @@ exit:
     return result;
 }
 
-esp_err_t audio_service_stop(void)
+esp_err_t audio_service_write_leased(audio_service_lease_t lease,
+                                     void *data, size_t bytes,
+                                     size_t *written, uint32_t timeout_ms)
 {
-    return _quiesce(AUDIO_SERVICE_WAIT_FOREVER, false, false, NULL);
-}
-
-esp_err_t audio_service_suspend(uint32_t timeout_ms, bool *resume_required)
-{
-    if (resume_required == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return _quiesce(timeout_ms, false, false, resume_required);
-}
-
-esp_err_t audio_service_resume(uint32_t timeout_ms)
-{
-    (void)timeout_ms;
-    return audio_service_start();
-}
-
-esp_err_t audio_service_write(void *data, size_t bytes, size_t *written,
-                              uint32_t timeout_ms)
-{
-    if (data == NULL || bytes == 0U)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
     if (written != NULL)
     {
         *written = 0U;
     }
-    audio_service_io_op_t write_op = NULL;
-    esp_err_t result = _acquire_io_lease(false, &write_op);
+    if (data == NULL || bytes == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    audio_service_io_op_t operation = NULL;
+    esp_err_t result = _acquire_io_lease(lease, false, &operation);
     if (result == ESP_OK)
     {
-        result = write_op(data, bytes, written, timeout_ms);
+        result = operation(data, bytes, written, timeout_ms);
         _release_io_lease();
     }
     return result;
 }
 
-esp_err_t audio_service_read(void *data, size_t bytes, size_t *read,
-                             uint32_t timeout_ms)
+esp_err_t audio_service_read_leased(audio_service_lease_t lease,
+                                    void *data, size_t bytes,
+                                    size_t *read, uint32_t timeout_ms)
 {
-    if (data == NULL || bytes == 0U)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
     if (read != NULL)
     {
         *read = 0U;
     }
-    audio_service_io_op_t read_op = NULL;
-    esp_err_t result = _acquire_io_lease(true, &read_op);
+    if (data == NULL || bytes == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    audio_service_io_op_t operation = NULL;
+    esp_err_t result = _acquire_io_lease(lease, true, &operation);
     if (result == ESP_OK)
     {
-        result = read_op(data, bytes, read, timeout_ms);
+        result = operation(data, bytes, read, timeout_ms);
         _release_io_lease();
     }
+    return result;
+}
+
+bool audio_service_is_leased(void)
+{
+    if (_lock_service() != ESP_OK)
+    {
+        return false;
+    }
+    const bool leased = s_audio_service.leased;
+    _unlock_service();
+    return leased;
+}
+
+esp_err_t audio_service_get_lease(audio_service_lease_t *lease)
+{
+    if (lease == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = _lock_service();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (!s_audio_service.leased)
+    {
+        result = ESP_ERR_NOT_FOUND;
+        goto exit;
+    }
+    *lease = s_audio_service.lease;
+    result = ESP_OK;
+
+exit:
+    _unlock_service();
     return result;
 }
 

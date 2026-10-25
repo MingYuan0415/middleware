@@ -30,6 +30,12 @@ target_compile_options(audio_service_host_test PRIVATE
     -UNDEBUG
 )
 target_link_libraries(audio_service_host_test PRIVATE Threads::Threads)
+target_link_options(audio_service_host_test PRIVATE
+    -Wl,--wrap=xSemaphoreCreateMutex
+    -Wl,--wrap=xSemaphoreCreateBinary
+    -Wl,--wrap=xSemaphoreTake
+    -Wl,--wrap=xSemaphoreGive
+)
 
 if(AUDIO_SERVICE_SANITIZER STREQUAL "address")
     target_compile_options(audio_service_host_test PRIVATE

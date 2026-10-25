@@ -47,6 +47,9 @@ typedef enum
  *
  * This function does not claim or release the BSP device. The board must have
  * been initialized before this call and remains the owner of its resources.
+ * The startup owner must serialize the first initialization, including creation
+ * of synchronization objects. After initialization, internal reservations
+ * isolate lifecycle transitions; conflicting controls return INVALID_STATE.
  *
  * @param config is validated and copied by the service.
  * @return ESP_OK on success, otherwise an ESP-IDF error.
@@ -63,12 +66,15 @@ esp_err_t audio_service_init(const audio_service_init_config_t *config);
 esp_err_t audio_service_get_config(audio_service_config_t *config);
 
 /**
- * @brief Stop streaming and reset service-owned state.
+ * @brief Quiesce the stream and reset service-owned state.
  *
- * The caller must serialize this function with other lifecycle control APIs.
- * In-flight read/write calls are allowed to finish before resources are
- * reset. Synchronization objects are retained for a later init so rejected
- * I/O calls can safely race this transition.
+ * An active lease is rejected with ESP_ERR_INVALID_STATE; the owner must
+ * release it first. Stop and reset share one internal lifecycle reservation.
+ * Conflicting controls return ESP_ERR_INVALID_STATE. In-flight I/O drains
+ * before reset. Synchronization objects and the lease generation are retained
+ * across deinit/init; partial initialization cleanup can be retried here.
+ *
+ * @return ESP_OK when reset (also before init), otherwise a cleanup error.
  */
 esp_err_t audio_service_deinit(void);
 
@@ -79,62 +85,131 @@ bool audio_service_is_available(void);
 audio_service_state_t audio_service_get_state(void);
 
 /**
- * @brief Configure PCM format while stopped and in the READY state.
+ * @brief Configure PCM format while READY and without a lease.
  *
- * An ERROR state must first be recovered through stop, resume, or deinit. The
- * caller must serialize this function with other lifecycle control APIs.
+ * READY may also represent a suspended owner; that case is rejected.
+ * ERROR and a conflicting lifecycle reservation return INVALID_STATE.
+ *
+ * @param config is validated and copied on success.
+ * @return ESP_OK, an argument/state error, or the BSP configuration error.
  */
 esp_err_t audio_service_configure(const audio_service_config_t *config);
 
-/**
- * @brief Start full-duplex DMA.
- *
- * The caller must serialize this function with other lifecycle control APIs.
- */
-esp_err_t audio_service_start(void);
+/** @brief Intended use of one exclusive audio lease. */
+typedef enum
+{
+    AUDIO_SERVICE_SESSION_RECORD = 0,  /**< Read and write, e.g. WAV capture. */
+    AUDIO_SERVICE_SESSION_PLAYBACK,    /**< Write only. */
+    AUDIO_SERVICE_SESSION_MAINTENANCE, /**< Read and write, benchmark path. */
+} audio_service_session_kind_t;
+
+/** @brief Exclusive stream lease returned by audio_service_acquire(). */
+typedef struct audio_service_lease
+{
+    uint32_t token;      /**< Nonzero owner token. */
+    uint32_t generation; /**< Invalidates handles after release/reacquire. */
+} audio_service_lease_t;
 
 /**
- * @brief Stop full-duplex DMA after all in-flight I/O finishes.
+ * @brief Claim the stream when idle and start full-duplex DMA.
  *
- * The caller must serialize this function with other lifecycle control APIs.
+ * A lease is exclusive; busy or reserved transitions return INVALID_STATE
+ * without preempting the owner. An initialized, ownerless READY or ERROR
+ * service may acquire. ERROR first retries stop. A failed start is compensated
+ * by stop: successful cleanup returns to READY, failed cleanup retains ERROR.
+ * No owner or generation is allocated on failure.
+ *
+ * @param kind selects the read/write permissions of the lease.
+ * @param lease receives the owner handle on success and zero on failure.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG for invalid kind/NULL,
+ *         ESP_ERR_INVALID_STATE when uninitialized, busy, or reserved, or
+ *         the BSP cleanup/start error (the original start error is preserved).
  */
-esp_err_t audio_service_stop(void);
+esp_err_t audio_service_acquire(audio_service_session_kind_t kind,
+                                audio_service_lease_t *lease);
+
+/**
+ * @brief Release one lease and stop DMA after draining in-flight I/O.
+ *
+ * Only the current owner can release. A stale handle returns
+ * ESP_ERR_INVALID_STATE without touching the stream. A failed stop keeps the
+ * lease in ERROR for retry; a reservation conflict also retains ownership.
+ * Releasing a READY suspended owner clears its lease without another stop.
+ *
+ * @param lease is the handle returned by audio_service_acquire().
+ * @return ESP_OK, ESP_ERR_INVALID_STATE for a stale handle, or the BSP error.
+ */
+esp_err_t audio_service_release(audio_service_lease_t lease);
 
 /**
  * @brief Quiesce streaming for system sleep within a bounded wait.
  *
- * New read/write calls are rejected before existing calls are drained. A
- * READY service is accepted without starting it on resume. An ERROR service
- * still retries the BSP stop operation. The caller must serialize this
- * function with other lifecycle control APIs.
+ * New read/write calls are rejected before existing calls are drained. The
+ * lease is retained; READY can mean idle or a suspended owner. READY suspend
+ * is a no-op with resume_required=false. ERROR retries BSP stop. System PM
+ * integration restores streaming with resume; it does not acquire a new lease.
+ * Drain timeout restores the previous state/admission and retains ownership;
+ * stop failure closes admission and retains ERROR and any owner for retry.
  *
  * @param timeout_ms maximum drain wait, or AUDIO_SERVICE_WAIT_FOREVER.
  * @param resume_required receives true only when the service was RUNNING.
- * @return ESP_OK when quiesced, ESP_ERR_TIMEOUT when I/O did not drain, or a
- *         BSP stop error. Failed transitions may be retried or resumed.
+ * @return ESP_OK when quiesced, ESP_ERR_TIMEOUT when I/O did not drain,
+ *         ESP_ERR_INVALID_STATE for a conflicting reservation, or a BSP error.
  */
 esp_err_t audio_service_suspend(uint32_t timeout_ms, bool *resume_required);
 
 /**
- * @brief Restore streaming after a suspend that requires resume.
+ * @brief Restore streaming after a suspend that retained a lease.
  *
- * This operation also recovers a failed RUNNING suspend from ERROR when the
- * BSP can start successfully. The caller must serialize this function with
- * other lifecycle control APIs.
+ * READY without an owner succeeds without starting DMA. RUNNING with an owner
+ * is already restored. READY or ERROR with an owner retries start using the
+ * same lease. Uninitialized, reserved, or ownerless ERROR states are rejected.
  *
  * @param timeout_ms reserved as the lifecycle deadline; BSP start is
  *                   synchronous and currently has no independent wait.
- * @return ESP_OK when streaming and I/O admission are restored.
+ * @return ESP_OK when restored or idle READY; ESP_ERR_INVALID_STATE for an
+ *         invalid state/reservation, or the BSP start error.
  */
 esp_err_t audio_service_resume(uint32_t timeout_ms);
 
-/** @brief Write interleaved PCM bytes to the speaker. */
-esp_err_t audio_service_write(void *data, size_t bytes, size_t *written,
-                              uint32_t timeout_ms);
+/**
+ * @brief Write interleaved PCM bytes to the speaker under one lease.
+ *
+ * Lease identity, RUNNING state, admission, and the in-flight reference are
+ * checked/committed under one lock. Rejected calls set non-NULL written to
+ * zero. BSP calls may report partial progress even on timeout or another error;
+ * callers must account for that progress before retrying.
+ *
+ * @return ESP_ERR_INVALID_STATE when the handle is stale; otherwise the BSP
+ *         result.
+ */
+esp_err_t audio_service_write_leased(audio_service_lease_t lease,
+                                     void *data, size_t bytes,
+                                     size_t *written, uint32_t timeout_ms);
 
-/** @brief Read interleaved PCM bytes from the microphone. */
-esp_err_t audio_service_read(void *data, size_t bytes, size_t *read,
-                             uint32_t timeout_ms);
+/**
+ * @brief Read interleaved PCM bytes from the microphone under one lease.
+ *
+ * Reading requires a RECORD or MAINTENANCE lease.
+ * Admission and the in-flight reference use the same atomic lease check as
+ * write. Rejected calls set non-NULL read to zero; an admitted BSP call may
+ * report partial progress even when its result is not ESP_OK.
+ *
+ * @return ESP_ERR_INVALID_STATE when the handle is stale or a PLAYBACK lease
+ *         attempts a read; otherwise the BSP result.
+ */
+esp_err_t audio_service_read_leased(audio_service_lease_t lease,
+                                    void *data, size_t bytes,
+                                    size_t *read, uint32_t timeout_ms);
+
+/** @brief Report whether one exclusive lease is currently held. */
+bool audio_service_is_leased(void);
+
+/**
+ * @brief Copy the active lease for diagnostics.
+ * @return ESP_OK, or ESP_ERR_NOT_FOUND when no lease is held.
+ */
+esp_err_t audio_service_get_lease(audio_service_lease_t *lease);
 
 /** @brief Set the speaker volume in the range 0..100 percent. */
 esp_err_t audio_service_set_volume(uint8_t percent);

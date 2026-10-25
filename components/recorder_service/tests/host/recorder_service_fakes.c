@@ -325,16 +325,85 @@ esp_err_t audio_service_get_config(audio_service_config_t *config)
 }
 
 unsigned s_fake_audio_starts;
+unsigned s_fake_audio_lease_generation;
+esp_err_t s_fake_audio_acquire_error;
+esp_err_t s_fake_audio_stop_error;
+static audio_service_lease_t s_audio_lease;
+static audio_service_session_kind_t s_audio_kind;
+static audio_service_state_t s_audio_state = AUDIO_SERVICE_STATE_READY;
 
-esp_err_t audio_service_start(void)
+static bool _audio_matches(audio_service_lease_t lease)
 {
-    ++s_fake_audio_starts;
-    return ESP_OK;
+    return lease.token != 0U && lease.token == s_audio_lease.token &&
+           lease.generation == s_audio_lease.generation;
 }
 
-esp_err_t s_fake_audio_stop_error;
-
-esp_err_t audio_service_stop(void)
+bool fake_audio_io_allowed(audio_service_lease_t lease, bool read)
 {
-    return s_fake_audio_stop_error;
+    pthread_mutex_lock(&s_mutex);
+    const bool allowed = _audio_matches(lease) &&
+                         s_audio_state == AUDIO_SERVICE_STATE_RUNNING &&
+                         (!read || s_audio_kind == AUDIO_SERVICE_SESSION_RECORD);
+    pthread_mutex_unlock(&s_mutex);
+    return allowed;
+}
+
+audio_service_lease_t fake_audio_active_lease(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    const audio_service_lease_t lease = s_audio_lease;
+    pthread_mutex_unlock(&s_mutex);
+    return lease;
+}
+
+esp_err_t audio_service_acquire(audio_service_session_kind_t kind,
+                                audio_service_lease_t *lease)
+{
+    if (lease == NULL) return ESP_ERR_INVALID_ARG;
+    *lease = (audio_service_lease_t)
+    {
+        0
+    };
+    pthread_mutex_lock(&s_mutex);
+    esp_err_t result = s_fake_audio_acquire_error;
+    if (s_audio_lease.token != 0U) result = ESP_ERR_INVALID_STATE;
+    if (result == ESP_OK)
+    {
+        ++s_fake_audio_starts;
+        ++s_fake_audio_lease_generation;
+        s_audio_lease = (audio_service_lease_t)
+        {
+            .token = s_fake_audio_lease_generation,
+            .generation = s_fake_audio_lease_generation,
+        };
+        s_audio_kind = kind;
+        s_audio_state = AUDIO_SERVICE_STATE_RUNNING;
+        *lease = s_audio_lease;
+    }
+    pthread_mutex_unlock(&s_mutex);
+    return result;
+}
+
+esp_err_t audio_service_release(audio_service_lease_t lease)
+{
+    pthread_mutex_lock(&s_mutex);
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    if (_audio_matches(lease))
+    {
+        result = s_fake_audio_stop_error;
+        if (result == ESP_OK)
+        {
+            s_audio_lease = (audio_service_lease_t)
+            {
+                0
+            };
+            s_audio_state = AUDIO_SERVICE_STATE_READY;
+        }
+        else
+        {
+            s_audio_state = AUDIO_SERVICE_STATE_ERROR;
+        }
+    }
+    pthread_mutex_unlock(&s_mutex);
+    return result;
 }

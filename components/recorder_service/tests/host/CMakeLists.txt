@@ -18,6 +18,9 @@ add_executable(recorder_service_test
 add_executable(recorder_service_races_test
     recorder_service_races_test.c
     recorder_service_fakes.c)
+add_executable(recorder_service_recovery_test
+    recorder_service_recovery_test.c
+    recorder_service_fakes.c)
 add_executable(recorder_service_library_test
     recorder_service_library_test.c
     recorder_service_fakes.c
@@ -34,7 +37,8 @@ target_compile_definitions(recorder_service_stream_test PRIVATE
 target_link_options(recorder_service_stream_test PRIVATE
     -Wl,--wrap=xTaskCreatePinnedToCoreWithCaps)
 foreach(target recorder_service_test recorder_service_races_test
-        recorder_service_library_test recorder_service_stream_test)
+        recorder_service_library_test recorder_service_stream_test
+        recorder_service_recovery_test)
 target_include_directories(${target} PRIVATE
     include
     "${RECORDER_DIR}/include"
@@ -65,7 +69,8 @@ endforeach()
 add_test(NAME recorder_service COMMAND recorder_service_test)
 add_test(NAME recorder_service_races COMMAND recorder_service_races_test)
 add_test(NAME recorder_service_library COMMAND recorder_service_library_test)
+add_test(NAME recorder_service_recovery COMMAND recorder_service_recovery_test)
 set_tests_properties(recorder_service recorder_service_races
-    recorder_service_library PROPERTIES TIMEOUT 10)
+    recorder_service_library recorder_service_recovery PROPERTIES TIMEOUT 10)
 add_test(NAME recorder_service_stream COMMAND recorder_service_stream_test)
 set_tests_properties(recorder_service_stream PROPERTIES TIMEOUT 20)

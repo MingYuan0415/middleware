@@ -68,6 +68,13 @@
   环形缓冲里，恢复后写入文件，产生用户没录过的音频且数据长度超出上报时长。
 - 失败的录音（IO 错误、时长上限、写头失败）在关闭后删除 `.part` 工作文件；否则库永远
   不列出这些名字，用户也无法删除，只会缓慢占满存储卡。
+- 音频流：录音取得 `AUDIO_SERVICE_SESSION_RECORD` 租约（读写），播放取得
+  `AUDIO_SERVICE_SESSION_PLAYBACK` 租约（只写）；流任务用租约读写，收尾/错误路径
+  只有 release 真正返回 `ESP_OK` 才清除同代句柄。任何错误（包括
+  `ESP_ERR_INVALID_STATE`）均保留清理义务；stop、下一次 start/play 或 deinit
+  可重试。start/play 在取得 SD SESSION 或打开/创建文件之前先清理旧租约，
+  失败原样返回，不覆盖旧代次。音频被其它写者占用时启动回滚文件和 SD 使用权，
+  不停止对方流。
 - 占用：目录准备、文件创建、录制、暂停、关闭、WAV finalize 与索引刷新，以及
   播放从打开到关闭，全程持有 `sd_storage_service` 的业务使用权（SESSION）；
   删除取独占维护权。因此录音/播放期间可以浏览，但删除、卸载与格式化会被拒绝。
@@ -103,6 +110,11 @@
   SHUTDOWN 退出前均先回收；deinit 超时不强杀 I/O 或释放仍在使用的资源。
   这些外部栈路径仅访问 SD/SDSPI 与 I2S，不执行 NVS、flash 文件系统、OTA 或显式 sleep。
   SDSPI 复用 SDK slot 的 516 字节内部 DMA staging；外移量不等于净 DMA 空闲增量。
+- deinit 在全部清理成功前保持 initialized/stopping，拒绝新命令。队列存在且尚未
+  成功发送 SHUTDOWN 时按 FIFO 发送 STOP、SHUTDOWN；入队失败可重试，成功发送
+  SHUTDOWN 后的超时重试只等待退出，不再向无人消费的队列追加命令。
+  命令任务退出后删除队列并清空指针；之后音频 release 即使失败，下一次 deinit
+  仍直接重试剩余清理，不访问空队列。成功 deinit 后可重新 init、录音与播放。
 
 ## 内存归属
 
@@ -119,6 +131,11 @@
   先于 IDLE 发布和下一命令接受的顺序。阻塞容量查询时 UI 快照与列表仍只读缓存。
   `recorder_service_races_test` 用私有实现测试和确定性 barrier 覆盖通知、目录错误重试、
   旧/新扫描发布竞争、列表验证/复制交错，以及 EIO 与非存储错误的区分。
+  `recorder_service_recovery_test` 用条件变量和仅测试侧的时钟/队列 seam 覆盖
+  STOP/SHUTDOWN 入队失败、SHUTDOWN 已发送后的等待超时/重试、队列已删除但
+  音频仍失败时多次 deinit，以及不重置 fixture 的重新初始化/录音/播放。
+  音频 fake 用同一 mutex 校验 token/generation、独占 kind 和 RUNNING I/O，
+  release 失败保留 ERROR 与 owner；races/stream 回归同时覆盖保留旧代的恢复。
   确定性租约 barrier 覆盖播放/删除接受后发生 revision 变化或同路径重挂载替换：
   原目标终态失败、替换文件逐字节保留、不启动音频且释放 SESSION / MAINTENANCE；
   同时覆盖当前目标的成功播放/删除及索引元数据与快照 epoch 对应。

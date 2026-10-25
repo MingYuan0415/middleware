@@ -28,6 +28,8 @@ static pthread_cond_t s_io_changed = PTHREAD_COND_INITIALIZER;
 static uint32_t s_io_entered;
 static uint32_t s_io_active;
 static bool s_io_blocked;
+static bool s_stop_blocked;
+static bool s_stop_entered;
 
 static struct timespec _deadline_after_ms(uint32_t timeout_ms)
 {
@@ -96,7 +98,8 @@ static esp_err_t _configure(const bsp_audio_config_t *config)
 static esp_err_t _start(void)
 {
     ++s_fake.start_count;
-    if (s_fake.start_result == ESP_OK)
+    s_fake.last_start_stop_count = s_fake.stop_count;
+    if (s_fake.start_result == ESP_OK || s_fake.start_enables_before_failure)
     {
         s_fake.started = true;
     }
@@ -106,7 +109,13 @@ static esp_err_t _start(void)
 static esp_err_t _stop(void)
 {
     (void)pthread_mutex_lock(&s_io_lock);
-    s_fake.stop_during_io = s_io_active != 0U;
+    s_fake.stop_during_io |= s_io_active != 0U;
+    s_stop_entered = true;
+    (void)pthread_cond_broadcast(&s_io_changed);
+    while (s_stop_blocked)
+    {
+        (void)pthread_cond_wait(&s_io_changed, &s_io_lock);
+    }
     (void)pthread_mutex_unlock(&s_io_lock);
     ++s_fake.stop_count;
     if (s_fake.stop_result == ESP_OK)
@@ -203,6 +212,8 @@ void audio_service_fakes_reset(void)
 {
     (void)pthread_mutex_lock(&s_io_lock);
     s_io_blocked = false;
+    s_stop_blocked = false;
+    s_stop_entered = false;
     s_io_entered = 0U;
     s_io_active = 0U;
     (void)pthread_cond_broadcast(&s_io_changed);
@@ -245,6 +256,29 @@ bool audio_service_fakes_wait_for_io(uint32_t count, uint32_t timeout_ms)
     const bool reached = s_io_entered >= count;
     (void)pthread_mutex_unlock(&s_io_lock);
     return reached;
+}
+
+void audio_service_fakes_block_stop(bool blocked)
+{
+    (void)pthread_mutex_lock(&s_io_lock);
+    s_stop_blocked = blocked;
+    (void)pthread_cond_broadcast(&s_io_changed);
+    (void)pthread_mutex_unlock(&s_io_lock);
+}
+
+bool audio_service_fakes_wait_for_stop(uint32_t timeout_ms)
+{
+    const struct timespec deadline = _deadline_after_ms(timeout_ms);
+    (void)pthread_mutex_lock(&s_io_lock);
+    int wait_result = 0;
+    while (!s_stop_entered && wait_result == 0)
+    {
+        wait_result = pthread_cond_timedwait(&s_io_changed, &s_io_lock,
+                                             &deadline);
+    }
+    const bool entered = s_stop_entered;
+    (void)pthread_mutex_unlock(&s_io_lock);
+    return entered;
 }
 
 const bsp_audio_ops_t *bsp_hal_get_audio(void)

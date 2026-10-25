@@ -51,6 +51,7 @@ extern void fake_sd_set_mount_path(const char *path);
 extern void fake_sd_mutate(bool remount);
 extern unsigned fake_sd_leases(sd_storage_service_usage_kind_t kind);
 extern esp_err_t s_fake_audio_stop_error;
+extern audio_service_lease_t fake_audio_active_lease(void);
 static int s_open_error;
 static int s_read_error;
 static bool s_fail_after_wav;
@@ -266,6 +267,20 @@ int main(void)
     assert(files[0].target.generation == expected_generation);
     assert(files[0].target.revision == expected_revision);
     _recorder_refresh_index(NULL);
+    /* A different consumer keeps its generation while startup rolls back. */
+    audio_service_lease_t background = {0};
+    assert(audio_service_acquire(AUDIO_SERVICE_SESSION_PLAYBACK, &background) == ESP_OK);
+    const size_t before_busy = s_recorder.file_count;
+    assert(_recorder_start_now() == ESP_ERR_INVALID_STATE);
+    assert(s_recorder.file == NULL && !s_recorder.audio_leased);
+    assert(fake_sd_leases(SD_STORAGE_SERVICE_USAGE_SESSION) == 0U);
+    _recorder_refresh_index(NULL);
+    assert(s_recorder.file_count == before_busy);
+    assert(fake_audio_active_lease().generation == background.generation);
+    assert(_recorder_play_now(&s_index_files[0].target) == ESP_ERR_INVALID_STATE);
+    assert(fake_sd_leases(SD_STORAGE_SERVICE_USAGE_SESSION) == 0U);
+    assert(fake_audio_active_lease().generation == background.generation);
+    assert(audio_service_release(background) == ESP_OK);
 
     /* Task allocation, audio shutdown, and ENOSPC are operation errors, not
      * proof of broken media. Every path still closes and releases SESSION. */
@@ -275,11 +290,30 @@ int main(void)
     assert(fake_sd_leases(SD_STORAGE_SERVICE_USAGE_SESSION) == 0U);
     assert(_recorder_start_now() == ESP_OK);
     s_fake_audio_stop_error = ESP_FAIL;
-    _recorder_finish(false, ESP_OK, false);
+    assert(_recorder_stop_now() == ESP_FAIL);
+    const audio_service_lease_t retained = s_recorder.audio_lease;
+    assert(retained.token != 0U && s_recorder.audio_leased);
+    const unsigned failed_opens = s_file_opens;
+    const size_t failed_count = s_recorder.file_count;
+    assert(_recorder_start_now() == ESP_FAIL);
+    assert(_recorder_play_now(&s_index_files[0].target) == ESP_FAIL);
+    assert(s_file_opens == failed_opens && s_recorder.file_count == failed_count);
+    assert(_recorder_stop_now() == ESP_FAIL);
+    assert(_recorder_stop_playback_now() == ESP_FAIL);
+    assert(fake_sd_leases(SD_STORAGE_SERVICE_USAGE_SESSION) == 0U);
+    assert(s_recorder.audio_lease.token == retained.token &&
+           s_recorder.audio_lease.generation == retained.generation);
+    assert(fake_audio_active_lease().generation == retained.generation);
+    /* INVALID_STATE may mean a service transition, never a released lease. */
+    s_fake_audio_stop_error = ESP_ERR_INVALID_STATE;
+    assert(_recorder_audio_release() == ESP_ERR_INVALID_STATE);
+    assert(s_recorder.audio_leased);
     s_fake_audio_stop_error = ESP_OK;
     _assert_mounted(true);
     assert(fake_sd_leases(SD_STORAGE_SERVICE_USAGE_SESSION) == 0U);
     assert(_recorder_start_now() == ESP_OK);
+    assert(s_recorder.audio_lease.generation != retained.generation);
+    assert(audio_service_release(retained) == ESP_ERR_INVALID_STATE);
     s_flush_error = ENOSPC;
     _recorder_finish(false, ESP_OK, false);
     s_flush_error = 0;

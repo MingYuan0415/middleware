@@ -113,10 +113,13 @@ typedef struct recorder_runtime
     uint32_t space_generation;
     sd_storage_service_usage_t usage;
     bool usage_held;
+    audio_service_lease_t audio_lease;
+    bool audio_leased;
     char directory_path[RECORDER_SERVICE_PATH_BYTES];
     TaskHandle_t task;
     TaskHandle_t command_task;
     QueueHandle_t command_queue;
+    bool command_shutdown_sent;
 } recorder_runtime_t;
 
 static recorder_runtime_t s_recorder;
@@ -750,6 +753,65 @@ static void _recorder_usage_release(bool medium_eio, esp_err_t error)
     (void)sd_storage_service_usage_release(&usage);
 }
 
+static esp_err_t _recorder_audio_release(void);
+
+static esp_err_t _recorder_audio_acquire(
+    audio_service_session_kind_t kind)
+{
+    const esp_err_t cleanup_result = _recorder_audio_release();
+    if (cleanup_result != ESP_OK)
+    {
+        return cleanup_result;
+    }
+    audio_service_lease_t lease = {0};
+    const esp_err_t result = audio_service_acquire(kind, &lease);
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    _recorder_lock();
+    s_recorder.audio_lease = lease;
+    s_recorder.audio_leased = true;
+    _recorder_unlock();
+    return ESP_OK;
+}
+
+#ifdef ESP_PLATFORM
+static audio_service_lease_t _recorder_audio_lease_copy(void)
+{
+    _recorder_lock();
+    const audio_service_lease_t lease = s_recorder.audio_lease;
+    _recorder_unlock();
+    return lease;
+}
+#endif
+
+static esp_err_t _recorder_audio_release(void)
+{
+    _recorder_lock();
+    const bool held = s_recorder.audio_leased;
+    const audio_service_lease_t lease = s_recorder.audio_lease;
+    _recorder_unlock();
+    if (!held)
+    {
+        return ESP_OK;
+    }
+    esp_err_t result = audio_service_release(lease);
+    if (result == ESP_OK)
+    {
+        _recorder_lock();
+        if (s_recorder.audio_leased &&
+                s_recorder.audio_lease.token == lease.token &&
+                s_recorder.audio_lease.generation == lease.generation)
+        {
+            s_recorder.audio_leased = false;
+            memset(&s_recorder.audio_lease, 0, sizeof(s_recorder.audio_lease));
+        }
+        _recorder_unlock();
+    }
+    return result;
+}
+
 static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -769,7 +831,7 @@ static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
     s_recorder.file = NULL;
     _recorder_unlock();
     esp_err_t final_error = failed ? error : ESP_OK;
-    const esp_err_t audio_error = audio_service_stop();
+    const esp_err_t audio_error = _recorder_audio_release();
     if (final_error == ESP_OK && audio_error != ESP_OK)
     {
         final_error = audio_error;
@@ -893,6 +955,8 @@ static void _recorder_task(void *argument)
             _recorder_stream_park();
             return;
         }
+        const audio_service_lease_t audio_lease =
+            _recorder_audio_lease_copy();
         if (paused && !playback)
         {
             /* The capture device keeps running while paused. Not reading it
@@ -901,8 +965,9 @@ static void _recorder_task(void *argument)
              * contain audible paused audio and its data size would exceed the
              * reported duration. Drain and discard instead. */
             size_t discarded = 0U;
-            if (audio_service_read(s_recorder_pcm, sizeof(s_recorder_pcm),
-                                   &discarded, 250U) != ESP_OK)
+            if (audio_service_read_leased(audio_lease, s_recorder_pcm,
+                                          sizeof(s_recorder_pcm),
+                                          &discarded, 250U) != ESP_OK)
             {
                 _recorder_finish(true, ESP_ERR_INVALID_RESPONSE, false);
                 _recorder_stream_park();
@@ -934,12 +999,15 @@ static void _recorder_task(void *argument)
                 _recorder_stream_park();
                 return;
             }
-            if (!io_failed && audio_service_write(s_recorder_pcm, received, NULL, 250U) != ESP_OK)
+            if (!io_failed && audio_service_write_leased(audio_lease,
+                    s_recorder_pcm, received, NULL, 250U) != ESP_OK)
             {
                 io_failed = true;
             }
         }
-        else if (audio_service_read(s_recorder_pcm, sizeof(s_recorder_pcm), &received, 250U) != ESP_OK ||
+        else if (audio_service_read_leased(audio_lease, s_recorder_pcm,
+                                           sizeof(s_recorder_pcm), &received,
+                                           250U) != ESP_OK ||
                  received == 0U)
         {
             io_failed = true;
@@ -1098,22 +1166,21 @@ esp_err_t recorder_service_deinit(void)
     s_recorder.stopping = true;
     _recorder_unlock();
     const int64_t deadline = esp_timer_get_time() + 5000000LL;
-    /* Serialize the last close behind any command already running. */
-    const recorder_command_t stop = {.type = RECORDER_COMMAND_STOP};
-    if (xQueueSend(s_recorder.command_queue, &stop, pdMS_TO_TICKS(100U)) != pdTRUE)
-    {
-        return ESP_ERR_TIMEOUT;
-    }
     if (s_recorder.command_queue != NULL)
     {
-        const recorder_command_t shutdown =
+        if (!s_recorder.command_shutdown_sent)
         {
-            .type = RECORDER_COMMAND_SHUTDOWN,
-        };
-        if (xQueueSend(s_recorder.command_queue, &shutdown,
-                       pdMS_TO_TICKS(100U)) != pdTRUE)
-        {
-            return ESP_ERR_TIMEOUT;
+            /* Keep FIFO ordering, but never append to an exited consumer. */
+            const recorder_command_t stop = {.type = RECORDER_COMMAND_STOP};
+            const recorder_command_t shutdown = {.type = RECORDER_COMMAND_SHUTDOWN};
+            if (xQueueSend(s_recorder.command_queue, &stop,
+                           pdMS_TO_TICKS(100U)) != pdTRUE ||
+                    xQueueSend(s_recorder.command_queue, &shutdown,
+                               pdMS_TO_TICKS(100U)) != pdTRUE)
+            {
+                return ESP_ERR_TIMEOUT;
+            }
+            s_recorder.command_shutdown_sent = true;
         }
         for (;;)
         {
@@ -1138,6 +1205,11 @@ esp_err_t recorder_service_deinit(void)
     }
     /* A retained session lease would block the following unmount. */
     _recorder_usage_release(false, ESP_OK);
+    const esp_err_t audio_result = _recorder_audio_release();
+    if (audio_result != ESP_OK)
+    {
+        return audio_result;
+    }
     s_initialized = false;
     return ESP_OK;
 }
@@ -1354,6 +1426,11 @@ static esp_err_t _recorder_start_now(void)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    const esp_err_t cleanup_result = _recorder_audio_release();
+    if (cleanup_result != ESP_OK)
+    {
+        return cleanup_result;
+    }
     /* Occupancy covers directory preparation, file creation, the whole
      * recording, the WAV finalize and the index refresh. */
     const esp_err_t usage_result = _recorder_usage_acquire();
@@ -1427,7 +1504,8 @@ static esp_err_t _recorder_start_now(void)
         _recorder_usage_release(medium_eio, ESP_FAIL);
         return ESP_FAIL;
     }
-    if (audio_service_start() != ESP_OK)
+    const esp_err_t audio_result = _recorder_audio_acquire(AUDIO_SERVICE_SESSION_RECORD);
+    if (audio_result != ESP_OK)
     {
         errno = 0;
         const int close_result = fclose(file);
@@ -1437,8 +1515,8 @@ static esp_err_t _recorder_start_now(void)
         {
             medium_eio |= errno == EIO;
         }
-        _recorder_usage_release(medium_eio, ESP_FAIL);
-        return ESP_FAIL;
+        _recorder_usage_release(medium_eio, audio_result);
+        return audio_result;
     }
     const int64_t started_us = esp_timer_get_time();
     _recorder_lock();
@@ -1520,14 +1598,14 @@ static esp_err_t _recorder_stop_now(void)
                       s_recorder.snapshot.state == RECORDER_SERVICE_PLAYING;
     if (!busy)
     {
+        const bool cleanup_pending = s_recorder.audio_leased;
         _recorder_unlock();
-        return ESP_ERR_INVALID_STATE;
+        return cleanup_pending ? _recorder_audio_release() : ESP_ERR_INVALID_STATE;
     }
     s_recorder.stop_requested = true;
 #ifndef ESP_PLATFORM
     _recorder_unlock();
     _recorder_finish(false, ESP_OK, false);
-    return ESP_OK;
 #else
     _recorder_unlock();
     while (atomic_load_explicit(&s_recorder.task_running,
@@ -1536,7 +1614,10 @@ static esp_err_t _recorder_stop_now(void)
         vTaskDelay(pdMS_TO_TICKS(10U));
     }
 #endif
-    return ESP_OK;
+    _recorder_lock();
+    const esp_err_t result = s_recorder.snapshot.last_error;
+    _recorder_unlock();
+    return result;
 }
 
 static esp_err_t _recorder_play_now(const recorder_service_target_t *target)
@@ -1554,6 +1635,11 @@ static esp_err_t _recorder_play_now(const recorder_service_target_t *target)
     if (busy)
     {
         return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t cleanup_result = _recorder_audio_release();
+    if (cleanup_result != ESP_OK)
+    {
+        return cleanup_result;
     }
     /* Playback holds the business lease from open to close. */
     const esp_err_t usage_result = _recorder_usage_acquire();
@@ -1594,15 +1680,17 @@ static esp_err_t _recorder_play_now(const recorder_service_target_t *target)
                             stat(target->name, &info) == 0 &&
                             _recorder_header_valid(&header, (uint64_t)info.st_size);
     bool medium_eio = !file_valid && errno == EIO;
-    if (!file_valid || audio_service_start() != ESP_OK)
+    const esp_err_t audio_result = file_valid ?
+                                   _recorder_audio_acquire(AUDIO_SERVICE_SESSION_PLAYBACK) : ESP_FAIL;
+    if (audio_result != ESP_OK)
     {
         errno = 0;
         if (fclose(file) != 0)
         {
             medium_eio |= errno == EIO;
         }
-        _recorder_usage_release(medium_eio, ESP_FAIL);
-        return ESP_FAIL;
+        _recorder_usage_release(medium_eio, audio_result);
+        return audio_result;
     }
     const int64_t started_us = esp_timer_get_time();
     _recorder_lock();
@@ -1640,11 +1728,12 @@ static esp_err_t _recorder_stop_playback_now(void)
     }
     _recorder_lock();
     const bool playing = s_recorder.snapshot.state == RECORDER_SERVICE_PLAYING;
+    const bool cleanup_pending = s_recorder.audio_leased;
     s_recorder.stop_requested = playing;
     _recorder_unlock();
     if (!playing)
     {
-        return ESP_ERR_INVALID_STATE;
+        return cleanup_pending ? _recorder_audio_release() : ESP_ERR_INVALID_STATE;
     }
 #ifndef ESP_PLATFORM
     _recorder_finish(false, ESP_OK, false);
@@ -1655,7 +1744,10 @@ static esp_err_t _recorder_stop_playback_now(void)
         vTaskDelay(pdMS_TO_TICKS(10U));
     }
 #endif
-    return ESP_OK;
+    _recorder_lock();
+    const esp_err_t result = s_recorder.snapshot.last_error;
+    _recorder_unlock();
+    return result;
 }
 
 static esp_err_t _recorder_delete_now(const recorder_service_target_t *target)

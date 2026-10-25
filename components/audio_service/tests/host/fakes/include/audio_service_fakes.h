@@ -12,6 +12,7 @@ typedef struct audio_service_fake_state
     bool expose_ops;
     bool available;
     bool started;
+    bool start_enables_before_failure;
     bool muted;
     bool pa_enabled;
     bool stop_during_io;
@@ -19,6 +20,7 @@ typedef struct audio_service_fake_state
     uint32_t configure_count;
     uint32_t start_count;
     uint32_t stop_count;
+    uint32_t last_start_stop_count;
     uint32_t write_count;
     uint32_t read_count;
     uint32_t last_timeout_ms;
@@ -34,5 +36,7 @@ void audio_service_fakes_reset(void);
 audio_service_fake_state_t *audio_service_fakes_state(void);
 void audio_service_fakes_block_io(bool blocked);
 bool audio_service_fakes_wait_for_io(uint32_t count, uint32_t timeout_ms);
+void audio_service_fakes_block_stop(bool blocked);
+bool audio_service_fakes_wait_for_stop(uint32_t timeout_ms);
 
 #endif /* __AUDIO_SERVICE_FAKES_H__ */

@@ -9,6 +9,9 @@
 
 extern void fake_sd_set_mount_path(const char *path);
 extern unsigned fake_sd_leases(sd_storage_service_usage_kind_t kind);
+extern bool fake_audio_io_allowed(audio_service_lease_t lease, bool read);
+extern esp_err_t s_fake_audio_stop_error;
+extern audio_service_lease_t fake_audio_active_lease(void);
 
 static pthread_mutex_t s_io_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_io_changed = PTHREAD_COND_INITIALIZER;
@@ -83,9 +86,13 @@ static esp_err_t _audio_gate(bool write)
     return failed ? ESP_FAIL : ESP_OK;
 }
 
-esp_err_t audio_service_read(void *data, size_t bytes, size_t *read_bytes,
-                             uint32_t timeout_ms)
+esp_err_t audio_service_read_leased(audio_service_lease_t lease, void *data,
+                                    size_t bytes, size_t *read_bytes,
+                                    uint32_t timeout_ms)
 {
+    if (read_bytes != NULL) *read_bytes = 0U;
+    if (!fake_audio_io_allowed(lease, true)) return ESP_ERR_INVALID_STATE;
+    if (data == NULL || read_bytes == NULL) return ESP_ERR_INVALID_ARG;
     (void)timeout_ms;
     const esp_err_t result = _audio_gate(false);
     if (result == ESP_OK)
@@ -96,9 +103,13 @@ esp_err_t audio_service_read(void *data, size_t bytes, size_t *read_bytes,
     return result;
 }
 
-esp_err_t audio_service_write(void *data, size_t bytes, size_t *written,
-                              uint32_t timeout_ms)
+esp_err_t audio_service_write_leased(audio_service_lease_t lease, void *data,
+                                     size_t bytes, size_t *written,
+                                     uint32_t timeout_ms)
 {
+    if (written != NULL) *written = 0U;
+    if (!fake_audio_io_allowed(lease, false)) return ESP_ERR_INVALID_STATE;
+    if (data == NULL) return ESP_ERR_INVALID_ARG;
     (void)timeout_ms;
     const unsigned char *pcm = data;
     for (size_t i = 0U; i < bytes; ++i) assert(pcm[i] == 0x5a);
@@ -428,6 +439,35 @@ static void _pause_discards_capture(void)
     assert(_snapshot().state == RECORDER_SERVICE_IDLE);
     _reaped(owners);
 }
+static void _release_failure_recovery(const recorder_service_config_t *config)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    _start_record();
+    const audio_service_lease_t retained = fake_audio_active_lease();
+    pthread_mutex_lock(&s_io_lock);
+    s_read_failure = true;
+    s_fake_audio_stop_error = ESP_FAIL;
+    pthread_mutex_unlock(&s_io_lock);
+    _io_release();
+    WAIT_UNTIL(!_running());
+    _reaped(owners);
+    /* Stream I/O failure is the primary INVALID_RESPONSE; cleanup ESP_FAIL
+     * must retain ownership without replacing that published operation error. */
+    assert(_snapshot().state == RECORDER_SERVICE_ERROR);
+    assert(_snapshot().last_error == ESP_ERR_INVALID_RESPONSE);
+    assert(fake_audio_active_lease().generation == retained.generation);
+    assert(recorder_service_deinit() == ESP_FAIL);
+    assert(s_recorder.command_queue == NULL && s_initialized);
+    assert(fake_audio_active_lease().generation == retained.generation);
+    assert(recorder_service_deinit() == ESP_FAIL);
+    s_fake_audio_stop_error = ESP_OK;
+    assert(recorder_service_deinit() == ESP_OK);
+    WAIT_UNTIL(host_dynamic_task_count() == s_base_tasks);
+    assert(fake_audio_active_lease().token == 0U);
+    assert(recorder_service_init(config) == ESP_OK);
+    (void)_record_stop();
+}
+
 
 int main(void)
 {
@@ -468,6 +508,7 @@ int main(void)
         _play_eof(&target, true);
         assert(_open_files() == descriptors);
     }
+    _release_failure_recovery(&config);
     const size_t owners = host_caps_task_owner_delete_count();
     _start_record();
     _stop_blocked(true);
