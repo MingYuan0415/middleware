@@ -115,11 +115,14 @@ typedef struct event_bus_ui_batch
     bool coalesced;
 } event_bus_ui_batch_t;
 
-static event_bus_sub_slot_t s_subscriptions[EVENT_BUS_MAX_SUBSCRIBERS];
-static event_bus_envelope_t s_envelopes[EVENT_BUS_MAX_PENDING_UI_PAYLOADS];
+static EVENT_BUS_EXT_BSS event_bus_sub_slot_t
+s_subscriptions[EVENT_BUS_MAX_SUBSCRIBERS];
+static EVENT_BUS_EXT_BSS event_bus_envelope_t
+s_envelopes[EVENT_BUS_MAX_PENDING_UI_PAYLOADS];
 static EVENT_BUS_EXT_BSS event_bus_aligned_payload_t
 s_payloads[EVENT_BUS_MAX_PENDING_UI_PAYLOADS];
-static event_bus_dispatch_item_t s_dispatch_items[EVENT_BUS_MAX_PENDING_UI_CALLBACKS];
+static EVENT_BUS_EXT_BSS event_bus_dispatch_item_t
+s_dispatch_items[EVENT_BUS_MAX_PENDING_UI_CALLBACKS];
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_ui_admission_mutex;
 static event_bus_ui_dispatch_fn s_ui_dispatch;
