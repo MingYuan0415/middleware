@@ -124,6 +124,11 @@ static esp_err_t _space(void *context, void *handle, uint64_t *total,
     }
     if (fake->fault_during_query)
     {
+        /* Confirm the fault inside the query: a single transient report no
+         * longer invalidates the volume, so this needs the confirming pair to
+         * observe that a failed query publishes no capacity. */
+        assert(sd_storage_service_usage_report_fault(&fake->query_usage,
+                TEST_ERROR) == ESP_OK);
         assert(sd_storage_service_usage_report_fault(&fake->query_usage,
                 TEST_ERROR) == ESP_OK);
     }
@@ -195,6 +200,66 @@ static void _test_leased_capacity_and_revision(void)
     assert(sd_storage_service_deinit() == ESP_OK);
 }
 
+static void _test_single_fault_is_transient(void)
+{
+    fake_sd_t fake = {0};
+    _start(&fake);
+    const uint32_t generation = _generation();
+    sd_storage_service_usage_t usage;
+    assert(sd_storage_service_usage_acquire(SD_STORAGE_SERVICE_USAGE_SESSION,
+                                            &usage) == ESP_OK);
+
+    /* One failed transfer: the medium stays usable, so the user never sees a
+     * remount prompt for a one-off timeout. */
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
+    sd_storage_service_snapshot_t snapshot;
+    assert(sd_storage_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(!snapshot.faulted && snapshot.mounted);
+    assert(snapshot.generation == generation);
+    assert(snapshot.phase == SD_STORAGE_SERVICE_PHASE_MOUNTED);
+    assert(snapshot.last_error == TEST_ERROR);
+    assert(sd_storage_service_is_mounted());
+    assert(sd_storage_service_get_mount_path() != NULL);
+
+    /* A successful capacity query proves the card answers again and clears the
+     * pending count, so the next isolated failure is tolerated as well. */
+    uint64_t total = 0U;
+    uint64_t available = 0U;
+    assert(sd_storage_service_get_space(&usage, &total, &available) == ESP_OK);
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
+    assert(sd_storage_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(!snapshot.faulted && snapshot.mounted);
+
+    /* Two reports with no successful access between them are a real fault. */
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
+    assert(sd_storage_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(snapshot.faulted && !snapshot.mounted);
+    assert(snapshot.phase == SD_STORAGE_SERVICE_PHASE_ERROR);
+    assert(snapshot.generation != generation);
+    assert(sd_storage_service_usage_release(&usage) == ESP_OK);
+    assert(sd_storage_service_init(&s_config) == ESP_OK);
+    assert(sd_storage_service_deinit() == ESP_OK);
+}
+
+static void _test_fault_streak_cleared_by_content_change(void)
+{
+    fake_sd_t fake = {0};
+    _start(&fake);
+    sd_storage_service_usage_t usage;
+    assert(sd_storage_service_usage_acquire(SD_STORAGE_SERVICE_USAGE_SESSION,
+                                            &usage) == ESP_OK);
+    /* A completed mutation is medium evidence too: a written file that the
+     * card accepted means the previous read failure was not the card dying. */
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
+    assert(sd_storage_service_note_content_change(&usage) == ESP_OK);
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
+    sd_storage_service_snapshot_t snapshot;
+    assert(sd_storage_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(!snapshot.faulted && snapshot.mounted);
+    assert(sd_storage_service_usage_release(&usage) == ESP_OK);
+    assert(sd_storage_service_deinit() == ESP_OK);
+}
+
 static void _test_fault_invalidates_and_remounts(void)
 {
     fake_sd_t fake = {0};
@@ -203,6 +268,9 @@ static void _test_fault_invalidates_and_remounts(void)
     sd_storage_service_usage_t usage;
     assert(sd_storage_service_usage_acquire(SD_STORAGE_SERVICE_USAGE_SESSION,
                                             &usage) == ESP_OK);
+    /* Confirmation needs a persisting failure, so report twice with no
+     * successful access in between. */
+    assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
     assert(sd_storage_service_usage_report_fault(&usage, TEST_ERROR) == ESP_OK);
     sd_storage_service_snapshot_t snapshot;
     assert(sd_storage_service_get_snapshot(&snapshot) == ESP_OK);
@@ -369,6 +437,8 @@ static void _test_recovery_confirmation_epoch(void)
 int main(void)
 {
     _test_leased_capacity_and_revision();
+    _test_single_fault_is_transient();
+    _test_fault_streak_cleared_by_content_change();
     _test_fault_invalidates_and_remounts();
     _test_cleanup_retry_and_stale_actions();
     _test_failed_mount_cleanup_retry();

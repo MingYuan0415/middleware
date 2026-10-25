@@ -222,9 +222,15 @@ esp_err_t sd_storage_service_usage_release(
 /**
  * @brief Report a medium-level I/O fault for one lease.
  *
- * A confirmed fault immediately clears usability and advances the epoch.
- * The reporting consumer must still close its file handles and release its
- * original lease before lifecycle cleanup/remount can begin.
+ * A report alone does not clear usability: one failed transfer is also what a
+ * preemption or a marginal contact produces, and unmounting on the first one
+ * turns a transient into a card the user has to remount by hand. The service
+ * counts reports and only invalidates the medium once they keep arriving with
+ * no successful access in between.
+ *
+ * A confirmed fault clears usability and advances the epoch. The reporting
+ * consumer must still close its file handles and release its original lease
+ * before lifecycle cleanup/remount can begin.
  * A report carrying a stale generation is ignored so a late failure cannot
  * poison a later mount.
  *

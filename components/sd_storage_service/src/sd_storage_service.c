@@ -8,6 +8,19 @@
 #define SD_STORAGE_SERVICE_PATH_MAX (64U)
 #define SD_STORAGE_SERVICE_LEASE_CAPACITY (8U)
 
+/**
+ * @brief Reported faults needed before the medium is declared unusable.
+ *
+ * One failed transfer is not evidence of a dead card: a preemption, a clock
+ * change during light sleep, or a marginal contact produces the same error and
+ * the next access succeeds. Unmounting on the first report turned any such
+ * transient into "card removed" plus a manual remount requirement.
+ *
+ * The count is per content epoch and resets on any successful medium access,
+ * so it tracks a persisting failure rather than the total number of errors.
+ */
+#define SD_STORAGE_SERVICE_FAULT_CONFIRMATIONS (2U)
+
 typedef enum sd_storage_service_state
 {
     SD_STORAGE_SERVICE_STATE_STOPPED = 0,
@@ -39,6 +52,7 @@ static uint32_t s_revision;
 static uint32_t s_next_token;
 static esp_err_t s_last_error;
 static bool s_faulted;
+static uint32_t s_fault_streak; /**< Fault reports since the last medium success. */
 static sd_storage_service_lease_t s_leases[SD_STORAGE_SERVICE_LEASE_CAPACITY];
 
 static bool _config_valid(const sd_storage_service_config_t *config)
@@ -217,6 +231,7 @@ static esp_err_t _mount(const sd_storage_service_config_t *requested,
     {
         s_state = SD_STORAGE_SERVICE_STATE_MOUNTED;
         s_faulted = false;
+        s_fault_streak = 0U;
         ++s_generation;
     }
     else
@@ -267,6 +282,7 @@ static esp_err_t _unmount(bool stop, bool check_generation,
     {
         s_handle = NULL;
         s_faulted = false;
+        s_fault_streak = 0U;
         s_state = stop ? SD_STORAGE_SERVICE_STATE_STOPPED : SD_STORAGE_SERVICE_STATE_IDLE;
     }
     else
@@ -324,6 +340,7 @@ esp_err_t sd_storage_service_format(const sd_storage_service_config_t *config,
               SD_STORAGE_SERVICE_STATE_CLEANUP_PENDING;
     if (result == ESP_OK)
     {
+        s_fault_streak = 0U;
         ++s_revision;
     }
     taskEXIT_CRITICAL(&s_state_lock);
@@ -356,6 +373,13 @@ esp_err_t sd_storage_service_get_space(const sd_storage_service_usage_t *usage,
     }
     taskENTER_CRITICAL(&s_state_lock);
     const bool valid = _usage_valid_locked(usage);
+    if (valid)
+    {
+        /* The medium answered, so any earlier failed transfer was transient.
+         * Reset here rather than on a timer: this is the only real proof that
+         * the card still responds, and it runs on every capacity query. */
+        s_fault_streak = 0U;
+    }
     taskEXIT_CRITICAL(&s_state_lock);
     if (!valid)
     {
@@ -470,6 +494,8 @@ esp_err_t sd_storage_service_note_content_change(const sd_storage_service_usage_
     const bool valid = _usage_valid_locked(usage);
     if (valid)
     {
+        /* A completed mutation proves the medium accepted a write. */
+        s_fault_streak = 0U;
         ++s_revision;
     }
     taskEXIT_CRITICAL(&s_state_lock);
@@ -556,12 +582,24 @@ esp_err_t sd_storage_service_usage_report_fault(const sd_storage_service_usage_t
     const bool valid = _usage_valid_locked(usage);
     if (valid)
     {
-        s_faulted = true;
+        /* A single failed transfer does not condemn the medium: the same
+         * error comes from a preemption or a marginal contact, and the next
+         * access succeeds. Only a failure that survives a successful access
+         * in between is a real fault, so the count is what confirms it. */
+        if (s_fault_streak < SD_STORAGE_SERVICE_FAULT_CONFIRMATIONS)
+        {
+            ++s_fault_streak;
+        }
         s_last_error = error == ESP_OK ? ESP_FAIL : error;
-        s_state = SD_STORAGE_SERVICE_STATE_CLEANUP_PENDING;
-        ++s_generation;
-        /* Keep original token+generation entries until their owners release.
-         * The invalidated epoch cannot be mounted over live file handles. */
+        if (s_fault_streak >= SD_STORAGE_SERVICE_FAULT_CONFIRMATIONS)
+        {
+            s_faulted = true;
+            s_state = SD_STORAGE_SERVICE_STATE_CLEANUP_PENDING;
+            ++s_generation;
+            /* Keep original token+generation entries until their owners
+             * release. The invalidated epoch cannot be mounted over live file
+             * handles. */
+        }
     }
     taskEXIT_CRITICAL(&s_state_lock);
     return valid ? ESP_OK : ESP_ERR_INVALID_STATE;
