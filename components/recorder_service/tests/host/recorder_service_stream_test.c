@@ -304,6 +304,39 @@ static void _quick_restart(const recorder_service_target_t *target, bool next_pl
     _reaped(owners + 1U);
 }
 
+static void _is_busy_covers_active_session(const recorder_service_target_t *target)
+{
+    /* Standby admission reads this one predicate. A false negative here lets
+     * the PM worker request light sleep while the recorder still owns the SD
+     * card: the SPI clock stops mid-transfer and the read times out (0x107),
+     * which the fault path then reports as a dead medium. */
+    assert(!recorder_service_is_busy());
+
+    _io_reset(false, false, false);
+    assert(recorder_service_play(target) == ESP_OK);
+    assert(_command().last_error == ESP_OK);
+    _io_entered(1U);
+    /* Playing: the session lease and the open file both outlive this poll. */
+    assert(_snapshot().state == RECORDER_SERVICE_PLAYING);
+    assert(recorder_service_is_busy());
+
+    /* Completion publishes IDLE before the owner has cleared its stream, so
+     * the snapshot alone must not decide: the file is still open here. */
+    const size_t owners = host_caps_task_owner_delete_count();
+    _io_release();
+    WAIT_UNTIL(!_running());
+    _recorder_lock();
+    const bool stream_open = s_recorder.file != NULL;
+    _recorder_unlock();
+    if (stream_open)
+    {
+        assert(recorder_service_is_busy());
+    }
+    _reaped(owners);
+    assert(!recorder_service_is_busy());
+
+}
+
 static void _creation_failures(const recorder_service_target_t *target)
 {
     const unsigned descriptors = _open_files();
@@ -486,6 +519,7 @@ int main(void)
     recorder_service_target_t target = _record_stop();
     const unsigned descriptors = _open_files();
     _play_eof(&target, false);
+    _is_busy_covers_active_session(&target);
     _creation_failures(&target);
     target = _record_stop();
     _io_error(true, &target);

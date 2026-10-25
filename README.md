@@ -90,6 +90,7 @@ Manager 偏好和内置 App 状态，data 挂载后由 `fs_storage_wipe_data()` 
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
 - Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 上限 32 字节；个人网络密码上限 64 字节（契约边界，1..64 均接受，物理关联失败留作操作结果）。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、天气、时间、电源、IMU、音频、SD、Chore 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。`chore_service` 的 job 回调本身运行在 worker 上，可在其中调用其他服务 API，但必须短时返回并遵守各服务的上下文限制。
 - `system_pm` 接受 1 至 4 个唯一 RTC GPIO 唤醒源，且有效电平必须一致。唤醒回调应只通知其他 worker；外设准备和恢复钩子运行在 PM worker 中，可以阻塞但必须遵守配置超时。
+- Light sleep 停止 APB/SPI 时钟，板级 SD 走 SPI 且不持有 PM lock，因此在途的卡传输会超时为 `0x107`，并被存储层判为介质故障而卸载。`recorder_service` 的录音/播放会话持有 SESSION 使用权，宿主 app 的 standby 准入必须在 prepare 之前和最后一次 commit 之前都用 `recorder_service_is_busy()` 拒绝，不能只在 PM tick 的 admission 检查一次。
 - `SYSTEM_PM_DEVELOPMENT_MODE=y` 不是让 USB Serial/JTAG 在 light sleep 中继续工作；ESP32-S3 硬件不支持这一点。该模式在 USB 主机连接时跳过 app standby（显示仍可熄灭），并启用 IDF 的自动睡眠连接保护；拔出 USB 后恢复正常 light sleep。
 - 当前板级 EXIO3/5/6 经过 TCA9554，只能由 time/power/IMU worker 轮询，不能成为 RTC GPIO 唤醒源。触摸唤醒尚未实现，GPIO21 未注册；实际 wake descriptor 仍只有 GPIO0 低电平。
 

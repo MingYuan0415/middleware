@@ -1328,7 +1328,22 @@ bool recorder_service_is_busy(void)
         return false;
     }
     _recorder_lock();
+    /* The snapshot alone answers too early. Completion publishes IDLE (or
+     * ERROR) before the owner releases the stream, file handle and storage
+     * lease, and between admission and the first snapshot update the state is
+     * still the previous one. Standby admission must stay negative for that
+     * whole window: it gates light sleep, and light sleep stops the SPI clock
+     * under an in-flight card transfer, which then fails with ESP_ERR_TIMEOUT
+     * (0x107) and is reported as a dead medium.
+     *
+     * task_running, an open file and a held storage lease are the facts that
+     * outlive the state, so they decide here alongside it. */
     const bool busy = s_recorder.snapshot.operation_pending ||
+                      s_recorder.stop_requested || s_recorder.stopping ||
+                      s_recorder.file != NULL ||
+                      atomic_load_explicit(&s_recorder.task_running,
+                                           memory_order_acquire) ||
+                      s_recorder.usage_held || s_recorder.audio_leased ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_RECORDING ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_PAUSED ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_PLAYING;
