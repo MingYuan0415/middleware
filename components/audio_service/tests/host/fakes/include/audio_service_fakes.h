@@ -39,4 +39,19 @@ bool audio_service_fakes_wait_for_io(uint32_t count, uint32_t timeout_ms);
 void audio_service_fakes_block_stop(bool blocked);
 bool audio_service_fakes_wait_for_stop(uint32_t timeout_ms);
 
+/** @brief Scalar NVS control for the volume persistence tests. */
+void audio_service_fakes_nv_reset(void);
+bool audio_service_fakes_nv_present(void);
+uint8_t audio_service_fakes_nv_value(void);
+unsigned audio_service_fakes_nv_set_count(void);
+unsigned audio_service_fakes_nv_erase_count(void);
+/** @brief Force the next nv_storage_set_u8 call to fail. */
+void audio_service_fakes_nv_fail_set(void);
+/** @brief Force the next nv_storage_get_u8 call to fail. */
+void audio_service_fakes_nv_fail_get(void);
+/** @brief Force the next nv_storage_erase_key call to fail. */
+void audio_service_fakes_nv_fail_erase(void);
+/** @brief Store an arbitrary value directly, to seed corrupt records. */
+void audio_service_fakes_nv_seed(uint8_t value);
+
 #endif /* __AUDIO_SERVICE_FAKES_H__ */

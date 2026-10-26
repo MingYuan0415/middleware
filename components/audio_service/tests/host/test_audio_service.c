@@ -1022,6 +1022,136 @@ static void _test_suspended_release_and_resume(void)
     assert(audio_service_deinit() == ESP_OK);
 }
 
+/* The plain setter is used by drag previews and benchmarks, so it must never
+ * touch flash. */
+static void _test_volume_set_does_not_persist(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    assert(audio_service_set_volume(35U) == ESP_OK);
+    assert(audio_service_fakes_state()->volume == 35U);
+    assert(audio_service_fakes_nv_set_count() == 0U);
+    assert(!audio_service_fakes_nv_present());
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
+/* A settled choice is applied and stored exactly once. */
+static void _test_volume_persisted_applies_and_stores(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    assert(audio_service_set_volume_persisted(40U) == ESP_OK);
+    assert(audio_service_fakes_state()->volume == 40U);
+    assert(audio_service_fakes_nv_present());
+    assert(audio_service_fakes_nv_value() == 40U);
+    assert(audio_service_fakes_nv_set_count() == 1U);
+
+    /* Out of range is refused before anything is applied or stored. */
+    assert(audio_service_set_volume_persisted(101U) == ESP_ERR_INVALID_ARG);
+    assert(audio_service_fakes_state()->volume == 40U);
+    assert(audio_service_fakes_nv_set_count() == 1U);
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
+/* The level is already audible, so a storage fault must not revert it. */
+static void _test_volume_persist_failure_keeps_level(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    audio_service_fakes_nv_fail_set();
+    assert(audio_service_set_volume_persisted(55U) == ESP_FAIL);
+    assert(audio_service_fakes_state()->volume == 55U);
+    assert(!audio_service_fakes_nv_present());
+    assert(audio_service_fakes_nv_set_count() == 1U);
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
+/* A refused audio request must not reach storage at all. */
+static void _test_volume_persist_skipped_without_audio_path(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    assert(audio_service_deinit() == ESP_OK);
+
+    /* Deinitialized: the audio path rejects the level. */
+    assert(audio_service_set_volume_persisted(70U) == ESP_ERR_INVALID_STATE);
+    assert(audio_service_fakes_nv_set_count() == 0U);
+    assert(!audio_service_fakes_nv_present());
+}
+
+static void _test_volume_restore(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    /* No record keeps the configured default and is not an error. */
+    assert(audio_service_restore_volume() == ESP_OK);
+    assert(audio_service_fakes_state()->volume == 60U);
+
+    /* A stored level overrides the default. */
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    assert(audio_service_set_volume_persisted(25U) == ESP_OK);
+    assert(audio_service_deinit() == ESP_OK);
+
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    assert(audio_service_fakes_state()->volume == 60U);
+    assert(audio_service_restore_volume() == ESP_OK);
+    assert(audio_service_fakes_state()->volume == 25U);
+
+    /* A storage read fault is reported, not swallowed. */
+    audio_service_fakes_nv_fail_get();
+    assert(audio_service_restore_volume() == ESP_FAIL);
+    assert(audio_service_fakes_state()->volume == 25U);
+
+    /* A corrupt record is refused so the default stands instead of muting or
+     * overdriving the speaker. */
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+    audio_service_fakes_nv_seed(200U);
+    assert(audio_service_restore_volume() == ESP_ERR_INVALID_STATE);
+    assert(audio_service_fakes_state()->volume == 60U);
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
+static void _test_volume_reset_persisted_state(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    /* Absent key counts as success. */
+    assert(audio_service_reset_persisted_state() == ESP_OK);
+    assert(audio_service_fakes_nv_erase_count() == 1U);
+
+    /* A stored key is erased. */
+    assert(audio_service_set_volume_persisted(80U) == ESP_OK);
+    assert(audio_service_fakes_nv_present());
+    assert(audio_service_reset_persisted_state() == ESP_OK);
+    assert(!audio_service_fakes_nv_present());
+
+    /* A real erase failure still surfaces. */
+    audio_service_fakes_nv_fail_erase();
+    assert(audio_service_reset_persisted_state() == ESP_FAIL);
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
 int main(void)
 {
     _test_missing_hal();
@@ -1043,6 +1173,12 @@ int main(void)
     _test_io_failure_transferred_zero();
     _test_acquire_start_compensation();
     _test_suspended_release_and_resume();
+    _test_volume_set_does_not_persist();
+    _test_volume_persisted_applies_and_stores();
+    _test_volume_persist_failure_keeps_level();
+    _test_volume_persist_skipped_without_audio_path();
+    _test_volume_restore();
+    _test_volume_reset_persisted_state();
     puts("audio service host tests passed");
     return 0;
 }

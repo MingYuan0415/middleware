@@ -3,10 +3,18 @@
 #include "bsp_hal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "nv_storage.h"
+
+#include "nvs.h"
+
 #include <string.h>
 
 #define DBG_TAG "audio_service"
 #include "mt_log.h"
+
+/* Speaker level persisted across boots. Owned here like every other module
+ * that stores its own setting, so the key never leaks to the UI bridge. */
+#define AUDIO_SERVICE_VOLUME_KEY "volume"
 
 typedef esp_err_t (*audio_service_io_op_t)(void *data, size_t bytes,
         size_t *transferred, uint32_t timeout_ms);
@@ -702,6 +710,61 @@ esp_err_t audio_service_set_volume(uint8_t percent)
 exit:
     _unlock_service();
     return result;
+}
+
+/* Storage never runs under the service lock: nv_storage commits can block on
+ * flash, and holding the audio lock across them would stall every stream and
+ * quiesce path. The level is already audible, so a failed write is reported
+ * without rolling the speaker back. */
+esp_err_t audio_service_set_volume_persisted(uint8_t percent)
+{
+    if (percent > 100U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t applied = audio_service_set_volume(percent);
+    if (applied != ESP_OK)
+    {
+        return applied;
+    }
+    const esp_err_t stored = nv_storage_set_u8(AUDIO_SERVICE_VOLUME_KEY,
+        percent);
+    if (stored != ESP_OK)
+    {
+        LOG_W("volume store failed: %s", esp_err_to_name(stored));
+    }
+    return stored;
+}
+
+esp_err_t audio_service_restore_volume(void)
+{
+    uint8_t percent = 0U;
+    const esp_err_t stored = nv_storage_get_u8(AUDIO_SERVICE_VOLUME_KEY,
+        &percent);
+    if (stored == ESP_ERR_NVS_NOT_FOUND)
+    {
+        /* Never written: the configured default applied by init() stands. */
+        return ESP_OK;
+    }
+    if (stored != ESP_OK)
+    {
+        return stored;
+    }
+    if (percent > 100U)
+    {
+        /* Refuse a corrupt record instead of muting the speaker with it. */
+        LOG_W("stored volume %u out of range, keeping the default",
+              (unsigned)percent);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return audio_service_set_volume(percent);
+}
+
+esp_err_t audio_service_reset_persisted_state(void)
+{
+    const esp_err_t result = nv_storage_erase_key(AUDIO_SERVICE_VOLUME_KEY);
+    /* An absent key is already the desired post-reset state. */
+    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
 }
 
 esp_err_t audio_service_get_volume(uint8_t *percent)

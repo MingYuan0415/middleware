@@ -37,6 +37,18 @@ Public header `include/audio_service.h`:
 - `audio_service_set_volume()` / `get_volume()`, `set_mute()` / `get_mute()`,
   `set_pa()` / `get_pa()`: system-level volume, mute, and power-amplifier
   control, which do not participate in the lease.
+- `audio_service_set_volume_persisted()` / `audio_service_restore_volume()` /
+  `audio_service_reset_persisted_state()`: the persisted speaker level. Storage
+  belongs to this component, like every other module that owns a setting, so the
+  `volume` key never leaks to a caller. The plain `set_volume()` applies only and
+  never touches flash, which keeps drag previews and benchmark overrides clean;
+  `set_volume_persisted()` applies and then commits once, for a settled choice.
+  A failed commit is reported without reverting the level, since it is already
+  audible. Storage never runs under the service lock, because an NVS commit can
+  block on flash and would otherwise stall every stream and quiesce path.
+  `restore_volume()` keeps the `audio_service_init_config_t` default when no
+  record exists and refuses a corrupt one; `reset_persisted_state()` clears the
+  key for a factory reset and treats an absent key as success.
 - `audio_service_is_available()` / `audio_service_get_state()` /
   `audio_service_get_config()` / `audio_service_is_leased()` /
   `audio_service_get_lease()`: availability, state, configuration, and lease
@@ -45,9 +57,11 @@ Public header `include/audio_service.h`:
 ## Configuration and Dependencies
 
 - `idf_component.yml`: only `idf: ">=5.0"`.
-- CMake: `REQUIRES bsp`, `PRIV_REQUIRES freertos mt_log`.
+- CMake: `REQUIRES bsp`, `PRIV_REQUIRES freertos mt_log nv_storage`.
 - No Kconfig; the start-up policy is supplied by `audio_service_init_config_t`
-  (PCM format, initial volume, mute, PA).
+  (PCM format, initial volume, mute, PA). Call
+  `audio_service_restore_volume()` after a successful init to adopt a persisted
+  level over that default.
 - The board device must already be initialized; the BSP holds its resources
   before the service is used.
 

@@ -1,5 +1,6 @@
 #include "audio_service_fakes.h"
 
+#include <assert.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,9 @@
 
 #include "audio_service.h"
 #include "freertos/semphr.h"
+#include "nv_storage.h"
+
+#include "nvs.h"
 
 typedef enum audio_service_fake_semaphore_kind
 {
@@ -225,6 +229,120 @@ void audio_service_fakes_reset(void)
     s_fake.start_result = ESP_OK;
     s_fake.set_pa_result = ESP_OK;
     s_fake.stop_result = ESP_OK;
+    audio_service_fakes_nv_reset();
+}
+
+/* ── Scalar NVS fake for the volume persistence tests ── */
+
+static bool s_nv_present;
+static uint8_t s_nv_value;
+static unsigned s_nv_set_count;
+static unsigned s_nv_erase_count;
+static bool s_nv_fail_set;
+static bool s_nv_fail_get;
+static bool s_nv_fail_erase;
+
+void audio_service_fakes_nv_reset(void)
+{
+    s_nv_present = false;
+    s_nv_value = 0U;
+    s_nv_set_count = 0U;
+    s_nv_erase_count = 0U;
+    s_nv_fail_set = false;
+    s_nv_fail_get = false;
+    s_nv_fail_erase = false;
+}
+
+bool audio_service_fakes_nv_present(void)
+{
+    return s_nv_present;
+}
+
+uint8_t audio_service_fakes_nv_value(void)
+{
+    return s_nv_value;
+}
+
+unsigned audio_service_fakes_nv_set_count(void)
+{
+    return s_nv_set_count;
+}
+
+unsigned audio_service_fakes_nv_erase_count(void)
+{
+    return s_nv_erase_count;
+}
+
+void audio_service_fakes_nv_fail_set(void)
+{
+    s_nv_fail_set = true;
+}
+
+void audio_service_fakes_nv_fail_get(void)
+{
+    s_nv_fail_get = true;
+}
+
+void audio_service_fakes_nv_fail_erase(void)
+{
+    s_nv_fail_erase = true;
+}
+
+void audio_service_fakes_nv_seed(uint8_t value)
+{
+    s_nv_present = true;
+    s_nv_value = value;
+}
+
+esp_err_t nv_storage_set_u8(const char *key, uint8_t value)
+{
+    assert(key != NULL);
+    assert(strcmp(key, "volume") == 0);
+    ++s_nv_set_count;
+    if (s_nv_fail_set)
+    {
+        s_nv_fail_set = false;
+        return ESP_FAIL;
+    }
+    s_nv_present = true;
+    s_nv_value = value;
+    return ESP_OK;
+}
+
+esp_err_t nv_storage_get_u8(const char *key, uint8_t *output)
+{
+    assert(key != NULL);
+    assert(output != NULL);
+    assert(strcmp(key, "volume") == 0);
+    if (s_nv_fail_get)
+    {
+        s_nv_fail_get = false;
+        return ESP_FAIL;
+    }
+    if (!s_nv_present)
+    {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    *output = s_nv_value;
+    return ESP_OK;
+}
+
+esp_err_t nv_storage_erase_key(const char *key)
+{
+    assert(key != NULL);
+    assert(strcmp(key, "volume") == 0);
+    ++s_nv_erase_count;
+    if (s_nv_fail_erase)
+    {
+        s_nv_fail_erase = false;
+        return ESP_FAIL;
+    }
+    if (!s_nv_present)
+    {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    s_nv_present = false;
+    return ESP_OK;
 }
 
 audio_service_fake_state_t *audio_service_fakes_state(void)

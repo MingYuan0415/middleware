@@ -211,8 +211,44 @@ bool audio_service_is_leased(void);
  */
 esp_err_t audio_service_get_lease(audio_service_lease_t *lease);
 
-/** @brief Set the speaker volume in the range 0..100 percent. */
+/**
+ * @brief Set the speaker volume in the range 0..100 percent.
+ *
+ * The level is applied only; nothing is written to storage. Use this for
+ * transient changes such as a drag preview or a benchmark override.
+ */
 esp_err_t audio_service_set_volume(uint8_t percent);
+
+/**
+ * @brief Apply and persist the speaker volume.
+ *
+ * Intended for a settled user choice: call it once when the knob is released,
+ * never while it is moving, because each call commits to flash. A failed store
+ * is reported without reverting the level, which is already audible.
+ *
+ * @return ESP_OK when applied and stored; otherwise the audio or storage error.
+ */
+esp_err_t audio_service_set_volume_persisted(uint8_t percent);
+
+/**
+ * @brief Restore the persisted speaker volume over the configured default.
+ *
+ * Call after audio_service_init() succeeded. A key that was never written keeps
+ * the init_config default and reports ESP_OK; a corrupt record is refused so
+ * the default stands.
+ *
+ * @return ESP_OK when restored or absent; ESP_ERR_INVALID_STATE when the stored
+ *         level is out of range and the default stands; otherwise the storage
+ *         or audio error.
+ */
+esp_err_t audio_service_restore_volume(void);
+
+/**
+ * @brief Delete the persisted speaker volume during a factory reset.
+ *
+ * @return ESP_OK when erased or already absent; otherwise the storage error.
+ */
+esp_err_t audio_service_reset_persisted_state(void);
 
 /** @brief Copy the current speaker volume. */
 esp_err_t audio_service_get_volume(uint8_t *percent);
