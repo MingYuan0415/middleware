@@ -1,3 +1,5 @@
+**English** | [简体中文](README_ZH.md)
+
 # Factory Reset Service
 
 `factory_reset_service` owns the durable, versioned factory-reset journal. It

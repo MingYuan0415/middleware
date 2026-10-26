@@ -1,3 +1,5 @@
+**English** | [简体中文](README_ZH.md)
+
 # ble_runtime
 
 `ble_runtime` is the sole owner of the ESP-IDF NimBLE host lifecycle and

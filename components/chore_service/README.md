@@ -1,32 +1,50 @@
+**English** | [简体中文](README_ZH.md)
+
 # chore_service
 
-通用有界后台 worker：在独立任务上执行短小、有界的后台作业（周期维护、快照格式化、小型存储查询等）。
+General-purpose bounded background worker: runs short, bounded background jobs
+(periodic maintenance, snapshot formatting, small storage queries, and so on)
+on a dedicated task.
 
-## 对外 API
+## Public API
 
-公共头 `include/chore_service.h`：
+Public header `include/chore_service.h`:
 
-- `chore_service_init()` / `chore_service_deinit()`：初始化或停止单例 worker；deinit 取消全部作业并在返回前释放每个作业参数。
-- `chore_service_submit()`：提交一次性或周期作业（`delay_ms`、`period_ms`）；成功后参数所有权转移给服务。
-- `chore_service_cancel()`：请求协作式取消并等待作业静默。
-- `chore_service_suspend()` / `chore_service_resume()`：轻睡眠前后暂停或恢复 worker。
-- `chore_service_get_status()` / `chore_service_is_available()`：状态快照与可用性查询。
-- `chore_service_cancel_pending()`：作业在 run 循环中轮询取消令牌。
+- `chore_service_init()` / `chore_service_deinit()`: initialize or stop the
+  singleton worker; deinit cancels every job and releases each job argument
+  before returning.
+- `chore_service_submit()`: submit a one-shot or periodic job (`delay_ms`,
+  `period_ms`); on success the argument ownership transfers to the service.
+- `chore_service_cancel()`: request cooperative cancellation and wait for the
+  job to go quiet.
+- `chore_service_suspend()` / `chore_service_resume()`: suspend or resume the
+  worker around light sleep.
+- `chore_service_get_status()` / `chore_service_is_available()`: status snapshot
+  and availability query.
+- `chore_service_cancel_pending()`: the job polls the cancellation token in its
+  run loop.
 
-## 配置与依赖
+## Configuration and Dependencies
 
-- Kconfig：`CHORE_SERVICE_TASK_STACK_SIZE`（默认 4096）、`CHORE_SERVICE_JOB_CAPACITY`（默认 8，1..16）。
-- `idf_component.yml`：仅 `idf: ">=5.0"`。
-- CMake：`PRIV_REQUIRES mt_log esp_timer freertos heap`。
-- 运行时策略由 `chore_service_config_t`（worker 优先级、时长告警阈值）提供。
+- Kconfig: `CHORE_SERVICE_TASK_STACK_SIZE` (default 4096),
+  `CHORE_SERVICE_JOB_CAPACITY` (default 8, 1..16).
+- `idf_component.yml`: only `idf: ">=5.0"`.
+- CMake: `PRIV_REQUIRES mt_log esp_timer freertos heap`.
+- The runtime policy is supplied by `chore_service_config_t` (worker priority,
+  duration warning threshold).
 
-## 状态与并发
+## State and Concurrency
 
-- 单例；一个 pinned worker 任务，固定容量作业池。
-- 互斥锁保护队列，事件组做每槽取消确认；`run`/`release` 在 worker 上下文执行，不得调用 LVGL 或长时间阻塞。
-- 作业句柄带世代，实例切换后旧句柄不会命中新作业。
+- Singleton; one pinned worker task and a fixed-capacity job pool.
+- A mutex protects the queue and an event group acknowledges cancellation per
+  slot; `run`/`release` execute in the worker context and must not call LVGL or
+  block for long.
+- Job handles carry a generation, so an old handle never matches a new job after
+  an instance switch.
 
-## 测试边界
+## Test Boundary
 
-- `tests/host` 存在，覆盖提交、取消、暂停和 deinit 排空与并发语义。
-- 宿主不覆盖真机任务调度时序与栈水位实际值。
+- `tests/host` exists and covers submission, cancellation, suspend, and deinit
+  drain together with the concurrency semantics.
+- The host does not cover on-device task scheduling timing or actual stack
+  watermark values.

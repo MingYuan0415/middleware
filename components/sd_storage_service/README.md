@@ -1,85 +1,123 @@
+**English** | [简体中文](README_ZH.md)
+
 # sd_storage_service
 
-独立于板级引脚的可插拔 SD 文件系统挂载服务；默认不格式化，只有显式恢复挂载
-或主动格式化才允许擦除介质。同时拥有卷的使用权与介质级故障状态。
+Pluggable SD filesystem mount service independent of board-level pins; by
+default it does not format, and only an explicit mount recovery or an explicit
+format may erase the medium. It also owns the volume usage rights and the
+medium-level fault state.
 
-## 对外 API
+## Public API
 
-公共头 `include/sd_storage_service.h`：
+Public header `include/sd_storage_service.h`:
 
-- `sd_storage_service_register_mount_ops()`：初始化前注册板级
-  mount/unmount/is_mounted/format/get_space 适配；服务不拥有引脚映射。
-- `sd_storage_service_init()`：按普通模式挂载，挂载失败绝不格式化。
-- `sd_storage_service_recover_and_mount(config, expected_generation)`：显式允许
-  挂载失败后格式化恢复；健康挂载不擦除。故障/清理未完成时先真实释放旧适配器。
-- `sd_storage_service_unmount(expected_generation)`：安全卸载，重复清理成功后幂等。
-- `sd_storage_service_format(config, expected_generation)`：擦除已挂载介质并
-  重新挂载；开始时即令旧纪元失效，失败保留资源清理义务，不再公开可用状态。
-- 三个用户确认操作在同一临界区检查 expected_generation 与无活动 lease；
-  旧确认不得操作后来的卷。普通 init 不请求格式化。
-- `sd_storage_service_get_space(usage, total, free)`：在调用者已经持有的有效
-  ACCESS/SESSION/MAINTENANCE lease 下查询；不额外占用 lease 槽，失败或查询期间
-  纪元失效时输出保持不变，绝不冒充剩余空间为零。
-- `sd_storage_service_deinit()`：卸载并释放适配资源；`start` / `stop` 为别名。
-- `sd_storage_service_get_snapshot()`：一个加锁读取的快照，包含
-  mounted、phase、generation、revision、mount_path、last_error、使用权计数、
-  maintenance 与 faulted。
-- 使用权：`sd_storage_service_usage_acquire/release/report_fault`，分为
-  ACCESS（浏览/查询）、SESSION（录音、暂停、播放）与 MAINTENANCE
-  （卸载/格式化）。
-- `sd_storage_service_content_revision()` / `note_content_change(usage)`：
-  由 SD 服务共享并原子更新内容版本，发布成功的文件/目录变更须持有效 lease。
+- `sd_storage_service_register_mount_ops()`: registers the board-level
+  mount/unmount/is_mounted/format/get_space adaptation before initialization;
+  the service does not own the pin mapping.
+- `sd_storage_service_init()`: mounts in normal mode; a mount failure never
+  formats.
+- `sd_storage_service_recover_and_mount(config, expected_generation)`:
+  explicitly allows format-based recovery after a mount failure; a healthy
+  mount erases nothing. When a fault or an incomplete cleanup is present, the
+  old adapter is really released first.
+- `sd_storage_service_unmount(expected_generation)`: safe unmount, idempotent
+  once the repeated cleanup succeeds.
+- `sd_storage_service_format(config, expected_generation)`: erases the mounted
+  medium and remounts; the old generation is invalidated at the start, a
+  failure retains the resource cleanup obligation, and no usable state is
+  exposed afterwards.
+- The three user-confirmed operations check expected_generation and the
+  absence of an active lease in the same critical section; an old confirmation
+  must not operate on a later volume. A normal init requests no format.
+- `sd_storage_service_get_space(usage, total, free)`: queries under a valid
+  ACCESS/SESSION/MAINTENANCE lease the caller already holds; it occupies no
+  additional lease slot, and on failure or if the generation is invalidated
+  during the query the outputs stay unchanged — it never pretends free space
+  is zero.
+- `sd_storage_service_deinit()`: unmounts and releases the adapter resources;
+  `start` / `stop` are aliases.
+- `sd_storage_service_get_snapshot()`: a snapshot read under one lock,
+  containing mounted, phase, generation, revision, mount_path, last_error, the
+  usage right counts, maintenance, and faulted.
+- Usage rights:
+  `sd_storage_service_usage_acquire/release/report_fault`, split into ACCESS
+  (browsing/query), SESSION (recording, pause, playback), and MAINTENANCE
+  (unmount/format).
+- `sd_storage_service_content_revision()` / `note_content_change(usage)`:
+  shared and atomically updated content version maintained by the SD service;
+  a file/directory change that is published successfully must hold a valid
+  lease.
 
-## 阶段与代际
+## Phases and Generations
 
-`sd_storage_service_phase_t` 对外区分 `UNMOUNTED`、`MOUNTING`、`MOUNTED`、
-`UNMOUNTING`、`FORMATTING` 与 `ERROR`。普通挂载失败只进入 `ERROR`，不会被
-推断成“无卡”或“格式错误”。
+`sd_storage_service_phase_t` distinguishes `UNMOUNTED`, `MOUNTING`, `MOUNTED`,
+`UNMOUNTING`, `FORMATTING`, and `ERROR` externally. A failed normal mount only
+enters `ERROR`; it is never inferred as "no card" or "format error".
 
-`generation` 在挂载、卸载、主动格式化、确认的格式化恢复尝试与故障失效时
-变化。即使擦除后重新挂载失败，旧确认和旧结果也已失效。使用权与故障上报
-携带代际；迟到故障不会污染后续挂载。`revision` 是跨消费者的内容版本；
-成功格式化也更新该版本，普通文件变更在原 SD 临界区中递增。
+`generation` changes on mount, unmount, an explicit format, a confirmed
+format-recovery attempt, and a fault invalidation. Even if the remount after an
+erase fails, the old confirmation and the old results are already invalidated.
+Usage rights and fault reports carry a generation; a late fault does not
+pollute a later mount. `revision` is the content version shared across
+consumers; a successful format also updates it, and normal file changes
+increment it inside the original SD critical section.
 
-## 使用权规则
+## Usage Rights Rules
 
-- ACCESS 与 SESSION 在介质已挂载且未故障时可并存：浏览可以与录音并行。
-- MAINTENANCE 只有在没有任何其他使用权时授予；反过来，持有维护权时新的
-  ACCESS/SESSION 会被拒绝，避免“先查 busy、再操作”的竞争窗口。
-- 确认介质故障后立即 mounted=false、phase=ERROR、mount_path=NULL，并推进
-  generation；所有容量/变更操作与新使用权都拒绝，直到真实清理并重新挂载。
-  原 token + 原 generation 仍能释放，所有生命周期在原消费者关闭句柄并释放
-  前均拒绝执行，不将其当作已消失的计数。
-- 文件不存在、权限或非空目录等业务错误不属于介质故障。
-- 固定八个 lease 槽。容量查询复用传入 lease；即使表已满也不额外申请，
-  慢查询在锁外执行，快照读取、其他 lease 的释放与非冲突获取保持响应。
+- ACCESS and SESSION may coexist while the medium is mounted and not faulted:
+  browsing can run in parallel with recording.
+- MAINTENANCE is granted only when no other usage right exists; conversely,
+  while maintenance is held new ACCESS/SESSION are rejected, avoiding the
+  "check busy, then operate" race window.
+- After a medium fault is confirmed, mounted=false, phase=ERROR,
+  mount_path=NULL immediately, and the generation advances; all capacity/change
+  operations and new usage rights are rejected until a real cleanup and
+  remount happen. The original token + original generation can still be
+  released, and all lifecycle operations are rejected before the original
+  consumer closes its handles and releases — they are not treated as counts
+  that already vanished.
+- Business errors such as a missing file, permissions, or a non-empty
+  directory are not medium faults.
+- Fixed eight lease slots. A capacity query reuses the passed-in lease; it
+  requests no extra slot even when the table is full, and the slow query runs
+  outside the lock so snapshot reads, releases of other leases, and
+  non-conflicting acquisitions stay responsive.
 
-## 配置与依赖
+## Configuration and Dependencies
 
-- CMake：`PRIV_REQUIRES mt_log freertos`。
-- `idf_component.yml`：仅 `idf: ">=5.0"`。
-- 无 Kconfig；运行时由 `sd_storage_service_config_t`（挂载路径、最大文件数、
-  分配单元）提供。
+- CMake: `PRIV_REQUIRES mt_log freertos`.
+- `idf_component.yml`: only `idf: ">=5.0"`.
+- No Kconfig; at runtime `sd_storage_service_config_t` provides the mount path,
+  the maximum file count, and the allocation unit.
 
-## 并发
+## Concurrency
 
-- 单例；临界区保护状态与使用权表，**临界区内不做文件 I/O**。
-- 无 worker 任务；挂载、卸载与格式化由调用者（`file_service` worker）同步
-  执行。
+- Singleton; the critical section protects the state and the usage rights
+  table, and **no file I/O happens inside the critical section**.
+- No worker task; mount, unmount, and format are executed synchronously by the
+  caller (the `file_service` worker).
 
-## 归档与格式化要求
+## Archive and Format Requirements
 
-- 适配器 `format()` 必须重新挂载并确认容量可读、非零，只有全部成功才返回
-  `ESP_OK`。板级后端自行持有 card/SDSPI/diskio/FatFs/VFS 资源并用公共
-  `f_mount` / `f_mkfs` 组合实现，不使用 SDK sdcard 格式化组合 helper。
-- 清理逐阶段提交资源状态；失败保留未完成阶段。mount/unmount/deinit 均可重试
-  旧适配器清理，成功阶段不再释放，mount 不叠加旧资源。
-- 容量适配器使用 `esp_vfs_fat_info()`（宿主为 `statvfs()`）；服务在锁外查询，
-  返回后重新核验传入 lease/纪元，成功才发布输出。
+- The adapter `format()` must remount and confirm that the capacity is readable
+  and non-zero, and only return `ESP_OK` when everything succeeded. The
+  board-level backend owns the card/SDSPI/diskio/FatFs/VFS resources itself and
+  implements the operation with the public `f_mount` / `f_mkfs` combination; it
+  does not use the SDK sdcard format combination helper.
+- Cleanup commits the resource state phase by phase; a failure retains the
+  incomplete phase. mount/unmount/deinit can all retry cleaning up the old
+  adapter, successful phases are not released again, and mount does not stack
+  old resources on top of new ones.
+- The capacity adapter uses `esp_vfs_fat_info()` (`statvfs()` on the host); the
+  service queries outside the lock and revalidates the passed-in lease and
+  generation after the call returns, publishing the outputs only on success.
 
-## 测试边界
+## Test Boundary
 
-- `tests/host` 覆盖代际绑定的恢复/卸载/格式化、全表容量查询、共享内容版本、
-  故障即时失效与原 lease 释放、失败清理重试；pthread 阻塞容量回调验证状态锁
-  不被 I/O 占用且生命周期拒绝运行。所有适配回调均断言没有持有状态锁。
-- 宿主不覆盖真实 SD 卡协议、时序与热插拔。
+- `tests/host` covers generation-bound recovery/unmount/format, capacity queries
+  with a full table, the shared content version, immediate invalidation on a
+  fault plus release of the original lease, and retries of a failed cleanup; a
+  pthread-blocking capacity callback verifies that the state lock is not held by
+  I/O and that lifecycle operations are rejected. All adapter callbacks assert
+  that no state lock is held.
+- The host does not cover real SD card protocol, timing, or hot-plug.

@@ -1,162 +1,272 @@
+**English** | [简体中文](README_ZH.md)
+
 # recorder_service
 
-在 `audio_service` 与 `sd_storage_service` 之上提供 WAV 录音、播放与文件管理，并维护状态快照。
+Provides WAV recording, playback, and file management on top of
+`audio_service` and `sd_storage_service`, and maintains a state snapshot.
 
-## 对外 API
+## Public API
 
-公共头 `include/recorder_service.h`：
+Public header `include/recorder_service.h`:
 
-- `recorder_service_init()` / `deinit()`：初始化或停止服务；目录是卷内相对路径
-  （例如 `MicroTech/Recordings`），服务在每次使用时通过 `sd_storage_service`
-  解析当前挂载点，不硬编码挂载路径。无卡时初始化同样成功，录音只是不可开始。
-- `recorder_service_start()` / `pause()` / `resume()` / `stop()`：录音命令，完成通过快照报告。
-- `recorder_service_play()` / `stop_playback()`：播放指定 WAV 并停止播放。
-- `recorder_service_list()` / `delete()`：枚举已完成 WAV 与删除文件，不暴露目录句柄。
-  列表按修改时间倒序（`has_mtime` 为假的行排在已知时间之后，同时间按文件名倒序），
-  最多保留最新的 `RECORDER_SERVICE_MAX_FILES` 条；超出时快照的 `library_truncated`
-  为真，UI 据此提示「仅显示最新 N 个」。
-  列表每行的 `target` 保留完整 UTF-8 后端路径（192 字节，含终止符）及该次
-  索引发布的挂载 generation / 内容 revision；播放与删除接收该 target 的指针，
-  队列复制完整 target，不按同名路径重新选择文件。每行另带 `has_mtime` 与
-  `modified_epoch_s`（来自 `stat`），供 UI 显示录制时间。
-- `recorder_service_refresh()`：只读快照计数的调用方用它请求重新发布过期索引；
-  与 `list()` 的隐式请求同样合并，索引新鲜时不排队。
-- `recorder_service_get_snapshot()` / `is_busy()`：状态快照与忙碌查询。快照
-  区分 `free_bytes`（`space_valid` 为真时才有效）、`space_error` 与
-  `storage_ready`；容量查询失败不会被当作空间不足。当前 SD 的
-  `storage_generation` / `content_revision` 在 recorder 锁外读取；
-  `index_generation` / `index_revision` / `index_valid` / `file_count` /
-  `library_truncated` 在锁内与索引一同复制；`max_duration_ms` 来自初始化配置，
-  UI 用它显示上限与剩余录音时间。
+- `recorder_service_init()` / `deinit()`: initialize or stop the service; the
+  directory is a volume-relative path (for example `MicroTech/Recordings`), and
+  the service resolves the current mount point through `sd_storage_service` on
+  every use instead of hardcoding a mount path. Initialization also succeeds
+  without a card; recording is simply unable to start.
+- `recorder_service_start()` / `pause()` / `resume()` / `stop()`: recording
+  commands; completion is reported through the snapshot.
+- `recorder_service_play()` / `stop_playback()`: play the specified WAV and stop
+  playback.
+- `recorder_service_list()` / `delete()`: enumerate finished WAV files and
+  delete files, without exposing a directory handle.
+  The list is ordered by modification time, newest first (rows with `has_mtime`
+  false sort after the known times, and equal times sort by file name
+  descending), keeping at most the newest `RECORDER_SERVICE_MAX_FILES` entries;
+  when exceeded, the snapshot's `library_truncated` is true and the UI uses it
+  to hint `"仅显示最新 N 个"` (only the newest N are shown).
+  Each row's `target` retains the full UTF-8 backend path (192 bytes, including
+  the terminator) plus the mount generation / content revision current when
+  that index was published; playback and deletion receive a pointer to that
+  target, and the queue copies the full target instead of re-selecting a file
+  by path name. Each row also carries `has_mtime` and `modified_epoch_s` (from
+  `stat`) for the UI to display the recording time.
+- `recorder_service_refresh()`: callers that only read snapshot counts use it to
+  request republication of a stale index; it merges with `list()`'s implicit
+  request in the same way, and no request is queued while the index is fresh.
+- `recorder_service_get_snapshot()` / `is_busy()`: state snapshot and busy
+  query. The snapshot distinguishes `free_bytes` (valid only when `space_valid`
+  is true), `space_error`, and `storage_ready`; a failed capacity query is not
+  treated as insufficient space. The current SD's `storage_generation` /
+  `content_revision` are read outside the recorder lock; `index_generation` /
+  `index_revision` / `index_valid` / `file_count` / `library_truncated` are
+  copied together with the index inside the lock; `max_duration_ms` comes from
+  the initialization configuration, and the UI uses it to show the limit and
+  the remaining recording time.
 
-`recorder_service_snapshot_t.name`、`recorder_service_file_t.target.name` 和播放/删除命令均保存
-完整文件路径，容量为 `RECORDER_SERVICE_PATH_BYTES` 字节（含结尾 NUL）；路径拼接超出该容量的
-录音文件不进入服务索引。
+`recorder_service_snapshot_t.name`, `recorder_service_file_t.target.name`, and
+the playback/delete commands all store a full file path with a capacity of
+`RECORDER_SERVICE_PATH_BYTES` bytes (including the terminating NUL); a
+recording file whose concatenated path exceeds that capacity does not enter the
+service index.
 
-## 文件命名
+## File Naming
 
-新录音以 `REC_YYYYMMDD_HHMMSS` 命名（本地时间，系统时钟不早于 2020 时才采用）；
-时钟未校准时回退为 `REC_<esp_timer 微秒>`，保持单调可排序。同一秒内的第二次录音
-追加 `-2`、`-3` 后缀：创建用 `open(O_CREAT|O_EXCL)` 占位，并额外探测对应的
-`.wav` 是否已存在，因此重启或在同一秒内连续录音都不会覆盖既有文件。
+A new recording is named `REC_YYYYMMDD_HHMMSS` (local time, adopted only when
+the system clock is not earlier than 2020); when the clock is not calibrated it
+falls back to `REC_<esp_timer microseconds>`, which stays monotonic and
+sortable. A second recording within the same second gets a `-2`, `-3` suffix
+appended: creation reserves the name with `open(O_CREAT|O_EXCL)` and
+additionally probes whether the corresponding `.wav` already exists, so neither
+a reboot nor consecutive recordings within the same second overwrite an
+existing file.
 
-名字中出现连续两点（如 `REC_..a.wav`）不影响播放与删除：路径归属检查只要求文件名是
-录音目录的直接子项且不含分隔符，`.`/`..` 条目本身仍被拒绝。此前按“含 `..` 即拒绝”
-判定，会让扫描列出的这类录音长期可见却无法操作。
+A double dot inside a name (such as `REC_..a.wav`) does not affect playback or
+deletion: the path ownership check only requires that the file name is a direct
+child of the recordings directory and contains no separator, while the `.`/`..`
+entries themselves are still rejected. The previous "reject anything containing
+`..`" rule made such recordings listed by the scan permanently visible yet
+impossible to operate on.
 
-## 配置与依赖
+## Configuration and Dependencies
 
-- CMake：`PRIV_REQUIRES audio_service esp_timer fatfs freertos mt_log sd_storage_service`。
-- `idf_component.yml`：`idf: ">=5.0"`，本地依赖 `audio_service`、`sd_storage_service`、`mt_log`。
-- 无 Kconfig；运行时由 `recorder_service_config_t` 提供目录、最大录音时长与最小剩余空间。
+- CMake: `PRIV_REQUIRES audio_service esp_timer fatfs freertos mt_log sd_storage_service`.
+- `idf_component.yml`: `idf: ">=5.0"`, local dependencies `audio_service`,
+  `sd_storage_service`, `mt_log`.
+- No Kconfig; at runtime `recorder_service_config_t` provides the directory, the
+  maximum recording duration, and the minimum free space.
 
-## 状态与并发
+## State and Concurrency
 
-- 单例；命令经有界队列交给 pinned worker 任务，录音与播放共用一个流任务。
-  设备流任务的 4096 字节栈以 `SPIRAM | 8BIT` 显式分配，不回退内部 RAM；
-  共用 4096 字节 PCM 位于外部 BSS。TCB、队列、锁和 6144 字节命令栈仍在内部。
-  命令栈承载每次索引扫描向下的 VFS → FATFS → diskio → SDSPI 调用链；按 `-O2`
-  实测该链（扫描 304、`vfs_fat_stat` 336、`f_stat` 96、`sdspi_host_start_command`
-  272、`start_command_default` 96，未计 newlib printf 与扇区缓冲）约需 1.8 KB，
-  加上命令任务自身 576 字节与打断余量，4096 不足，6144 留出约 3 KB 裕量。
-  普通宿主与模拟器只运行命令 worker，不模拟音频流，SESSION 保留至显式停止；
-  独立的设备分支宿主目标执行真实流任务以验证生命周期。
-- 状态以 `generation` / `operation_id` 标识，命令异步完成；临界区与原子量保护共享字段。
-  所有跨服务调用（包括 SD 状态、revision、租约和计时）均在 recorder 临界区之外执行。
-- 状态机：IDLE / RECORDING / PAUSED / PLAYING / ERROR。
-- 暂停期间采集设备仍在运行，流任务继续读取并丢弃输入；不读会让暂停区间积存在 I2S
-  环形缓冲里，恢复后写入文件，产生用户没录过的音频且数据长度超出上报时长。
-- 失败的录音（IO 错误、时长上限、写头失败）在关闭后删除 `.part` 工作文件；否则库永远
-  不列出这些名字，用户也无法删除，只会缓慢占满存储卡。
-- 音频流：录音取得 `AUDIO_SERVICE_SESSION_RECORD` 租约（读写），播放取得
-  `AUDIO_SERVICE_SESSION_PLAYBACK` 租约（只写）；流任务用租约读写，收尾/错误路径
-  只有 release 真正返回 `ESP_OK` 才清除同代句柄。任何错误（包括
-  `ESP_ERR_INVALID_STATE`）均保留清理义务；stop、下一次 start/play 或 deinit
-  可重试。start/play 在取得 SD SESSION 或打开/创建文件之前先清理旧租约，
-  失败原样返回，不覆盖旧代次。音频被其它写者占用时启动回滚文件和 SD 使用权，
-  不停止对方流。
-- 占用：目录准备、文件创建、录制、暂停、关闭、WAV finalize 与索引刷新，以及
-  播放从打开到关闭，全程持有 `sd_storage_service` 的业务使用权（SESSION）；
-  删除取独占维护权。因此录音/播放期间可以浏览，但删除、卸载与格式化会被拒绝。
-  播放取得 SESSION、删除取得 MAINTENANCE 后，先核对目标 generation 与租约、
-  当前 SD generation / revision；过期目标在打开或删除之前失败并释放租约，
-  不会触碰同路径的新文件。`ESP_OK` 仅表示命令接受，须等待同一 `operation_id`
-  的 `operation_pending == false` 并检查 `last_error` 后才能判断成功。
-- 索引：worker 在独立扫描前取得 ACCESS，从路径解析、容量查询到目录与每个
-  WAV 头检查、关闭句柄全程持有；录音结束与删除后的刷新复用既有 SESSION / MAINTENANCE。
-  扫描前后核对 SD generation 与内容 revision，变化则丢弃结果；UI 查询只读缓存，
-  过期列表返回空并请求异步刷新，设备与宿主均不在查询中做文件/容量 I/O。
-  失败或中断的目录扫描不发布有效索引；并发扫描用 publication version 防止旧结果覆盖
-  新索引。有效索引变化递增快照 generation，列表验证与复制在同一临界区完成。
-  录音目录由首次录音惰性创建，未录制过的卡上目录不存在属于空库而非扫描失败，
-  `opendir()` 返回 `ENOENT`/`ENOTDIR` 时照常发布空索引（否则首次开机将永久停在读取中）。
-  索引只在内容真正变化时按实际条数复制进运行时缓存；无条件复制 7 KB 会在关中断临界区里
-  付出几十微秒的中断延迟，而读到的字节对任何读者都不可见。
-  每次扫描的完整工作集（`RECORDER_SERVICE_MAX_FILES` 条元数据加两个路径缓冲，
-  约 7.3 KB，类型 `recorder_scan_t`）独立分配在堆上，发布后或扫描失败时释放，不放在
-  `recorder_cmd` 的任务栈上，也不与并发收尾扫描共用 scratch。扫描按字段
-  （文件名、mtime、epoch）比较并直接写入目标槽位，不在栈上构造候选记录。
-  分配失败使索引无效并释放本次 ACCESS；不会上报介质故障，后续 list 可请求重扫。
-- 内容 revision 由 `sd_storage_service` 统一维护，无 `file_service` 依赖。
-  录音先关闭并 finalize WAV，再通知内容变更、刷新索引并释放 SESSION，最后发布
-  IDLE / ERROR 和允许下一次开始；播放关闭不修改内容 revision。
-  缓存容量附带挂载 generation，拔卡/重挂载时不会返回旧容量为有效值。
-- 仅文件系统调用确认的 `errno == EIO` 上报介质故障；任务内存不足、音频失败、
-  权限错误或空间不足不会将健康 SD 标记为故障，仍保证文件关闭与租约释放。
-- 流任务先完成音频停止、文件关闭/收尾、索引刷新和 SESSION 释放，最后锁内发布
-  `task_running=false`，随后只循环 delay park，不自删除。命令任务是唯一创建/回收
-  owner，在锁外用非空 handle 调用 `vTaskDeleteWithCaps`；有待回收流任务时以
-  50 ms 周期接收命令，确保自然 EOF/错误无需新用户命令也能回收。STOP 完成和
-  SHUTDOWN 退出前均先回收；deinit 超时不强杀 I/O 或释放仍在使用的资源。
-  这些外部栈路径仅访问 SD/SDSPI 与 I2S，不执行 NVS、flash 文件系统、OTA 或显式 sleep。
-  SDSPI 复用 SDK slot 的 516 字节内部 DMA staging；外移量不等于净 DMA 空闲增量。
-- deinit 在全部清理成功前保持 initialized/stopping，拒绝新命令。队列存在且尚未
-  成功发送 SHUTDOWN 时按 FIFO 发送 STOP、SHUTDOWN；入队失败可重试，成功发送
-  SHUTDOWN 后的超时重试只等待退出，不再向无人消费的队列追加命令。
-  命令任务退出后删除队列并清空指针；之后音频 release 即使失败，下一次 deinit
-  仍直接重试剩余清理，不访问空队列。成功 deinit 后可重新 init、录音与播放。
+- Singleton; commands go through a bounded queue to a pinned worker task, and
+  recording and playback share one stream task.
+  The device stream task's 4096-byte stack is explicitly allocated with
+  `SPIRAM | 8BIT` and does not fall back to internal RAM; the shared 4096-byte
+  PCM buffer lives in external BSS. The TCB, queues, locks, and the 6144-byte
+  command stack remain internal.
+  The command stack carries the VFS → FATFS → diskio → SDSPI call chain of every
+  index scan; measured at `-O2`, that chain (scan 304, `vfs_fat_stat` 336,
+  `f_stat` 96, `sdspi_host_start_command` 272, `start_command_default` 96, not
+  counting newlib printf and the sector buffer) needs about 1.8 KB, plus the
+  command task's own 576 bytes and interrupt margin; 4096 is not enough, and
+  6144 leaves about 3 KB of headroom.
+  The normal host and the simulator run only the command worker and do not
+  simulate the audio stream, so SESSION is retained until an explicit stop; a
+  separate device-branch host target runs the real stream task to verify the
+  lifecycle.
+- State is identified by `generation` / `operation_id`, and commands complete
+  asynchronously; critical sections and atomics protect the shared fields.
+  All cross-service calls (including SD state, revisions, leases, and timing)
+  execute outside the recorder critical section.
+- State machine: IDLE / RECORDING / PAUSED / PLAYING / ERROR.
+- While paused the capture device keeps running and the stream task keeps
+  reading and discarding input; not reading would accumulate the paused interval
+  in the I2S ring buffer and write it into the file after resume, producing
+  audio the user never recorded and a data length exceeding the reported
+  duration.
+- A failed recording (I/O error, duration limit, header write failure) deletes
+  its `.part` working file after closing; otherwise the library would never
+  list those names and the user could not delete them either, so they would just
+  slowly fill the storage card.
+- Audio streams: recording takes an `AUDIO_SERVICE_SESSION_RECORD` lease
+  (read-write), playback takes an `AUDIO_SERVICE_SESSION_PLAYBACK` lease
+  (write-only); the stream task uses the lease for reads and writes, and the
+  teardown/error paths clear the same-generation handle only when release
+  actually returns `ESP_OK`. Any error (including `ESP_ERR_INVALID_STATE`)
+  retains the cleanup obligation; stop, the next start/play, or deinit can
+  retry it. start/play clean up the old lease before acquiring the SD SESSION or
+  opening/creating the file, and a failure is returned as is without
+  overwriting the old generation. When audio is occupied by another writer,
+  startup rolls back the file and the SD usage rights and does not stop the
+  other stream.
+- Occupancy: directory preparation, file creation, recording, pause, close,
+  WAV finalize, and index refresh, as well as playback from open to close, hold
+  the `sd_storage_service` business usage right (SESSION) throughout; deletion
+  takes the exclusive maintenance right. Therefore browsing works during
+  recording/playback, but deletion, unmount, and format are rejected.
+  After playback acquires SESSION and deletion acquires MAINTENANCE, they first
+  verify the target generation and lease plus the current SD generation /
+  revision; a stale target fails before the open or delete and releases the
+  lease, without touching a new file at the same path. `ESP_OK` only means the
+  command was accepted; success can be judged only after waiting for
+  `operation_pending == false` on the same `operation_id` and checking
+  `last_error`.
+- Index: the worker acquires ACCESS before an independent scan and holds it from
+  path resolution and the capacity query through the directory and every WAV
+  header check and handle close; the refresh after a recording ends and after a
+  deletion reuses the existing SESSION / MAINTENANCE. It verifies the SD
+  generation and content revision before and after the scan and discards the
+  result if they changed; UI queries only read the cache, a stale list returns
+  empty and requests an asynchronous refresh, and neither the device nor the
+  host performs file/capacity I/O inside a query.
+  A failed or interrupted directory scan publishes no valid index; concurrent
+  scans use a publication version to prevent an old result from overwriting a
+  new index. A change to a valid index increments the snapshot generation, and
+  list validation and copying complete in the same critical section.
+  The recordings directory is created lazily by the first recording; a missing
+  directory on a card that has never recorded counts as an empty library rather
+  than a scan failure, and an `opendir()` returning `ENOENT`/`ENOTDIR` still
+  publishes an empty index (otherwise the first boot would stay in loading
+  forever).
+  The index is copied into the runtime cache with the actual entry count only
+  when the content really changed; an unconditional 7 KB copy would pay tens of
+  microseconds of interrupt latency inside the interrupts-disabled critical
+  section while the bytes read are invisible to any reader.
+  The full working set of each scan (`RECORDER_SERVICE_MAX_FILES` entries of
+  metadata plus two path buffers, about 7.3 KB, type `recorder_scan_t`) is
+  allocated independently on the heap and freed after publication or on scan
+  failure; it is not placed on the `recorder_cmd` task stack and is not shared
+  as scratch with a concurrent teardown scan. The scan compares field by field
+  (file name, mtime, epoch) and writes directly into the target slot instead of
+  building a candidate record on the stack.
+  An allocation failure invalidates the index and releases this ACCESS; it does
+  not report a medium fault, and a later list can request a rescan.
+- The content revision is maintained centrally by `sd_storage_service`, with no
+  `file_service` dependency.
+  Recording first closes and finalizes the WAV, then notifies the content
+  change, refreshes the index, and releases SESSION, and finally publishes
+  IDLE / ERROR and allows the next start; a playback close does not modify the
+  content revision.
+  The cached capacity carries the mount generation, so a card removal/remount
+  never returns the old capacity as a valid value.
+- Only `errno == EIO` confirmed by a filesystem call reports a medium fault;
+  task out-of-memory, audio failure, permission errors, or insufficient space do
+  not mark a healthy SD as faulted, and file close plus lease release are still
+  guaranteed.
+- The stream task first finishes the audio stop, file close/finalize, index
+  refresh, and SESSION release, and finally publishes `task_running=false`
+  inside the lock; afterwards it only loops in a delay park and does not delete
+  itself. The command task is the only creation/reclaim owner and calls
+  `vTaskDeleteWithCaps` with a non-NULL handle outside the lock; while there is
+  a stream task awaiting reclamation it receives commands on a 50 ms period, so
+  a natural EOF/error is reclaimed without a new user command. Both STOP
+  completion and SHUTDOWN exit reclaim first; a deinit timeout neither kills
+  I/O nor releases resources still in use.
+  These external stack paths access only SD/SDSPI and I2S and perform no NVS,
+  flash filesystem, OTA, or explicit sleep.
+  SDSPI reuses the SDK slot's 516-byte internal DMA staging; the amount moved
+  out is not the net DMA headroom gain.
+- deinit keeps initialized/stopping until all cleanup succeeds and rejects new
+  commands. When the queue exists and SHUTDOWN has not been sent successfully,
+  STOP and SHUTDOWN are sent in FIFO order; an enqueue failure can be retried,
+  and after SHUTDOWN has been sent successfully a timeout retry only waits for
+  exit and no longer appends commands to a queue nobody consumes.
+  After the command task exits it deletes the queue and clears the pointer; a
+  later audio release failure still lets the next deinit retry the remaining
+  cleanup directly without touching an empty queue. After a successful deinit,
+  init, recording, and playback work again.
 
-## 内存归属
+## Memory Ownership
 
-索引缓存（`RECORDER_SERVICE_MAX_FILES` × 每条元数据，32 条共 7,168 B）放在 PSRAM。
-内部 DRAM 同时承担显示 SPI bounce 缓冲（10 行 × 368 × 2 B × 队列 2 = 14,720 B 连续块）
-与 I2S 全双工 DMA 环（每方向 5,760 B）；索引若留在内部 DRAM，录音启动后单个显示分块
-就会 `ESP_ERR_NO_MEM`，界面停止刷新。
+The index cache (`RECORDER_SERVICE_MAX_FILES` × per-entry metadata, 32 entries
+totaling 7,168 B) lives in PSRAM. Internal DRAM simultaneously carries the
+display SPI bounce buffer (10 lines × 368 × 2 B × queue 2 = 14,720 B contiguous)
+and the I2S full-duplex DMA ring (5,760 B per direction); if the index stayed in
+internal DRAM, a single display chunk after recording starts would fail with
+`ESP_ERR_NO_MEM` and the UI would stop refreshing.
 
-## 测试边界
+## Test Boundary
 
-- `tests/host` 使用真实 pthread 命令 worker 与 audio/SD fake，覆盖异步状态迁移、
-  无卡启动与重挂载、容量查询失败/空间不足、暂停与播放 SESSION、浏览 ACCESS 共存、
-  扫描 ACCESS 阻止维护、扫描中 revision/epoch 变化丢弃、以及关闭/内容失效/租约释放
-  先于 IDLE 发布和下一命令接受的顺序。阻塞容量查询时 UI 快照与列表仍只读缓存。
-  `recorder_service_races_test` 用私有实现测试和确定性 barrier 覆盖通知、目录错误重试、
-  旧/新扫描发布竞争、列表验证/复制交错，以及 EIO 与非存储错误的区分。
-  `recorder_service_recovery_test` 用条件变量和仅测试侧的时钟/队列 seam 覆盖
-  STOP/SHUTDOWN 入队失败、SHUTDOWN 已发送后的等待超时/重试、队列已删除但
-  音频仍失败时多次 deinit，以及不重置 fixture 的重新初始化/录音/播放。
-  音频 fake 用同一 mutex 校验 token/generation、独占 kind 和 RUNNING I/O，
-  release 失败保留 ERROR 与 owner；races/stream 回归同时覆盖保留旧代的恢复。
-  确定性租约 barrier 覆盖播放/删除接受后发生 revision 变化或同路径重挂载替换：
-  原目标终态失败、替换文件逐字节保留、不启动音频且释放 SESSION / MAINTENANCE；
-  同时覆盖当前目标的成功播放/删除及索引元数据与快照 epoch 对应。
-  扫描缓冲 OOM 回归检查索引失效、ACCESS 释放、介质保持可用与后续恢复。
-  `recorder_service_library_test` 覆盖上限截断标记、按修改时间倒序发布、
-  删除至上限后清除截断标记，以及同一秒内两次录音仍取得不同文件名。
-  `recorder_service_stream_test` 单独定义 `ESP_PLATFORM`，使用真实 pthread-backed
-  FreeRTOS 流任务与条件变量控制音频读写。覆盖 WAV 长度/头、显式停止、最大时长、
-  无命令的播放 EOF、读写错误、创建失败补偿、完成早于创建返回、立即 start/play、
-  活跃录音 deinit 与 20 次重复录放，并核对 owner 删除和任务/文件句柄/SESSION 无累计。
-  静态栈帧不含完整 libc/VFS/驱动调用链，不能替代真机栈高水位测量。
-- 宿主不覆盖真实 I2S 音频、SD 卡 I/O 与文件系统掉电。
+- `tests/host` uses a real pthread command worker with audio/SD fakes and covers
+  asynchronous state transitions, boot without a card and remount, a failed
+  capacity query / insufficient space, pause and playback SESSION, browsing
+  ACCESS coexistence, scan ACCESS blocking maintenance, revision/epoch changes
+  during a scan being discarded, and the ordering in which close/content
+  invalidation/lease release precede the IDLE publication and the acceptance of
+  the next command. While a capacity query blocks, the UI snapshot and list
+  still only read the cache.
+  `recorder_service_races_test` uses private implementation tests and
+  deterministic barriers to cover notification, directory error retry, the
+  old/new scan publication race, list validation/copy interleaving, and the
+  distinction between EIO and non-storage errors.
+  `recorder_service_recovery_test` uses condition variables and test-only
+  clock/queue seams to cover STOP/SHUTDOWN enqueue failures, the wait timeout /
+  retry after SHUTDOWN has been sent, repeated deinit while the queue is already
+  deleted but audio still fails, and re-initialization/recording/playback
+  without resetting the fixture.
+  The audio fake uses the same mutex to validate token/generation, the exclusive
+  kind, and RUNNING I/O, and a failed release retains ERROR and the owner; the
+  races/stream regressions also cover recovery that retains the old generation.
+  Deterministic lease barriers cover a revision change or a same-path remount
+  replacement after playback/deletion acceptance: the original target ends in
+  failure, the replacement file is preserved byte for byte, no audio starts, and
+  SESSION / MAINTENANCE is released; they also cover successful
+  playback/deletion of the current target and the index metadata matching the
+  snapshot epoch.
+  The scan buffer OOM regression checks index invalidation, ACCESS release, the
+  medium staying usable, and later recovery.
+  `recorder_service_library_test` covers the limit truncation flag, publication
+  ordered by modification time descending, clearing the truncation flag after
+  deleting down to the limit, and two recordings within the same second still
+  getting different file names.
+  `recorder_service_stream_test` defines `ESP_PLATFORM` separately and uses the
+  real pthread-backed FreeRTOS stream task with condition variables to control
+  audio reads and writes. It covers WAV length/header, explicit stop, maximum
+  duration, playback EOF without a command, read/write errors, compensation when
+  creation fails, completion before creation returns, immediate start/play,
+  deinit of an active recording, and 20 repeated record/playback cycles, and
+  verifies that the owner deletion leaves no accumulation of tasks/file
+  handles/SESSION.
+  Static stack frames do not contain the full libc/VFS/driver call chain and
+  cannot replace an on-device stack high-water measurement.
+- The host does not cover real I2S audio, SD card I/O, or filesystem power loss.
 
-### 设备验证范围
+### Device Verification Scope
 
-带诊断候选 `095ce70ddb04083a6f95fa25c42ab21032c3846c5e9af8ab8cb827d6b1409ffa`
-已完成天气 HTTPS 更新后的长录音、文件浏览、暂停/继续、停止和播放自然结束；
-用户确认操作正常，并进一步确认 Wi-Fi/BLE 同时开启时连续录音正常。
-串口确认流栈与 PCM 在 PSRAM，命令栈仍在内部 RAM；各次已观察流任务由 owner
-回收，任务数从 28 回到 27，未出现目标 LCD DMA 分配失败或显示提交失败。
+The diagnostic candidate
+`095ce70ddb04083a6f95fa25c42ab21032c3846c5e9af8ab8cb827d6b1409ffa` has
+completed a long recording after a weather HTTPS update, file browsing,
+pause/resume, stop, and playback reaching its natural end; the user confirmed
+the operations were normal and further confirmed that continuous recording works
+with Wi-Fi/BLE enabled simultaneously.
+The serial console confirmed that the stream stack and PCM are in PSRAM while
+the command stack remains in internal RAM; every observed stream task was
+reclaimed by the owner, the task count returned from 28 to 27, and no target LCD
+DMA allocation failure or display submit failure occurred.
 
-这些结果支持当前资源放置方案，不构成所有无线负载的内部堆余量保证，也不替代
-冷启动、待机/唤醒或文件系统掉电验证。清理诊断后的固件与该候选分别保存；
-候选的实机结果不能冒充清理后固件已重新上板验证。
+These results support the current resource placement scheme; they do not
+constitute an internal heap headroom guarantee for all wireless loads, nor do
+they replace cold boot, standby/wake, or filesystem power-loss verification. The
+diagnostic-cleaned firmware and that candidate are stored separately; the
+candidate's on-device results cannot claim that the cleaned firmware has been
+re-verified on the board.

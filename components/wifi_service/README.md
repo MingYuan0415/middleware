@@ -1,3 +1,5 @@
+**English** | [简体中文](README_ZH.md)
+
 # Wi-Fi Service
 
 `wifi_service` is the worker-owned single-radio executor. Commands deep-copy

@@ -1,34 +1,49 @@
+**English** | [简体中文](README_ZH.md)
+
 # imu_service
 
-周期采样板载 IMU（QMI8658C），维护最新快照，并经事件总线发布快照、可用性与中断事件。
+Periodically samples the on-board IMU (QMI8658C), maintains the latest
+snapshot, and publishes snapshot, availability, and interrupt events over the
+event bus.
 
-## 对外 API
+## Public API
 
-公共头 `include/imu_service.h`：
+Public header `include/imu_service.h`:
 
-- `imu_service_register_ops()` / `register_imu_ops()`：启动前注册板级操作表（`read` 必需，其余可选）。
-- `imu_service_init()` / `start()`：创建采样 worker 并开始连续采样。
-- `imu_service_stop()` / `deinit()`：停止 worker；deinit 释放 worker 同步对象并清空操作表。
-- `imu_service_suspend()` / `resume()`：暂停或恢复采样，暂停时可选关闭传感器电源门。
-- `imu_service_get_state()`：worker 生命周期状态。
-- `imu_service_get_snapshot()`：复制缓存快照，不访问硬件。
-- `imu_service_read()` / `read_sample()`：与 worker 读串行化的同步硬件读取。
-- 发布 `IMU_SERVICE_MSG` 的 SNAPSHOT_UPDATE、AVAILABILITY_CHANGED、INTERRUPT 子类型。
+- `imu_service_register_ops()` / `register_imu_ops()`: registers the
+  board-level ops table before start (`read` required, the rest optional).
+- `imu_service_init()` / `start()`: creates the sampling worker and begins
+  continuous sampling.
+- `imu_service_stop()` / `deinit()`: stops the worker; deinit releases the
+  worker synchronization objects and clears the ops table.
+- `imu_service_suspend()` / `resume()`: suspends or resumes sampling; while
+  suspended the sensor power gate may optionally be turned off.
+- `imu_service_get_state()`: worker lifecycle state.
+- `imu_service_get_snapshot()`: copies the cached snapshot without accessing
+  the hardware.
+- `imu_service_read()` / `read_sample()`: synchronous hardware read serialized
+  against the worker read.
+- Publishes the SNAPSHOT_UPDATE, AVAILABILITY_CHANGED, and INTERRUPT subtypes
+  of `IMU_SERVICE_MSG`.
 
-## 配置与依赖
+## Configuration and Dependencies
 
-- Kconfig：`IMU_SERVICE_TASK_STACK`（默认 3072）。
-- `idf_component.yml`：仅 `idf: ">=5.0"`。
-- CMake：`REQUIRES event_bus`；`PRIV_REQUIRES mt_log esp_timer`。
-- 运行时由 `imu_service_config_t`（采样率、任务优先级）与注册的 ops 表提供。
+- Kconfig: `IMU_SERVICE_TASK_STACK` (default 3072).
+- `idf_component.yml`: only `idf: ">=5.0"`.
+- CMake: `REQUIRES event_bus`; `PRIV_REQUIRES mt_log esp_timer`.
+- At runtime the sampling rate and task priority come from
+  `imu_service_config_t` plus the registered ops table.
 
-## 状态与并发
+## State and Concurrency
 
-- 单例；pinned worker 任务、互斥锁、临界区与事件组。
-- 同步读与 worker 读共用同一串行化边界；暂停、恢复、停止期间的读会被拒绝。
-- 服务在接受样本时填充单调时间戳与序号。
+- Singleton; pinned worker task, mutex, critical section, and event group.
+- The synchronous read and the worker read share the same serialization
+  boundary; reads are rejected while suspending, resuming, or stopping.
+- The service fills in the monotonic timestamp and sequence number when it
+  accepts a sample.
 
-## 测试边界
+## Test Boundary
 
-- `tests/host` 存在，覆盖 worker 生命周期、快照/读路径与暂停语义。
-- 宿主不覆盖真机传感器 I2C、INT1 电平与 ODR 时序。
+- `tests/host` exists and covers the worker lifecycle, the snapshot/read
+  paths, and suspend semantics.
+- The host does not cover on-device sensor I2C, INT1 level, or ODR timing.
