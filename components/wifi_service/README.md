@@ -36,6 +36,22 @@ Worker credentials are wiped when an attempt is abandoned or suspended.
 The ESP-IDF port retains initialized resources if configuration clearing fails
 during deinit, so a later deinit can retry rather than hiding a failed erase.
 
+## Single target and attempt budgets
+
+The executor drives exactly one target per CONNECT. Choosing among several saved
+networks, their order, and their persistence belong to the caller; the executor
+holds no profile table and never touches NVS.
+
+`wifi_service_request_connect_with_options()` lets the caller define one attempt:
+`retry_limit` bounds completed internal retries, and `association_timeout_ms`
+and `dhcp_timeout_ms` override the compiled deadlines (zero selects the compiled
+value). A caller that owns candidate ordering passes a zero retry limit so an
+absent access point reaches its policy layer with a terminal result instead of
+consuming the internal backoff sequence. The budget belongs to the admitted
+attempt and is wiped together with the worker credentials.
+`wifi_service_request_connect()` is the same call with the compiled retry limit
+and phase deadlines.
+
 ## Verification boundary
 
 `tests/connectivity` links the real executor and manager with a controlled radio

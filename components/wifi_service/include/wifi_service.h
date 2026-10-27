@@ -117,6 +117,25 @@ typedef struct wifi_service_credentials
 bool wifi_service_credentials_valid(
     const wifi_service_credentials_t *credentials);
 
+/**
+ * @brief Per-attempt budget applied to one CONNECT.
+ *
+ * The executor still drives a single target; the budget only decides how long
+ * one attempt may take before its terminal result is published. A caller that
+ * owns candidate ordering uses a zero retry limit so a disappeared access point
+ * reaches the policy layer immediately instead of consuming the internal
+ * backoff sequence.
+ */
+typedef struct wifi_service_connect_options
+{
+    /** Completed internal retries before the attempt terminates (0..limit). */
+    uint8_t retry_limit;
+    /** Association deadline in ms; zero selects the compiled default. */
+    uint16_t association_timeout_ms;
+    /** DHCP deadline in ms; zero selects the compiled default. */
+    uint16_t dhcp_timeout_ms;
+} wifi_service_connect_options_t;
+
 /** @brief One bounded scan result copied from the Wi-Fi driver. */
 typedef struct wifi_service_scan_record
 {
@@ -253,10 +272,33 @@ esp_err_t wifi_service_request_scan(
  * @return ESP_OK when queued; otherwise an ESP-IDF error.
  *
  * @note The caller retains ownership and may scrub its buffers on every return.
+ * @note Equivalent to wifi_service_request_connect_with_options() with a zeroed
+ *       option block, which selects the compiled retry and phase defaults.
  */
 esp_err_t wifi_service_request_connect(
     wifi_service_session_id_t session_id,
     const wifi_service_credentials_t *credentials,
+    wifi_service_operation_id_t *out_operation_id);
+
+/**
+ * @brief Deep-copy credentials and admit a connect with an explicit budget.
+ *
+ * @param session_id identifies the current client session.
+ * @param credentials contains borrowed credential bytes copied before return.
+ * @param options is the per-attempt budget; NULL selects every compiled default.
+ * @param out_operation_id receives the admitted operation generation.
+ *
+ * @return ESP_OK when queued; ESP_ERR_INVALID_ARG for an unsupported retry
+ *         limit or an option value that does not fit its wire width; otherwise
+ *         an ESP-IDF error.
+ *
+ * @note The budget belongs to this attempt only; a later attempt without
+ *       options returns to the compiled defaults.
+ */
+esp_err_t wifi_service_request_connect_with_options(
+    wifi_service_session_id_t session_id,
+    const wifi_service_credentials_t *credentials,
+    const wifi_service_connect_options_t *options,
     wifi_service_operation_id_t *out_operation_id);
 
 /**

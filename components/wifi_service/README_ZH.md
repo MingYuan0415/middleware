@@ -30,6 +30,18 @@ CONNECT/DISCONNECT。已完成的结果在下一次 CONNECT/DISCONNECT 采纳或
 若反初始化期间清除配置失败，ESP-IDF 端口保留已初始化资源，因此后续反初始化
 可以重试，而不会掩盖一次失败的擦除。
 
+## 单一目标与尝试预算
+
+执行器每次 CONNECT 只驱动一个目标。在多个已保存网络之间选择、其顺序以及
+持久化都属于调用方；执行器不持有档位表，也从不访问 NVS。
+
+`wifi_service_request_connect_with_options()` 让调用方界定"一次尝试"：
+`retry_limit` 限制已完成的内部重试次数，`association_timeout_ms` 与
+`dhcp_timeout_ms` 覆盖编译期截止时间（传零则使用编译期值）。自行负责候选排序的
+调用方传零重试上限，使一个已消失的接入点以终态立刻回到其策略层，而不消耗内部
+退避序列。该预算只属于被采纳的那次尝试，并与 worker 凭据一起被擦除。
+`wifi_service_request_connect()` 就是使用编译期重试上限与阶段截止时间的同一次调用。
+
 ## 验证边界
 
 `tests/connectivity` 在受控射频边界下链接真实执行器与管理器，并另外针对 SDK

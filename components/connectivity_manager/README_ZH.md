@@ -10,14 +10,46 @@ Wi-Fi 连接策略 owner：策略 worker 负责扫描、连接、重连、配置
 
 - `connectivity_manager_init()` / `deinit()` / `suspend()` / `resume()`：生命周期与待机。
 - `connectivity_manager_clear_persisted_profile()`：初始化前幂等擦除持久化 profile（复位域）。
-- 前台命令：`request_scan()`、`request_connect()`、`request_sync_profile()`、`request_save_profile()`、`request_disconnect()`、`request_reconnect_saved()`、`request_forget()`、`set_auto_connect()`、`cancel()`；均返回非零 `operation_id`。
-- `connectivity_manager_get_status()` / `get_scan_snapshot()`：读取不含密码的不可变状态或扫描快照。
+- 前台命令：`request_scan()`、`request_connect()`、`request_sync_profile()`、`request_save_profile()`、`request_connect_network()`、`request_forget_network()`、`request_disconnect()`、`request_reconnect_saved()`、`request_forget()`、`set_auto_connect()`、`cancel()`；均返回非零 `operation_id`。
+- `connectivity_manager_get_status()` / `get_scan_snapshot()` / `get_profiles()`：读取不含密码的不可变状态、扫描或已保存网络快照。
 - `connectivity_manager_is_available()`：公开 API 是否可用。
-- 通过 `EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG)` 发布状态与扫描快照事件。
+- 通过 `EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG)` 发布状态、扫描与已保存网络快照事件。
+
+## 已保存网络
+
+管理器最多保留 `CONNECTIVITY_MANAGER_MAX_PROFILES` 个已保存网络，并以单条记录整体持久化，
+因此多份凭据可跨重启存活。
+
+- `request_save_profile()` 按 SSID upsert：已存在则替换，否则追加。当所有槽位都被其他网络占用时
+  以 `ESP_ERR_NO_MEM` 拒绝，不会静默淘汰任一网络。保存同时启用自动连接，这正是"配网后下次开机
+  即可用"的依据。
+- 其中一个条目是被选中的档位。`request_connect_network()` 从指定条目开始尝试，
+  `request_reconnect_saved()` 从被选中的条目开始；指定条目只有在链路成功后才成为选中档位。
+  失败的尝试绝不改写选中档位，因此即使用户选择的那条在扫描中失败、其余网络也都试过，用户的选择
+  依然保留。
+- `request_forget_network()` 删除单个条目：删的是承载链路的条目时，由断开终态完成删除；否则
+  保留已建立的链路、其状态与自动连接策略，且不会让射频进入手动离线保持。`request_forget()`
+  是合同级 FORGET，清空全部条目，从而使 Device Link 的 `profile_ssid` 为空。
+- 被拒绝的删除写入会在 RAM 中回滚，因此列表绝不会宣称一次未落到 flash 的删除。
+- `status.profile_count`、`status.saved_profile` 与 Device Link 的 `profile_ssid` 投影描述的是
+  已保存列表与被选中条目，而不是任意一条；扫描失败后两者仍指向被选中的条目。
+
+### 尝试顺序
+
+尝试顺序只存在于 RAM，仅在保存、删除或选择档位时改变；建立连接不会为记录它而写 flash。
+
+已保存网络多于一个时，一次连接操作会扫描整个列表：先试起始条目，再按尝试顺序试其余条目。
+分类为 `AP_NOT_FOUND`、`ASSOCIATION_TIMEOUT`、`DHCP_TIMEOUT` 或 `LINK_LOST` 时前进到下一个候选；
+认证失败会结束扫描，让错误密码暴露出来而不是静默连到别处；射频级失败同样结束扫描，因为问题在
+radio 而非候选。候选耗尽后进入长退避策略，不发布失败终态；取消则结束该操作。扫描使用自己的
+游标，从不改写选中档位，因此候选全部耗尽后用户的选择与其持久化的 `active_index` 都保持不变。
+
+每次扫描尝试都带 `wifi_service_connect_options_t` 的零重试上限，使缺失的接入点立刻回到策略层，
+而不消耗执行器内部的退避序列。只保存了一个网络时管理器不传选项块，执行器继续使用编译期重试预算。
 
 ## 配置与依赖
 
-- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 6144）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）。
+- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 6144）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）、`CONNECTIVITY_MANAGER_MAX_PROFILES`（默认 4，范围 1..5）。
 - CMake：`REQUIRES event_bus`；`PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`。
 - 运行时由 `connectivity_manager_config_t`（策略 worker 优先级、低层 Wi-Fi worker 优先级）配置。
 
@@ -31,6 +63,19 @@ Wi-Fi 连接策略 owner：策略 worker 负责扫描、连接、重连、配置
 - terminal outbox 在每轮策略 phase 前排空；背压期间不消费 pending/retry/恢复意图。排空后由同一 worker 自主推进，不依赖额外驱动事件；STOPPING 不重开连接。
 - 挂起中的显式 CONNECT/SYNC 保留原 manager operation、候选与 sync 元数据；恢复仅重启 executor，由 policy phase 使用新 radio ID/epoch 续接。取消和替代在本地发布一次终态，不对已退休的 radio ID0 发 cancel。
 - retry 的绝对 deadline 跨待机保留；resume 控制失败不自动重试，也不丢弃候选。低层已实际 SUSPENDED 时，即使控制返回原 stop 错误，也保存 parked 意图供显式 resume 回滚。
+
+## 持久化记录
+
+`wifi_profile` NVS 键保存一条带版本的记录：头部（magic、version、数量、选中索引、自动连接策略、
+revision 与 Device Link 同步窗口）之后是五个固定 103 字节的条目槽。无论
+`CONNECTIVITY_MANAGER_MAX_PROFILES` 取何值，记录始终保留五个槽，因此由槽数更多的构建写下的记录
+在调小该值后仍可读取。加载时保留前 `CONNECTIVITY_MANAGER_MAX_PROFILES` 个条目，把选中索引夹到
+该范围内，并在同一次启动内回写记录使 flash 与 RAM 一致；超出上限的条目在此刻被丢弃。结构上无效的
+记录仍会被拒绝，而不是只加载其中一部分。
+
+v1（112 字节）、v2（128 字节）或 v3（168 字节）的单档记录会在加载时升级为单条目列表并回写；
+写失败时原字节保持不变，初始化报告存储失败。无效记录会被拒绝且不清除 flash；被拒绝的写入
+也绝不会让 RAM 列表宣称一个尚未持久化的条目。写入方会拒绝编码选中索引不指向已保留条目的记录。
 
 ## 测试边界
 

@@ -20,7 +20,7 @@
 | `recorder_service` | 独占录音音频会话和 SD WAV 文件；专属 worker 执行录音、播放、删除和 finalize；扫描持 ACCESS，录音/播放持 SESSION，容量、代次及内容修订均来自 SD owner，UI 只读缓存 | `audio_service`、`sd_storage_service`；`esp_timer`、`mt_log`（私有） |
 | `system_pm` | 串行执行外设休眠钩子、ESP32 轻睡眠与唤醒恢复，并管理 CPU 最高频率锁 | `mt_log` 和 ESP-IDF PM/GPIO/硬件支持组件（私有） |
 | `time_service` | 维护 `CST-8` 本地时区、RTC/日历 alarm 桥接、时钟可信度和系统级异步 SNTP 同步 | `event_bus`、`nv_storage`、网络栈等（私有） |
-| `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理 profile、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
+| `connectivity_manager` | 生产 Wi-Fi 策略唯一所有者；管理多个已保存网络与候选回退、自动连接、长退避、前台抢占和待机协调 | `event_bus`；`nv_storage`、`wifi_service`（私有） |
 | `wifi_service` | 单射频异步执行层；串行处理扫描、连接、断开和射频挂起，不持久化 STA 凭据 | `event_bus`；ESP-IDF Wi-Fi/网络组件（私有） |
 | `ble_runtime` | NimBLE host、静态 GATT、GAP/ADV、Device Link v1 transport、不可变异步身份和 TX/deadline 调度的唯一底层 owner | `bt`、`device_link`；`freertos`、`mt_log`（私有） |
 | `device_link_service` | 串行拥有绑定窗口、Numeric Comparison 确认、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link`、`event_bus` |

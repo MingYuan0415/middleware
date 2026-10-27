@@ -17,6 +17,8 @@ extern "C" {
 #define CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS   5U
 #define CONNECTIVITY_MANAGER_WAIT_FOREVER       UINT32_MAX
 #define CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL UINT64_C(1)
+/** @brief Maximum number of saved networks retained at the same time. */
+#define CONNECTIVITY_MANAGER_MAX_PROFILES CONFIG_CONNECTIVITY_MANAGER_MAX_PROFILES
 
 EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG);
 
@@ -71,6 +73,7 @@ typedef enum
 {
     CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT = 1,
     CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
+    CONNECTIVITY_MANAGER_MSG_SUB_TYPE_PROFILE_SNAPSHOT,
 } connectivity_manager_msg_sub_type_t;
 
 /** @brief Borrowed credentials copied during command admission. */
@@ -85,6 +88,33 @@ typedef struct connectivity_manager_credentials
 
 /** @brief Nonzero client identity used to make profile sync idempotent. */
 typedef uint64_t connectivity_manager_client_sync_id_t;
+
+/** @brief Password-free description of one saved network. */
+typedef struct connectivity_manager_profile_info
+{
+    char ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U]; /**< NUL-terminated SSID. */
+    uint8_t ssid_length;                            /**< Number of SSID bytes. */
+    uint8_t active;                                 /**< Selected target profile. */
+    connectivity_manager_security_t security;       /**< Saved security mode. */
+} connectivity_manager_profile_info_t;
+
+/**
+ * @brief Immutable bounded list of saved networks and their attempt order.
+ *
+ * @note `active_index` selects the profile CONNECT and Device Link's
+ *       `profile_ssid` refer to. `order` lists indices in the order the manager
+ *       would attempt them next; it is a RAM hint and is not persisted per
+ *       connection.
+ */
+typedef struct connectivity_manager_profile_snapshot
+{
+    uint64_t generation;                        /**< Snapshot generation. */
+    uint8_t count;                              /**< Valid profile entries. */
+    uint8_t active_index;                       /**< Selected entry or UINT8_MAX. */
+    uint8_t order[CONNECTIVITY_MANAGER_MAX_PROFILES]; /**< Attempt order. */
+    connectivity_manager_profile_info_t
+    profiles[CONNECTIVITY_MANAGER_MAX_PROFILES]; /**< Saved networks. */
+} connectivity_manager_profile_snapshot_t;
 
 /** @brief One sanitized bounded scan result. */
 typedef struct connectivity_manager_scan_record
@@ -107,6 +137,7 @@ typedef struct connectivity_manager_status_snapshot
     uint32_t ipv4_address;                          /**< Network-order IPv4. */
     uint32_t retry_delay_ms;                        /**< Remaining policy delay. */
     uint8_t retry_count;                            /**< Long retry attempt. */
+    uint8_t profile_count;                          /**< Saved networks, 0..max. */
     bool available;                                 /**< Manager is initialized. */
     bool radio_available;                           /**< Radio executor is ready. */
     bool saved_profile;                             /**< A valid profile exists. */
@@ -147,7 +178,7 @@ esp_err_t connectivity_manager_init(
     const connectivity_manager_config_t *config);
 
 /**
- * @brief Idempotently erase the persisted Wi-Fi profile before init.
+ * @brief Idempotently erase every persisted Wi-Fi profile before init.
  *
  * This reset-domain API owns the private profile key and excludes a racing
  * manager initialization through the lifecycle state machine.
@@ -211,11 +242,44 @@ esp_err_t connectivity_manager_request_sync_profile(
 /**
  * @brief Persist credentials without starting a connection.
  *
+ * An existing entry with the same SSID is replaced; otherwise the credentials
+ * are appended. The save is rejected with ESP_ERR_NO_MEM when all profile slots
+ * are occupied by other networks.
+ *
  * @param credentials contains borrowed bytes copied before return.
  * @param out_operation_id receives the admitted operation generation.
  */
 esp_err_t connectivity_manager_request_save_profile(
     const connectivity_manager_credentials_t *credentials,
+    connectivity_manager_operation_id_t *out_operation_id);
+
+/**
+ * @brief Connect one specific saved network.
+ *
+ * The named profile becomes the active target on success. A name that is not
+ * saved returns ESP_ERR_NOT_FOUND through the operation terminal rather than
+ * silently falling back to another profile.
+ *
+ * @param ssid is borrowed and copied before return.
+ * @param ssid_length is the number of SSID bytes.
+ * @param out_operation_id receives the admitted operation generation.
+ * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
+ */
+esp_err_t connectivity_manager_request_connect_network(
+    const char *ssid, size_t ssid_length,
+    connectivity_manager_operation_id_t *out_operation_id);
+
+/**
+ * @brief Forget one saved network and disconnect it when it is the active link.
+ *
+ * @param ssid is borrowed and compared before return.
+ * @param ssid_length is the number of SSID bytes.
+ * @param out_operation_id receives the admitted operation generation.
+ * @return ESP_OK when queued; ESP_ERR_NOT_FOUND for an unknown SSID; otherwise
+ *         an argument, lifecycle, or queue error.
+ */
+esp_err_t connectivity_manager_request_forget_network(
+    const char *ssid, size_t ssid_length,
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
@@ -228,7 +292,10 @@ esp_err_t connectivity_manager_request_disconnect(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Connect immediately using the saved profile.
+ * @brief Connect immediately using the selected saved profile.
+ *
+ * When the selected profile fails, the manager continues with the remaining
+ * saved profiles in its attempt order before it reports a terminal failure.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
@@ -237,7 +304,11 @@ esp_err_t connectivity_manager_request_reconnect_saved(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Forget the saved profile and disconnect.
+ * @brief Forget every saved network and disconnect.
+ *
+ * This is the contract-level FORGET: afterwards `saved_profile` is false and the
+ * Device Link `profile_ssid` is empty. Use
+ * connectivity_manager_request_forget_network() to remove a single entry.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
@@ -247,6 +318,8 @@ esp_err_t connectivity_manager_request_forget(
 
 /**
  * @brief Persistently enable or disable automatic connection.
+ *
+ * The policy applies to the whole saved-network list, not to one entry.
  *
  * @param enabled selects the persistent automatic connection policy.
  * @param out_operation_id receives the admitted operation generation.
@@ -281,6 +354,15 @@ esp_err_t connectivity_manager_get_status(
  */
 esp_err_t connectivity_manager_get_scan_snapshot(
     connectivity_manager_scan_snapshot_t *snapshot);
+
+/**
+ * @brief Read the cached saved-network list without exposing passwords.
+ *
+ * @param snapshot receives the bounded immutable copy.
+ * @return ESP_OK on success; otherwise an argument or lifecycle error.
+ */
+esp_err_t connectivity_manager_get_profiles(
+    connectivity_manager_profile_snapshot_t *snapshot);
 
 /**
  * @brief Report whether the policy worker is initialized.

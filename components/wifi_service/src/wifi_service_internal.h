@@ -30,6 +30,9 @@
     #define WIFI_SERVICE_DHCP_TIMEOUT_MS 15000U
 #endif
 
+/** Largest association or DHCP deadline accepted through an option block. */
+#define WIFI_SERVICE_MAX_PHASE_TIMEOUT_MS 60000U
+
 #define WIFI_SERVICE_CREDENTIAL_SLOTS 2U
 #define WIFI_SERVICE_RETRY_LIMIT      3U
 #define WIFI_SERVICE_WORKER_POLL_MS   20U
@@ -101,6 +104,7 @@ typedef struct wifi_queue_item
     uint64_t admission_generation;
     uint64_t credential_generation;
     uint8_t credential_slot;
+    wifi_service_connect_options_t options;
     wifi_service_port_event_t event;
 } wifi_queue_item_t;
 
@@ -123,6 +127,7 @@ typedef struct wifi_worker_context
     TickType_t publish_retry_deadline;
     wifi_service_port_credentials_t credentials;
     bool has_credentials;
+    wifi_service_connect_options_t attempt_options;
     bool radio_ready;
     bool suspended;
     bool scan_active;
@@ -261,6 +266,28 @@ void wifi_service_worker_publish_availability(bool available);
  * @param context is the worker-owned runtime state.
  */
 void wifi_service_worker_wipe_secret(wifi_worker_context_t *context);
+
+/**
+ * @brief Return the completed-retry budget of the current attempt.
+ * @param context is the worker-owned runtime state.
+ * @return Zero when the attempt must not retry, otherwise the retry limit.
+ */
+uint8_t wifi_service_worker_retry_limit(const wifi_worker_context_t *context);
+
+/**
+ * @brief Return the association deadline ticks of the current attempt.
+ * @param context is the worker-owned runtime state.
+ * @return Absolute-relative tick count resolved from the attempt budget.
+ */
+TickType_t wifi_service_worker_association_ticks(
+    const wifi_worker_context_t *context);
+
+/**
+ * @brief Return the DHCP deadline ticks of the current attempt.
+ * @param context is the worker-owned runtime state.
+ * @return Absolute-relative tick count resolved from the attempt budget.
+ */
+TickType_t wifi_service_worker_dhcp_ticks(const wifi_worker_context_t *context);
 
 /**
  * @brief Commit a protected runtime state and command-admission policy.

@@ -10,4 +10,18 @@ config CONNECTIVITY_MANAGER_QUEUE_DEPTH
     default 8
     range 4 32
 
+config CONNECTIVITY_MANAGER_MAX_PROFILES
+    int "Saved Wi-Fi networks retained at the same time"
+    default 4
+    range 1 5
+    help
+        The upper bound of 5 keeps the password-free profile snapshot inside
+        the event-bus UI payload budget. The persisted record always reserves
+        five entry slots, so a record written by a build with more slots stays
+        readable after this value is lowered: loading keeps the first
+        CONNECTIVITY_MANAGER_MAX_PROFILES entries, clamps the selected index
+        into that range, and rewrites the record. Entries beyond the limit are
+        dropped by that rewrite. A structurally invalid record is still
+        rejected rather than partially loaded.
+
 endmenu

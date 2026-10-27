@@ -688,7 +688,8 @@ static wifi_credential_slot_t *_wifi_service_reserve_credentials_locked(
 
 static esp_err_t _wifi_service_enqueue_connect_locked(
     wifi_service_session_id_t session_id, wifi_credential_slot_t *slot,
-    uint8_t slot_index, wifi_service_operation_id_t *out_operation_id)
+    uint8_t slot_index, const wifi_service_connect_options_t *options,
+    wifi_service_operation_id_t *out_operation_id)
 {
     esp_err_t result = ESP_ERR_NO_MEM;
     wifi_service_operation_id_t operation =
@@ -701,6 +702,7 @@ static esp_err_t _wifi_service_enqueue_connect_locked(
         .admission_generation = g_wifi_service.admission_generation,
         .credential_generation = slot->generation,
         .credential_slot = slot_index,
+        .options = *options,
     };
     if (xQueueSend(g_wifi_service.queue, &item, 0) == pdTRUE)
     {
@@ -711,17 +713,48 @@ static esp_err_t _wifi_service_enqueue_connect_locked(
     return result;
 }
 
+static bool _wifi_service_connect_options_valid(
+    const wifi_service_connect_options_t *options)
+{
+    return options == NULL ||
+           (options->retry_limit <= WIFI_SERVICE_RETRY_LIMIT &&
+            options->association_timeout_ms <=
+            WIFI_SERVICE_MAX_PHASE_TIMEOUT_MS &&
+            options->dhcp_timeout_ms <= WIFI_SERVICE_MAX_PHASE_TIMEOUT_MS);
+}
+
 esp_err_t wifi_service_request_connect(
     wifi_service_session_id_t session_id,
     const wifi_service_credentials_t *credentials,
+    wifi_service_operation_id_t *out_operation_id)
+{
+    return wifi_service_request_connect_with_options(session_id, credentials,
+            NULL, out_operation_id);
+}
+
+esp_err_t wifi_service_request_connect_with_options(
+    wifi_service_session_id_t session_id,
+    const wifi_service_credentials_t *credentials,
+    const wifi_service_connect_options_t *options,
     wifi_service_operation_id_t *out_operation_id)
 {
     esp_err_t result = ESP_ERR_INVALID_ARG;
     bool state_owned = false;
     wifi_credential_slot_t *slot = NULL;
     uint8_t slot_index = 0;
+    /* An absent option block keeps the compiled retry limit; a supplied block
+     * uses its value verbatim, so a zero limit means single attempt. */
+    const wifi_service_connect_options_t budget =
+    {
+        .retry_limit = options != NULL ? options->retry_limit :
+        WIFI_SERVICE_RETRY_LIMIT,
+        .association_timeout_ms = options != NULL ?
+        options->association_timeout_ms : 0U,
+        .dhcp_timeout_ms = options != NULL ? options->dhcp_timeout_ms : 0U,
+    };
     if (session_id == 0 || out_operation_id == NULL ||
-            !wifi_service_credentials_valid(credentials))
+            !wifi_service_credentials_valid(credentials) ||
+            !_wifi_service_connect_options_valid(options))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -748,7 +781,7 @@ esp_err_t wifi_service_request_connect(
         goto exit;
     }
     result = _wifi_service_enqueue_connect_locked(
-                 session_id, slot, slot_index, out_operation_id);
+                 session_id, slot, slot_index, &budget, out_operation_id);
 
 exit:
     if (result != ESP_OK && slot != NULL)

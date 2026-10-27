@@ -249,7 +249,39 @@ void wifi_service_worker_wipe_secret(wifi_worker_context_t *context)
     wifi_service_secure_zero(&context->credentials,
                              sizeof(context->credentials));
     context->has_credentials = false;
+    memset(&context->attempt_options, 0, sizeof(context->attempt_options));
     _wifi_service_mark_worker_secret(true);
+}
+
+uint8_t wifi_service_worker_retry_limit(const wifi_worker_context_t *context)
+{
+    return context->attempt_options.retry_limit;
+}
+
+static TickType_t _wifi_service_phase_ticks(uint16_t requested_ms,
+        uint32_t default_ms)
+{
+    const uint32_t total_ms = requested_ms != 0U ? requested_ms : default_ms;
+    TickType_t ticks = pdMS_TO_TICKS(total_ms);
+    if (total_ms != 0U && ticks == 0U)
+    {
+        ticks = 1;
+    }
+    return ticks;
+}
+
+TickType_t wifi_service_worker_association_ticks(
+    const wifi_worker_context_t *context)
+{
+    return _wifi_service_phase_ticks(
+               context->attempt_options.association_timeout_ms,
+               WIFI_SERVICE_ASSOCIATION_TIMEOUT_MS);
+}
+
+TickType_t wifi_service_worker_dhcp_ticks(const wifi_worker_context_t *context)
+{
+    return _wifi_service_phase_ticks(context->attempt_options.dhcp_timeout_ms,
+                                     WIFI_SERVICE_DHCP_TIMEOUT_MS);
 }
 
 void wifi_service_worker_set_runtime(wifi_runtime_state_t state,
@@ -624,8 +656,7 @@ esp_err_t wifi_service_worker_connect_driver(
     {
         context->retry_pending = false;
         context->phase_deadline = xTaskGetTickCount() +
-                                  pdMS_TO_TICKS(
-                                      WIFI_SERVICE_ASSOCIATION_TIMEOUT_MS);
+                                  wifi_service_worker_association_ticks(context);
         context->phase_deadline_pending = true;
         context->status.state = WIFI_SERVICE_STATE_CONNECTING;
         context->status.failure = WIFI_SERVICE_FAILURE_NONE;
@@ -660,7 +691,8 @@ void wifi_service_worker_schedule_retry(wifi_worker_context_t *context,
     if (!context->status.desired_connected ||
             !context->has_credentials ||
             failure == WIFI_SERVICE_FAILURE_AUTHENTICATION ||
-            context->status.retry_count >= WIFI_SERVICE_RETRY_LIMIT)
+            context->status.retry_count >=
+            wifi_service_worker_retry_limit(context))
     {
         const wifi_service_radio_transition_t transition =
             wifi_service_worker_transition_radio(context, WIFI_RADIO_TARGET_STARTED);
@@ -994,6 +1026,7 @@ static void _wifi_service_begin_connect(wifi_worker_context_t *context,
     wifi_service_worker_wipe_secret(context);
     context->credentials = credentials;
     context->has_credentials = true;
+    context->attempt_options = item->options;
     _wifi_service_mark_worker_secret(false);
     context->status.session_id = item->session_id;
     context->status.operation_id = item->operation_id;
@@ -1101,7 +1134,7 @@ static void _wifi_service_process_connected(wifi_worker_context_t *context)
     {
         context->status.state = WIFI_SERVICE_STATE_WAITING_IP;
         context->phase_deadline = xTaskGetTickCount() +
-                                  pdMS_TO_TICKS(WIFI_SERVICE_DHCP_TIMEOUT_MS);
+                                  wifi_service_worker_dhcp_ticks(context);
         context->phase_deadline_pending = true;
         context->status.last_error = ESP_OK;
         wifi_service_worker_publish_status(context);

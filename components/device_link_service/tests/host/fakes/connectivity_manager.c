@@ -255,3 +255,32 @@ esp_err_t connectivity_manager_cancel(
 {
     return operation_id == 0U ? ESP_ERR_INVALID_ARG : ESP_OK;
 }
+
+esp_err_t connectivity_manager_request_connect_network(
+    const char *ssid, size_t ssid_length,
+    connectivity_manager_operation_id_t *operation_id)
+{
+    return ssid == NULL || ssid_length == 0U ? ESP_ERR_INVALID_ARG :
+           _admit(operation_id);
+}
+
+esp_err_t connectivity_manager_request_forget_network(
+    const char *ssid, size_t ssid_length,
+    connectivity_manager_operation_id_t *operation_id)
+{
+    return ssid == NULL || ssid_length == 0U ? ESP_ERR_INVALID_ARG :
+           _admit(operation_id);
+}
+
+esp_err_t connectivity_manager_get_profiles(
+    connectivity_manager_profile_snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->generation = 1U;
+    snapshot->active_index = UINT8_MAX;
+    return ESP_OK;
+}
