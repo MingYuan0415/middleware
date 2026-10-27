@@ -18,7 +18,7 @@ extern "C" {
 #define CONNECTIVITY_MANAGER_WAIT_FOREVER       UINT32_MAX
 #define CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL UINT64_C(1)
 /** @brief Maximum number of saved networks retained at the same time. */
-#define CONNECTIVITY_MANAGER_MAX_PROFILES CONFIG_CONNECTIVITY_MANAGER_MAX_PROFILES
+#define CONNECTIVITY_MANAGER_MAX_PROFILES 5U
 
 EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG);
 
@@ -126,7 +126,16 @@ typedef struct connectivity_manager_scan_record
     bool saved;                                             /**< Saved profile. */
 } connectivity_manager_scan_record_t;
 
-/** @brief Immutable global connectivity policy snapshot. */
+/**
+ * @brief Immutable global connectivity policy snapshot.
+ *
+ * @note `ssid` names the selected profile, which is what Device Link's
+ *       `profile_ssid` projects. During a fallback sweep the manager may be
+ *       attempting a different network; `attempt_index` and `attempt_total`
+ *       describe that cursor, and `attempt_total` is 0 when no sweep runs.
+ *       `ssid` keeps naming the selected profile throughout, so a failed sweep
+ *       cannot make it disagree with the persisted selection.
+ */
 typedef struct connectivity_manager_status_snapshot
 {
     uint64_t generation;                            /**< Snapshot generation. */
@@ -138,6 +147,8 @@ typedef struct connectivity_manager_status_snapshot
     uint32_t retry_delay_ms;                        /**< Remaining policy delay. */
     uint8_t retry_count;                            /**< Long retry attempt. */
     uint8_t profile_count;                          /**< Saved networks, 0..max. */
+    uint8_t attempt_index;                          /**< Candidate being tried. */
+    uint8_t attempt_total;                          /**< Candidates in the sweep. */
     bool available;                                 /**< Manager is initialized. */
     bool radio_available;                           /**< Radio executor is ready. */
     bool saved_profile;                             /**< A valid profile exists. */

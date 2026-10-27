@@ -49,6 +49,8 @@
 #define CONNECTIVITY_MANAGER_ATTEMPT_BUDGET_ASSOCIATION_TIMEOUT_MS 8000U
 #define CONNECTIVITY_MANAGER_ATTEMPT_BUDGET_DHCP_TIMEOUT_MS 10000U
 #define CONNECTIVITY_MANAGER_NO_ACTIVE_PROFILE UINT8_MAX
+/** Reported when no fallback sweep is running. */
+#define CONNECTIVITY_MANAGER_NO_ATTEMPT UINT8_MAX
 #define CONNECTIVITY_MANAGER_TERMINAL_OUTBOX_CAPACITY \
     (CONFIG_CONNECTIVITY_MANAGER_QUEUE_DEPTH + 2U)
 #define CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY \
@@ -332,10 +334,9 @@ _Static_assert(sizeof(manager_profile_v2_t) == 128U,
                "Wi-Fi profile v2 record size changed");
 _Static_assert(sizeof(manager_profile_v1_t) == 112U,
                "Wi-Fi profile v1 record size changed");
-_Static_assert(CONNECTIVITY_MANAGER_MAX_PROFILES >= 1U &&
-               CONNECTIVITY_MANAGER_MAX_PROFILES <=
+_Static_assert(CONNECTIVITY_MANAGER_MAX_PROFILES ==
                CONNECTIVITY_MANAGER_PERSISTED_PROFILES,
-               "configured profile slots must fit the persisted record");
+               "the in-RAM list and the persisted record share one width");
 _Static_assert(sizeof(connectivity_manager_status_snapshot_t) <=
                EVENT_BUS_MAX_UI_PAYLOAD_SIZE, "status snapshot too large");
 _Static_assert(sizeof(connectivity_manager_scan_snapshot_t) <=
@@ -918,14 +919,6 @@ static void _manager_worker_clear_profiles(manager_worker_t *worker)
     }
 }
 
-/** @brief Report how many saved entries the compiled configuration keeps. */
-static uint8_t _manager_effective_count(uint8_t persisted_count)
-{
-    const uint8_t limit = (uint8_t)CONNECTIVITY_MANAGER_MAX_PROFILES;
-
-    return persisted_count > limit ? limit : persisted_count;
-}
-
 static esp_err_t _manager_profile_load(manager_worker_t *worker)
 {
     uint8_t raw[sizeof(manager_profile_t)];
@@ -1047,32 +1040,12 @@ static esp_err_t _manager_profile_load(manager_worker_t *worker)
         return ESP_ERR_INVALID_RESPONSE;
     }
     _manager_worker_clear_profiles(worker);
-    worker->profile_count = _manager_effective_count(profile.count);
-    if (profile.count == 0U)
-    {
-        worker->active_index = CONNECTIVITY_MANAGER_NO_ACTIVE_PROFILE;
-    }
-    else if (profile.active_index < worker->profile_count)
-    {
-        worker->active_index = profile.active_index;
-    }
-    else
-    {
-        /* A record written with a larger slot count keeps a valid index that
-         * this build no longer has room for; clamp it so the list stays
-         * self-consistent and the rewrite below aligns flash with RAM. */
-        worker->active_index = (uint8_t)(worker->profile_count - 1U);
-    }
-    if (worker->profile_count != profile.count)
-    {
-        LOG_W("profile count %u exceeds limit %u, keeping the first %u",
-              (unsigned)profile.count,
-              (unsigned)CONNECTIVITY_MANAGER_MAX_PROFILES,
-              (unsigned)worker->profile_count);
-        /* Flash still holds the wider list, so the clamped one must be written
-         * back inside this boot instead of waiting for the next save. */
-        migration_required = true;
-    }
+    /* The in-RAM list and the persisted record are both exactly
+     * CONNECTIVITY_MANAGER_MAX_PROFILES wide, so a valid record loads whole. */
+    worker->profile_count = profile.count;
+    worker->active_index = profile.count == 0U ?
+                           CONNECTIVITY_MANAGER_NO_ACTIVE_PROFILE :
+                           profile.active_index;
     worker->auto_connect = profile.auto_connect;
     worker->profile_revision = profile.profile_revision;
     worker->last_client_sync_id = profile.last_client_sync_id;
@@ -1566,11 +1539,20 @@ static void _manager_set_target_status(manager_worker_t *worker)
                                             worker->sync_window_valid != 0U ?
                                             worker->last_client_sync_id : 0U;
     const manager_profile_entry_t *target = _manager_target_profile(worker);
+    /* A sweep moves `target` across saved entries, but the reported SSID stays
+     * on the selected profile: that is what Device Link's `profile_ssid` means,
+     * and letting the cursor drive it would make a failed sweep look like the
+     * user reselected whatever was tried last. The cursor is reported
+     * separately through attempt_index/attempt_total. A connect with fresh,
+     * unsaved credentials is not a sweep, so it still names its own SSID. */
+    const bool sweeping = worker->attempt_active != 0U && worker->target_valid &&
+                          !worker->target_candidate;
+    const manager_profile_entry_t *named = sweeping ? active : target;
 
-    if (target != NULL)
+    if (named != NULL)
     {
-        _manager_copy_ssid(worker->status.ssid, target->ssid,
-                           target->ssid_length);
+        _manager_copy_ssid(worker->status.ssid, named->ssid,
+                           named->ssid_length);
     }
     else if (active != NULL)
     {
@@ -1580,6 +1562,17 @@ static void _manager_set_target_status(manager_worker_t *worker)
     else
     {
         worker->status.ssid[0] = '\0';
+    }
+    if (sweeping && worker->attempt_position > 0U)
+    {
+        worker->status.attempt_index =
+            worker->attempt_order[worker->attempt_position - 1U];
+        worker->status.attempt_total = worker->profile_count;
+    }
+    else
+    {
+        worker->status.attempt_index = CONNECTIVITY_MANAGER_NO_ATTEMPT;
+        worker->status.attempt_total = 0U;
     }
 }
 

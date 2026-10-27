@@ -17,8 +17,9 @@ Wi-Fi 连接策略 owner：策略 worker 负责扫描、连接、重连、配置
 
 ## 已保存网络
 
-管理器最多保留 `CONNECTIVITY_MANAGER_MAX_PROFILES` 个已保存网络，并以单条记录整体持久化，
-因此多份凭据可跨重启存活。
+管理器最多保留 `CONNECTIVITY_MANAGER_MAX_PROFILES`（五个）已保存网络，并以单条记录整体持久化，
+因此多份凭据可跨重启存活。该数量是固定的编译期常量而非配置项：持久化记录本就预留五个槽，
+可调上限只会引入第二种宽度去推理。
 
 - `request_save_profile()` 按 SSID upsert：已存在则替换，否则追加。当所有槽位都被其他网络占用时
   以 `ESP_ERR_NO_MEM` 拒绝，不会静默淘汰任一网络。保存同时启用自动连接，这正是"配网后下次开机
@@ -44,12 +45,17 @@ Wi-Fi 连接策略 owner：策略 worker 负责扫描、连接、重连、配置
 radio 而非候选。候选耗尽后进入长退避策略，不发布失败终态；取消则结束该操作。扫描使用自己的
 游标，从不改写选中档位，因此候选全部耗尽后用户的选择与其持久化的 `active_index` 都保持不变。
 
+因此 `status.ssid` 在整个扫描期间始终命名被选中的档位，这也正是 Device Link 的 `profile_ssid`
+所投影的内容。真正在尝试的候选通过 `status.attempt_index` 与 `status.attempt_total` 单独上报
+（未扫描时为 `UINT8_MAX` 与 `0`），使展示层可以说明当前尝试的是哪一条，而无需重新定义档位 SSID
+的含义。
+
 每次扫描尝试都带 `wifi_service_connect_options_t` 的零重试上限，使缺失的接入点立刻回到策略层，
 而不消耗执行器内部的退避序列。只保存了一个网络时管理器不传选项块，执行器继续使用编译期重试预算。
 
 ## 配置与依赖
 
-- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 6144）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）、`CONNECTIVITY_MANAGER_MAX_PROFILES`（默认 4，范围 1..5）。
+- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 6144）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）、`CONNECTIVITY_MANAGER_MAX_PROFILES`（固定 5，不可配置）。
 - CMake：`REQUIRES event_bus`；`PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`。
 - 运行时由 `connectivity_manager_config_t`（策略 worker 优先级、低层 Wi-Fi worker 优先级）配置。
 
@@ -67,11 +73,8 @@ radio 而非候选。候选耗尽后进入长退避策略，不发布失败终�
 ## 持久化记录
 
 `wifi_profile` NVS 键保存一条带版本的记录：头部（magic、version、数量、选中索引、自动连接策略、
-revision 与 Device Link 同步窗口）之后是五个固定 103 字节的条目槽。无论
-`CONNECTIVITY_MANAGER_MAX_PROFILES` 取何值，记录始终保留五个槽，因此由槽数更多的构建写下的记录
-在调小该值后仍可读取。加载时保留前 `CONNECTIVITY_MANAGER_MAX_PROFILES` 个条目，把选中索引夹到
-该范围内，并在同一次启动内回写记录使 flash 与 RAM 一致；超出上限的条目在此刻被丢弃。结构上无效的
-记录仍会被拒绝，而不是只加载其中一部分。
+revision 与 Device Link 同步窗口）之后是五个固定 103 字节的条目槽。RAM 列表与该记录宽度相同，
+因此合法记录总是整条加载。数量超过五的记录属于结构无效，会被拒绝，而不是只加载其中一部分。
 
 v1（112 字节）、v2（128 字节）或 v3（168 字节）的单档记录会在加载时升级为单条目列表并回写；
 写失败时原字节保持不变，初始化报告存储失败。无效记录会被拒绝且不清除 flash；被拒绝的写入

@@ -28,8 +28,11 @@ Public header `include/connectivity_manager.h`:
 
 ## Saved networks
 
-The manager keeps up to `CONNECTIVITY_MANAGER_MAX_PROFILES` saved networks and
-persists them as one list, so several credentials survive reboot.
+The manager keeps up to `CONNECTIVITY_MANAGER_MAX_PROFILES` (five) saved networks
+and persists them as one list, so several credentials survive reboot. The count is
+a fixed compile-time constant rather than a configuration item: the persisted
+record already reserves five slots, so a tunable limit would only add a second
+width to reason about.
 
 - `request_save_profile()` upserts by SSID: an existing entry is replaced, a new
   one appended. A save is refused with `ESP_ERR_NO_MEM` when every slot holds a
@@ -68,6 +71,12 @@ sweep keeps its own cursor: it never rewrites the selected profile, so exhaustin
 every candidate leaves the user's choice, and its persisted `active_index`,
 untouched.
 
+`status.ssid` therefore keeps naming the selected profile throughout a sweep,
+which is what Device Link's `profile_ssid` projects. The candidate actually being
+tried is reported separately through `status.attempt_index` and
+`status.attempt_total` (`UINT8_MAX` and `0` when no sweep runs), so a presenter can
+say which network an attempt is on without redefining what the profile SSID means.
+
 Each sweep attempt runs with `wifi_service_connect_options_t` retry limit 0, so a
 missing access point reaches the policy layer immediately instead of consuming
 the executor's internal backoff. With a single saved network the manager passes
@@ -77,7 +86,7 @@ no option block, so the executor keeps its compiled retry budget.
 
 - Kconfig: `CONNECTIVITY_MANAGER_TASK_STACK` (default 6144),
   `CONNECTIVITY_MANAGER_QUEUE_DEPTH` (default 8),
-  `CONNECTIVITY_MANAGER_MAX_PROFILES` (default 4, range 1..5).
+  `CONNECTIVITY_MANAGER_MAX_PROFILES` (fixed 5, not configurable).
 - CMake: `REQUIRES event_bus`; `PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`.
 - At runtime the service is configured by `connectivity_manager_config_t` (the
   policy worker priority and the low-level Wi-Fi worker priority).
@@ -116,13 +125,10 @@ no option block, so the executor keeps its compiled retry budget.
 
 The `wifi_profile` NVS key holds one versioned record: a header (magic, version,
 count, active index, auto-connect policy, revision, and the Device Link sync
-window) followed by five fixed 103-byte entry slots. The record always reserves
-five slots whatever `CONNECTIVITY_MANAGER_MAX_PROFILES` is, so a record written by
-a build with more slots stays readable after the value is lowered. Loading keeps
-the first `CONNECTIVITY_MANAGER_MAX_PROFILES` entries, clamps the selected index
-into that range, and rewrites the record inside the same boot so flash matches
-RAM; the entries beyond the limit are dropped at that point. A record that is
-structurally invalid is still rejected instead of being partially loaded.
+window) followed by five fixed 103-byte entry slots. The in-RAM list and the
+record share that width, so a valid record always loads whole. A record whose
+count exceeds five is structurally invalid and is rejected rather than partially
+loaded.
 
 A v1 (112-byte), v2 (128-byte), or v3 (168-byte) single-profile record is
 upgraded on load into a one-entry list and rewritten; if that write fails the
