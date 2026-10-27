@@ -594,6 +594,49 @@ static void _test_cache(void)
           ESP_ERR_INVALID_SIZE);
 }
 
+static void _test_cache_creates_directory(void)
+{
+    /* An empty runtime data partition holds no entries, so the store must
+       create its own directory instead of failing with ENOENT. */
+    char root[] = "/tmp/mt-weather-missing-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char directory[128];
+    int count = snprintf(directory, sizeof(directory), "%s/data", root);
+    CHECK(count > 0 && (size_t)count < sizeof(directory));
+
+    weather_service_snapshot_t source = {0};
+    source.generation = 3U;
+    source.available_mask = WEATHER_SERVICE_DATA_CURRENT;
+    source.current.meta.available = true;
+    source.current.temperature_tenths_c = 288;
+    memcpy(source.current.condition_text, "Clear", sizeof("Clear"));
+
+    weather_service_snapshot_t loaded = {0};
+    uint64_t sequence = 0U;
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) ==
+          ESP_ERR_NOT_FOUND);
+    CHECK(weather_service_cache_store(directory, &source, 1U) == ESP_OK);
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) == ESP_OK);
+    CHECK(sequence == 1U);
+    CHECK(loaded.generation == 3U);
+    CHECK(loaded.current.temperature_tenths_c == 288);
+    /* A second store must keep working on the now-existing directory. */
+    source.current.temperature_tenths_c = 290;
+    CHECK(weather_service_cache_store(directory, &source, 2U) == ESP_OK);
+    memset(&loaded, 0, sizeof(loaded));
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) == ESP_OK);
+    CHECK(sequence == 2U);
+    CHECK(loaded.current.temperature_tenths_c == 290);
+
+    char path[160];
+    (void)snprintf(path, sizeof(path), "%s/weather_a.bin", directory);
+    CHECK(unlink(path) == 0);
+    (void)snprintf(path, sizeof(path), "%s/weather_b.bin", directory);
+    CHECK(unlink(path) == 0);
+    CHECK(rmdir(directory) == 0);
+    CHECK(rmdir(root) == 0);
+}
+
 static uint32_t _crc32(const uint8_t *data, size_t size)
 {
     uint32_t crc = UINT32_MAX;
@@ -712,6 +755,7 @@ int main(void)
     _test_weather_location_localization();
     _test_alert_boundaries();
     _test_cache();
+    _test_cache_creates_directory();
     _test_cache_legacy_coordinate_slots();
     printf("weather service: %u checks, %u failures\n", s_checks, s_failures);
     return s_failures == 0U ? 0 : 1;

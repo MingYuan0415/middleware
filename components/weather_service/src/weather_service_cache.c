@@ -685,6 +685,19 @@ esp_err_t weather_service_cache_load(const char *directory,
     return result;
 }
 
+static esp_err_t _weather_cache_ensure_directory(const char *directory)
+{
+    /* The cache directory is a LittleFS mount root whose contents the
+       service owns exclusively: an empty partition has no entries at all,
+       so the parent must be created here instead of assuming an existing
+       directory. An existing directory is the expected steady state. */
+    if (mkdir(directory, 0700) == 0 || errno == EEXIST)
+    {
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
 esp_err_t weather_service_cache_store(const char *directory,
                                       const weather_service_snapshot_t *snapshot, uint64_t sequence)
 {
@@ -704,6 +717,11 @@ esp_err_t weather_service_cache_store(const char *directory,
             (size_t)temporary_size >= sizeof(temporary))
     {
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (_weather_cache_ensure_directory(directory) != ESP_OK)
+    {
+        LOG_W("cache directory %s unavailable: errno=%d", directory, errno);
+        return ESP_FAIL;
     }
     size_t capacity = sizeof(*snapshot) * 2U;
     uint8_t *payload = _weather_cache_allocate(capacity);

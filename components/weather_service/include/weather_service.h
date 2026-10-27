@@ -249,7 +249,11 @@ typedef struct weather_service_config
 {
     const char *server_base_url;  /**< HTTPS mt-server Origin, or empty. */
     const char *device_token;     /**< Bearer token, or empty. */
-    const char *cache_directory;  /**< Mounted writable cache directory. */
+    /** @brief Writable cache directory on a mounted filesystem.
+     *
+     * @note The service owns the directory contents and creates the
+     *       directory itself, so an empty mount is valid. */
+    const char *cache_directory;
     uint32_t task_priority;
     uint32_t current_refresh_seconds;
     uint32_t alerts_refresh_seconds;
