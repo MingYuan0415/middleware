@@ -42,10 +42,14 @@ Public header `include/audio_service.h`:
   belongs to this component, like every other module that owns a setting, so the
   `volume` key never leaks to a caller. The plain `set_volume()` applies only and
   never touches flash, which keeps drag previews and benchmark overrides clean;
-  `set_volume_persisted()` applies and then commits once, for a settled choice.
-  A failed commit is reported without reverting the level, since it is already
-  audible. Storage never runs under the service lock, because an NVS commit can
-  block on flash and would otherwise stall every stream and quiesce path.
+  `set_volume_persisted()` applies synchronously and queues one commit, for a
+  settled choice. The commit never runs on the caller's task: the LVGL worker
+  that settles the knob keeps its stack in PSRAM, and a flash write asserts when
+  the active stack is in PSRAM, so the one-byte store runs on the chore worker's
+  internal-RAM stack instead. The queue result is returned; a storage fault in
+  the job is logged without reverting the level, since it is already audible.
+  Storage never runs under the service lock, because an NVS commit can block on
+  flash and would otherwise stall every stream and quiesce path.
   `restore_volume()` keeps the `audio_service_init_config_t` default when no
   record exists and refuses a corrupt one; `reset_persisted_state()` clears the
   key for a factory reset and treats an absent key as success.
@@ -57,7 +61,11 @@ Public header `include/audio_service.h`:
 ## Configuration and Dependencies
 
 - `idf_component.yml`: only `idf: ">=5.0"`.
-- CMake: `REQUIRES bsp`, `PRIV_REQUIRES freertos mt_log nv_storage`.
+- CMake: `REQUIRES bsp`, `PRIV_REQUIRES freertos mt_log nvs_flash nv_storage
+  chore_service`.
+- `chore_service` must be initialized before the first persisted volume commit;
+  the one-byte store is queued there. `main` initializes it before
+  `audio_service_init()`.
 - No Kconfig; the start-up policy is supplied by `audio_service_init_config_t`
   (PCM format, initial volume, mute, PA). Call
   `audio_service_restore_volume()` after a successful init to adopt a persisted
@@ -67,7 +75,8 @@ Public header `include/audio_service.h`:
 
 ## State and Concurrency
 
-- Singleton, with no dedicated worker task.
+- Singleton, with no dedicated worker task. Queued volume commits run on the
+  shared chore worker, whose stack is internal RAM.
 - Lifecycle states: UNINITIALIZED / READY / RUNNING / SUSPENDING / ERROR.
 
 - RUNNING has a valid lease; READY may be idle without an owner, or may retain

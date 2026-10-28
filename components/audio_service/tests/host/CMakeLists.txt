@@ -14,6 +14,7 @@ get_filename_component(AUDIO_SERVICE_DIR
 add_executable(audio_service_host_test
     test_audio_service.c
     fakes/audio_service_fakes.c
+    fakes/chore_service_fake.c
     "${AUDIO_SERVICE_DIR}/src/audio_service.c"
 )
 target_include_directories(audio_service_host_test PRIVATE

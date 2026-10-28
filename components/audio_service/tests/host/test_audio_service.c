@@ -1050,16 +1050,19 @@ static void _test_volume_persisted_applies_and_stores(void)
     assert(audio_service_fakes_nv_present());
     assert(audio_service_fakes_nv_value() == 40U);
     assert(audio_service_fakes_nv_set_count() == 1U);
+    assert(audio_service_fakes_chore_submit_count() == 1U);
 
     /* Out of range is refused before anything is applied or stored. */
     assert(audio_service_set_volume_persisted(101U) == ESP_ERR_INVALID_ARG);
     assert(audio_service_fakes_state()->volume == 40U);
     assert(audio_service_fakes_nv_set_count() == 1U);
+    assert(audio_service_fakes_chore_submit_count() == 1U);
 
     assert(audio_service_deinit() == ESP_OK);
 }
 
-/* The level is already audible, so a storage fault must not revert it. */
+/* The queued commit runs after the call returns on the firmware; a storage
+ * fault is logged and must not revert the level. */
 static void _test_volume_persist_failure_keeps_level(void)
 {
     audio_service_fakes_reset();
@@ -1067,10 +1070,29 @@ static void _test_volume_persist_failure_keeps_level(void)
     assert(audio_service_init(&s_init_config) == ESP_OK);
 
     audio_service_fakes_nv_fail_set();
-    assert(audio_service_set_volume_persisted(55U) == ESP_FAIL);
+    assert(audio_service_set_volume_persisted(55U) == ESP_OK);
     assert(audio_service_fakes_state()->volume == 55U);
     assert(!audio_service_fakes_nv_present());
     assert(audio_service_fakes_nv_set_count() == 1U);
+    assert(audio_service_fakes_chore_submit_count() == 1U);
+
+    assert(audio_service_deinit() == ESP_OK);
+}
+
+/* A full or unavailable chore queue still applies the level but reports that
+ * the commit was not accepted. */
+static void _test_volume_persist_queue_failure_keeps_level(void)
+{
+    audio_service_fakes_reset();
+    audio_service_fakes_state()->expose_ops = true;
+    assert(audio_service_init(&s_init_config) == ESP_OK);
+
+    audio_service_fakes_chore_fail(ESP_ERR_NO_MEM);
+    assert(audio_service_set_volume_persisted(45U) == ESP_ERR_NO_MEM);
+    assert(audio_service_fakes_state()->volume == 45U);
+    assert(!audio_service_fakes_nv_present());
+    assert(audio_service_fakes_nv_set_count() == 0U);
+    assert(audio_service_fakes_chore_submit_count() == 1U);
 
     assert(audio_service_deinit() == ESP_OK);
 }
@@ -1176,6 +1198,7 @@ int main(void)
     _test_volume_set_does_not_persist();
     _test_volume_persisted_applies_and_stores();
     _test_volume_persist_failure_keeps_level();
+    _test_volume_persist_queue_failure_keeps_level();
     _test_volume_persist_skipped_without_audio_path();
     _test_volume_restore();
     _test_volume_reset_persisted_state();

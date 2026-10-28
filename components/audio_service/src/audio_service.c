@@ -1,6 +1,7 @@
 #include "audio_service.h"
 
 #include "bsp_hal.h"
+#include "chore_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nv_storage.h"
@@ -712,10 +713,30 @@ exit:
     return result;
 }
 
+/* The commit cannot run on the caller's task: the LVGL worker, which settles
+ * the volume from a release event, keeps its stack in PSRAM, and a flash write
+ * disables the cache and asserts on a PSRAM stack. chore_service runs its jobs
+ * on an internal-RAM worker, which is safe for this one-byte NVS commit. */
+static void _volume_persist_job(const chore_service_cancel_token_t *cancel,
+                                void *arg)
+{
+    (void)cancel;
+    /* The level travels by value in the job argument: a settle allocates
+     * nothing, and a queued job owns no memory to release. */
+    const uint8_t percent = (uint8_t)(uintptr_t)arg;
+    const esp_err_t stored = nv_storage_set_u8(AUDIO_SERVICE_VOLUME_KEY,
+        percent);
+    if (stored != ESP_OK)
+    {
+        LOG_W("volume store failed: %s", esp_err_to_name(stored));
+    }
+}
+
 /* Storage never runs under the service lock: nv_storage commits can block on
  * flash, and holding the audio lock across them would stall every stream and
- * quiesce path. The level is already audible, so a failed write is reported
- * without rolling the speaker back. */
+ * quiesce path. Applying the level stays synchronous so the knob settles
+ * immediately; only the commit is queued, and a failed store is logged because
+ * the level is already audible. */
 esp_err_t audio_service_set_volume_persisted(uint8_t percent)
 {
     if (percent > 100U)
@@ -727,13 +748,18 @@ esp_err_t audio_service_set_volume_persisted(uint8_t percent)
     {
         return applied;
     }
-    const esp_err_t stored = nv_storage_set_u8(AUDIO_SERVICE_VOLUME_KEY,
-        percent);
-    if (stored != ESP_OK)
+    const chore_service_job_t job =
     {
-        LOG_W("volume store failed: %s", esp_err_to_name(stored));
+        .run = _volume_persist_job,
+        .arg = (void *)(uintptr_t)percent,
+    };
+    chore_service_handle_t handle;
+    const esp_err_t queued = chore_service_submit(&job, &handle);
+    if (queued != ESP_OK)
+    {
+        LOG_W("volume store submit failed: %s", esp_err_to_name(queued));
     }
-    return stored;
+    return queued;
 }
 
 esp_err_t audio_service_restore_volume(void)

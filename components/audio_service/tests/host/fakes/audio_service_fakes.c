@@ -230,6 +230,7 @@ void audio_service_fakes_reset(void)
     s_fake.set_pa_result = ESP_OK;
     s_fake.stop_result = ESP_OK;
     audio_service_fakes_nv_reset();
+    audio_service_fakes_chore_reset();
 }
 
 /* ── Scalar NVS fake for the volume persistence tests ── */

@@ -223,10 +223,13 @@ esp_err_t audio_service_set_volume(uint8_t percent);
  * @brief Apply and persist the speaker volume.
  *
  * Intended for a settled user choice: call it once when the knob is released,
- * never while it is moving, because each call commits to flash. A failed store
- * is reported without reverting the level, which is already audible.
+ * never while it is moving. The level is applied synchronously; the one-byte
+ * NVS commit is queued to the background chore worker, so a caller whose stack
+ * lives in PSRAM (the LVGL worker) never executes a flash write. A storage
+ * fault is logged because the level is already audible.
  *
- * @return ESP_OK when applied and stored; otherwise the audio or storage error.
+ * @return ESP_OK when the level was applied and the commit was queued;
+ *         otherwise the audio or queue error.
  */
 esp_err_t audio_service_set_volume_persisted(uint8_t percent);
 

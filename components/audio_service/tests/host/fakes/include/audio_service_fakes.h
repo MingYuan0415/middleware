@@ -54,4 +54,11 @@ void audio_service_fakes_nv_fail_erase(void);
 /** @brief Store an arbitrary value directly, to seed corrupt records. */
 void audio_service_fakes_nv_seed(uint8_t value);
 
+/** @brief Reset the fake chore queue between test cases. */
+void audio_service_fakes_chore_reset(void);
+/** @brief Number of jobs submitted to the fake chore queue. */
+unsigned audio_service_fakes_chore_submit_count(void);
+/** @brief Make the next chore submission fail with the given error. */
+void audio_service_fakes_chore_fail(esp_err_t error);
+
 #endif /* __AUDIO_SERVICE_FAKES_H__ */
