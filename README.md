@@ -214,7 +214,7 @@ refresh window.
 
 Kconfig keeps only static resource budgets: Event Bus three pools of 24 and
 payload 256 B, NVS blob pool 16, IMU/Power stack 3072, Time stack 3072,
-Connectivity stack 4096 and queue 8, Wi-Fi stack 4096 and queue 16, System PM
+Connectivity stack 8192 and queue 8, Wi-Fi stack 4096 and queue 16, System PM
 stack 4096, Weather stack 8192 and maximum temporary response 256 KiB, Chore
 stack 4096 and job capacity 8. The sampling rate, polling period, task
 priorities, PCM, mount point, time zone, and SNTP server are all passed in at

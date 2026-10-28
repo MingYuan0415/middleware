@@ -293,6 +293,10 @@ typedef struct manager_shared
     bool command_pool_used[CONNECTIVITY_MANAGER_COMMAND_POOL_CAPACITY];
     TaskHandle_t worker;
     StaticTask_t worker_control;
+    /* The policy state stays in the singleton: as a task-stack local it
+     * consumed half the worker stack, and the scan-snapshot publish chain
+     * (event bus plus Device Link callbacks) runs on this same task. */
+    manager_worker_t worker_state;
     StackType_t worker_stack[CONFIG_CONNECTIVITY_MANAGER_TASK_STACK];
     connectivity_manager_config_t config;
     bool control_inflight;
@@ -3628,8 +3632,8 @@ static void _manager_process_command(manager_worker_t *worker,
 static void _manager_worker_run(void *argument)
 {
     (void)argument;
-    manager_worker_t worker;
-    const esp_err_t init_result = _manager_worker_init(&worker);
+    manager_worker_t *worker = &s_manager.worker_state;
+    const esp_err_t init_result = _manager_worker_init(worker);
     atomic_store_explicit(&s_manager.control_result, init_result,
                           memory_order_release);
     if (init_result != ESP_OK)
@@ -3646,7 +3650,7 @@ static void _manager_worker_run(void *argument)
             vTaskDelay(1U);
             continue;
         }
-        _manager_continue_policy(&worker);
+        _manager_continue_policy(worker);
         if (s_manager.terminal_outbox_count > 0U)
         {
             continue;
@@ -3657,7 +3661,7 @@ static void _manager_worker_run(void *argument)
         {
             manager_command_t command = *queued_command;
             _manager_command_pool_release(queued_command);
-            _manager_process_command(&worker, &command, &stop);
+            _manager_process_command(worker, &command, &stop);
             _manager_secure_zero(&command, sizeof(command));
             if (stop)
             {
@@ -3668,19 +3672,19 @@ static void _manager_worker_run(void *argument)
         {
             continue;
         }
-        _manager_poll_status(&worker);
+        _manager_poll_status(worker);
         if (s_manager.terminal_outbox_count > 0U)
         {
             continue;
         }
-        _manager_poll_scan(&worker);
+        _manager_poll_scan(worker);
         if (s_manager.terminal_outbox_count > 0U)
         {
             continue;
         }
-        _manager_continue_policy(&worker);
+        _manager_continue_policy(worker);
     }
-    _manager_secure_zero(&worker, sizeof(worker));
+    _manager_secure_zero(worker, sizeof(*worker));
     vTaskSuspend(NULL);
     vTaskDelete(NULL);
 }

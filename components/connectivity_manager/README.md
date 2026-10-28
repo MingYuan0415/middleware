@@ -84,7 +84,7 @@ no option block, so the executor keeps its compiled retry budget.
 
 ## Configuration and Dependencies
 
-- Kconfig: `CONNECTIVITY_MANAGER_TASK_STACK` (default 6144),
+- Kconfig: `CONNECTIVITY_MANAGER_TASK_STACK` (default 8192),
   `CONNECTIVITY_MANAGER_QUEUE_DEPTH` (default 8),
   `CONNECTIVITY_MANAGER_MAX_PROFILES` (fixed 5, not configurable).
 - CMake: `REQUIRES event_bus`; `PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`.

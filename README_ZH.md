@@ -74,7 +74,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 ## 配置
 
 Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
-IMU/Power stack 3072，Time stack 3072，Connectivity stack 4096 和 queue 8，Wi-Fi
+IMU/Power stack 3072，Time stack 3072，Connectivity stack 8192 和 queue 8，Wi-Fi
 stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
 256 KiB，Chore stack 4096 和 job 容量 8。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
 `app_product_config_t` 在运行时传入。恢复出厂启动先清 Wi-Fi profile、引导状态、App

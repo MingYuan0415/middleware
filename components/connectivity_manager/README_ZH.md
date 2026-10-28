@@ -55,7 +55,7 @@ radio 而非候选。候选耗尽后进入长退避策略，不发布失败终�
 
 ## 配置与依赖
 
-- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 6144）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）、`CONNECTIVITY_MANAGER_MAX_PROFILES`（固定 5，不可配置）。
+- Kconfig：`CONNECTIVITY_MANAGER_TASK_STACK`（默认 8192）、`CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）、`CONNECTIVITY_MANAGER_MAX_PROFILES`（固定 5，不可配置）。
 - CMake：`REQUIRES event_bus`；`PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`。
 - 运行时由 `connectivity_manager_config_t`（策略 worker 优先级、低层 Wi-Fi worker 优先级）配置。
 
