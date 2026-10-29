@@ -538,6 +538,11 @@ esp_err_t event_bus_publish_ex(event_bus_msg_id_t msg_id, uint32_t sub_type,
         payload_size, flags);
     if (result != ESP_OK)
     {
+        if (out_report != NULL)
+        {
+            out_report->sync_result = result;
+            out_report->ui_result = result;
+        }
         return result;
     }
 

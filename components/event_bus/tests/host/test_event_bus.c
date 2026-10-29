@@ -604,13 +604,13 @@ static void _test_publish_ex_error_report(void)
     assert(report.sync_delivered == 0U);
     assert(report.ui_queued == false);
     assert(report.ui_coalesced == false);
-    assert(report.sync_result == ESP_OK);
-    assert(report.ui_result == ESP_OK);
+    assert(report.sync_result == ESP_ERR_INVALID_ARG);
+    assert(report.ui_result == ESP_ERR_INVALID_ARG);
 
     assert(event_bus_publish_ex(TEST_MSG, 0, NULL, 1, 0, &report)
            == ESP_ERR_INVALID_ARG);
-    assert(report.sync_result == ESP_OK);
-    assert(report.ui_result == ESP_OK);
+    assert(report.sync_result == ESP_ERR_INVALID_ARG);
+    assert(report.ui_result == ESP_ERR_INVALID_ARG);
     _tearDown();
 }
 

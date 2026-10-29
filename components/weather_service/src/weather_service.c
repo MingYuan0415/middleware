@@ -1744,13 +1744,19 @@ static void _weather_worker(void *context)
         xSemaphoreGive(s_weather.mutex);
         if (!configured)
         {
-            _weather_status_set(WEATHER_SERVICE_STATE_UNCONFIGURED,
-                                WEATHER_SERVICE_FAILURE_NOT_CONFIGURED, 0U);
+            if (_weather_status_set(WEATHER_SERVICE_STATE_UNCONFIGURED,
+                                    WEATHER_SERVICE_FAILURE_NOT_CONFIGURED, 0U))
+            {
+                _weather_publish(0U);
+            }
         }
         else if (!network_ready)
         {
-            _weather_status_set(WEATHER_SERVICE_STATE_WAITING_NETWORK,
-                                WEATHER_SERVICE_FAILURE_NETWORK, 0U);
+            if (_weather_status_set(WEATHER_SERVICE_STATE_WAITING_NETWORK,
+                                    WEATHER_SERVICE_FAILURE_NETWORK, 0U))
+            {
+                _weather_publish(0U);
+            }
         }
         else
         {
@@ -1912,8 +1918,11 @@ esp_err_t weather_service_suspend(uint32_t timeout_ms)
     {
         return ESP_ERR_TIMEOUT;
     }
-    _weather_status_set(WEATHER_SERVICE_STATE_SUSPENDED,
-                        WEATHER_SERVICE_FAILURE_NONE, 0U);
+    if (_weather_status_set(WEATHER_SERVICE_STATE_SUSPENDED,
+                            WEATHER_SERVICE_FAILURE_NONE, 0U))
+    {
+        _weather_publish(0U);
+    }
     return ESP_OK;
 }
 
