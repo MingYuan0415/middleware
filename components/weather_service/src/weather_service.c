@@ -1716,8 +1716,15 @@ static void _weather_worker(void *context)
     uint32_t command = 0U;
     while (true)
     {
-        (void)xTaskNotifyWait(0U, UINT32_MAX, &command,
-                              pdMS_TO_TICKS(1000U));
+        xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+        const bool active = s_weather.config.configured &&
+                            s_weather.network_ready &&
+                            !s_weather.suspended &&
+                            !s_weather.stopping;
+        xSemaphoreGive(s_weather.mutex);
+        const TickType_t wait_ticks = active ? pdMS_TO_TICKS(1000U) :
+                                      portMAX_DELAY;
+        (void)xTaskNotifyWait(0U, UINT32_MAX, &command, wait_ticks);
         if ((command & WEATHER_CMD_STOP) != 0U)
         {
             break;
