@@ -3671,8 +3671,9 @@ static void _manager_worker_run(void *argument)
             continue;
         }
         manager_command_t *queued_command = NULL;
-        if (xQueueReceive(s_manager.queue, &queued_command,
-                          pdMS_TO_TICKS(CONNECTIVITY_MANAGER_POLL_MS)) == pdTRUE)
+        const TickType_t wait = worker->suspended ? portMAX_DELAY :
+                                pdMS_TO_TICKS(CONNECTIVITY_MANAGER_POLL_MS);
+        if (xQueueReceive(s_manager.queue, &queued_command, wait) == pdTRUE)
         {
             manager_command_t command = *queued_command;
             _manager_command_pool_release(queued_command);

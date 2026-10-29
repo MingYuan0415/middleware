@@ -275,6 +275,49 @@ static void _wifi_service_process_control(wifi_worker_context_t *context,
     _wifi_service_control_complete(generation, result);
 }
 
+static TickType_t _wifi_service_remaining_ticks(TickType_t now,
+        TickType_t deadline)
+{
+    const int32_t remaining = (int32_t)(deadline - now);
+    return remaining <= 0 ? 0U : (TickType_t)remaining;
+}
+
+static TickType_t _wifi_service_next_wait_ticks(
+    const wifi_worker_context_t *context)
+{
+    TickType_t wait = portMAX_DELAY;
+    const TickType_t now = xTaskGetTickCount();
+
+    if (context->retry_pending)
+    {
+        const TickType_t retry = _wifi_service_remaining_ticks(now,
+            context->retry_deadline);
+        if (retry < wait)
+        {
+            wait = retry;
+        }
+    }
+    if (context->publish_retry_scheduled)
+    {
+        const TickType_t publish = _wifi_service_remaining_ticks(now,
+            context->publish_retry_deadline);
+        if (publish < wait)
+        {
+            wait = publish;
+        }
+    }
+    if (context->phase_deadline_pending)
+    {
+        const TickType_t phase = _wifi_service_remaining_ticks(now,
+            context->phase_deadline);
+        if (phase < wait)
+        {
+            wait = phase;
+        }
+    }
+    return wait;
+}
+
 static bool _wifi_service_poll_control(wifi_control_type_t *type,
                                        uint64_t *generation)
 {
@@ -320,8 +363,7 @@ void wifi_service_worker_run(void *argument)
 
         wifi_queue_item_t item;
         if (xQueueReceive(g_wifi_service.queue, &item,
-                          pdMS_TO_TICKS(
-                              WIFI_SERVICE_WORKER_POLL_MS)) == pdTRUE)
+                          _wifi_service_next_wait_ticks(&context)) == pdTRUE)
         {
             wifi_service_worker_process_item(&context, &item);
         }

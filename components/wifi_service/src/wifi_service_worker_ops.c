@@ -1264,6 +1264,11 @@ static void _wifi_service_process_port_event(
 void wifi_service_worker_process_item(wifi_worker_context_t *context,
                                       const wifi_queue_item_t *item)
 {
+    if (item->type == WIFI_ITEM_CONTROL)
+    {
+        /* Control requests are polled at the top of the worker loop. */
+        return;
+    }
     if (item->type == WIFI_ITEM_PORT_EVENT)
     {
         _wifi_service_process_port_event(context, &item->event);
@@ -1288,6 +1293,7 @@ void wifi_service_worker_process_item(wifi_worker_context_t *context,
             _wifi_service_begin_disconnect(context, item);
             break;
         case WIFI_ITEM_PORT_EVENT:
+        case WIFI_ITEM_CONTROL:
             break;
         }
     }

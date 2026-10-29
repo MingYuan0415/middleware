@@ -76,6 +76,7 @@ typedef enum
     WIFI_ITEM_CONNECT,
     WIFI_ITEM_DISCONNECT,
     WIFI_ITEM_PORT_EVENT,
+    WIFI_ITEM_CONTROL,
 } wifi_item_type_t;
 
 /** @brief Active public operation tracked by the worker. */

@@ -380,6 +380,11 @@ static esp_err_t _wifi_service_submit_control(
     atomic_store(&g_wifi_service.control_completed_generation, 0);
     atomic_store(&g_wifi_service.control_inflight, true);
     atomic_store_explicit(&g_wifi_service.control_request, type, memory_order_release);
+    const wifi_queue_item_t wake =
+    {
+        .type = WIFI_ITEM_CONTROL,
+    };
+    (void)xQueueSend(g_wifi_service.queue, &wake, 0U);
 
     if (xSemaphoreTake(g_wifi_service.control_done,
                        _wifi_service_remaining(deadline)) != pdTRUE)
@@ -833,6 +838,11 @@ esp_err_t wifi_service_cancel(wifi_service_session_id_t session_id,
     g_wifi_service.cancel_session = session_id;
     g_wifi_service.cancel_operation = operation_id;
     *out_disposition = WIFI_SERVICE_CANCEL_ACCEPTED;
+    const wifi_queue_item_t wake =
+    {
+        .type = WIFI_ITEM_CONTROL,
+    };
+    (void)xQueueSend(g_wifi_service.queue, &wake, 0U);
 
 exit:
     if (state_owned)
