@@ -453,10 +453,19 @@ static esp_err_t _device_link_service_submit_link_work(
 static void _device_link_service_publish_now(
     const device_link_service_snapshot_t *snapshot)
 {
-    (void)event_bus_publish(
-        DEVICE_LINK_SERVICE_MSG,
-        DEVICE_LINK_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT,
-        snapshot, sizeof(*snapshot), EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
+    _Static_assert(sizeof(*snapshot) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "device link snapshot exceeds the UI payload capacity");
+    event_bus_publish_report_t report = {0};
+    const esp_err_t result = event_bus_publish_ex(
+                                 DEVICE_LINK_SERVICE_MSG,
+                                 DEVICE_LINK_SERVICE_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                                 snapshot, sizeof(*snapshot),
+                                 EVENT_BUS_PUBLISH_FLAG_UI_LATEST, &report);
+    if (result != ESP_OK)
+    {
+        LOG_W("snapshot publish dropped: %s (ui=%s)",
+              esp_err_to_name(result), esp_err_to_name(report.ui_result));
+    }
 }
 
 static bool _device_link_service_tick_reached(TickType_t now,

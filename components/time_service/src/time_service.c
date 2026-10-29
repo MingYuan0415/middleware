@@ -312,6 +312,8 @@ static esp_err_t _publish_pending_alarm_event(void)
         return ESP_OK;
     }
 
+    _Static_assert(sizeof(event) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "time alarm exceeds the UI payload capacity");
     esp_err_t result = event_bus_publish(
                            TIME_SERVICE_MSG,
                            TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM,

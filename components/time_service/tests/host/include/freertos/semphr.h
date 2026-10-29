@@ -5,6 +5,8 @@
 
 /** @brief Create one pthread-backed mutex. */
 SemaphoreHandle_t xSemaphoreCreateMutex(void);
+/** @brief Create one pthread-backed binary semaphore, initially empty. */
+SemaphoreHandle_t xSemaphoreCreateBinary(void);
 /** @brief Lock one fake mutex. */
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
                           TickType_t timeout_ticks);

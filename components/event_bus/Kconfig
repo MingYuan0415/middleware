@@ -5,19 +5,29 @@ config EVENT_BUS_SUBSCRIBER_CAPACITY
     range 1 64
     default 24
 
-config EVENT_BUS_UI_CALLBACK_CAPACITY
-    int "Pending UI callback pool capacity"
-    range 1 64
-    default 24
-
-config EVENT_BUS_UI_PAYLOAD_CAPACITY
-    int "Pending UI payload pool capacity"
-    range 1 64
-    default 24
+config EVENT_BUS_UI_BATCH_CAPACITY
+    int "Pending UI batch capacity"
+    range 1 16
+    default 8
+    help
+        Maximum number of UI batches pending in the dispatcher queue. It must
+        not exceed the depth reported to event_bus_register_ui_dispatch().
 
 config EVENT_BUS_UI_PAYLOAD_SIZE
     int "Maximum UI payload size in bytes"
     range 32 1024
-    default 256
+    default 320
+
+config EVENT_BUS_STATS
+    bool "Collect dispatch statistics"
+    default y
+
+config EVENT_BUS_TRACE
+    bool "Log every publication"
+    default n
+    help
+        Compile the publication trace into the event bus. The trace raises
+        this file's compile-time log ceiling to debug, but the event_bus log
+        tag must still allow ESP_LOG_DEBUG at runtime.
 
 endmenu

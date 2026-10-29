@@ -39,6 +39,13 @@ SemaphoreHandle_t xSemaphoreCreateMutex(void)
     return xSemaphoreCreateMutexStatic(&s_event_bus_mutexes[s_event_bus_mutex_count++]);
 }
 
+static StaticSemaphore_t s_event_bus_signal;
+
+SemaphoreHandle_t xSemaphoreCreateBinary(void)
+{
+    return xSemaphoreCreateBinaryStatic(&s_event_bus_signal);
+}
+
 #define BOOT_ID UINT64_C(0x1020304050607080)
 #define CONN_HANDLE UINT16_C(7)
 #define RX_HANDLE UINT16_C(0x10)

@@ -243,6 +243,8 @@ static void _publish_snapshot(uint32_t subtype,
                               const imu_service_snapshot_t *snapshot,
                               uint32_t flags)
 {
+    _Static_assert(sizeof(*snapshot) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "imu snapshot exceeds the UI payload capacity");
     const esp_err_t result = event_bus_publish(IMU_SERVICE_MSG, subtype,
         snapshot, sizeof(*snapshot), flags);
     if (result != ESP_OK)
@@ -258,6 +260,8 @@ static esp_err_t _publish_pending_interrupt(void)
         return ESP_OK;
     }
 
+    _Static_assert(sizeof(imu_service_sample_t) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "imu interrupt sample exceeds the UI payload capacity");
     const imu_service_sample_t sample = s_pending_interrupt_sample;
     esp_err_t result = event_bus_publish(IMU_SERVICE_MSG,
                                          IMU_SERVICE_MSG_SUB_TYPE_INTERRUPT,

@@ -38,6 +38,8 @@ static void _wifi_service_schedule_publication_retry(
 
 static bool _wifi_service_try_publish_status(wifi_worker_context_t *context)
 {
+    _Static_assert(sizeof(context->status) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "wifi status exceeds the UI payload capacity");
     bool published = !context->status_publish_pending;
     if (context->status_publish_pending)
     {
@@ -57,6 +59,8 @@ static bool _wifi_service_try_publish_status(wifi_worker_context_t *context)
 
 static bool _wifi_service_try_publish_scan(wifi_worker_context_t *context)
 {
+    _Static_assert(sizeof(context->scan) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "wifi scan exceeds the UI payload capacity");
     bool published = !context->scan_publish_pending;
     if (context->scan_publish_pending)
     {
@@ -156,6 +160,9 @@ void wifi_service_worker_publish_scan(wifi_worker_context_t *context)
 
 void wifi_service_worker_publish_availability(bool available)
 {
+    _Static_assert(sizeof(wifi_service_availability_event_t)
+                   <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "wifi availability exceeds the UI payload capacity");
     const wifi_service_availability_event_t event =
     {
         .available = available,

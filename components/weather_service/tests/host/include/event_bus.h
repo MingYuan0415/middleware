@@ -13,6 +13,7 @@ typedef const void *event_bus_msg_id_t;
     static const uint8_t s_##name##_id; \
     const event_bus_msg_id_t name = &s_##name##_id
 #define EVENT_BUS_PUBLISH_FLAG_UI_LATEST (UINT32_C(1) << 1)
+#define EVENT_BUS_MAX_UI_PAYLOAD_SIZE 320U
 
 esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
                             const void *payload, size_t payload_size,

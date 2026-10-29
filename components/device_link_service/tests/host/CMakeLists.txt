@@ -24,6 +24,7 @@ add_executable(test_device_link_wifi_adapter
                fakes/event_bus.c
                fakes/ble_link_service_fake.c
                "${HOST_CONNECTIVITY}/freertos_host.c"
+               "${HOST_CONNECTIVITY}/host_dynamic_semaphore.c"
                "${COMPONENT}/src/device_link_wifi_adapter.c"
                "${DEVICE_LINK}/src/device_link_v1.c")
 target_compile_features(test_device_link_wifi_adapter PRIVATE c_std_11)
@@ -87,6 +88,7 @@ add_executable(test_device_link_lifecycle
     "${BLE_RUNTIME}/src/ble_runtime.c"
     "${BLE_RUNTIME}/src/ble_event_router.c"
     "${HOST_CONNECTIVITY}/freertos_host.c"
+    "${HOST_CONNECTIVITY}/host_dynamic_semaphore.c"
     "${HOST_CONNECTIVITY}/nv_storage_fake.c"
     fakes/event_bus.c)
 target_compile_features(test_device_link_lifecycle PRIVATE c_std_11)

@@ -58,6 +58,16 @@
 
 EVENT_BUS_DEFINE_ID(CONNECTIVITY_MANAGER_MSG);
 
+_Static_assert(sizeof(connectivity_manager_status_snapshot_t)
+               <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+               "connectivity status exceeds the UI payload capacity");
+_Static_assert(sizeof(connectivity_manager_scan_snapshot_t)
+               <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+               "connectivity scan exceeds the UI payload capacity");
+_Static_assert(sizeof(connectivity_manager_profile_snapshot_t)
+               <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+               "connectivity profile exceeds the UI payload capacity");
+
 typedef enum
 {
     MANAGER_COMMAND_INIT = 0,
@@ -1246,19 +1256,21 @@ static esp_err_t _manager_dispatch_terminal(
         return event_bus_publish(
                    CONNECTIVITY_MANAGER_MSG,
                    CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
-                   &event->payload.status, sizeof(event->payload.status), 0U);
+                   &event->payload.status, sizeof(event->payload.status),
+                   EVENT_BUS_PUBLISH_FLAG_ATOMIC);
     case MANAGER_TERMINAL_SCAN:
         return event_bus_publish(
                    CONNECTIVITY_MANAGER_MSG,
                    CONNECTIVITY_MANAGER_MSG_SUB_TYPE_SCAN_SNAPSHOT,
-                   &event->payload.scan, sizeof(event->payload.scan), 0U);
+                   &event->payload.scan, sizeof(event->payload.scan),
+                   EVENT_BUS_PUBLISH_FLAG_ATOMIC);
     case MANAGER_TERMINAL_PROFILES:
     default:
         return event_bus_publish(
                    CONNECTIVITY_MANAGER_MSG,
                    CONNECTIVITY_MANAGER_MSG_SUB_TYPE_PROFILE_SNAPSHOT,
                    &event->payload.profiles, sizeof(event->payload.profiles),
-                   0U);
+                   EVENT_BUS_PUBLISH_FLAG_ATOMIC);
     }
 }
 

@@ -150,6 +150,7 @@ foreach(test_target IN ITEMS
             "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_confirmation.c"
             "${PROJECT_ROOT}/layers/middleware/components/device_link_service/src/device_link_revoke_progress.c"
             "${PROJECT_ROOT}/layers/middleware/components/event_bus/src/event_bus.c"
+            "${PROJECT_ROOT}/layers/middleware/components/event_bus/src/event_bus_core.c"
             "${CMAKE_CURRENT_LIST_DIR}/fakes/nv_storage.c"
             "${PROJECT_ROOT}/layers/middleware/components/device_link_service/tests/host/fakes/connectivity_manager.c")
         target_link_options(${test_target} PRIVATE

@@ -92,6 +92,8 @@ static void _publish_snapshot(uint32_t subtype,
                               const power_service_snapshot_t *snapshot,
                               uint32_t flags)
 {
+    _Static_assert(sizeof(*snapshot) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "power snapshot exceeds the UI payload capacity");
     const esp_err_t result = event_bus_publish(
                                  POWER_SERVICE_MSG, subtype, snapshot, sizeof(*snapshot), flags);
     if (result != ESP_OK)
@@ -107,6 +109,8 @@ static esp_err_t _publish_pending_irq(void)
         return ESP_OK;
     }
 
+    _Static_assert(sizeof(power_service_irq_event_t) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "power irq event exceeds the UI payload capacity");
     const power_service_irq_event_t event = s_pending_irq_event;
     esp_err_t result = event_bus_publish(
                            POWER_SERVICE_MSG, POWER_SERVICE_MSG_SUB_TYPE_IRQ,

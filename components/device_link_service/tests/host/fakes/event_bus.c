@@ -37,6 +37,13 @@ esp_err_t event_bus_subscribe(event_bus_msg_id_t msg_id, uint32_t sub_type,
     return ESP_OK;
 }
 
+esp_err_t event_bus_unsubscribe_sync(event_bus_sub_handle_t handle,
+                                     uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return event_bus_unsubscribe(handle);
+}
+
 esp_err_t event_bus_unsubscribe(event_bus_sub_handle_t handle)
 {
     if (handle == 0U)
@@ -63,6 +70,22 @@ esp_err_t event_bus_publish(event_bus_msg_id_t msg_id, uint32_t sub_type,
         s_callback(msg_id, sub_type, payload, payload_size, s_callback_arg);
     }
     return ESP_OK;
+}
+
+esp_err_t event_bus_publish_ex(event_bus_msg_id_t msg_id, uint32_t sub_type,
+                               const void *payload, size_t payload_size,
+                               uint32_t flags,
+                               event_bus_publish_report_t *out_report)
+{
+    if (out_report != NULL)
+    {
+        *out_report = (event_bus_publish_report_t)
+        {
+            .sync_result = ESP_OK,
+            .ui_result = ESP_OK,
+        };
+    }
+    return event_bus_publish(msg_id, sub_type, payload, payload_size, flags);
 }
 
 /* Test hook: publish one message through the single-slot bus. */

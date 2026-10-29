@@ -196,6 +196,8 @@ static void _weather_publish(uint32_t changed_mask)
         .failure = s_weather.status.failure,
     };
     xSemaphoreGive(s_weather.mutex);
+    _Static_assert(sizeof(event) <= EVENT_BUS_MAX_UI_PAYLOAD_SIZE,
+                   "weather snapshot exceeds the UI payload capacity");
     esp_err_t result = event_bus_publish(
                            WEATHER_SERVICE_MSG,
                            WEATHER_SERVICE_MSG_SUB_TYPE_SNAPSHOT,

@@ -577,7 +577,7 @@ void device_link_wifi_adapter_bridge_stop(void)
     {
         return;
     }
-    (void)event_bus_unsubscribe(s_bridge.subscription);
+    (void)event_bus_unsubscribe_sync(s_bridge.subscription, 1000U);
     ble_link_service_set_v1_ops(NULL, NULL);
     _device_link_wifi_lock();
     memset(&s_bridge, 0, sizeof(s_bridge));

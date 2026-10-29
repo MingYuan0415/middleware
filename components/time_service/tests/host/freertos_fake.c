@@ -23,6 +23,9 @@ struct host_task
 struct host_semaphore
 {
     pthread_mutex_t lock;
+    pthread_cond_t changed;
+    bool binary;
+    bool signaled;
 };
 
 struct host_event_group
@@ -289,13 +292,63 @@ void vTaskDelete(TaskHandle_t task)
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
 {
-    SemaphoreHandle_t semaphore = malloc(sizeof(*semaphore));
-    if (semaphore != NULL && pthread_mutex_init(&semaphore->lock, NULL) != 0)
+    SemaphoreHandle_t semaphore = calloc(1, sizeof(*semaphore));
+    if (semaphore == NULL)
     {
+        return NULL;
+    }
+    if (pthread_mutex_init(&semaphore->lock, NULL) != 0
+            || pthread_cond_init(&semaphore->changed, NULL) != 0)
+    {
+        (void)pthread_mutex_destroy(&semaphore->lock);
         free(semaphore);
-        semaphore = NULL;
+        return NULL;
+    }
+    semaphore->binary = false;
+    return semaphore;
+}
+
+SemaphoreHandle_t xSemaphoreCreateBinary(void)
+{
+    SemaphoreHandle_t semaphore = xSemaphoreCreateMutex();
+    if (semaphore != NULL)
+    {
+        semaphore->binary = true;
+        semaphore->signaled = false;
     }
     return semaphore;
+}
+
+static BaseType_t _binary_take(SemaphoreHandle_t semaphore,
+                               TickType_t timeout_ticks)
+{
+    BaseType_t result = pdFALSE;
+    const struct timespec deadline = _deadline_after_ticks(timeout_ticks);
+
+    (void)pthread_mutex_lock(&semaphore->lock);
+    while (!semaphore->signaled)
+    {
+        if (timeout_ticks == 0U)
+        {
+            break;
+        }
+        const int wait_result = timeout_ticks == portMAX_DELAY ?
+                                pthread_cond_wait(&semaphore->changed,
+                                    &semaphore->lock) :
+                                pthread_cond_timedwait(&semaphore->changed,
+                                    &semaphore->lock, &deadline);
+        if (wait_result == ETIMEDOUT)
+        {
+            break;
+        }
+    }
+    if (semaphore->signaled)
+    {
+        semaphore->signaled = false;
+        result = pdTRUE;
+    }
+    (void)pthread_mutex_unlock(&semaphore->lock);
+    return result;
 }
 
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
@@ -304,6 +357,10 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
     if (semaphore == NULL)
     {
         return pdFALSE;
+    }
+    if (semaphore->binary)
+    {
+        return _binary_take(semaphore, timeout_ticks);
     }
     if (timeout_ticks == portMAX_DELAY)
     {
@@ -321,14 +378,28 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
 
 BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore)
 {
-    return semaphore != NULL && pthread_mutex_unlock(&semaphore->lock) == 0 ?
-           pdTRUE : pdFALSE;
+    if (semaphore == NULL)
+    {
+        return pdFALSE;
+    }
+    if (!semaphore->binary)
+    {
+        return pthread_mutex_unlock(&semaphore->lock) == 0 ? pdTRUE : pdFALSE;
+    }
+
+    (void)pthread_mutex_lock(&semaphore->lock);
+    const bool was_signaled = semaphore->signaled;
+    semaphore->signaled = true;
+    (void)pthread_cond_signal(&semaphore->changed);
+    (void)pthread_mutex_unlock(&semaphore->lock);
+    return was_signaled ? pdFALSE : pdTRUE;
 }
 
 void vSemaphoreDelete(SemaphoreHandle_t semaphore)
 {
     if (semaphore != NULL)
     {
+        (void)pthread_cond_destroy(&semaphore->changed);
         (void)pthread_mutex_destroy(&semaphore->lock);
         free(semaphore);
     }
