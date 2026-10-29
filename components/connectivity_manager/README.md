@@ -139,6 +139,8 @@ to encode a record whose selected index does not address a retained entry.
 
 ## Test Boundary
 
-- No `tests/host`.
+- No component-local `tests/host`; `tests/connectivity` links the real manager
+  and executor with a controlled radio boundary and covers profile migration,
+  retry/sweep, cancellation, suspend/resume and queue overflow.
 - The host does not cover the Wi-Fi driver, RF, association/DHCP timing, or NVS
   power loss; those are covered by `wifi_service` and on-device verification.

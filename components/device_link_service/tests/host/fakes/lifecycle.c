@@ -344,3 +344,7 @@ esp_err_t device_link_wifi_adapter_bridge_start(void)
 }
 void device_link_wifi_adapter_bridge_stop(void) {}
 void device_link_wifi_adapter_tick(void) {}
+uint32_t device_link_wifi_adapter_next_wait_ms(void)
+{
+    return UINT32_MAX;
+}

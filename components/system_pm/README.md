@@ -41,6 +41,8 @@ Public header `include/system_pm.h`:
 
 ## Test Boundary
 
-- No `tests/host`.
+- `tests/host` exists; it covers configuration validation, init rollback,
+  standby cycle/wake reason classification, hook/commit failure, cancellation,
+  CPU frequency lock refcounting and deinit retry.
 - The host does not cover real light-sleep entry and wake, RTC GPIO electrical
   behavior, or power consumption.

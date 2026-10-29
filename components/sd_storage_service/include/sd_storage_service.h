@@ -240,6 +240,20 @@ esp_err_t sd_storage_service_usage_release(
 esp_err_t sd_storage_service_usage_report_fault(
     const sd_storage_service_usage_t *usage, esp_err_t error);
 
+/**
+ * @brief Report one successful medium-level access for a lease.
+ *
+ * A successful read/directory/stat/open proves the card still responds. It
+ * resets the fault-confirmation streak, so transient errors reported by
+ * different consumers cannot accumulate into a false permanent fault.
+ *
+ * @param usage is the lease that observed the successful access.
+ * @return ESP_OK on success; ESP_ERR_INVALID_ARG for NULL/zero token;
+ *         ESP_ERR_INVALID_STATE when the lease is stale.
+ */
+esp_err_t sd_storage_service_usage_report_success(
+    const sd_storage_service_usage_t *usage);
+
 #ifdef __cplusplus
 }
 #endif

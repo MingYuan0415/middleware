@@ -6008,6 +6008,11 @@ static esp_err_t _ble_nimble_port_rollback_init(
         }
     }
     _ble_nimble_port_timer_teardown();
+    /* Undo manager initialisation in reverse order. These calls tolerate a
+     * manager that was never initialised, so partial init failures do not
+     * leak the TX scheduler pending pool or ADV state. */
+    ble_tx_scheduler_deinit();
+    ble_adv_manager_deinit();
     /* The command queue is statically allocated and stays for the module
      * lifetime; the lock and exit semaphore are recycled. */
     if (s_link_state_lock != NULL)

@@ -29,6 +29,7 @@
 #define TIME_SERVICE_NOTIFY_PAUSE        BIT2
 #define TIME_SERVICE_NOTIFY_RESUME       BIT3
 #define TIME_SERVICE_NOTIFY_NETWORK      (UINT32_C(1) << 4)
+#define TIME_SERVICE_NOTIFY_ALARM        (UINT32_C(1) << 5)
 #define TIME_SERVICE_LEGACY_TIMEOUT_MS  30000U
 #define TIME_SERVICE_ALARM_POLL_MS       100U
 #define TIME_SERVICE_NETWORK_READY_BIT   UINT32_C(1)
@@ -137,6 +138,10 @@ static void _set_alarm_monitor_enabled(bool enabled)
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_alarm_monitor_enabled = enabled;
     xSemaphoreGive(s_state_mutex);
+    if (s_sync_worker != NULL)
+    {
+        (void)xTaskNotify(s_sync_worker, TIME_SERVICE_NOTIFY_ALARM, eSetBits);
+    }
 }
 
 static void _wait_for_worker_event_tail(void)
@@ -460,8 +465,12 @@ static void _sync_worker(void *context)
     for (;;)
     {
         uint32_t pending = 0U;
-        xTaskNotifyWait(0U, UINT32_MAX, &pending,
-                        pdMS_TO_TICKS(TIME_SERVICE_ALARM_POLL_MS));
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        const bool alarm_monitor = s_alarm_monitor_enabled && !s_stopping;
+        xSemaphoreGive(s_state_mutex);
+        const TickType_t wait_ticks = alarm_monitor ?
+                                      pdMS_TO_TICKS(TIME_SERVICE_ALARM_POLL_MS) : portMAX_DELAY;
+        xTaskNotifyWait(0U, UINT32_MAX, &pending, wait_ticks);
         notifications |= pending;
         if ((notifications & TIME_SERVICE_NOTIFY_STOP) != 0U)
         {
@@ -837,9 +846,15 @@ esp_err_t time_service_deinit(void)
     xSemaphoreGive(s_state_mutex);
 
     xTaskNotify(s_sync_worker, TIME_SERVICE_NOTIFY_STOP, eSetBits);
+    /* The worker may take s_control_mutex from its network-ready path. Release
+     * it while waiting for STOPPED so the worker can reach its stop handler. */
+    xSemaphoreGive(s_control_mutex);
+    control_owned = false;
     xEventGroupWaitBits(s_sync_events, TIME_SERVICE_WORKER_STOPPED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
     _wait_for_worker_event_tail();
+    (void)xSemaphoreTake(s_control_mutex, portMAX_DELAY);
+    control_owned = true;
 
     vEventGroupDelete(s_sync_events);
     s_sync_events = NULL;
@@ -902,6 +917,7 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
     }
 
     esp_err_t result = ESP_ERR_INVALID_STATE;
+    bool control_owned = true;
     bool reopen_admission = false;
     bool reopen_network_admission = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
@@ -940,6 +956,11 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
         goto exit;
     }
 
+    /* The worker may call the public sync/cancel path, which takes
+     * s_control_mutex. Release it while waiting for PAUSED so the worker can
+     * make progress; suspend/deinit are caller-serialized lifecycle calls. */
+    xSemaphoreGive(control);
+    control_owned = false;
     const EventBits_t bits = xEventGroupWaitBits(
                                  events, TIME_SERVICE_WORKER_PAUSED_BIT, pdFALSE,
                                  pdTRUE, _deadline_remaining(&deadline));
@@ -967,6 +988,11 @@ esp_err_t time_service_suspend(uint32_t timeout_ms)
     result = ESP_ERR_TIMEOUT;
 
 exit:
+    if (!control_owned)
+    {
+        (void)xSemaphoreTake(control, portMAX_DELAY);
+        control_owned = true;
+    }
     xSemaphoreGive(control);
     if (reopen_network_admission)
     {

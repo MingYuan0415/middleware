@@ -73,7 +73,7 @@ idf_component_register(SRCS "app.c" REQUIRES connectivity_manager event_bus)
 
 ## 配置
 
-Kconfig 只保留静态资源预算：Event Bus 三个池 24、payload 256 B，NVS blob pool 16，
+Kconfig 只保留静态资源预算：Event Bus 24 个订阅、8 个待处理 UI 批次、320 B payload，NVS blob pool 16，
 IMU/Power stack 3072，Time stack 3072，Connectivity stack 8192 和 queue 8，Wi-Fi
 stack 4096 和 queue 16，System PM stack 4096，Weather stack 8192 和最大临时响应
 256 KiB，Chore stack 4096 和 job 容量 8。采样率、轮询周期、任务优先级、PCM、挂载点、时区和 SNTP server 都由根
@@ -88,7 +88,7 @@ Manager 偏好和内置 App 状态，data 挂载后由 `fs_storage_wipe_data()` 
 
 ## 并发与资源边界
 
-- `event_bus` API 仅限任务上下文，不支持 ISR。最多 24 个订阅、24 个待处理 UI 回调和 24 份 UI payload；匹配 UI 订阅时 payload 最大 256 字节。发布者回调同步执行，UI 回调异步执行；取消订阅不是静默屏障，销毁 `user_data` 前仍需停止发布者并排空 UI 工作。
+- `event_bus` API 仅限任务上下文，不支持 ISR。最多 24 个订阅、8 个待处理 UI 批次、每批 payload 最大 320 字节。发布者回调同步执行，UI 回调异步执行；取消订阅不是静默屏障，销毁 `user_data` 前仍需停止发布者并排空 UI 工作。
 - `EVENT_BUS_PUBLISH_FLAG_UI_LATEST` 只用于可覆盖的状态快照，不得用于边沿、命令、审计或计数事件。事件 payload 只在回调期间有效。
 - `nv_storage` 成功初始化后独占默认 NVS 分区生命周期。键最长 15 字节，Blob 注册池为 16 项；注册数据缓冲和回调必须存活到成功反初始化。Blob 加载会冻结注册表，但回调执行时不持锁。
 - Connectivity 公共请求是非阻塞接纳操作，扫描快照最多保存 5 条记录；SSID 上限 32 字节；个人网络密码上限 64 字节（契约边界，1..64 均接受，物理关联失败留作操作结果）。`wifi_service` 公共接口仅保留给 manager 和底层测试。Connectivity、Wi-Fi、天气、时间、电源、IMU、音频、SD、Chore 和系统 PM 的挂起、等待、I/O 或反初始化接口可能阻塞，生命周期调用必须由上层串行化。`chore_service` 的 job 回调本身运行在 worker 上，可在其中调用其他服务 API，但必须短时返回并遵守各服务的上下文限制。

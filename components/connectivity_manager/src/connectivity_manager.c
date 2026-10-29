@@ -2473,9 +2473,12 @@ static void _manager_poll_scan(manager_worker_t *worker)
                               ESP_ERR_NOT_FINISHED : scan.last_error;
     worker->scan.running = scan.state == WIFI_SERVICE_SCAN_RUNNING;
     worker->scan.truncated = scan.truncated;
-    worker->scan.record_count = scan.record_count;
+    worker->scan.record_count = scan.record_count <
+                                CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS ?
+                                scan.record_count :
+                                CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS;
     memset(worker->scan.records, 0, sizeof(worker->scan.records));
-    for (size_t index = 0U; index < scan.record_count; ++index)
+    for (size_t index = 0U; index < worker->scan.record_count; ++index)
     {
         connectivity_manager_scan_record_t *record =
             &worker->scan.records[index];

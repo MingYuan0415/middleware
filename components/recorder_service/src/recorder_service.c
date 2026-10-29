@@ -103,6 +103,7 @@ typedef struct recorder_runtime
     bool stop_requested;
     bool stopping;
     atomic_bool task_running;
+    atomic_bool scan_active;
     bool playback;
     size_t file_count;
     bool index_valid;
@@ -148,6 +149,7 @@ static bool s_initialized;
 static uint32_t s_next_operation_id;
 
 static void _recorder_command_task(void *argument);
+static esp_err_t _recorder_request_refresh(void);
 
 static void _recorder_lock(void)
 {
@@ -398,7 +400,7 @@ static bool _recorder_record_newer(const char *name, bool has_mtime,
 }
 
 /** @brief Scan under a held lease and publish only a complete, current index. */
-static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage)
+static void _recorder_refresh_index_impl(const sd_storage_service_usage_t *held_usage)
 {
     sd_storage_service_usage_t access = {0};
     const sd_storage_service_usage_t *usage = held_usage;
@@ -657,10 +659,21 @@ static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage
     }
     _recorder_unlock();
     free(scan);
+    if (scan_ok && !medium_eio)
+    {
+        (void)sd_storage_service_usage_report_success(usage);
+    }
     if (held_usage == NULL)
     {
         (void)sd_storage_service_usage_release(&access);
     }
+}
+
+static void _recorder_refresh_index(const sd_storage_service_usage_t *held_usage)
+{
+    atomic_store_explicit(&s_recorder.scan_active, true, memory_order_release);
+    _recorder_refresh_index_impl(held_usage);
+    atomic_store_explicit(&s_recorder.scan_active, false, memory_order_release);
 }
 
 /**
@@ -904,9 +917,29 @@ static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
     {
         (void)sd_storage_service_note_content_change(&s_recorder.usage);
     }
-    if (final_error == ESP_OK)
+    if (final_error == ESP_OK && !playback)
     {
+#ifdef ESP_PLATFORM
+        _recorder_lock();
+        const bool request_refresh = !s_recorder.refresh_requested;
+        if (request_refresh)
+        {
+            s_recorder.refresh_requested = true;
+        }
+        _recorder_unlock();
+        if (request_refresh && _recorder_request_refresh() != ESP_OK)
+        {
+            _recorder_lock();
+            s_recorder.refresh_requested = false;
+            _recorder_unlock();
+        }
+#else
         _recorder_refresh_index(&s_recorder.usage);
+#endif
+    }
+    if (final_error == ESP_OK && !medium_eio)
+    {
+        (void)sd_storage_service_usage_report_success(&s_recorder.usage);
     }
     _recorder_usage_release(medium_eio, final_error);
     _recorder_lock();
@@ -975,7 +1008,8 @@ static void _recorder_task(void *argument)
             }
             continue;
         }
-        if (!playback && duration >= s_recorder.config.max_duration_seconds * 1000U)
+        if (!playback && (uint64_t)duration >=
+                (uint64_t)s_recorder.config.max_duration_seconds * 1000U)
         {
             _recorder_finish(false, ESP_OK, false);
             _recorder_stream_park();
@@ -1121,6 +1155,7 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
     }
     memset(&s_recorder, 0, sizeof(s_recorder));
     atomic_init(&s_recorder.task_running, false);
+    atomic_init(&s_recorder.scan_active, false);
     s_recorder.config = *config;
     s_recorder.snapshot.state = RECORDER_SERVICE_IDLE;
     s_recorder.snapshot.last_error = ESP_OK;
@@ -1343,6 +1378,9 @@ bool recorder_service_is_busy(void)
                       s_recorder.file != NULL ||
                       atomic_load_explicit(&s_recorder.task_running,
                                            memory_order_acquire) ||
+                      atomic_load_explicit(&s_recorder.scan_active,
+                                           memory_order_acquire) ||
+                      s_recorder.refresh_requested ||
                       s_recorder.usage_held || s_recorder.audio_leased ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_RECORDING ||
                       s_recorder.snapshot.state == RECORDER_SERVICE_PAUSED ||

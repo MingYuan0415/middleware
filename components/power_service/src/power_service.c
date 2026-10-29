@@ -300,7 +300,10 @@ static uint32_t _worker_wait_ms(int64_t next_sample_at_ms)
     }
 
     const int64_t until_sample_ms = next_sample_at_ms - now_ms;
-    uint32_t wait_ms = s_config.irq_poll_interval_ms;
+    /* Without a PMU interrupt source there is nothing to poll; wake at the
+     * telemetry period instead of spinning at the IRQ polling period. */
+    uint32_t wait_ms = s_power_ops.poll_irq != NULL ?
+                       s_config.irq_poll_interval_ms : s_config.poll_interval_ms;
     if (until_sample_ms < (int64_t)wait_ms)
     {
         wait_ms = (uint32_t)until_sample_ms;

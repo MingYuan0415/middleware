@@ -75,7 +75,8 @@ Production code must not initialize or control `wifi_service` on its own.
 Re-initializing with the same configuration is idempotent; a different
 configuration while active returns `ESP_ERR_INVALID_STATE`. Stop the publishers
 and wait for accepted work to drain, then deinit in reverse order. `event_bus`
-is a process-lifetime singleton and has no deinit interface.
+is a process-lifetime singleton; its deinit is only safe after every publisher
+and the UI dispatcher have stopped.
 
 ## New Service APIs and Events
 
@@ -212,8 +213,8 @@ refresh window.
 
 ## Configuration
 
-Kconfig keeps only static resource budgets: Event Bus three pools of 24 and
-payload 256 B, NVS blob pool 16, IMU/Power stack 3072, Time stack 3072,
+Kconfig keeps only static resource budgets: Event Bus 24 subscribers, 8 pending
+UI batches and 320 B payload, NVS blob pool 16, IMU/Power stack 3072, Time stack 3072,
 Connectivity stack 8192 and queue 8, Wi-Fi stack 4096 and queue 16, System PM
 stack 4096, Weather stack 8192 and maximum temporary response 256 KiB, Chore
 stack 4096 and job capacity 8. The sampling rate, polling period, task

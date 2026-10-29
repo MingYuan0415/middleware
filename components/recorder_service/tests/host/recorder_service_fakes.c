@@ -303,6 +303,15 @@ esp_err_t sd_storage_service_usage_release(const sd_storage_service_usage_t *usa
     return ESP_OK;
 }
 
+esp_err_t sd_storage_service_usage_report_success(
+    const sd_storage_service_usage_t *usage)
+{
+    pthread_mutex_lock(&s_mutex);
+    assert(_slot(usage) >= 0);
+    pthread_mutex_unlock(&s_mutex);
+    return ESP_OK;
+}
+
 esp_err_t sd_storage_service_usage_report_fault(const sd_storage_service_usage_t *usage,
         esp_err_t error)
 {

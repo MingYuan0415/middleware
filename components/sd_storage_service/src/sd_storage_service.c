@@ -571,6 +571,24 @@ esp_err_t sd_storage_service_usage_release(const sd_storage_service_usage_t *usa
     return ESP_OK;
 }
 
+esp_err_t sd_storage_service_usage_report_success(
+    const sd_storage_service_usage_t *usage)
+{
+    if (usage == NULL || usage->token == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_state_lock);
+    const bool valid = _usage_valid_locked(usage);
+    if (valid)
+    {
+        s_fault_streak = 0U;
+        s_last_error = ESP_OK;
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
+    return valid ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 esp_err_t sd_storage_service_usage_report_fault(const sd_storage_service_usage_t *usage,
         esp_err_t error)
 {

@@ -82,5 +82,5 @@ v1（112 字节）、v2（128 字节）或 v3（168 字节）的单档记录会�
 
 ## 测试边界
 
-- 无 `tests/host`。
+- 无组件本地 `tests/host`；根目录 `tests/connectivity` 将真实 manager/executor 与受控射频边界链接，覆盖 profile 迁移、重试/扫描、取消、suspend/resume 与队列溢出。
 - 宿主不覆盖 Wi-Fi 驱动、射频、关联/DHCP 时序与 NVS 掉电；这些由 `wifi_service` 和上板验证。

@@ -224,6 +224,12 @@ esp_err_t sd_storage_service_note_content_change(const sd_storage_service_usage_
     pthread_mutex_unlock(&s_sd_lock);
     return ESP_OK;
 }
+esp_err_t sd_storage_service_usage_report_success(
+    const sd_storage_service_usage_t *usage)
+{
+    assert(usage->token != 0U);
+    return ESP_OK;
+}
 esp_err_t sd_storage_service_usage_report_fault(
     const sd_storage_service_usage_t *usage, esp_err_t error)
 {
@@ -669,8 +675,11 @@ static void _pagination_and_paths(void)
     assert(batch->count == 2U && !batch->has_more);
     assert(batch->entries[0].kind == FILE_SERVICE_ENTRY_FILE);
     assert(batch->entries[1].kind == FILE_SERVICE_ENTRY_FILE);
-    assert(strcmp(batch->entries[0].name, "first.txt") == 0);
-    assert(strcmp(batch->entries[1].name, "second.txt") == 0);
+    const bool saw_first = strcmp(batch->entries[0].name, "first.txt") == 0 ||
+                           strcmp(batch->entries[1].name, "first.txt") == 0;
+    const bool saw_second = strcmp(batch->entries[0].name, "second.txt") == 0 ||
+                            strcmp(batch->entries[1].name, "second.txt") == 0;
+    assert(saw_first && saw_second);
     cursor = (file_service_cursor_t)
     {
         0

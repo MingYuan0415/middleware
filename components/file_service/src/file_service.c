@@ -627,6 +627,8 @@ static void _finish(request_slot_t *slot, esp_err_t error,
     {
         if (system_error == EIO)
             (void)sd_storage_service_usage_report_fault(&slot->usage, error);
+        else if (error == ESP_OK)
+            (void)sd_storage_service_usage_report_success(&slot->usage);
         (void)sd_storage_service_usage_release(&slot->usage);
         slot->usage.token = 0U;
     }

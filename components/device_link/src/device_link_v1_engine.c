@@ -361,6 +361,10 @@ bool device_link_v1_engine_rollback(device_link_v1_engine_t *engine)
         return false;
     }
     _device_link_v1_engine_clear_record(engine);
+    engine->in_flight = DEVICE_LINK_V1_TX_NONE;
+    engine->pending_accepted = false;
+    engine->pending_ack = false;
+    engine->response_request_id = 0U;
     return true;
 }
 

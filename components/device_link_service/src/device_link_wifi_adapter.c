@@ -5,6 +5,7 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "ble_link_service.h"
 #include "connectivity_manager.h"
@@ -32,6 +33,8 @@ typedef struct device_link_wifi_bridge
     bool terminal_pending;
     bool terminal_completing;
     bool terminal_warning_logged;
+    uint8_t terminal_retry_count;
+    TickType_t terminal_retry_not_before;
     uint64_t terminal_generation;
     uint64_t completed_terminal_generation;
     uint32_t terminal_ble_operation_id;
@@ -138,10 +141,14 @@ static void _device_link_wifi_map_snapshot(
         out->profile_ssid_length = (uint8_t)length;
     }
     if (!device_link_v1_snapshot_valid(out) &&
-            out->state == DEVICE_LINK_V1_WIFI_CONNECTING)
+            (out->state == DEVICE_LINK_V1_WIFI_CONNECTING ||
+             out->state == DEVICE_LINK_V1_WIFI_CONNECTED))
     {
-        out->state = DEVICE_LINK_V1_WIFI_IDLE;
-        out->failure = DEVICE_LINK_V1_WIFI_FAILURE_NONE;
+        /* A connected snapshot without a profile cannot satisfy the wire
+         * contract. Treat it as a classified internal error, not a CONNECTED
+         * state that every terminal completion rejects. */
+        out->state = DEVICE_LINK_V1_WIFI_ERROR;
+        out->failure = DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL;
     }
 }
 
@@ -164,6 +171,8 @@ static void _device_link_wifi_drop_terminal_locked(uint32_t ble_operation_id)
     s_bridge.terminal_pending = false;
     s_bridge.terminal_completing = false;
     s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_retry_count = 0U;
+    s_bridge.terminal_retry_not_before = 0U;
     s_bridge.terminal_ble_operation_id = 0U;
     s_bridge.terminal_manager_operation_id = 0U;
     s_bridge.terminal_count = 0U;
@@ -185,7 +194,10 @@ static void _device_link_wifi_try_complete_terminal(void)
 
     _device_link_wifi_lock();
     if (!s_bridge.terminal_pending || s_bridge.terminal_completing ||
-            s_bridge.terminal_ble_operation_id == 0U)
+            s_bridge.terminal_ble_operation_id == 0U ||
+            (s_bridge.terminal_retry_not_before != 0U &&
+             (int32_t)(xTaskGetTickCount() -
+                       s_bridge.terminal_retry_not_before) < 0))
     {
         _device_link_wifi_unlock();
         return;
@@ -221,6 +233,15 @@ static void _device_link_wifi_try_complete_terminal(void)
             else
             {
                 s_bridge.terminal_completing = false;
+                if (s_bridge.terminal_retry_count < UINT8_MAX)
+                {
+                    ++s_bridge.terminal_retry_count;
+                }
+                if (s_bridge.terminal_retry_count >= 4U)
+                {
+                    s_bridge.terminal_retry_not_before = xTaskGetTickCount() +
+                                                         pdMS_TO_TICKS(1000U);
+                }
                 if (!s_bridge.terminal_warning_logged)
                 {
                     s_bridge.terminal_warning_logged = true;
@@ -292,14 +313,19 @@ static void _device_link_wifi_on_status(
     {
         failure = DEVICE_LINK_V1_WIFI_FAILURE_TIMEOUT;
     }
-    else if (operation == DEVICE_LINK_V1_OPERATION_CONNECT &&
+    else if ((operation == DEVICE_LINK_V1_OPERATION_CONNECT ||
+              operation == DEVICE_LINK_V1_OPERATION_DISCONNECT) &&
              failure == DEVICE_LINK_V1_WIFI_FAILURE_STORAGE)
     {
+        /* STORAGE is not a legal terminal failure for DISCONNECT; report the
+         * bridge's internal classification instead of retrying forever. */
         failure = DEVICE_LINK_V1_WIFI_FAILURE_INTERNAL;
     }
     s_bridge.terminal_pending = true;
     s_bridge.terminal_completing = false;
     s_bridge.terminal_warning_logged = false;
+    s_bridge.terminal_retry_count = 0U;
+    s_bridge.terminal_retry_not_before = 0U;
     s_bridge.terminal_generation = status->generation;
     s_bridge.terminal_ble_operation_id = ble_operation_id;
     s_bridge.terminal_manager_operation_id = status->operation_id;
@@ -356,8 +382,12 @@ static void _device_link_wifi_on_scan(
                                  scan->records[i].security);
         source[i].rssi_dbm = scan->records[i].rssi;
     }
+    const uint8_t source_count = scan->record_count <
+                                 CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS ?
+                                 scan->record_count :
+                                 CONNECTIVITY_MANAGER_MAX_SCAN_RECORDS;
     count = device_link_v1_filter_scan_networks(
-                source, scan->record_count, networks,
+                source, source_count, networks,
                 DEVICE_LINK_V1_MAX_SCAN_NETWORKS);
     memset(&status, 0, sizeof(status));
     (void)connectivity_manager_get_status(&status);
@@ -387,6 +417,8 @@ static void _device_link_wifi_on_scan(
         s_bridge.terminal_pending = true;
         s_bridge.terminal_completing = false;
         s_bridge.terminal_warning_logged = false;
+        s_bridge.terminal_retry_count = 0U;
+        s_bridge.terminal_retry_not_before = 0U;
         s_bridge.terminal_generation = scan->generation;
         s_bridge.terminal_ble_operation_id = ble_operation_id;
         s_bridge.terminal_manager_operation_id = manager_operation_id;
@@ -577,11 +609,46 @@ void device_link_wifi_adapter_bridge_stop(void)
     {
         return;
     }
-    (void)event_bus_unsubscribe_sync(s_bridge.subscription, 1000U);
+    const esp_err_t unsubscribe_result =
+        event_bus_unsubscribe_sync(s_bridge.subscription, 1000U);
+    if (unsubscribe_result != ESP_OK &&
+            unsubscribe_result != ESP_ERR_NOT_FOUND)
+    {
+        /* Keep the bridge and handle intact: a late publisher callback must
+         * still see a live bridge, and a later stop can retry the unsubscribe. */
+        LOG_W("wifi bridge unsubscribe deferred: %d",
+              (int)unsubscribe_result);
+        return;
+    }
     ble_link_service_set_v1_ops(NULL, NULL);
     _device_link_wifi_lock();
     memset(&s_bridge, 0, sizeof(s_bridge));
     _device_link_wifi_unlock();
+}
+
+uint32_t device_link_wifi_adapter_next_wait_ms(void)
+{
+    uint32_t wait_ms = UINT32_MAX;
+    _device_link_wifi_lock();
+    if (s_bridge.started && s_bridge.terminal_pending &&
+            !s_bridge.terminal_completing)
+    {
+        if (s_bridge.terminal_retry_not_before == 0U)
+        {
+            wait_ms = 1000U;
+        }
+        else
+        {
+            const TickType_t now = xTaskGetTickCount();
+            const TickType_t deadline = s_bridge.terminal_retry_not_before;
+            const TickType_t remaining = (int32_t)(deadline - now) > 0 ?
+                                         deadline - now : 0U;
+            wait_ms = remaining == 0U ? 1U :
+                      (uint32_t)remaining * portTICK_PERIOD_MS;
+        }
+    }
+    _device_link_wifi_unlock();
+    return wait_ms;
 }
 
 void device_link_wifi_adapter_tick(void)

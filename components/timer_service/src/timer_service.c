@@ -30,19 +30,31 @@ typedef struct timer_service_runtime
 } timer_service_runtime_t;
 
 static timer_service_runtime_t s_timer;
-static atomic_flag s_lock = ATOMIC_FLAG_INIT;
+#ifdef ESP_PLATFORM
+    static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+#else
+    static atomic_flag s_lock = ATOMIC_FLAG_INIT;
+#endif
 static atomic_bool s_initialized = false;
 
 static void _timer_lock(void)
 {
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_lock);
+#else
     while (atomic_flag_test_and_set_explicit(&s_lock, memory_order_acquire))
     {
     }
+#endif
 }
 
 static void _timer_unlock(void)
 {
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_lock);
+#else
     atomic_flag_clear_explicit(&s_lock, memory_order_release);
+#endif
 }
 
 static uint32_t _timer_elapsed_ms(int64_t started_us, int64_t now_us)
@@ -240,9 +252,13 @@ esp_err_t timer_service_init(const timer_service_config_t *config)
     atomic_store_explicit(&s_initialized, true, memory_order_release);
     _timer_unlock();
 #ifdef ESP_PLATFORM
-    if (s_timer.stopped == NULL ||
-            xTaskCreatePinnedToCore(_timer_worker, "timer_service", 3072, NULL,
-                                    4, &s_timer.worker, tskNO_AFFINITY) != pdPASS)
+    /* The snapshot is computed on demand by timer_service_get_snapshot().
+     * A worker is only needed to turn elapsed deadlines into completion
+     * callbacks; without a callback the task would be a pure 10 Hz poll. */
+    if (config->completion_cb != NULL &&
+            (s_timer.stopped == NULL ||
+             xTaskCreatePinnedToCore(_timer_worker, "timer_service", 3072, NULL,
+                                     4, &s_timer.worker, tskNO_AFFINITY) != pdPASS))
     {
         atomic_store_explicit(&s_initialized, false, memory_order_release);
         _timer_lock();

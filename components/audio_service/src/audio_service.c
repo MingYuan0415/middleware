@@ -696,6 +696,10 @@ exit:
 
 esp_err_t audio_service_set_volume(uint8_t percent)
 {
+    if (percent > 100U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t result = _lock_service();
     if (result != ESP_OK)
     {
@@ -703,13 +707,14 @@ esp_err_t audio_service_set_volume(uint8_t percent)
     }
     if (!s_audio_service.initialized)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        _unlock_service();
+        return ESP_ERR_INVALID_STATE;
     }
-    result = s_audio_service.ops.set_volume(percent);
-
-exit:
+    /* Do not hold the service mutex across the BSP codec I2C transaction:
+     * stream I/O admission uses the same mutex on the audio worker. */
+    const bsp_audio_ops_t ops = s_audio_service.ops;
     _unlock_service();
+    result = ops.set_volume(percent);
     return result;
 }
 
@@ -826,14 +831,12 @@ esp_err_t audio_service_set_mute(bool muted)
     }
     if (!s_audio_service.initialized)
     {
-        result = ESP_ERR_INVALID_STATE;
-        goto exit;
+        _unlock_service();
+        return ESP_ERR_INVALID_STATE;
     }
-    result = s_audio_service.ops.set_mute(muted);
-
-exit:
+    const bsp_audio_ops_t ops = s_audio_service.ops;
     _unlock_service();
-    return result;
+    return ops.set_mute(muted);
 }
 
 esp_err_t audio_service_get_mute(bool *muted)

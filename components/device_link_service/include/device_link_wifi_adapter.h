@@ -33,6 +33,9 @@ void device_link_wifi_adapter_bridge_stop(void);
 /** @brief Retry a retained Wi-Fi terminal completion from the owner task. */
 void device_link_wifi_adapter_tick(void);
 
+/** @brief Return the next retry delay for a retained terminal, or UINT32_MAX. */
+uint32_t device_link_wifi_adapter_next_wait_ms(void);
+
 #ifdef __cplusplus
 }
 #endif

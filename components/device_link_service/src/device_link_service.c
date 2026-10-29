@@ -554,6 +554,8 @@ static uint32_t _device_link_service_next_wait_ms(void)
         wait_ms = _device_link_service_min_wait(
                       wait_ms, DEVICE_LINK_SERVICE_RETRY_MS);
     }
+    wait_ms = _device_link_service_min_wait(
+                  wait_ms, device_link_wifi_adapter_next_wait_ms());
     if (s_service.window_open)
     {
         wait_ms = _device_link_service_min_wait(
@@ -2441,8 +2443,18 @@ esp_err_t device_link_service_release_startup_gate(void)
              * START failure is retained by the ADV owner and retried with
              * backoff, so it is an availability event rather than a failed
              * factory-reset transaction or reopen the reset journal. */
-            s_service.startup_gate_released = true;
-            s_service.bluetooth_policy_default_pending = false;
+            if (s_service.bluetooth_policy_default_pending)
+            {
+                result = _device_link_service_store_bluetooth_policy(true);
+            }
+            if (result == ESP_OK)
+            {
+                s_service.startup_gate_released = true;
+                s_service.bluetooth_policy_default_pending = false;
+            }
+        }
+        if (result == ESP_OK)
+        {
             const esp_err_t resume_result = ble_adv_manager_set_pause_reason(
                                                 BLE_ADV_MANAGER_PAUSE_REASON_STARTUP_GATE,
                                                 false);
