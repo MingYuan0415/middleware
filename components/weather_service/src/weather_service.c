@@ -1056,6 +1056,28 @@ static bool _weather_kind_due(weather_service_kind_t kind, int64_t now_ms,
            s_weather.next_due_ms[kind] <= now_ms;
 }
 
+static bool _weather_any_kind_due_locked(int64_t now_ms, bool force)
+{
+    if (force || s_weather.pending_scope_session != 0U)
+    {
+        return true;
+    }
+    if (s_weather.location_retry_due_ms != 0 &&
+            s_weather.location_retry_due_ms <= now_ms)
+    {
+        return true;
+    }
+    for (weather_service_kind_t kind = WEATHER_SERVICE_KIND_CURRENT;
+            kind < WEATHER_SERVICE_KIND_COUNT; ++kind)
+    {
+        if (_weather_kind_due(kind, now_ms, false))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool _weather_scope_current_due(int64_t now_ms, bool fresh_scope,
                                        bool force)
 {
@@ -1208,6 +1230,21 @@ static void _weather_run_cycle(bool force)
             _weather_publish(0U);
         }
         return;
+    }
+    if (!force)
+    {
+        xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+        const bool can_skip = s_weather.current != NULL &&
+                              s_weather.current->snapshot.location.available &&
+                              s_weather.located_session != 0U &&
+                              s_weather.network_session == s_weather.located_session &&
+                              !_weather_any_kind_due_locked(monotonic_now_ms,
+                                  false);
+        xSemaphoreGive(s_weather.mutex);
+        if (can_skip)
+        {
+            return;
+        }
     }
     weather_snapshot_node_t *staging = _weather_clone_current();
     if (staging == NULL)
