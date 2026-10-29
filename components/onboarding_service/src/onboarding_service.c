@@ -3,13 +3,14 @@
 #include "nv_storage.h"
 #include "nvs.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #define ONBOARDING_STORAGE_KEY "onboard_state"
 
-static bool s_initialized;
-static onboarding_service_state_t s_state;
+static atomic_bool s_initialized;
+static atomic_int s_state;
 
 static esp_err_t _onboarding_store(onboarding_service_state_t state)
 {
@@ -17,14 +18,14 @@ static esp_err_t _onboarding_store(onboarding_service_state_t state)
                                          (uint8_t)state);
     if (result == ESP_OK)
     {
-        s_state = state;
+        atomic_store_explicit(&s_state, (int)state, memory_order_release);
     }
     return result;
 }
 
 esp_err_t onboarding_service_init(void)
 {
-    if (s_initialized)
+    if (atomic_load_explicit(&s_initialized, memory_order_acquire))
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -51,19 +52,20 @@ esp_err_t onboarding_service_init(void)
         }
         stored = ONBOARDING_SERVICE_PENDING;
     }
-    s_state = (onboarding_service_state_t)stored;
-    s_initialized = true;
+    atomic_store_explicit(&s_state, (int)stored, memory_order_release);
+    atomic_store_explicit(&s_initialized, true, memory_order_release);
     return ESP_OK;
 }
 
 esp_err_t onboarding_service_deinit(void)
 {
-    if (!s_initialized)
+    if (!atomic_load_explicit(&s_initialized, memory_order_acquire))
     {
         return ESP_ERR_INVALID_STATE;
     }
-    s_initialized = false;
-    s_state = ONBOARDING_SERVICE_PENDING;
+    atomic_store_explicit(&s_initialized, false, memory_order_release);
+    atomic_store_explicit(&s_state, ONBOARDING_SERVICE_PENDING,
+                          memory_order_release);
     return ESP_OK;
 }
 
@@ -73,28 +75,32 @@ esp_err_t onboarding_service_get_state(onboarding_service_state_t *state)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_initialized)
+    if (!atomic_load_explicit(&s_initialized, memory_order_acquire))
     {
         return ESP_ERR_INVALID_STATE;
     }
-    *state = s_state;
+    *state = (onboarding_service_state_t)atomic_load_explicit(
+                 &s_state, memory_order_acquire);
     return ESP_OK;
 }
 
 esp_err_t onboarding_service_defer(void)
 {
-    return s_initialized ? _onboarding_store(ONBOARDING_SERVICE_DEFERRED) :
+    return atomic_load_explicit(&s_initialized, memory_order_acquire) ?
+           _onboarding_store(ONBOARDING_SERVICE_DEFERRED) :
            ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t onboarding_service_complete(void)
 {
-    return s_initialized ? _onboarding_store(ONBOARDING_SERVICE_COMPLETED) :
+    return atomic_load_explicit(&s_initialized, memory_order_acquire) ?
+           _onboarding_store(ONBOARDING_SERVICE_COMPLETED) :
            ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t onboarding_service_reset(void)
 {
-    return s_initialized ? _onboarding_store(ONBOARDING_SERVICE_PENDING) :
+    return atomic_load_explicit(&s_initialized, memory_order_acquire) ?
+           _onboarding_store(ONBOARDING_SERVICE_PENDING) :
            ESP_ERR_INVALID_STATE;
 }

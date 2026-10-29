@@ -839,6 +839,11 @@ esp_err_t file_service_init(const file_service_config_t *config)
             (config->root_relative_path != NULL &&
              _check_relative(config->root_relative_path) != ESP_OK))
         return ESP_ERR_INVALID_ARG;
+    const size_t allocation_unit = config->allocation_unit_size;
+    if (allocation_unit != 0U &&
+            (allocation_unit < 512U || allocation_unit > 65536U ||
+             (allocation_unit & (allocation_unit - 1U)) != 0U))
+        return ESP_ERR_INVALID_ARG;
     if (s_files.initialized) return ESP_ERR_INVALID_STATE;
     memset(&s_files, 0, sizeof(s_files));
     strcpy(s_files.mount_path, config->mount_path);
