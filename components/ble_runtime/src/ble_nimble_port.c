@@ -1652,7 +1652,11 @@ static bool _ble_nimble_port_timer_reconcile_handle(unsigned int kind)
 
     if (slot == NULL || !slot->armed)
     {
-        _ble_nimble_port_timer_free_handle(kind);
+        if (s_timer_handles[kind] != NULL)
+        {
+            (void)esp_timer_stop(s_timer_handles[kind]);
+            s_timer_handle_epochs[kind] = 0U;
+        }
         return true;
     }
     if (s_timer_handles[kind] != NULL &&
@@ -1667,15 +1671,22 @@ static bool _ble_nimble_port_timer_reconcile_handle(unsigned int kind)
     {
         remaining_us = slot->deadline_us - now;
     }
-    _ble_nimble_port_timer_free_handle(kind);
+    if (s_timer_handles[kind] != NULL)
+    {
+        (void)esp_timer_stop(s_timer_handles[kind]);
+    }
     esp_timer_create_args_t args;
 
     memset(&args, 0, sizeof(args));
     args.callback = _ble_nimble_port_timer_cb;
     args.name = (kind == BLE_NIMBLE_PORT_TIMER_KIND_INDICATION) ?
                 "ble_ind_tmo" : "ble_reasm_idle";
+    if (s_timer_handles[kind] == NULL &&
+            esp_timer_create(&args, &s_timer_handles[kind]) != ESP_OK)
+    {
+        return false;
+    }
     if (remaining_us == 0U ||
-            esp_timer_create(&args, &s_timer_handles[kind]) != ESP_OK ||
             esp_timer_start_once(s_timer_handles[kind], remaining_us) != ESP_OK)
     {
         /* The bounded owner wait is still authoritative, but a failed wake
@@ -5807,6 +5818,10 @@ static esp_err_t _ble_nimble_port_production_notify(
     uint16_t conn_handle, uint16_t value_handle,
     const uint8_t *data, size_t len)
 {
+    if (len > UINT16_MAX)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     int result;
 
@@ -5836,6 +5851,10 @@ static esp_err_t _ble_nimble_port_production_indicate(
     uint16_t conn_handle, uint16_t value_handle,
     const uint8_t *data, size_t len)
 {
+    if (len > UINT16_MAX)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     int result;
 
