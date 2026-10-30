@@ -1,0 +1,23 @@
+menu "Music service"
+
+    config MUSIC_SERVICE_API_TASK_STACK_SIZE
+        int "Music API task stack size"
+        range 6144 32768
+        default 10240
+
+    config MUSIC_SERVICE_AUDIO_TASK_STACK_SIZE
+        int "Music audio task stack size"
+        range 8192 32768
+        default 20480
+
+    config MUSIC_SERVICE_API_QUEUE_DEPTH
+        int "Music API command queue depth"
+        range 4 16
+        default 8
+
+    config MUSIC_SERVICE_MAX_RESPONSE_BYTES
+        int "Maximum QQ Music JSON response bytes"
+        range 65536 1048576
+        default 524288
+
+endmenu

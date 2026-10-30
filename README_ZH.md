@@ -26,6 +26,7 @@
 | `device_link_service` | 串行拥有绑定窗口、Numeric Comparison 确认、应用状态和 factory-reset startup gate | `ble_runtime`、`device_link`、`event_bus` |
 | `factory_reset_service` | 持有版本化恢复出厂 journal；marker 持久化后才重启，并在全部 reset domain 与广告前置条件收敛后清除 marker | `nv_storage`；`mt_log`（私有） |
 | `weather_service` | 每个 IPv4 会话完成一次城市级定位（`/api/v1/location`），以服务端下发的 opaque `location_key` 作为位置作用域身份；顺序更新实时、预警、逐小时和逐日数据，并提供 PSRAM 不可变快照及 A/B 离线缓存 | `event_bus`；HTTP、cJSON、FreeRTOS、heap（私有） |
+| `music_service` | 负责 QQ 音乐扫码登录、个人/推荐歌单、歌曲 URL/歌词/封面获取，以及通过 `audio_service` 独占租约播放 MP3/AAC/FLAC 流；发布不可变快照与小体积播放状态 | `event_bus`；HTTP、cJSON、esp_audio_codec、esp_new_jpeg、NVS、audio_service、time_service 与 FreeRTOS（私有） |
 | `chore_service` | 单一后台杂活 worker：任意任务可提交一次性或周期 job（固定槽位池、协作式取消、挂起后不追补），用于不便在 GUI worker 或调用上下文执行的短时有界工作；禁止 LVGL 调用与长阻塞 | `mt_log`、`esp_timer`、`freertos`、`heap`（私有） |
 | `device_link` | Device Link v1 fixed-binary 编解码与单 slot 操作引擎；不拥有 NimBLE | 无 |
 
