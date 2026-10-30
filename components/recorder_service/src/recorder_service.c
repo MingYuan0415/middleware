@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "sd_storage_service.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
@@ -25,7 +26,24 @@
     #include "freertos/idf_additions.h"
     #include "esp_attr.h"
     #include "esp_heap_caps.h"
+    /*
+    * Core 1, above the LVGL worker that also runs there.
+    *
+    * The stream used to sit at priority 5 while LVGL runs at 6 on the same
+    * core, so every redraw preempted it. The default I2S ring is six
+    * descriptors of 240 frames, i.e. 90 ms at 16 kHz, and a capture task that
+    * comes back after a redraw finds the ring already wrapped; the driver
+    * then overwrites the oldest descriptor, which drops a whole 60 ms chunk
+    * without telling the reader. Staying above LVGL makes the capture worker
+    * preempt the redraw instead.
+    *
+    * This does not starve the display: the worker blocks in i2s_channel_read
+    * for one 8 ms block at a time, so it yields for the remaining wall clock.
+    * Core 0 keeps Wi-Fi, Bluetooth and the main task, where the radio
+    * priorities are higher than this one.
+    */
     #define RECORDER_TASK_CORE 1
+    #define RECORDER_TASK_PRIORITY 7
 #else
     #include "recorder_host_worker.h"
 #endif
@@ -59,6 +77,71 @@ typedef struct recorder_command
     uint32_t operation_id;
     recorder_service_target_t target;
 } recorder_command_t;
+
+/** @brief Fixed capture format of the WAV files this service writes. */
+#define RECORDER_SAMPLE_RATE_HZ 16000U
+/** @brief Stereo 16-bit frames captured per millisecond of wall clock. */
+#define RECORDER_FRAMES_PER_MS (RECORDER_SAMPLE_RATE_HZ / 1000U)
+/** @brief Bytes of stereo 16-bit PCM per second, i.e. the WAV byte rate. */
+#define RECORDER_BYTES_PER_SECOND \
+    (RECORDER_SAMPLE_RATE_HZ * 2U * (uint32_t)sizeof(int16_t))
+
+/**
+ * @brief One biquad stage in transposed direct form II.
+ *
+ * Kept as two first-order sections and one second-order section rather than a
+ * generic filter object: the coefficient set is fixed at build time and the
+ * per-sample cost is what matters on a 16 kHz capture path.
+ */
+typedef struct recorder_biquad
+{
+    float b0;
+    float b1;
+    float b2;
+    float a1;
+    float a2;
+    float z1;
+    float z2;
+} recorder_biquad_t;
+
+static recorder_biquad_t s_recorder_high_pass;
+static recorder_biquad_t s_recorder_low_pass;
+
+/*
+ * Coefficients below were derived for RECORDER_SAMPLE_RATE_HZ with a
+ * Butterworth (Q = 0.7071) bilinear transform and are stored as literals so
+ * the capture path needs no libm and no per-take trigonometry:
+ *
+ *   high-pass 80 Hz : -3.01 dB at 80 Hz, -0.34 dB at 150 Hz, -36 dB at 10 Hz
+ *   low-pass 3.4 kHz: -3.01 dB at 3400 Hz, -11.5 dB at 5 kHz, -32 dB at 7 kHz
+ *
+ * Changing RECORDER_SAMPLE_RATE_HZ requires recomputing both sets.
+ */
+static void _recorder_biquad_design(recorder_biquad_t *filter, bool high_pass)
+{
+    if (high_pass)
+    {
+        filter->b0 = 0.978030479F;
+        filter->b1 = -1.956060958F;
+        filter->b2 = 0.978030479F;
+        filter->a1 = -1.955578240F;
+        filter->a2 = 0.956543677F;
+    }
+    else
+    {
+        filter->b0 = 0.227117964F;
+        filter->b1 = 0.454235928F;
+        filter->b2 = 0.227117964F;
+        filter->a1 = -0.276664615F;
+        filter->a2 = 0.185136470F;
+    }
+}
+
+static void _recorder_biquad_reset(recorder_biquad_t *filter)
+{
+    filter->z1 = 0.0F;
+    filter->z2 = 0.0F;
+}
 
 typedef struct recorder_wav_header
 {
@@ -116,6 +199,14 @@ typedef struct recorder_runtime
     bool usage_held;
     audio_service_lease_t audio_lease;
     bool audio_leased;
+    uint32_t warmup_frames; /**< Captured frames still to discard at start. */
+    uint32_t warmup_total; /**< Frames the warm-up window started with. */
+    uint64_t warmup_energy; /**< Sum of squared samples over the warm-up tail. */
+    uint32_t warmup_samples; /**< Samples accumulated in warmup_energy. */
+    float noise_power; /**< Mean square of the warm-up tail; 0 disables the gate. */
+    bool gate_open; /**< Expander state, hysteresis keeps it from chattering. */
+    uint32_t gate_hold; /**< Frames the gate stays open after the level drops. */
+    float gate_gain; /**< Smoothed expander gain, 1.0 is unity. */
     char directory_path[RECORDER_SERVICE_PATH_BYTES];
     TaskHandle_t task;
     TaskHandle_t command_task;
@@ -276,8 +367,8 @@ static esp_err_t _recorder_header_write(FILE *file, uint32_t data_bytes)
         .fmt_size = 16U,
         .format = 1U,
         .channels = 2U,
-        .sample_rate = 16000U,
-        .byte_rate = 64000U,
+        .sample_rate = RECORDER_SAMPLE_RATE_HZ,
+        .byte_rate = RECORDER_BYTES_PER_SECOND,
         .block_align = 4U,
         .bits_per_sample = 16U,
         .data = {'d', 'a', 't', 'a'},
@@ -301,8 +392,10 @@ static bool _recorder_header_valid(const recorder_wav_header_t *header,
            memcmp(header->fmt, "fmt ", 4U) == 0 &&
            memcmp(header->data, "data", 4U) == 0 &&
            header->format == 1U && header->channels == 2U &&
-           header->sample_rate == 16000U && header->bits_per_sample == 16U &&
-           header->block_align == 4U && header->byte_rate == 64000U &&
+           header->sample_rate == RECORDER_SAMPLE_RATE_HZ &&
+           header->bits_per_sample == 16U &&
+           header->block_align == 4U &&
+           header->byte_rate == RECORDER_BYTES_PER_SECOND &&
            (uint64_t)header->file_size + 8U <= file_size &&
            (uint64_t)header->data_size + sizeof(*header) <= file_size;
 }
@@ -569,7 +662,7 @@ static void _recorder_refresh_index_impl(const sd_storage_service_usage_t *held_
                            path);
             row->bytes = (uint64_t)info.st_size;
             row->duration_ms = (uint32_t)(((uint64_t)header.data_size) *
-                                          1000U / 64000U);
+                                          1000U / RECORDER_BYTES_PER_SECOND);
             row->has_mtime = has_mtime;
             row->modified_epoch_s = epoch_s;
             if (file_count < RECORDER_SERVICE_MAX_FILES)
@@ -958,7 +1051,231 @@ static void _recorder_finish(bool failed, esp_err_t error, bool medium_eio)
 }
 
 #ifdef ESP_PLATFORM
-static EXT_RAM_BSS_ATTR uint8_t s_recorder_pcm[4096];
+/*
+ * One transfer unit is 512 bytes: 128 stereo frames, or 8 ms at 16 kHz. The
+ * same buffer holds playback reads, so both directions move in the same
+ * granularity.
+ *
+ * The request used to be 4096 bytes, i.e. 1024 frames or 64 ms of audio. The
+ * default I2S ring is six descriptors of 240 frames, 90 ms in total, and its
+ * only unit of loss is a whole descriptor: a reader that falls behind has the
+ * oldest one overwritten (i2s_common.c). One late 64 ms request therefore
+ * discarded 15 ms blocks instead of delivering them, and the capture worker
+ * then sat in a 250 ms wait for data the DMA had already dropped. The WAV
+ * kept its nominal length, so the seams stayed invisible to every check in
+ * this service while a listener heard them as a buzz riding on the voice.
+ * Requesting 8 ms at a time keeps the ring from ever filling.
+ */
+#define RECORDER_PCM_BYTES 512U
+#define RECORDER_IO_TIMEOUT_MS 50U
+
+/* Internal RAM on purpose: touching a PSRAM buffer while the flash cache is
+ * disabled stalls this worker for the whole erase/program window, and the
+ * 90 ms I2S ring cannot cover that. 512 bytes of internal RAM is cheap. */
+static uint8_t s_recorder_pcm[RECORDER_PCM_BYTES];
+
+/*
+ * Downward expander, expressed relative to the floor measured in the warm-up
+ * tail. It opens 9.5 dB above the floor and only closes again 6 dB above it,
+ * so converter noise cannot chatter it; the 200 ms hold keeps word gaps and
+ * unvoiced consonants from pumping. Closed, the gain settles at -24 dB, which
+ * takes the residual hiss out of the pauses without touching speech: on the
+ * reference take the talk segments move by less than 0.2 dB while the pauses
+ * drop by 20 dB or more.
+ */
+#define RECORDER_GATE_OPEN_RATIO 3.0F
+#define RECORDER_GATE_CLOSE_RATIO 2.0F
+/** -24 dB gain floor, the deepest attenuation the expander applies. */
+#define RECORDER_GATE_FLOOR_GAIN 0.0631F
+/** Milliseconds the gate stays open after the level crosses the close point. */
+#define RECORDER_GATE_HOLD_MS 200U
+/** The same hold expressed in frames, which is what the state machine uses. */
+#define RECORDER_GATE_HOLD_FRAMES \
+    (RECORDER_GATE_HOLD_MS * RECORDER_FRAMES_PER_MS)
+/** One-pole gain smoothing, about 5 ms at 16 kHz: fast enough to track
+ * syllables, slow enough that the gain step at the block edge is inaudible. */
+#define RECORDER_GATE_SMOOTH 0.0125F
+/**
+ * Loudest profile that still allows gating, -45 dBFS in mean-square units.
+ *
+ * A warm-up tail above that means the room itself is noisy or the user was
+ * already talking. Opening a gate 9.5 dB over that profile would put the
+ * threshold within a few dB of speech and chop syllables, so the expander is
+ * left inert and the take stays untouched.
+ */
+#define RECORDER_GATE_MAX_FLOOR_POWER 33950.0F
+
+/** @brief Discard the leading capture interval of a take.
+ *
+ * The counter is initialised when a recording starts and decremented after
+ * every drained block, so pause/resume cannot re-arm it.
+ */
+static bool _recorder_warmup_pending(void)
+{
+    _recorder_lock();
+    const bool pending = s_recorder.warmup_frames != 0U;
+    _recorder_unlock();
+    return pending;
+}
+
+static void _recorder_warmup_consumed(const uint8_t *pcm, size_t bytes)
+{
+    const size_t frames = bytes / (2U * sizeof(int16_t));
+    const int16_t *const samples = (const int16_t *)pcm;
+    _recorder_lock();
+    const uint32_t remaining = s_recorder.warmup_frames;
+    const bool finishing = frames >= remaining;
+    /* The first half of the window still contains the codec/PA enable
+     * transient; the second half is the shaped noise floor the expander needs.
+     * Measuring after shaping keeps the profile in the same units the gate
+     * compares against, and a warm-up that already carries speech yields a
+     * high profile, i.e. a gate that stays open. */
+    if (remaining != 0U && remaining <= s_recorder.warmup_total / 2U)
+    {
+        uint64_t energy = 0U;
+        for (size_t index = 0U; index < frames; ++index)
+        {
+            const int32_t value = samples[2U * index];
+            energy += (uint64_t)(value * value);
+        }
+        s_recorder.warmup_energy += energy;
+        s_recorder.warmup_samples += (uint32_t)frames;
+    }
+    s_recorder.warmup_frames = finishing ? 0U :
+                               remaining - (uint32_t)frames;
+    if (finishing)
+    {
+        if (s_recorder.warmup_samples != 0U)
+        {
+            const float profile = (float)s_recorder.warmup_energy /
+                                  (float)s_recorder.warmup_samples;
+            s_recorder.noise_power = profile <= RECORDER_GATE_MAX_FLOOR_POWER ?
+                                     profile : 0.0F;
+        }
+        /* The file starts here, so the clock must start here too. Duration is
+         * derived from started_us while RECORDING; leaving the original stamp
+         * would report 150 ms of audio that was deliberately thrown away, and
+         * the playback bar would disagree with the WAV. */
+        s_recorder.started_us = esp_timer_get_time();
+    }
+    _recorder_unlock();
+}
+
+static float _recorder_biquad_step(recorder_biquad_t *filter, float input)
+{
+    const float output = filter->b0 * input + filter->z1;
+    filter->z1 = filter->b1 * input - filter->a1 * output + filter->z2;
+    filter->z2 = filter->b2 * input - filter->a2 * output;
+    return output;
+}
+
+/**
+ * @brief Apply the calibrated downward expander to one shaped block.
+ *
+ * The block RMS drives a hysteresis decision, and the resulting gain is
+ * smoothed per sample so an 8 ms block boundary never produces a step. Both
+ * slots carry the same sample, so scaling the left one and copying it keeps
+ * the channels identical.
+ */
+static void _recorder_apply_noise_gate(int16_t *samples, size_t frames)
+{
+    if (s_recorder.noise_power <= 0.0F || frames == 0U)
+    {
+        return;
+    }
+    uint64_t energy = 0U;
+    for (size_t index = 0U; index < frames; ++index)
+    {
+        const int32_t value = samples[2U * index];
+        energy += (uint64_t)(value * value);
+    }
+    /* Everything stays in the power domain: the warm-up profile is a mean
+     * square, so the thresholds are its squares and the capture path needs no
+     * square root at all. */
+    const float power = (float)energy / (float)frames;
+    if (power >= s_recorder.noise_power *
+            (RECORDER_GATE_OPEN_RATIO * RECORDER_GATE_OPEN_RATIO))
+    {
+        s_recorder.gate_open = true;
+        s_recorder.gate_hold = RECORDER_GATE_HOLD_FRAMES;
+    }
+    else if (s_recorder.gate_open &&
+             power < s_recorder.noise_power *
+             (RECORDER_GATE_CLOSE_RATIO * RECORDER_GATE_CLOSE_RATIO))
+    {
+        if (s_recorder.gate_hold > frames)
+        {
+            s_recorder.gate_hold -= (uint32_t)frames;
+        }
+        else
+        {
+            s_recorder.gate_hold = 0U;
+            s_recorder.gate_open = false;
+        }
+    }
+    const float target = s_recorder.gate_open ? 1.0F : RECORDER_GATE_FLOOR_GAIN;
+    float gain = s_recorder.gate_gain;
+    for (size_t index = 0U; index < frames; ++index)
+    {
+        gain += RECORDER_GATE_SMOOTH * (target - gain);
+        samples[2U * index] = (int16_t)((float)samples[2U * index] * gain);
+        samples[2U * index + 1U] = samples[2U * index];
+    }
+    s_recorder.gate_gain = gain;
+}
+
+/**
+ * @brief Shape one captured block: high-pass, low-pass, gain, mono to stereo.
+ *
+ * The block is filtered, gained and copied in one pass, then the expander
+ * runs over the result.
+ *
+ * The ES8311 capture path is mono and lands in the left slot of the stereo I2S
+ * frame while the right slot stays at zero, so the WAV declared two channels
+ * but only carried one; duplicating the sample halves the file for the same
+ * content and makes both channels agree.
+ *
+ * The filters exist for a measured defect rather than for taste. Recordings
+ * carry a constant, sample-clock-locked buzz around 90.9 Hz spread as a comb
+ * from roughly 3.5 kHz upward, plus a DC offset of several hundred counts. The
+ * buzz measured 99 % above 3.5 kHz while speech measured 80 % between 300 Hz
+ * and 1 kHz, so a 3.4 kHz low-pass and an 80 Hz high-pass separate them: on
+ * the captured reference take this moved the speech-to-noise ratio from
+ * 11 dB to about 20 dB and removed the DC offset entirely. The filters cannot
+ * remove the source, which sits before the microphone PGA and needs a supply
+ * measurement on the board.
+ *
+ * The digital gain lifts the voice to the level the rest of the device already
+ * produces. Saturation is clamped instead of wrapped: a clipped sample must
+ * stay loud, never flip polarity into an audible click.
+ *
+ * The filters only remove what lives outside the voice band, so a take still
+ * carries the analog front end's broadband hiss around -53 dBFS. The expander
+ * at the end of the chain removes it from the pauses, which is where it is
+ * audible; it is calibrated from the warm-up tail and stays inert when that
+ * measurement is unavailable.
+ */
+static void _recorder_apply_capture_shaping(uint8_t *pcm, size_t bytes)
+{
+    const uint32_t gain = (uint32_t)s_recorder.config.input_gain_db;
+    /* 6 dB doubles, so the multiplier is 2^(gain/6); integer division keeps
+     * the table to the steps the ES8311 itself offers (0, 6, 12, 18 dB). */
+    const int32_t multiplier = (int32_t)(1U << (gain / 6U));
+    int16_t *const samples = (int16_t *)pcm;
+    const size_t frames = bytes / (2U * sizeof(int16_t));
+    for (size_t index = 0U; index < frames; ++index)
+    {
+        float value = (float)samples[2U * index];
+        value = _recorder_biquad_step(&s_recorder_high_pass, value);
+        value = _recorder_biquad_step(&s_recorder_low_pass, value);
+        const int32_t scaled = (int32_t)(value * (float)multiplier);
+        const int32_t clamped = scaled > INT16_MAX ? INT16_MAX :
+                                scaled < INT16_MIN ? INT16_MIN : scaled;
+        samples[2U * index] = (int16_t)clamped;
+        samples[2U * index + 1U] = (int16_t)clamped;
+    }
+    _recorder_apply_noise_gate(samples, frames);
+}
 
 static void _recorder_stream_park(void)
 {
@@ -971,6 +1288,10 @@ static void _recorder_stream_park(void)
 static void _recorder_task(void *argument)
 {
     (void)argument;
+    /* Playback keeps the block being transmitted until the BSP has taken all
+     * of it; a timed-out write resumes from the byte it stopped at. */
+    size_t playback_pending = 0U;
+    size_t playback_offset = 0U;
     /* One stream at a time; the command owner reaps before reusing PCM. */
     for (;;)
     {
@@ -990,22 +1311,31 @@ static void _recorder_task(void *argument)
         }
         const audio_service_lease_t audio_lease =
             _recorder_audio_lease_copy();
-        if (paused && !playback)
+        if ((paused && !playback) || (!playback && _recorder_warmup_pending()))
         {
             /* The capture device keeps running while paused. Not reading it
              * leaves the pre-pause interval queued in the I2S ring, which the
              * first reads after resume then append to the file: the take would
              * contain audible paused audio and its data size would exceed the
-             * reported duration. Drain and discard instead. */
+             * reported duration. The same drain covers the codec/PA enable
+             * transient at the start of a take, which is louder than anything
+             * the user said. A short read is normal here; only a rejected
+             * lease is fatal. */
             size_t discarded = 0U;
-            if (audio_service_read_leased(audio_lease, s_recorder_pcm,
-                                          sizeof(s_recorder_pcm),
-                                          &discarded, 250U) != ESP_OK)
+            const esp_err_t drain = audio_service_read_leased(audio_lease,
+                s_recorder_pcm, sizeof(s_recorder_pcm),
+                &discarded, RECORDER_IO_TIMEOUT_MS);
+            if (drain != ESP_OK && drain != ESP_ERR_TIMEOUT)
             {
                 _recorder_finish(true, ESP_ERR_INVALID_RESPONSE, false);
                 _recorder_stream_park();
                 return;
             }
+            /* Shape the discarded block too: the filters are settled before
+             * the file starts, and the tail of the window is the noise profile
+             * the expander compares every block against. */
+            _recorder_apply_capture_shaping(s_recorder_pcm, discarded);
+            _recorder_warmup_consumed(s_recorder_pcm, discarded);
             continue;
         }
         if (!playback && (uint64_t)duration >=
@@ -1020,39 +1350,85 @@ static void _recorder_task(void *argument)
         bool medium_eio = false;
         if (playback)
         {
-            errno = 0;
-            received = fread(s_recorder_pcm, 1U, sizeof(s_recorder_pcm), file);
-            if (ferror(file))
+            if (playback_offset >= playback_pending)
             {
-                io_failed = true;
-                medium_eio = errno == EIO;
+                /* The previous block is fully in the ring: take the next one.
+                 * Only here can a zero-byte read mean end of file. */
+                errno = 0;
+                playback_pending = fread(s_recorder_pcm, 1U,
+                                         sizeof(s_recorder_pcm), file);
+                playback_offset = 0U;
+                if (ferror(file))
+                {
+                    io_failed = true;
+                    medium_eio = errno == EIO;
+                }
+                else if (playback_pending == 0U)
+                {
+                    _recorder_finish(false, ESP_OK, false);
+                    _recorder_stream_park();
+                    return;
+                }
             }
-            else if (received == 0U)
+            if (!io_failed)
             {
-                _recorder_finish(false, ESP_OK, false);
-                _recorder_stream_park();
-                return;
+                /* A short or timed-out write is partial progress, not a
+                 * failure: audio_service_write_leased() reports how much the
+                 * BSP consumed and the contract requires the caller to account
+                 * for it. The remainder is retried from the same buffer, so a
+                 * late DMA buffer costs latency instead of cutting a hole in
+                 * the audio, and only a rejected lease or a driver error ends
+                 * playback. */
+                size_t written = 0U;
+                const size_t remaining = playback_pending - playback_offset;
+                const esp_err_t result = audio_service_write_leased(audio_lease,
+                    s_recorder_pcm + playback_offset,
+                    remaining, &written,
+                    RECORDER_IO_TIMEOUT_MS);
+                if (written > remaining)
+                {
+                    written = remaining;
+                }
+                playback_offset += written;
+                io_failed = result != ESP_OK && result != ESP_ERR_TIMEOUT;
+                received = written;
+                if (!io_failed &&
+                        playback_offset >= playback_pending)
+                {
+                    playback_pending = 0U;
+                    playback_offset = 0U;
+                }
             }
-            if (!io_failed && audio_service_write_leased(audio_lease,
-                    s_recorder_pcm, received, NULL, 250U) != ESP_OK)
-            {
-                io_failed = true;
-            }
-        }
-        else if (audio_service_read_leased(audio_lease, s_recorder_pcm,
-                                           sizeof(s_recorder_pcm), &received,
-                                           250U) != ESP_OK ||
-                 received == 0U)
-        {
-            io_failed = true;
         }
         else
         {
-            errno = 0;
-            if (fwrite(s_recorder_pcm, 1U, received, file) != received)
+            const esp_err_t result = audio_service_read_leased(audio_lease,
+                s_recorder_pcm, sizeof(s_recorder_pcm),
+                &received, RECORDER_IO_TIMEOUT_MS);
+            if (received > sizeof(s_recorder_pcm))
+            {
+                received = sizeof(s_recorder_pcm);
+            }
+            if (result != ESP_OK && result != ESP_ERR_TIMEOUT)
             {
                 io_failed = true;
-                medium_eio = errno == EIO;
+            }
+            else if (received == 0U)
+            {
+                /* No frame arrived inside the deadline so far. The DMA keeps
+                 * running, so the next request simply waits again; a starved
+                 * channel must not end the take. */
+                continue;
+            }
+            else
+            {
+                _recorder_apply_capture_shaping(s_recorder_pcm, received);
+                errno = 0;
+                if (fwrite(s_recorder_pcm, 1U, received, file) != received)
+                {
+                    io_failed = true;
+                    medium_eio = errno == EIO;
+                }
             }
         }
         if (io_failed)
@@ -1083,8 +1459,9 @@ static void _recorder_task(void *argument)
 static esp_err_t _recorder_stream_create(void)
 {
     TaskHandle_t task = NULL;
-    if (xTaskCreatePinnedToCoreWithCaps(_recorder_task, "recorder", 4096, NULL, 5,
-                                        &task, RECORDER_TASK_CORE,
+    if (xTaskCreatePinnedToCoreWithCaps(_recorder_task, "recorder", 4096, NULL,
+                                        RECORDER_TASK_PRIORITY, &task,
+                                        RECORDER_TASK_CORE,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         return ESP_ERR_NO_MEM;
@@ -1145,7 +1522,9 @@ static bool _recorder_relative_path_valid(const char *path)
 esp_err_t recorder_service_init(const recorder_service_config_t *config)
 {
     if (config == NULL || !_recorder_relative_path_valid(config->directory) ||
-            config->max_duration_seconds == 0U)
+            config->max_duration_seconds == 0U ||
+            config->input_gain_db > RECORDER_SERVICE_MAX_INPUT_GAIN_DB ||
+            config->warmup_ms >= config->max_duration_seconds * 1000U)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1156,6 +1535,7 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
     memset(&s_recorder, 0, sizeof(s_recorder));
     atomic_init(&s_recorder.task_running, false);
     atomic_init(&s_recorder.scan_active, false);
+    s_recorder.gate_gain = 1.0F;
     s_recorder.config = *config;
     s_recorder.snapshot.state = RECORDER_SERVICE_IDLE;
     s_recorder.snapshot.last_error = ESP_OK;
@@ -1164,6 +1544,10 @@ esp_err_t recorder_service_init(const recorder_service_config_t *config)
                                           UINT32_MAX / 1000U ? UINT32_MAX :
                                           config->max_duration_seconds * 1000U;
     s_recorder.stopping = false;
+    _recorder_biquad_design(&s_recorder_high_pass, true);
+    _recorder_biquad_design(&s_recorder_low_pass, false);
+    _recorder_biquad_reset(&s_recorder_high_pass);
+    _recorder_biquad_reset(&s_recorder_low_pass);
     /* The directory is prepared by the worker after a mount succeeds; a boot
      * without a card must not create filesystem paths. */
     s_recorder.command_queue = xQueueCreate(4U, sizeof(recorder_command_t));
@@ -1516,7 +1900,7 @@ static esp_err_t _recorder_start_now(void)
     }
     audio_service_config_t audio_config;
     if (audio_service_get_config(&audio_config) != ESP_OK ||
-            audio_config.sample_rate_hz != 16000U ||
+            audio_config.sample_rate_hz != RECORDER_SAMPLE_RATE_HZ ||
             audio_config.bits_per_sample != 16U || audio_config.channels != 2U)
     {
         _recorder_usage_release(false, ESP_OK);
@@ -1585,6 +1969,26 @@ static esp_err_t _recorder_start_now(void)
     ++s_recorder.snapshot.generation;
     atomic_store_explicit(&s_recorder.task_running, true,
                           memory_order_release);
+    /* The codec and speaker amplifier were enabled moments ago; their analog
+     * transient is louder than the speaker and belongs in neither the file nor
+     * the duration. Arm the discard before the worker starts reading. */
+    s_recorder.warmup_frames =
+        s_recorder.config.warmup_ms * RECORDER_FRAMES_PER_MS;
+    s_recorder.warmup_total = s_recorder.warmup_frames;
+    s_recorder.warmup_energy = 0U;
+    s_recorder.warmup_samples = 0U;
+    /* Until the warm-up tail has been measured there is no floor to compare
+     * against, and a zero floor keeps the expander inert rather than muted.
+     * The gate starts open so a take that begins with speech keeps its first
+     * syllable; the first quiet block closes it again. */
+    s_recorder.noise_power = 0.0F;
+    s_recorder.gate_open = true;
+    s_recorder.gate_hold = 0U;
+    s_recorder.gate_gain = 1.0F;
+    /* Every take starts from silence: a filter carrying state across takes
+     * would smear the previous session's tail into the new one. */
+    _recorder_biquad_reset(&s_recorder_high_pass);
+    _recorder_biquad_reset(&s_recorder_low_pass);
     _recorder_unlock();
 #ifdef ESP_PLATFORM
     if (_recorder_stream_create() != ESP_OK)
@@ -1756,7 +2160,8 @@ static esp_err_t _recorder_play_now(const recorder_service_target_t *target)
     s_recorder.snapshot.state = RECORDER_SERVICE_PLAYING;
     s_recorder.snapshot.playback_position_ms = 0U;
     s_recorder.snapshot.playback_duration_ms =
-        (uint32_t)(((uint64_t)header.data_size) * 1000U / 64000U);
+        (uint32_t)(((uint64_t)header.data_size) * 1000U /
+                   RECORDER_BYTES_PER_SECOND);
     (void)snprintf(s_recorder.snapshot.name, sizeof(s_recorder.snapshot.name),
                    "%s", target->name);
     ++s_recorder.snapshot.generation;

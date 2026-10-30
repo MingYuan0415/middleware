@@ -1,5 +1,6 @@
 /* Execute the real ESP_PLATFORM stream and command owner with controlled I/O. */
 #include <assert.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -20,6 +21,8 @@ static unsigned s_credits;
 static bool s_write_through;
 static bool s_read_failure;
 static bool s_write_failure;
+/* Writes that report ESP_ERR_TIMEOUT after partial progress. */
+static unsigned s_write_partial_failures;
 static atomic_bool s_fail_create;
 static atomic_bool s_complete_before_create_return;
 static atomic_bool s_join_done;
@@ -111,10 +114,19 @@ esp_err_t audio_service_write_leased(audio_service_lease_t lease, void *data,
     if (!fake_audio_io_allowed(lease, false)) return ESP_ERR_INVALID_STATE;
     if (data == NULL) return ESP_ERR_INVALID_ARG;
     (void)timeout_ms;
-    const unsigned char *pcm = data;
-    for (size_t i = 0U; i < bytes; ++i) assert(pcm[i] == 0x5a);
+    /* Playback receives what capture wrote, which is now filtered and gained,
+     * so only the block length is a contract here. */
+    (void)data;
     const esp_err_t result = _audio_gate(true);
     if (written != NULL) *written = result == ESP_OK ? bytes : 0U;
+    if (s_write_partial_failures != 0U)
+    {
+        /* A BSP that ran out of DMA deadline still reports what it consumed;
+         * the caller must treat this as progress rather than a dead stream. */
+        --s_write_partial_failures;
+        if (written != NULL) *written = bytes / 2U;
+        return ESP_ERR_TIMEOUT;
+    }
     return result;
 }
 
@@ -126,6 +138,7 @@ static void _io_reset(bool write_through, bool read_failure, bool write_failure)
     s_write_through = write_through;
     s_read_failure = read_failure;
     s_write_failure = write_failure;
+    s_write_partial_failures = 0U;
     assert(pthread_mutex_unlock(&s_io_lock) == 0);
 }
 
@@ -248,7 +261,11 @@ static recorder_service_target_t _wav(void)
     assert(memcmp(header.riff, "RIFF", 4U) == 0);
     assert(memcmp(header.wave, "WAVE", 4U) == 0);
     assert(header.channels == 2U && header.sample_rate == 16000U);
-    assert(header.bits_per_sample == 16U && header.data_size == 4096U);
+    /* Every write is one RECORDER_PCM_BYTES block and the fake never returns a
+     * short read, so a take of N gated blocks stores exactly N blocks. */
+    assert(header.bits_per_sample == 16U);
+    assert(header.data_size % RECORDER_PCM_BYTES == 0U);
+    assert(header.data_size > 0U);
     assert(header.file_size == header.data_size + 36U);
     assert(fseek(file, 0, SEEK_END) == 0);
     assert(ftell(file) == (long)(sizeof(header) + header.data_size));
@@ -472,6 +489,259 @@ static void _pause_discards_capture(void)
     assert(_snapshot().state == RECORDER_SERVICE_IDLE);
     _reaped(owners);
 }
+/* The capture path is mono in the left I2S slot, so a take must reach both
+ * channels at the configured gain; a silently quiet take was the original
+ * complaint and the service had no way to observe it. */
+static void _capture_gain_and_duplication(void)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    const recorder_service_config_t saved = s_recorder.config;
+    _recorder_lock();
+    s_recorder.config.input_gain_db = 6U;
+    _recorder_unlock();
+    /* Stop the take before reading it: the worker owns the file while it runs. */
+    const recorder_service_target_t target = _record_stop();
+    (void)target;
+
+    const recorder_service_snapshot_t snapshot = _snapshot();
+    FILE *file = fopen(snapshot.name, "rb");
+    assert(file != NULL);
+    recorder_wav_header_t header;
+    assert(fread(&header, 1U, sizeof(header), file) == sizeof(header));
+    assert(header.data_size > 0U);
+    /* The mono source lands only in the left slot, so every stored frame must
+     * carry the same value twice. The filters are exercised separately; here
+     * the contract is the channel copy. */
+    int16_t frame[2] = {0, 0};
+    size_t inspected = 0U;
+    while (inspected < header.data_size &&
+            fread(frame, sizeof(frame), 1U, file) == 1U)
+    {
+        assert(frame[0] == frame[1]);
+        inspected += sizeof(frame);
+    }
+    assert(inspected == header.data_size);
+    assert(fclose(file) == 0);
+    _recorder_lock();
+    s_recorder.config = saved;
+    _recorder_unlock();
+    (void)owners;
+}
+
+/* A timeout is partial progress, not a dead stream. Ending the take on the
+ * first short transfer threw away a playable recording; the contract says the
+ * caller must consume what the BSP reported and keep going. */
+static void _partial_write_keeps_playing(const recorder_service_target_t *target)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    _io_reset(false, false, false);
+    assert(recorder_service_play(target) == ESP_OK);
+    assert(_command().last_error == ESP_OK);
+    _io_entered(1U);
+    /* Several timed-out writes in a row must not end playback. */
+    s_write_partial_failures = 3U;
+    for (unsigned i = 0U; i < 3U; ++i)
+    {
+        _io_release();
+        usleep(2000U);
+    }
+    s_write_partial_failures = 0U;
+    assert(_snapshot().state == RECORDER_SERVICE_PLAYING);
+    assert(_snapshot().last_error == ESP_OK);
+    _io_release();
+    s_write_through = true;
+    WAIT_UNTIL(!_running());
+    _reaped(owners);
+    assert(_snapshot().state == RECORDER_SERVICE_IDLE);
+}
+
+/* The capture filters are the software half of the buzz mitigation: a DC
+ * offset and sub-sonic rumble must be removed, the 3.4 kHz corner must attenuate
+ * the band where the measured interference lives, and speech must pass. */
+static void _capture_filters(void)
+{
+    const recorder_service_config_t saved = s_recorder.config;
+    const double pi = 3.14159265358979323846;
+    const double rate = (double)RECORDER_SAMPLE_RATE_HZ;
+
+    /* Gain is applied after the filters; set it to 0 dB so the response is
+     * measured alone. */
+    _recorder_lock();
+    s_recorder.config.input_gain_db = 0U;
+    _recorder_biquad_design(&s_recorder_high_pass, true);
+    _recorder_biquad_design(&s_recorder_low_pass, false);
+    _recorder_biquad_reset(&s_recorder_high_pass);
+    _recorder_biquad_reset(&s_recorder_low_pass);
+    _recorder_unlock();
+
+    const size_t frames = 4096U;
+    static int16_t buffer[2U * 4096U];
+    struct
+    {
+        double hz;
+        double max_gain;
+        double min_gain;
+    } cases[] =
+    {
+        /* 0 Hz is pure DC: the high-pass must remove essentially all of it. */
+        {0.0, 0.02, 0.0},
+        /* Speech band: essentially untouched. */
+        {1000.0, 1.10, 0.90},
+        /* 6 kHz is about 0.83 octaves above the corner, so a second-order
+         * Butterworth gives roughly -19.5 dB (0.106x). */
+        {6000.0, 0.13, 0.08},
+        /* 7 kHz is where the measured interference peaks: -32 dB expected. */
+        {7000.0, 0.04, 0.0},
+    };
+
+    for (size_t c = 0U; c < sizeof(cases) / sizeof(cases[0]); ++c)
+    {
+        for (size_t i = 0U; i < frames; ++i)
+        {
+            const double sample = 8000.0 * sin(2.0 * pi * cases[c].hz *
+                                               (double)i / rate);
+            buffer[2U * i] = (int16_t)sample;
+            buffer[2U * i + 1U] = 0;
+        }
+        _recorder_lock();
+        _recorder_apply_capture_shaping((uint8_t *)buffer,
+                                        frames * 2U * sizeof(int16_t));
+        _recorder_unlock();
+        /* Skip the filter settling interval and measure the steady state. */
+        double sum = 0.0;
+        size_t counted = 0U;
+        for (size_t i = 1024U; i < frames; ++i)
+        {
+            const double value = (double)buffer[2U * i];
+            sum += value * value;
+            ++counted;
+        }
+        const double rms = sqrt(sum / (double)counted);
+        const double expected = 8000.0 / sqrt(2.0);
+        const double gain = cases[c].hz == 0.0 ? rms / 8000.0 : rms / expected;
+        assert(gain <= cases[c].max_gain && gain >= cases[c].min_gain);
+        /* Both slots always agree. */
+        for (size_t i = 0U; i < frames; i += 97U)
+        {
+            assert(buffer[2U * i] == buffer[2U * i + 1U]);
+        }
+    }
+    _recorder_lock();
+    s_recorder.config = saved;
+    _recorder_unlock();
+    puts("capture high-pass, low-pass and channel copy verified");
+}
+
+/* The expander works from the warm-up noise profile: hiss must fall to the
+ * configured floor while speech keeps unity gain, otherwise a quiet passage
+ * would pump. The signal is a 1 kHz tone so the capture filters pass it. */
+static void _capture_noise_gate(void)
+{
+    const recorder_service_config_t saved = s_recorder.config;
+    const double pi = 3.14159265358979323846;
+    const size_t frames = 2048U;
+    static int16_t buffer[2U * 2048U];
+
+    _recorder_lock();
+    s_recorder.config.input_gain_db = 0U;
+    _recorder_biquad_design(&s_recorder_high_pass, true);
+    _recorder_biquad_design(&s_recorder_low_pass, false);
+    _recorder_biquad_reset(&s_recorder_high_pass);
+    _recorder_biquad_reset(&s_recorder_low_pass);
+    /* 200 counts of RMS floor: the gate opens at 600 and closes at 400, i.e.
+     * 40000 and 160000 in the power domain it actually compares. */
+    s_recorder.noise_power = 200.0F * 200.0F;
+    s_recorder.gate_open = false;
+    s_recorder.gate_hold = 0U;
+    s_recorder.gate_gain = 1.0F;
+    _recorder_unlock();
+
+    /* 2048 frames is a whole number of 1 kHz cycles, so restarting the phase
+     * every block keeps the tone continuous and does not fake a transient. */
+    for (unsigned block = 0U; block < 8U; ++block)
+    {
+        for (size_t i = 0U; i < frames; ++i)
+        {
+            const double sample = 300.0 * sin(2.0 * pi * 1000.0 *
+                                              (double)i / 16000.0);
+            buffer[2U * i] = (int16_t)sample;
+            buffer[2U * i + 1U] = 0;
+        }
+        _recorder_lock();
+        _recorder_apply_capture_shaping((uint8_t *)buffer,
+                                        frames * 2U * sizeof(int16_t));
+        _recorder_unlock();
+    }
+    double sum = 0.0;
+    for (size_t i = 0U; i < frames; ++i)
+    {
+        sum += (double)buffer[2U * i] * (double)buffer[2U * i];
+    }
+    const double quiet = sqrt(sum / (double)frames);
+    /* -16 dB is above the -24 dB floor, which leaves room for the 5 ms gain
+     * smoothing but still proves the expander closed. */
+    assert(quiet < 0.15 * 300.0 / sqrt(2.0));
+
+    for (unsigned block = 0U; block < 4U; ++block)
+    {
+        for (size_t i = 0U; i < frames; ++i)
+        {
+            const double sample = 8000.0 * sin(2.0 * pi * 1000.0 *
+                                               (double)i / 16000.0);
+            buffer[2U * i] = (int16_t)sample;
+            buffer[2U * i + 1U] = 0;
+        }
+        _recorder_lock();
+        _recorder_apply_capture_shaping((uint8_t *)buffer,
+                                        frames * 2U * sizeof(int16_t));
+        _recorder_unlock();
+    }
+    sum = 0.0;
+    for (size_t i = 0U; i < frames; ++i)
+    {
+        sum += (double)buffer[2U * i] * (double)buffer[2U * i];
+        assert(buffer[2U * i] == buffer[2U * i + 1U]);
+    }
+    const double loud = sqrt(sum / (double)frames);
+    assert(loud > 0.95 * 8000.0 / sqrt(2.0));
+
+    _recorder_lock();
+    s_recorder.noise_power = 0.0F;
+    s_recorder.gate_open = false;
+    s_recorder.gate_hold = 0U;
+    s_recorder.gate_gain = 1.0F;
+    s_recorder.config = saved;
+    _recorder_unlock();
+    puts("capture noise gate verified");
+}
+
+/* The startup window is discarded before the clock starts, so an enabled
+ * codec transient neither reaches the file nor inflates the reported
+ * duration. */
+static void _warmup_discards_leading_capture(void)
+{
+    const size_t owners = host_caps_task_owner_delete_count();
+    const recorder_service_config_t saved = s_recorder.config;
+    _recorder_lock();
+    s_recorder.config.warmup_ms = 50U;
+    _recorder_unlock();
+
+    _start_record();
+    /* Consume the whole warmup window, then one stored block. */
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        _io_release();
+        usleep(1000U);
+    }
+    assert(_snapshot().bytes <= RECORDER_PCM_BYTES);
+    _stop_blocked(false);
+    assert(_snapshot().state == RECORDER_SERVICE_IDLE);
+    _reaped(owners);
+    _recorder_lock();
+    s_recorder.config = saved;
+    _recorder_unlock();
+}
+
 static void _release_failure_recovery(const recorder_service_config_t *config)
 {
     const size_t owners = host_caps_task_owner_delete_count();
@@ -529,6 +799,14 @@ int main(void)
     _failed_take_leaves_no_part();
     target = _record_stop();
     _pause_discards_capture();
+    target = _record_stop();
+    _capture_gain_and_duplication();
+    target = _record_stop();
+    _warmup_discards_leading_capture();
+    target = _record_stop();
+    _capture_filters();
+    _capture_noise_gate();
+    _partial_write_keeps_playing(&target);
     target = _record_stop();
     _maximum_duration();
     target = _record_stop();

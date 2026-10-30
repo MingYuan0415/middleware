@@ -35,6 +35,30 @@ typedef struct recorder_service_config
     const char *directory;
     uint32_t max_duration_seconds;
     uint64_t minimum_free_bytes;
+    /**
+     * @brief Digital gain applied to captured PCM, 0 through 18 dB.
+     *
+     * The ES8311 capture path is mono at a fixed analog gain, so a voice memo
+     * recorded at arm's length reaches the file at roughly -33 dBFS while the
+     * synthesised playback path of the same device runs near full scale. This
+     * gain is applied in the capture worker before the samples are stored, so
+     * every player sees the same level. Zero keeps the PCM untouched.
+     *
+     * Steps are rounded down to the 6 dB grid of the hardware; the value also
+     * reproduces the mono capture into both stereo slots either way.
+     */
+    uint8_t input_gain_db;
+    /**
+     * @brief Capture discarded when a take starts, in milliseconds.
+     *
+     * Enabling the codec and the power amplifier steps the analog rail, and
+     * the first tens of milliseconds of ADC output are that transient rather
+     * than the room. Discarding them keeps the click out of the file and the
+     * duration, because the capture clock restarts once the window closes.
+     * Zero stores the stream from the first block, which is what deterministic
+     * tests use.
+     */
+    uint32_t warmup_ms;
 } recorder_service_config_t;
 
 /** @brief Exact storage epoch and full backend path selected from the index. */
@@ -72,6 +96,9 @@ typedef struct recorder_service_snapshot
 
 /** @brief Recordings retained by one published index, newest first. */
 #define RECORDER_SERVICE_MAX_FILES 32U
+
+/** @brief Largest capture gain recorder_service_config_t.input_gain_db accepts. */
+#define RECORDER_SERVICE_MAX_INPUT_GAIN_DB 18U
 
 /** @brief Bounded metadata for one completed WAV recording. */
 typedef struct recorder_service_file

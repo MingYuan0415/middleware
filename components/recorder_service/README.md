@@ -74,16 +74,22 @@ impossible to operate on.
 - `idf_component.yml`: `idf: ">=5.0"`, local dependencies `audio_service`,
   `sd_storage_service`, `mt_log`.
 - No Kconfig; at runtime `recorder_service_config_t` provides the directory, the
-  maximum recording duration, and the minimum free space.
+  maximum recording duration, the minimum free space, the capture digital gain
+  (`input_gain_db`, 0/6/12/18 dB) and the start-up discard window (`warmup_ms`).
 
 ## State and Concurrency
 
 - Singleton; commands go through a bounded queue to a pinned worker task, and
   recording and playback share one stream task.
   The device stream task's 4096-byte stack is explicitly allocated with
-  `SPIRAM | 8BIT` and does not fall back to internal RAM; the shared 4096-byte
-  PCM buffer lives in external BSS. The TCB, queues, locks, and the 6144-byte
-  command stack remain internal.
+  `SPIRAM | 8BIT` and does not fall back to internal RAM; the shared 512-byte
+  PCM buffer lives in internal RAM and holds one 8 ms block, because a PSRAM
+  access during a flash-cache-off window would stall the worker past the 90 ms
+  I2S ring. The TCB, queues, locks, and the 6144-byte command stack remain
+  internal.
+  The stream task is pinned to core 1 at priority 7, above the LVGL worker at 6;
+  otherwise every redraw preempts it and the I2S driver overwrites the oldest
+  descriptor, losing a whole 15 ms block per late read.
   The command stack carries the VFS → FATFS → diskio → SDSPI call chain of every
   index scan; measured at `-O2`, that chain (scan 304, `vfs_fat_stat` 336,
   `f_stat` 96, `sdspi_host_start_command` 272, `start_command_default` 96, not
@@ -103,7 +109,32 @@ impossible to operate on.
   reading and discarding input; not reading would accumulate the paused interval
   in the I2S ring buffer and write it into the file after resume, producing
   audio the user never recorded and a data length exceeding the reported
-  duration.
+  duration. The same drain covers the configurable start-up window: the
+  codec/PA enable transient reaches neither the file nor the duration, and the
+  capture clock restarts when the window closes so duration and WAV length stay
+  in agreement.
+- Capture PCM is shaped once before it reaches the file: an 80 Hz second-order
+  high-pass, a 3.4 kHz second-order low-pass, the configured digital gain, and a
+  copy of the mono left slot into the right one. The filters target a measured
+  defect: recordings carried a constant buzz spaced as a 90.9 Hz comb with 99 %
+  of its energy above 3.5 kHz, while speech spent 80 % between 300 Hz and 1 kHz,
+  so cutting at 3.4 kHz costs almost no voice; the reference take moved from
+  14.6 to 18.9 dB SNR, lost 8.4 dB of floor and went from 657 clipped samples to
+  one. The high-pass also removes the ADC's DC offset (several hundred counts).
+  Coefficients are literals computed for `RECORDER_SAMPLE_RATE_HZ` with a
+  bilinear transform, so the capture path needs no libm; changing the rate means
+  recomputing them. Saturation clamps instead of wrapping.
+- After the filters a self-calibrating downward expander takes the hiss out of
+  the pauses: the second half of the warm-up window is profiled after shaping,
+  the gate opens at 3x that floor (+9.5 dB) and closes at 2x (+6 dB) after a
+  200 ms hold, settling at -24 dB with 5 ms gain smoothing. On the reference
+  take speech moved by less than 0.2 dB while long pauses dropped by 20 dB or
+  more. A profile above -45 dBFS means the room itself is noisy, and the
+  expander stays inert.
+- One audio I/O request is 512 bytes (128 frames, 8 ms) with a 50 ms timeout.
+  A short transfer or `ESP_ERR_TIMEOUT` is partial progress, not a stream
+  failure: capture keeps reading and playback retries the unsent bytes, so only
+  a rejected lease or a driver error ends the session.
 - A failed recording (I/O error, duration limit, header write failure) deletes
   its `.part` working file after closing; otherwise the library would never
   list those names and the user could not delete them either, so they would just

@@ -36,6 +36,9 @@ target_compile_definitions(recorder_service_stream_test PRIVATE
     portEXIT_CRITICAL=taskEXIT_CRITICAL)
 target_link_options(recorder_service_stream_test PRIVATE
     -Wl,--wrap=xTaskCreatePinnedToCoreWithCaps)
+# The stream test synthesises tones to measure the capture filter response;
+# the component itself needs no libm (its coefficients are literals).
+target_link_libraries(recorder_service_stream_test PRIVATE m)
 foreach(target recorder_service_test recorder_service_races_test
         recorder_service_library_test recorder_service_stream_test
         recorder_service_recovery_test)
