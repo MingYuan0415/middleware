@@ -18,6 +18,8 @@ extern "C" {
 #define WIFI_SERVICE_PASSWORD_MAX_BYTES 64U
 /** @brief Maximum records retained in a scan snapshot. */
 #define WIFI_SERVICE_MAX_SCAN_RECORDS 5U
+/** @brief Maximum saved-network filters accepted by one filtered scan. */
+#define WIFI_SERVICE_MAX_SCAN_TARGETS 6U
 /** @brief Infinite timeout value for blocking lifecycle operations. */
 #define WIFI_SERVICE_WAIT_FOREVER UINT32_MAX
 
@@ -145,6 +147,14 @@ typedef struct wifi_service_scan_record
     wifi_service_security_t security;             /**< Advertised security. */
 } wifi_service_scan_record_t;
 
+/** @brief One saved-network filter applied while scanning. */
+typedef struct wifi_service_scan_target
+{
+    uint8_t ssid[WIFI_SERVICE_SSID_MAX_BYTES]; /**< Raw SSID bytes. */
+    uint8_t ssid_length;                       /**< Number of SSID bytes. */
+    wifi_service_security_t security;          /**< Saved security. */
+} wifi_service_scan_target_t;
+
 /**
  * @brief Immutable operation result and independent current link facts.
  *
@@ -182,6 +192,8 @@ typedef struct wifi_service_scan_snapshot
     wifi_service_scan_state_t state;          /**< Current scan state. */
     int32_t last_error;                       /**< Last ESP-IDF error value. */
     uint8_t record_count;                     /**< Number of valid records. */
+    uint8_t target_count;                     /**< Number of scan filters. */
+    uint8_t matched_mask;                     /**< Bit i set when target i was seen. */
     bool truncated;                           /**< Driver returned more records. */
     bool operation_canceled;                  /**< Lower layer confirmed cancel. */
     wifi_service_scan_record_t records[WIFI_SERVICE_MAX_SCAN_RECORDS];
@@ -202,6 +214,17 @@ typedef struct wifi_service_availability_event
  *          are ready. A failure is degradable only when cleanup is not pending.
  */
 esp_err_t wifi_service_init(const wifi_service_config_t *config);
+
+/**
+ * @brief Initialize the worker-owned Wi-Fi runtime with a bounded wait.
+ *
+ * @param config is copied before the worker starts.
+ * @param timeout_ms is the maximum control wait or WIFI_SERVICE_WAIT_FOREVER.
+ * @return ESP_OK when Wi-Fi is ready; ESP_ERR_TIMEOUT when the deadline expires;
+ *         otherwise an ESP-IDF error.
+ */
+esp_err_t wifi_service_init_with_timeout(
+    const wifi_service_config_t *config, uint32_t timeout_ms);
 
 /**
  * @brief Release all worker-owned Wi-Fi resources.
@@ -260,6 +283,26 @@ esp_err_t wifi_service_session_close(wifi_service_session_id_t session_id);
  */
 esp_err_t wifi_service_request_scan(
     wifi_service_session_id_t session_id,
+    wifi_service_operation_id_t *out_operation_id);
+
+/**
+ * @brief Admit a scan that also reports whether saved networks are present.
+ *
+ * The scan snapshot still retains at most WIFI_SERVICE_MAX_SCAN_RECORDS UI
+ * records, but matched_mask is computed against every visible access point
+ * returned by the driver. Hidden SSIDs do not expose their SSID and therefore
+ * cannot be matched by this filtered scan.
+ *
+ * @param session_id identifies the current client session.
+ * @param targets contains saved-network filters copied before return.
+ * @param target_count is the number of filters (0..WIFI_SERVICE_MAX_SCAN_TARGETS).
+ * @param out_operation_id receives the admitted operation generation.
+ *
+ * @return ESP_OK when queued; otherwise an ESP-IDF error.
+ */
+esp_err_t wifi_service_request_scan_targets(
+    wifi_service_session_id_t session_id,
+    const wifi_service_scan_target_t *targets, size_t target_count,
     wifi_service_operation_id_t *out_operation_id);
 
 /**

@@ -232,10 +232,14 @@ static size_t _ble_link_service_handle_admitted(
             else
             {
                 accepted = true;
+                const uint32_t operation_timeout =
+                    request->opcode == DEVICE_LINK_V1_CONNECT ?
+                    DEVICE_LINK_V1_CONNECT_TIMEOUT_MS :
+                    DEVICE_LINK_V1_OPERATION_TIMEOUT_MS;
                 device_link_v1_engine_arm_deadline(
                     &s_service.engine,
                     (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-                    DEVICE_LINK_V1_OPERATION_TIMEOUT_MS);
+                    operation_timeout);
             }
         }
         device_link_v1_engine_arm_response(&s_service.engine,

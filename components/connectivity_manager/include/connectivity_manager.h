@@ -19,6 +19,8 @@ extern "C" {
 #define CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL UINT64_C(1)
 /** @brief Maximum number of saved networks retained at the same time. */
 #define CONNECTIVITY_MANAGER_MAX_PROFILES 5U
+/** @brief Failed attempts allowed for each visible saved network per cycle. */
+#define CONNECTIVITY_MANAGER_MAX_CONNECT_FAILURES 3U
 
 EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG);
 
@@ -131,8 +133,10 @@ typedef struct connectivity_manager_scan_record
  *
  * @note `ssid` names the selected profile, which is what Device Link's
  *       `profile_ssid` projects. During a fallback sweep the manager may be
- *       attempting a different network; `attempt_index` and `attempt_total`
- *       describe that cursor, and `attempt_total` is 0 when no sweep runs.
+ *       attempting a different network; `attempt_index` is that profile's
+ *       array index, `attempt_ordinal` is its 1-based position among the
+ *       candidates, and `attempt_total` is the number of candidates. All three
+ *       are zero (or UINT8_MAX for `attempt_index`) when no sweep runs.
  *       `ssid` keeps naming the selected profile throughout, so a failed sweep
  *       cannot make it disagree with the persisted selection.
  */
@@ -144,24 +148,25 @@ typedef struct connectivity_manager_status_snapshot
     connectivity_manager_failure_t failure;         /**< Last classified failure. */
     int32_t last_error;                             /**< Diagnostic error value. */
     uint32_t ipv4_address;                          /**< Network-order IPv4. */
-    uint32_t retry_delay_ms;                        /**< Remaining policy delay. */
-    uint8_t retry_count;                            /**< Long retry attempt. */
+    uint32_t retry_delay_ms;                        /**< Remaining attempt delay. */
+    uint8_t retry_count;                            /**< Failed attempts on current network. */
     uint8_t profile_count;                          /**< Saved networks, 0..max. */
-    uint8_t attempt_index;                          /**< Candidate being tried. */
-    uint8_t attempt_total;                          /**< Candidates in the sweep. */
+    uint8_t attempt_index;                          /**< Candidate profile index. */
+    uint8_t attempt_ordinal;                        /**< 1-based candidate number. */
+    uint8_t attempt_total;                          /**< Candidates in the cycle. */
     bool available;                                 /**< Manager is initialized. */
     bool radio_available;                           /**< Radio executor is ready. */
     bool saved_profile;                             /**< A valid profile exists. */
     bool profile_persisted;                         /**< Current target is saved. */
-    bool auto_connect;                              /**< Persistent policy switch. */
-    bool manual_hold;                               /**< Offline for this boot. */
+    bool wifi_enabled;                              /**< Persistent Wi-Fi on/off policy. */
+    bool manual_hold;                               /**< Radio deliberately stopped. */
     bool operation_complete;                        /**< Foreground terminal event. */
     bool operation_canceled;                        /**< Owner confirmed cancellation. */
     bool operation_conflict;                        /**< Sync identity conflict. */
     uint64_t profile_revision;                       /**< Durable profile revision. */
     connectivity_manager_client_sync_id_t
     applied_client_sync_id;                         /**< Last durable sync id. */
-    char ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U]; /**< Target SSID. */
+    char ssid[CONNECTIVITY_MANAGER_SSID_MAX_BYTES + 1U]; /**< Selected profile SSID. */
 } connectivity_manager_status_snapshot_t;
 
 /** @brief Immutable bounded scan snapshot. */
@@ -171,6 +176,7 @@ typedef struct connectivity_manager_scan_snapshot
     connectivity_manager_operation_id_t operation_id; /**< Scan operation. */
     int32_t last_error;                             /**< Scan result. */
     uint8_t record_count;                           /**< Valid records. */
+    uint8_t matched_mask;                           /**< Saved profile presence mask. */
     bool running;                                   /**< Scan is active. */
     bool truncated;                                 /**< Results were truncated. */
     bool operation_canceled;                        /**< Owner confirmed cancellation. */
@@ -247,7 +253,6 @@ esp_err_t connectivity_manager_request_connect(
 esp_err_t connectivity_manager_request_sync_profile(
     const connectivity_manager_credentials_t *credentials,
     connectivity_manager_client_sync_id_t client_sync_id,
-    bool auto_connect,
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
@@ -294,24 +299,30 @@ esp_err_t connectivity_manager_request_forget_network(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Disconnect and hold automatic connection for this boot.
+ * @brief Turn Wi-Fi off and stop the radio.
+ *
+ * Cancels any scan or connection cycle, clears the pending attempt, suspends
+ * the radio, and leaves the saved-network list untouched.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
  */
-esp_err_t connectivity_manager_request_disconnect(
+esp_err_t connectivity_manager_request_wifi_disable(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Connect immediately using the selected saved profile.
+ * @brief Turn Wi-Fi on and run one bounded connection cycle.
  *
- * When the selected profile fails, the manager continues with the remaining
- * saved profiles in its attempt order before it reports a terminal failure.
+ * The cycle scans for saved networks, attempts only the ones that are present,
+ * gives each one up to CONNECTIVITY_MANAGER_MAX_CONNECT_FAILURES attempts, and
+ * stops the radio when no candidate connects. When the selected profile
+ * fails, the remaining saved profiles in attempt order are tried before the
+ * cycle reports a terminal failure.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
  */
-esp_err_t connectivity_manager_request_reconnect_saved(
+esp_err_t connectivity_manager_request_wifi_enable(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
@@ -326,18 +337,6 @@ esp_err_t connectivity_manager_request_reconnect_saved(
  */
 esp_err_t connectivity_manager_request_forget(
     connectivity_manager_operation_id_t *out_operation_id);
-
-/**
- * @brief Persistently enable or disable automatic connection.
- *
- * The policy applies to the whole saved-network list, not to one entry.
- *
- * @param enabled selects the persistent automatic connection policy.
- * @param out_operation_id receives the admitted operation generation.
- * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
- */
-esp_err_t connectivity_manager_set_auto_connect(
-    bool enabled, connectivity_manager_operation_id_t *out_operation_id);
 
 /**
  * @brief Cancel the exact foreground operation when it is still active.

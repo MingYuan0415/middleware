@@ -35,6 +35,22 @@ Worker credentials are wiped when an attempt is abandoned or suspended.
 
 The ESP-IDF port retains initialized resources if configuration clearing fails
 during deinit, so a later deinit can retry rather than hiding a failed erase.
+`wifi_service_init_with_timeout()` provides a bounded control wait; the legacy
+`wifi_service_init()` keeps the infinite-wait compatibility wrapper.
+
+## Scan targets and presence
+
+`wifi_service_request_scan_targets()` accepts up to
+`WIFI_SERVICE_MAX_SCAN_TARGETS` saved-network filters. The scan snapshot still
+retains at most five records for display, but `matched_mask` is computed against
+every visible access point returned by the driver. Hidden APs do not expose an
+SSID in scan results, so a saved hidden network cannot be proven present by this
+filtered scan and is intentionally not matched here. This lets the policy layer
+distinguish "saved network absent" from "saved network not in the strongest five
+UI records" without expanding the event payload. Filtered scans request only
+visible results; a hidden saved profile is not treated as present. Connection
+attempts use `WIFI_FAST_SCAN` because the policy layer has already selected a
+visible saved profile.
 
 ## Single target and attempt budgets
 

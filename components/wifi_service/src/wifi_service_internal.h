@@ -36,6 +36,9 @@
 #define WIFI_SERVICE_CREDENTIAL_SLOTS 2U
 #define WIFI_SERVICE_RETRY_LIMIT      3U
 #define WIFI_SERVICE_WORKER_POLL_MS   20U
+#ifndef WIFI_SERVICE_SCAN_TIMEOUT_MS
+    #define WIFI_SERVICE_SCAN_TIMEOUT_MS 15000U
+#endif
 
 /** @brief Creation state of the process-lifetime static control plane. */
 typedef enum
@@ -134,6 +137,8 @@ typedef struct wifi_worker_context
     bool scan_active;
     bool scan_id_known;
     uint8_t next_scan_id;
+    TickType_t scan_deadline;
+    bool scan_deadline_pending;
     wifi_service_state_t pre_scan_state;
     bool retry_pending;
     TickType_t retry_deadline;
@@ -198,6 +203,11 @@ typedef struct wifi_service_shared
     wifi_service_status_snapshot_t status_cache;
     wifi_service_scan_snapshot_t scan_cache;
     wifi_credential_slot_t credential_slots[WIFI_SERVICE_CREDENTIAL_SLOTS];
+    /* One scan is admitted at a time; keeping its targets here instead of in
+     * every queue item removes six target records per queued command. */
+    bool scan_targets_valid;
+    uint8_t scan_target_count;
+    wifi_service_scan_target_t scan_targets[WIFI_SERVICE_MAX_SCAN_TARGETS];
 
     atomic_bool control_inflight;
     atomic_int control_type;
@@ -222,6 +232,21 @@ uint64_t wifi_service_internal_next_generation(void);
 
 /** @brief Clear credential slots while the caller holds state_mutex. */
 void wifi_service_internal_clear_slots_locked(void);
+
+/**
+ * @brief Return the admitted scan filter list while a scan owns it.
+ *
+ * The worker is the only consumer while the scan operation is current. The
+ * pointer remains valid until the scan ends or the service is suspended.
+ */
+const wifi_service_scan_target_t *wifi_service_internal_scan_targets(
+    uint8_t *target_count);
+
+/** @brief Clear any scan targets that have not been consumed by the worker. */
+void wifi_service_internal_clear_scan_targets(void);
+
+/** @brief Abort a scan that missed its deadline and publish the failure. */
+void wifi_service_worker_check_scan_deadline(wifi_worker_context_t *context);
 
 /**
  * @brief Compare task ticks using wrap-safe signed subtraction.

@@ -24,7 +24,7 @@ later is required.
 | `recorder_service` | Exclusive recording audio session and SD WAV files; dedicated worker performs recording, playback, deletion, and finalize; scanning holds ACCESS, recording/playback hold SESSION, capacity, generation, and content revision all come from the SD owner, and the UI only reads the cache | `audio_service`, `sd_storage_service`; `esp_timer`, `mt_log` (private) |
 | `system_pm` | Serially executes peripheral sleep hooks, ESP32 light sleep, and wake resume, and manages the CPU maximum frequency lock | `mt_log` and ESP-IDF PM/GPIO/hardware support components (private) |
 | `time_service` | Maintains the `CST-8` local time zone, RTC/calendar alarm bridging, clock trustworthiness, and system-level asynchronous SNTP sync | `event_bus`, `nv_storage`, network stack, etc. (private) |
-| `connectivity_manager` | Sole owner of the production Wi-Fi policy; keeps several saved networks, runs candidate fallback, auto-connect, long backoff, foreground preemption, and standby coordination | `event_bus`; `nv_storage`, `wifi_service` (private) |
+| `connectivity_manager` | Sole owner of the production Wi-Fi policy; keeps several saved networks, runs one scan-first bounded connection cycle, foreground preemption, and standby coordination. The radio is initialized lazily; the former auto-connect switch is removed. | `event_bus`; `nv_storage`, `wifi_service` (private) |
 | `wifi_service` | Single-radio asynchronous execution layer; serially handles scan, connect, disconnect, and radio suspend, and does not persist STA credentials | `event_bus`; ESP-IDF Wi-Fi/network components (private) |
 | `ble_runtime` | Sole low-level owner of the NimBLE host, static GATT, GAP/ADV, Device Link v1 transport, immutable async identity, and TX/deadline scheduling | `bt`, `device_link`; `freertos`, `mt_log` (private) |
 | `device_link_service` | Serially owns the binding window, Numeric Comparison confirmation, app state, and the factory-reset startup gate | `ble_runtime`, `device_link`, `event_bus` |
@@ -113,8 +113,8 @@ and the UI dispatcher have stopped.
   poll_interrupt. `time_service_alarm_*` manages repeating UTC calendar alarms;
   the worker polls the active-low RTC_INT on a fixed 100 ms period and publishes
   `TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM` sequence events with flags `0`.
-- `connectivity_manager` is the sole owner of Wi-Fi profiles, auto-connect, and
-  transparent sync. `connectivity_manager_request_sync_profile()` accepts
+- `connectivity_manager` is the sole owner of Wi-Fi profiles and the scan-first
+  bounded connection cycle; `wifi_service` is initialized lazily. `request_sync_profile()` accepts
   credentials with a non-zero client sync ID; the same ID with the same
   credentials is idempotent, the same ID with different credentials conflicts,
   and a new profile replaces the old one only after both IPv4 and the durable

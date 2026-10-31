@@ -457,15 +457,17 @@ exit:
     return result;
 }
 
-esp_err_t wifi_service_init(const wifi_service_config_t *config)
+esp_err_t wifi_service_init_with_timeout(const wifi_service_config_t *config,
+        uint32_t timeout_ms)
 {
     if (config == NULL || config->task_priority == 0U ||
-            config->task_priority >= configMAX_PRIORITIES)
+            config->task_priority >= configMAX_PRIORITIES ||
+            timeout_ms == 0U)
     {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t result = _wifi_service_control(WIFI_CONTROL_INIT,
-        WIFI_SERVICE_WAIT_FOREVER, config);
+        timeout_ms, config);
     if (result == ESP_OK)
     {
         LOG_I("ready: scan=%u, queue=%u, credentials=RAM-only",
@@ -473,6 +475,12 @@ esp_err_t wifi_service_init(const wifi_service_config_t *config)
               (unsigned)CONFIG_WIFI_SERVICE_QUEUE_DEPTH);
     }
     return result;
+}
+
+esp_err_t wifi_service_init(const wifi_service_config_t *config)
+{
+    return wifi_service_init_with_timeout(config,
+                                          WIFI_SERVICE_WAIT_FOREVER);
 }
 
 esp_err_t wifi_service_deinit(uint32_t timeout_ms)
@@ -588,13 +596,38 @@ static bool _wifi_service_scan_allowed_locked(void)
            g_wifi_service.status_cache.state == WIFI_SERVICE_STATE_IP_READY;
 }
 
-static esp_err_t _wifi_service_admit_simple(
+static bool _wifi_service_scan_targets_valid(
+    const wifi_service_scan_target_t *targets, size_t target_count)
+{
+    if (target_count > WIFI_SERVICE_MAX_SCAN_TARGETS ||
+            (target_count > 0U && targets == NULL))
+    {
+        return false;
+    }
+    for (size_t index = 0U; index < target_count; ++index)
+    {
+        const wifi_service_scan_target_t *target = &targets[index];
+
+        if (target->ssid_length == 0U ||
+                target->ssid_length > WIFI_SERVICE_SSID_MAX_BYTES ||
+                (target->security != WIFI_SERVICE_SECURITY_OPEN &&
+                 target->security != WIFI_SERVICE_SECURITY_PERSONAL))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t _wifi_service_admit_item(
     wifi_item_type_t type, wifi_service_session_id_t session_id,
+    const wifi_service_scan_target_t *targets, size_t target_count,
     wifi_service_operation_id_t *out_operation_id)
 {
     esp_err_t result = ESP_ERR_INVALID_ARG;
     bool state_owned = false;
-    if (session_id == 0 || out_operation_id == NULL)
+    if (session_id == 0 || out_operation_id == NULL ||
+            !_wifi_service_scan_targets_valid(targets, target_count))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -627,8 +660,27 @@ static esp_err_t _wifi_service_admit_simple(
         .operation_id = operation,
         .admission_generation = g_wifi_service.admission_generation,
     };
+    if (type == WIFI_ITEM_SCAN)
+    {
+        g_wifi_service.scan_targets_valid = target_count > 0U;
+        g_wifi_service.scan_target_count = (uint8_t)target_count;
+        memset(g_wifi_service.scan_targets, 0,
+               sizeof(g_wifi_service.scan_targets));
+        if (target_count > 0U)
+        {
+            memcpy(g_wifi_service.scan_targets, targets,
+                   target_count * sizeof(g_wifi_service.scan_targets[0]));
+        }
+    }
     if (xQueueSend(g_wifi_service.queue, &item, 0) != pdTRUE)
     {
+        if (type == WIFI_ITEM_SCAN)
+        {
+            g_wifi_service.scan_targets_valid = false;
+            g_wifi_service.scan_target_count = 0U;
+            memset(g_wifi_service.scan_targets, 0,
+                   sizeof(g_wifi_service.scan_targets));
+        }
         result = ESP_ERR_NO_MEM;
         goto exit;
     }
@@ -644,12 +696,54 @@ exit:
     return result;
 }
 
+static esp_err_t _wifi_service_admit_simple(
+    wifi_item_type_t type, wifi_service_session_id_t session_id,
+    wifi_service_operation_id_t *out_operation_id)
+{
+    return _wifi_service_admit_item(type, session_id, NULL, 0U,
+                                    out_operation_id);
+}
+
+const wifi_service_scan_target_t *wifi_service_internal_scan_targets(
+    uint8_t *target_count)
+{
+    if (target_count == NULL)
+    {
+        return NULL;
+    }
+    xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
+    *target_count = g_wifi_service.scan_targets_valid ?
+                    g_wifi_service.scan_target_count : 0U;
+    const wifi_service_scan_target_t *targets = g_wifi_service.scan_targets;
+    xSemaphoreGive(g_wifi_service.state_mutex);
+    return targets;
+}
+
+void wifi_service_internal_clear_scan_targets(void)
+{
+    xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
+    g_wifi_service.scan_targets_valid = false;
+    g_wifi_service.scan_target_count = 0U;
+    memset(g_wifi_service.scan_targets, 0,
+           sizeof(g_wifi_service.scan_targets));
+    xSemaphoreGive(g_wifi_service.state_mutex);
+}
+
 esp_err_t wifi_service_request_scan(
     wifi_service_session_id_t session_id,
     wifi_service_operation_id_t *out_operation_id)
 {
     return _wifi_service_admit_simple(WIFI_ITEM_SCAN, session_id,
                                       out_operation_id);
+}
+
+esp_err_t wifi_service_request_scan_targets(
+    wifi_service_session_id_t session_id,
+    const wifi_service_scan_target_t *targets, size_t target_count,
+    wifi_service_operation_id_t *out_operation_id)
+{
+    return _wifi_service_admit_item(WIFI_ITEM_SCAN, session_id, targets,
+                                    target_count, out_operation_id);
 }
 
 esp_err_t wifi_service_request_disconnect(

@@ -28,7 +28,17 @@ CONNECT/DISCONNECT。已完成的结果在下一次 CONNECT/DISCONNECT 采纳或
 尝试被放弃或挂起时会擦除 worker 凭据。
 
 若反初始化期间清除配置失败，ESP-IDF 端口保留已初始化资源，因此后续反初始化
-可以重试，而不会掩盖一次失败的擦除。
+可以重试，而不会掩盖一次失败的擦除。`wifi_service_init_with_timeout()` 提供有界的
+control 等待；旧 `wifi_service_init()` 保留无限等待兼容包装。
+
+## 扫描目标与存在性
+
+`wifi_service_request_scan_targets()` 接受至多 `WIFI_SERVICE_MAX_SCAN_TARGETS`
+个已保存网络过滤器。扫描快照仍只保留五条记录用于展示，但 `matched_mask` 是针对
+驱动返回的全部可见 AP 计算的。隐藏 AP 的扫描结果不暴露 SSID，因此已保存的隐藏网络
+无法通过该过滤扫描证明存在，本层不会把其标记为命中。这样策略层可以区分“已保存网络
+不存在”与“已保存网络不在最强的五条 UI 记录中”，而无需扩大事件负载。过滤扫描只请求
+可见结果；连接尝试使用 `WIFI_FAST_SCAN`，因为策略层已经选定了可见的已保存 profile。
 
 ## 单一目标与尝试预算
 

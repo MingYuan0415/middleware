@@ -191,6 +191,12 @@ static void _wifi_service_copy_ssid(char destination[], const uint8_t *source,
     }
 }
 
+static void _wifi_service_clear_scan_targets(wifi_worker_context_t *context)
+{
+    (void)context;
+    wifi_service_internal_clear_scan_targets();
+}
+
 void wifi_service_internal_clear_slots_locked(void)
 {
     wifi_service_secure_zero(g_wifi_service.credential_slots,
@@ -770,9 +776,14 @@ static void _wifi_service_finish_scan(wifi_worker_context_t *context,
     size_t count = 0;
     bool truncated = false;
     bool reconnect_after_completion = false;
+    uint8_t matched_mask = 0U;
+    uint8_t target_count = 0U;
+    const wifi_service_scan_target_t *targets =
+        wifi_service_internal_scan_targets(&target_count);
     esp_err_t result = wifi_service_port_scan_finish(
                            records, WIFI_SERVICE_MAX_SCAN_RECORDS,
-                           &count, &truncated);
+                           targets, target_count,
+                           &matched_mask, &count, &truncated);
     if (result != ESP_OK && wifi_service_port_scan_is_owned())
     {
         const wifi_service_radio_transition_t transition =
@@ -807,6 +818,8 @@ static void _wifi_service_finish_scan(wifi_worker_context_t *context,
     }
     memset(context->scan.records, 0, sizeof(context->scan.records));
     context->scan.record_count = 0;
+    context->scan.target_count = target_count;
+    context->scan.matched_mask = matched_mask;
     context->scan.truncated = false;
     if (result != ESP_OK || event->status != 0)
     {
@@ -832,6 +845,8 @@ static void _wifi_service_finish_scan(wifi_worker_context_t *context,
     }
     wifi_service_secure_zero(records, sizeof(records));
     context->scan_active = false;
+    context->scan_deadline_pending = false;
+    _wifi_service_clear_scan_targets(context);
     wifi_service_worker_release_operation(context);
     wifi_service_worker_publish_scan(context);
     if (reconnect_after_completion)
@@ -852,9 +867,33 @@ static void _wifi_service_cancel_scan(wifi_worker_context_t *context,
                                       esp_err_t reason,
                                       bool reconnect)
 {
+    const bool preserve_link =
+        context->pre_scan_state == WIFI_SERVICE_STATE_IP_READY &&
+        context->status.desired_connected;
     const esp_err_t abort_result = wifi_service_port_scan_abort();
     context->scan_active = false;
+    context->scan_deadline_pending = false;
     context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
+    context->scan.target_count = 0U;
+    context->scan.matched_mask = 0U;
+    _wifi_service_clear_scan_targets(context);
+    if (preserve_link)
+    {
+        /* A foreground scan while connected is a read-only observation. A
+         * cancel must release the scan list without tearing down the STA. */
+        context->scan.operation_canceled = abort_result == ESP_OK;
+        context->scan.last_error = abort_result == ESP_OK ? reason :
+                                   abort_result;
+        wifi_service_worker_release_operation(context);
+        wifi_service_worker_publish_scan(context);
+        context->status.state = WIFI_SERVICE_STATE_IP_READY;
+        context->status.last_error = context->scan.last_error;
+        if (context->status.available)
+        {
+            wifi_service_worker_publish_status(context);
+        }
+        return;
+    }
     const wifi_service_radio_transition_t transition =
         wifi_service_worker_transition_radio(context, WIFI_RADIO_TARGET_STARTED);
     esp_err_t boundary_result = transition.result;
@@ -888,6 +927,47 @@ static void _wifi_service_cancel_scan(wifi_worker_context_t *context,
         _wifi_service_set_status_idle(context, result, context->status.session_id,
                                       context->status.operation_id);
         context->status.desired_connected = desired_connected;
+        wifi_service_worker_publish_status(context);
+    }
+}
+
+void wifi_service_worker_check_scan_deadline(wifi_worker_context_t *context)
+{
+    if (!context->scan_active || !context->scan_deadline_pending ||
+            !wifi_service_worker_tick_reached(xTaskGetTickCount(),
+                    context->scan_deadline))
+    {
+        return;
+    }
+
+    context->scan_deadline_pending = false;
+    const esp_err_t abort_result = wifi_service_port_scan_abort();
+    const bool scan_owned = wifi_service_port_scan_is_owned();
+    context->scan_active = false;
+    context->scan.state = WIFI_SERVICE_SCAN_FAILED;
+    context->scan.last_error = abort_result != ESP_OK ? abort_result :
+                               ESP_ERR_TIMEOUT;
+    context->scan.operation_canceled = false;
+    context->scan.target_count = 0U;
+    context->scan.matched_mask = 0U;
+    context->scan.truncated = false;
+    _wifi_service_clear_scan_targets(context);
+
+    if (abort_result != ESP_OK || scan_owned)
+    {
+        const esp_err_t error = abort_result != ESP_OK ?
+                                abort_result : ESP_ERR_INVALID_STATE;
+        wifi_service_worker_enter_cleanup_pending(context, error);
+        wifi_service_worker_publish_scan(context);
+        return;
+    }
+
+    context->status.state = context->pre_scan_state;
+    context->status.last_error = context->scan.last_error;
+    wifi_service_worker_release_operation(context);
+    wifi_service_worker_publish_scan(context);
+    if (context->status.available)
+    {
         wifi_service_worker_publish_status(context);
     }
 }
@@ -950,6 +1030,7 @@ static void _wifi_service_reject_item(wifi_worker_context_t *context,
     const esp_err_t result = canceled ? ESP_ERR_INVALID_STATE : ESP_ERR_NOT_FOUND;
     if (item->type == WIFI_ITEM_SCAN)
     {
+        wifi_service_internal_clear_scan_targets();
         context->scan.session_id = item->session_id;
         context->scan.operation_id = item->operation_id;
         context->scan.state = WIFI_SERVICE_SCAN_CANCELED;
@@ -983,13 +1064,20 @@ static void _wifi_service_begin_scan(wifi_worker_context_t *context,
     context->scan.session_id = item->session_id;
     context->scan.operation_id = item->operation_id;
     context->scan.record_count = 0;
+    context->scan.matched_mask = 0U;
     context->scan.truncated = false;
     memset(context->scan.records, 0, sizeof(context->scan.records));
-    esp_err_t result = wifi_service_port_scan_start();
+    uint8_t target_count = 0U;
+    (void)wifi_service_internal_scan_targets(&target_count);
+    context->scan.target_count = target_count;
+    /* The scan filter cannot prove a hidden AP's SSID, so requesting hidden
+     * results only costs airtime without producing a match. */
+    esp_err_t result = wifi_service_port_scan_start(false);
     if (result != ESP_OK)
     {
         context->scan.state = WIFI_SERVICE_SCAN_FAILED;
         context->scan.last_error = result;
+        _wifi_service_clear_scan_targets(context);
         _wifi_service_operation_complete(item->session_id,
                                          item->operation_id);
         wifi_service_worker_publish_scan(context);
@@ -997,6 +1085,13 @@ static void _wifi_service_begin_scan(wifi_worker_context_t *context,
     else
     {
         context->scan_active = true;
+        TickType_t scan_timeout = pdMS_TO_TICKS(WIFI_SERVICE_SCAN_TIMEOUT_MS);
+        if (scan_timeout == 0U)
+        {
+            scan_timeout = 1U;
+        }
+        context->scan_deadline = xTaskGetTickCount() + scan_timeout;
+        context->scan_deadline_pending = true;
         _wifi_service_context_set_operation(context, WIFI_OPERATION_SCAN,
                                             item->session_id,
                                             item->operation_id);
@@ -1379,6 +1474,7 @@ void wifi_service_worker_reconcile_overflow(wifi_worker_context_t *context)
     {
         (void)wifi_service_port_scan_abort();
         context->scan_active = false;
+        context->scan_deadline_pending = false;
         context->scan.state = WIFI_SERVICE_SCAN_FAILED;
         context->scan.last_error = ESP_ERR_NO_MEM;
         publish_scan_terminal = true;

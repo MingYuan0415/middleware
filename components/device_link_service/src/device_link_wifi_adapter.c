@@ -517,10 +517,10 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
         }
         break;
     case DEVICE_LINK_V1_OPERATION_CONNECT:
-        result = connectivity_manager_request_reconnect_saved(&manager_id);
+        result = connectivity_manager_request_wifi_enable(&manager_id);
         break;
     case DEVICE_LINK_V1_OPERATION_DISCONNECT:
-        result = connectivity_manager_request_disconnect(&manager_id);
+        result = connectivity_manager_request_wifi_disable(&manager_id);
         break;
     case DEVICE_LINK_V1_OPERATION_FORGET:
         result = connectivity_manager_request_forget(&manager_id);

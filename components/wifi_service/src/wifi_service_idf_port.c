@@ -791,7 +791,7 @@ bool wifi_service_port_scan_is_owned(void)
     return s_state.scan_list_owned;
 }
 
-esp_err_t wifi_service_port_scan_start(void)
+esp_err_t wifi_service_port_scan_start(bool show_hidden)
 {
     if (wifi_service_port_get_state() != WIFI_SERVICE_PORT_STATE_STARTED ||
             s_state.scan_list_owned)
@@ -800,7 +800,7 @@ esp_err_t wifi_service_port_scan_start(void)
     }
     wifi_scan_config_t config;
     memset(&config, 0, sizeof(config));
-    config.show_hidden = false;
+    config.show_hidden = show_hidden;
     config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
     esp_err_t result = esp_wifi_scan_start(&config, false);
     wifi_service_secure_zero(&config, sizeof(config));
@@ -813,13 +813,16 @@ esp_err_t wifi_service_port_scan_start(void)
 
 esp_err_t wifi_service_port_scan_finish(
     wifi_service_port_scan_record_t *records, size_t capacity,
-    size_t *out_count, bool *out_truncated)
+    const wifi_service_scan_target_t *targets, size_t target_count,
+    uint8_t *out_matched_mask, size_t *out_count, bool *out_truncated)
 {
     esp_err_t result = ESP_OK;
     wifi_ap_record_t idf_record;
     if (records == NULL || capacity == 0 ||
             capacity > WIFI_SERVICE_MAX_SCAN_RECORDS || out_count == NULL ||
-            out_truncated == NULL)
+            out_truncated == NULL || out_matched_mask == NULL ||
+            target_count > WIFI_SERVICE_MAX_SCAN_TARGETS ||
+            (target_count > 0U && targets == NULL))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -829,6 +832,7 @@ esp_err_t wifi_service_port_scan_finish(
     }
     *out_count = 0;
     *out_truncated = false;
+    *out_matched_mask = 0U;
     memset(records, 0, capacity * sizeof(*records));
 
     uint16_t total = 0U;
@@ -851,6 +855,16 @@ esp_err_t wifi_service_port_scan_finish(
                 candidate.channel = idf_record.primary;
                 candidate.security = _wifi_service_port_map_security(
                                          idf_record.authmode);
+                for (size_t target = 0U; target < target_count; ++target)
+                {
+                    if (targets[target].ssid_length == candidate.ssid_length &&
+                            targets[target].security == candidate.security &&
+                            memcmp(targets[target].ssid, candidate.ssid,
+                                   candidate.ssid_length) == 0)
+                    {
+                        *out_matched_mask |= (uint8_t)(1U << target);
+                    }
+                }
                 _wifi_service_port_retain_scan_record(
                     records, capacity, out_count, out_truncated, &candidate);
             }
@@ -924,7 +938,10 @@ esp_err_t wifi_service_port_set_credentials(
         memcpy(config.sta.password, credentials->password,
                credentials->password_length);
     }
-    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    /* The policy layer already performed a filtered scan and only selects a
+     * present saved profile. A full all-channel scan on every attempt multiplies
+     * latency and power without adding candidate information. */
+    config.sta.scan_method = WIFI_FAST_SCAN;
     config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     config.sta.threshold.authmode =
         credentials->security == WIFI_SERVICE_SECURITY_PERSONAL ?

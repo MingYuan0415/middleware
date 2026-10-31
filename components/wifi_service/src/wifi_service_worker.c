@@ -20,6 +20,8 @@ static esp_err_t _wifi_service_worker_init_runtime(
     context->suspended = false;
     context->scan_active = false;
     context->scan_id_known = false;
+    context->scan_deadline = 0U;
+    context->scan_deadline_pending = false;
     context->retry_pending = false;
     context->operation_kind = WIFI_OPERATION_NONE;
     context->operation_session = 0;
@@ -67,10 +69,12 @@ static esp_err_t _wifi_service_worker_init_runtime(
 
 static esp_err_t _wifi_service_worker_suspend(wifi_worker_context_t *context)
 {
+    wifi_service_internal_clear_scan_targets();
     xSemaphoreTake(g_wifi_service.state_mutex, portMAX_DELAY);
     wifi_service_internal_clear_slots_locked();
     xSemaphoreGive(g_wifi_service.state_mutex);
     const bool had_scan = context->scan_active;
+    context->scan_deadline_pending = false;
     const esp_err_t scan_result = had_scan ? wifi_service_port_scan_abort() : ESP_OK;
     const wifi_service_radio_transition_t transition =
         wifi_service_worker_transition_radio(context, WIFI_RADIO_TARGET_STOPPED);
@@ -158,6 +162,8 @@ static esp_err_t _wifi_service_worker_deinit(
     wifi_worker_context_t *context)
 {
     atomic_store_explicit(&g_wifi_service.event_overflow, false, memory_order_release);
+    wifi_service_internal_clear_scan_targets();
+    context->scan_deadline_pending = false;
     if (context->scan_active)
     {
         (void)wifi_service_port_scan_abort();
@@ -315,6 +321,15 @@ static TickType_t _wifi_service_next_wait_ticks(
             wait = phase;
         }
     }
+    if (context->scan_deadline_pending)
+    {
+        const TickType_t scan = _wifi_service_remaining_ticks(now,
+            context->scan_deadline);
+        if (scan < wait)
+        {
+            wait = scan;
+        }
+    }
     return wait;
 }
 
@@ -360,6 +375,7 @@ void wifi_service_worker_run(void *argument)
         wifi_service_worker_reconcile_overflow(&context);
         wifi_service_worker_retry_publications(&context);
         wifi_service_worker_check_phase_deadline(&context);
+        wifi_service_worker_check_scan_deadline(&context);
 
         wifi_queue_item_t item;
         if (xQueueReceive(g_wifi_service.queue, &item,

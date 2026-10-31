@@ -119,15 +119,21 @@ esp_err_t wifi_service_port_stop(void);
 
 /**
  * @brief Start one non-blocking active scan.
+ *
+ * @param show_hidden selects whether hidden SSIDs are included.
  * @return ESP_OK when started, otherwise an ESP-IDF error.
  */
-esp_err_t wifi_service_port_scan_start(void);
+esp_err_t wifi_service_port_scan_start(bool show_hidden);
 
 /**
  * @brief Copy bounded scan results and release the ESP-IDF scan list.
  *
  * @param records receives at most capacity sanitized records.
  * @param capacity is the number of record slots supplied.
+ * @param targets selects saved networks whose presence is reported.
+ * @param target_count is the number of filter entries
+ *        (max WIFI_SERVICE_MAX_SCAN_TARGETS).
+ * @param out_matched_mask receives bit i set when targets[i] was seen.
  * @param out_count receives the number of copied records.
  * @param out_truncated receives whether additional records were discarded.
  *
@@ -135,7 +141,8 @@ esp_err_t wifi_service_port_scan_start(void);
  */
 esp_err_t wifi_service_port_scan_finish(
     wifi_service_port_scan_record_t *records, size_t capacity,
-    size_t *out_count, bool *out_truncated);
+    const wifi_service_scan_target_t *targets, size_t target_count,
+    uint8_t *out_matched_mask, size_t *out_count, bool *out_truncated);
 
 /**
  * @brief Abort a scan and release any owned scan list.

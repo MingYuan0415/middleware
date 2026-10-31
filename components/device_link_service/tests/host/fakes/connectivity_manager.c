@@ -13,7 +13,7 @@ static connectivity_manager_status_snapshot_t s_status =
     .available = true,
     .radio_available = true,
     .profile_persisted = true,
-    .auto_connect = true,
+    .wifi_enabled = true,
     .profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL,
 };
 static connectivity_manager_scan_snapshot_t s_scan =
@@ -55,7 +55,7 @@ void connectivity_manager_fake_reset(void)
     s_status.available = true;
     s_status.radio_available = true;
     s_status.profile_persisted = true;
-    s_status.auto_connect = true;
+    s_status.wifi_enabled = true;
     s_status.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
 }
 
@@ -141,7 +141,6 @@ void connectivity_manager_fake_set_scan(
 esp_err_t connectivity_manager_request_sync_profile(
     const connectivity_manager_credentials_t *credentials,
     connectivity_manager_client_sync_id_t client_sync_id,
-    bool auto_connect,
     connectivity_manager_operation_id_t *operation_id)
 {
     if (credentials == NULL || credentials->ssid == NULL ||
@@ -149,18 +148,18 @@ esp_err_t connectivity_manager_request_sync_profile(
     {
         return ESP_ERR_INVALID_ARG;
     }
-    s_status.auto_connect = auto_connect;
+    s_status.wifi_enabled = true;
     s_status.applied_client_sync_id = client_sync_id;
     return _admit(operation_id);
 }
 
-esp_err_t connectivity_manager_request_disconnect(
+esp_err_t connectivity_manager_request_wifi_disable(
     connectivity_manager_operation_id_t *operation_id)
 {
     return _admit(operation_id);
 }
 
-esp_err_t connectivity_manager_request_reconnect_saved(
+esp_err_t connectivity_manager_request_wifi_enable(
     connectivity_manager_operation_id_t *operation_id)
 {
     return _admit(operation_id);
@@ -202,12 +201,6 @@ esp_err_t connectivity_manager_request_save_profile(
     return _admit(operation_id);
 }
 
-esp_err_t connectivity_manager_set_auto_connect(
-    bool enabled, connectivity_manager_operation_id_t *operation_id)
-{
-    s_status.auto_connect = enabled;
-    return _admit(operation_id);
-}
 
 bool connectivity_manager_is_available(void)
 {
