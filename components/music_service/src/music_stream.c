@@ -7,6 +7,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
@@ -23,6 +24,7 @@
 #define MUSIC_STREAM_QUEUE_DEPTH 4U
 #define MUSIC_STREAM_READ_BYTES 4096U
 #define MUSIC_STREAM_PCM_BYTES 16384U
+#define MUSIC_STREAM_PCM_MAX_BYTES (256U * 1024U)
 
 typedef struct music_stream_command
 {
@@ -34,6 +36,7 @@ typedef struct music_stream_command
 typedef struct music_stream_runtime
 {
     bool initialized;
+    bool decoders_registered;
     QueueHandle_t queue;
     TaskHandle_t task;
     SemaphoreHandle_t lock;
@@ -66,14 +69,6 @@ static esp_audio_simple_dec_type_t _decoder_type(const char *url)
     if (length >= 5U && strcasecmp(url + length - 5U, ".flac") == 0)
     {
         return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
-    }
-    if (length >= 5U && strcasecmp(url + length - 5U, ".m4a") == 0)
-    {
-        return ESP_AUDIO_SIMPLE_DEC_TYPE_M4A;
-    }
-    if (length >= 4U && strcasecmp(url + length - 4U, ".aac") == 0)
-    {
-        return ESP_AUDIO_SIMPLE_DEC_TYPE_AAC;
     }
     return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
 }
@@ -161,15 +156,18 @@ static esp_err_t _stream_open_audio(uint32_t sample_rate, uint8_t bits,
     esp_err_t result = audio_service_configure(&config);
     if (result != ESP_OK)
     {
+        LOG_E("audio configure failed: %s", esp_err_to_name(result));
         return result;
     }
     result = audio_service_acquire(AUDIO_SERVICE_SESSION_PLAYBACK,
                                    &s_stream.lease);
-    if (result == ESP_OK)
+    if (result != ESP_OK)
     {
-        s_stream.lease_held = true;
+        LOG_E("audio acquire failed: %s", esp_err_to_name(result));
+        return result;
     }
-    return result;
+    s_stream.lease_held = true;
+    return ESP_OK;
 }
 
 static esp_err_t _stream_close_audio(void)
@@ -198,7 +196,9 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     esp_audio_simple_dec_handle_t decoder = NULL;
     uint8_t *input = NULL;
     uint8_t *pcm = NULL;
+    size_t pcm_size = MUSIC_STREAM_PCM_BYTES;
     bool audio_ready = false;
+    bool write_failure_logged = false;
     uint64_t played_bytes = 0U;
     uint32_t sample_rate = 44100U;
     uint8_t channels = 2U;
@@ -263,7 +263,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
 
     input = heap_caps_malloc(MUSIC_STREAM_READ_BYTES,
                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    pcm = heap_caps_malloc(MUSIC_STREAM_PCM_BYTES,
+    pcm = heap_caps_malloc(pcm_size,
                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (input == NULL || pcm == NULL)
     {
@@ -287,6 +287,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
             MUSIC_STREAM_READ_BYTES);
         if (read_length < 0)
         {
+            LOG_E("HTTP read failed: %d", read_length);
             _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                MUSIC_SERVICE_FAILURE_NETWORK);
             failed = true;
@@ -303,19 +304,58 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
             .eos = false,
         };
         bool fatal = false;
-        while (raw.consumed < raw.len &&
+        uint32_t stalled_calls = 0U;
+        while (raw.len > 0U &&
                 !atomic_load_explicit(&s_stream.stop, memory_order_acquire))
         {
             esp_audio_simple_dec_out_t output =
             {
                 .buffer = pcm,
-                .len = MUSIC_STREAM_PCM_BYTES,
+                .len = (uint32_t)pcm_size,
             };
+            raw.consumed = 0U;
+            const uint32_t raw_before = raw.len;
             const esp_audio_err_t decode_result =
                 esp_audio_simple_dec_process(decoder, &raw, &output);
-            if (decode_result != ESP_AUDIO_ERR_OK &&
-                    decode_result != ESP_AUDIO_ERR_BUFF_NOT_ENOUGH)
+            if (decode_result == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH)
             {
+                /* 4 KiB of MP3 expands to far more than the initial 16 KiB
+                 * PCM buffer at 44.1 kHz stereo. Grow to the size requested
+                 * by the decoder instead of silently continuing. */
+                size_t needed_size = output.needed_size;
+                if (needed_size <= pcm_size)
+                {
+                    needed_size = pcm_size * 2U;
+                }
+                if (needed_size > MUSIC_STREAM_PCM_MAX_BYTES)
+                {
+                    _stream_set_status(MUSIC_PLAYBACK_ERROR,
+                                       MUSIC_SERVICE_FAILURE_DECODE);
+                    failed = true;
+                    fatal = true;
+                    break;
+                }
+                uint8_t *grown = heap_caps_realloc(
+                                     pcm, needed_size,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (grown == NULL)
+                {
+                    _stream_set_status(MUSIC_PLAYBACK_ERROR,
+                                       MUSIC_SERVICE_FAILURE_DECODE);
+                    failed = true;
+                    fatal = true;
+                    break;
+                }
+                pcm = grown;
+                pcm_size = needed_size;
+                continue;
+            }
+            if (decode_result != ESP_AUDIO_ERR_OK)
+            {
+                LOG_E("decode failed: %d raw=%u consumed=%u decoded=%u",
+                      (int)decode_result, (unsigned)raw_before,
+                      (unsigned)raw.consumed,
+                      (unsigned)output.decoded_size);
                 _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                    MUSIC_SERVICE_FAILURE_DECODE);
                 failed = true;
@@ -352,6 +392,13 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                                                    output.decoded_size, &written,
                                                    1000U);
                 played_bytes += written;
+                if (write_result != ESP_OK && !write_failure_logged)
+                {
+                    write_failure_logged = true;
+                    LOG_W("audio write failed: %s written=%u/%u",
+                          esp_err_to_name(write_result), (unsigned)written,
+                          (unsigned)output.decoded_size);
+                }
                 if (write_result != ESP_OK && write_result != ESP_ERR_TIMEOUT)
                 {
                     if (write_result == ESP_ERR_INVALID_STATE &&
@@ -374,10 +421,19 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                                                        bytes_per_second));
                 }
             }
-            if (output.decoded_size == 0U && raw.consumed == 0U)
+            if (raw.consumed == 0U)
             {
-                break;
+                if (++stalled_calls >= 8U)
+                {
+                    LOG_W("decoder made no input progress: decoded=%u",
+                          (unsigned)output.decoded_size);
+                    break;
+                }
+                continue;
             }
+            stalled_calls = 0U;
+            raw.buffer += raw.consumed;
+            raw.len -= raw.consumed;
         }
         if (fatal || atomic_load_explicit(&s_stream.stop,
                                           memory_order_acquire))
@@ -461,6 +517,36 @@ static void _stream_task(void *argument)
     vTaskDelete(NULL);
 }
 
+static esp_err_t _stream_register_decoders(void)
+{
+    esp_audio_err_t result = esp_mp3_dec_register();
+    if (result != ESP_AUDIO_ERR_OK)
+    {
+        LOG_E("register MP3 decoder failed: %d", (int)result);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    result = esp_flac_dec_register();
+    if (result != ESP_AUDIO_ERR_OK)
+    {
+        LOG_E("register FLAC decoder failed: %d", (int)result);
+        esp_audio_dec_unregister(ESP_AUDIO_TYPE_MP3);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    s_stream.decoders_registered = true;
+    return ESP_OK;
+}
+
+static void _stream_unregister_decoders(void)
+{
+    if (!s_stream.decoders_registered)
+    {
+        return;
+    }
+    esp_audio_dec_unregister(ESP_AUDIO_TYPE_FLAC);
+    esp_audio_dec_unregister(ESP_AUDIO_TYPE_MP3);
+    s_stream.decoders_registered = false;
+}
+
 esp_err_t music_stream_init(uint32_t priority)
 {
     if (s_stream.initialized)
@@ -468,6 +554,11 @@ esp_err_t music_stream_init(uint32_t priority)
         return ESP_ERR_INVALID_STATE;
     }
     memset(&s_stream, 0, sizeof(s_stream));
+    if (_stream_register_decoders() != ESP_OK)
+    {
+        memset(&s_stream, 0, sizeof(s_stream));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     s_stream.lock = xSemaphoreCreateMutex();
     /* PSRAM-backed queue; delete it with vQueueDeleteWithCaps(). */
     s_stream.queue = xQueueCreateWithCaps(
@@ -484,6 +575,7 @@ esp_err_t music_stream_init(uint32_t priority)
         {
             vSemaphoreDelete(s_stream.lock);
         }
+        _stream_unregister_decoders();
         memset(&s_stream, 0, sizeof(s_stream));
         return ESP_ERR_NO_MEM;
     }
@@ -499,6 +591,7 @@ esp_err_t music_stream_init(uint32_t priority)
     {
         vQueueDeleteWithCaps(s_stream.queue);
         vSemaphoreDelete(s_stream.lock);
+        _stream_unregister_decoders();
         memset(&s_stream, 0, sizeof(s_stream));
         return ESP_ERR_NO_MEM;
     }
@@ -571,6 +664,7 @@ esp_err_t music_stream_deinit(void)
         vSemaphoreDelete(s_stream.lock);
         s_stream.lock = NULL;
     }
+    _stream_unregister_decoders();
     memset(&s_stream, 0, sizeof(s_stream));
     return result;
 }

@@ -35,17 +35,24 @@ PCM through the `audio_service` exclusive playback lease.
 ## Login and catalog
 
 - WeChat QR login is implemented through the QQ Music web OAuth flow.
-- QQ QR login and QQ Music App MQTT login are not implemented in this version.
+- QQ account QR login is implemented through `ptlogin2.qq.com`, the Graph
+  OAuth authorization step, and `QQConnectLogin.LoginServer/QQLogin`.
+- QR payloads may be JPEG or PNG; both are decoded to RGB565. QQ Music App
+  MQTT login is not implemented in this version.
 - Credentials are stored in the `music_cred` NVS blob and erasing them is part
   of the factory-reset sequence.
 - Home data combines the anonymous recommendation feed with the logged-in
   user's created and favorite playlists. Playlist detail and lyric requests are
   bounded by the public header limits.
+- Catalog parsers accept current (`mid`, `file.media_mid`, `dirinfo`) and legacy
+  (`songmid`, `strMediaMid`, `dissname`) response names. Song URL requests use
+  `CgiGetVkey` array parameters and `media_mid` filenames; lyrics use `crypt: 0`
+  plain LRC.
 
 ## Audio
 
 `music_stream.c` reads the CDN stream, uses `esp_audio_simple_dec` for
-MP3/AAC/FLAC, maps the decoded sample rate/channel/bit depth to the BSP format
+MP3/FLAC, maps the decoded sample rate/channel/bit depth to the BSP format
 table, and writes PCM through `audio_service_write_leased()`. Audio decoding
 and network reads run on the dedicated audio worker; no LVGL call is made from
 either worker.
@@ -58,6 +65,6 @@ quality through `music_service_config_t`.
 
 ## Test Boundary
 
-The service currently has no standalone host suite; protocol parsing,
-credential handling, and playback require on-device validation. TLS, Wi-Fi,
+The pure QQ login protocol parsers have a standalone host suite. Network, TLS,
+credential storage, and playback still require on-device validation; Wi-Fi,
 I2S/DMA, ES8311, and battery behavior are outside host-test scope.

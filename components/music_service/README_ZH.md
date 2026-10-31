@@ -32,14 +32,20 @@ NVS 写会关闭 flash cache；音频 worker 使用 PSRAM 栈，并通过 `audio
 ## 登录与曲库
 
 - 微信扫码通过 QQ 音乐 Web OAuth 流程实现。
-- 当前版本不实现 QQ 扫码与 QQ 音乐 App 的 MQTT 登录。
+- QQ 账号扫码通过 `ptlogin2.qq.com`、Graph OAuth 授权和
+  `QQConnectLogin.LoginServer/QQLogin` 完成。
+- 二维码可能是 JPEG 或 PNG，两种格式都会解码为 RGB565；当前版本不实现
+  QQ 音乐 App 的 MQTT 登录。
 - 凭证保存在 NVS 的 `music_cred` Blob；删除凭证是工厂重置流程的一部分。
 - 首页数据合并匿名推荐流与登录用户的自建/收藏歌单。歌单详情与歌词请求受
   公共头文件上限约束。
+- 曲库解析同时兼容当前字段（`mid`、`file.media_mid`、`dirinfo`）与旧字段
+  （`songmid`、`strMediaMid`、`dissname`）；歌曲 URL 请求使用 `CgiGetVkey`
+  数组参数和 `media_mid` 文件名，歌词使用 `crypt: 0` 的普通 LRC。
 
 ## 音频
 
-`music_stream.c` 读取 CDN 流，使用 `esp_audio_simple_dec` 解码 MP3/AAC/FLAC，
+`music_stream.c` 读取 CDN 流，使用 `esp_audio_simple_dec` 解码 MP3/FLAC，
 把解码采样率/声道/位深映射到 BSP 支持格式，再通过
 `audio_service_write_leased()` 写入 PCM。网络读取与解码在专用音频 worker
 执行；两个 worker 都不调用 LVGL。
@@ -51,5 +57,5 @@ NVS 写会关闭 flash cache；音频 worker 使用 PSRAM 栈，并通过 `audio
 
 ## 测试边界
 
-该服务当前没有独立 host 测试套件；协议解析、凭证处理与播放需要在板端验证。
-TLS、Wi-Fi、I2S/DMA、ES8311 与电池行为不在 host 测试范围内。
+QQ 登录协议解析已有独立 host 测试套件；网络、TLS、凭证存储与播放仍需在板端
+验证。Wi-Fi、I2S/DMA、ES8311 与电池行为不在 host 测试范围内。

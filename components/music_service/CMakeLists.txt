@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "src/music_service.c"
         "src/music_net.c"
+        "src/music_login_protocol.c"
         "src/music_stream.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
@@ -14,6 +15,7 @@ idf_component_register(
         espressif__cjson
         espressif__esp_audio_codec
         espressif__esp_new_jpeg
+        espressif__libpng
         freertos
         heap
         mbedtls

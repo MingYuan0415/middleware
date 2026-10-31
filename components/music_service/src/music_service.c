@@ -53,7 +53,8 @@ void music_service_unlock(void)
     }
 }
 
-void music_service_publish(uint32_t sub_type, uint32_t token)
+static void _music_service_publish_with_failure(uint32_t sub_type,
+        uint32_t token, music_service_failure_t failure)
 {
     if (!s_music.initialized)
     {
@@ -68,10 +69,27 @@ void music_service_publish(uint32_t sub_type, uint32_t token)
     event.sub_type = sub_type;
     event.token = token;
     event.state = s_music.status.state;
-    event.failure = s_music.status.failure;
+    event.failure = failure;
     music_service_unlock();
     (void)event_bus_publish(MUSIC_SERVICE_MSG, sub_type, &event,
                             sizeof(event), EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
+}
+
+void music_service_publish(uint32_t sub_type, uint32_t token)
+{
+    music_service_failure_t failure = MUSIC_SERVICE_FAILURE_NONE;
+    if (music_service_lock() == ESP_OK)
+    {
+        failure = s_music.status.failure;
+        music_service_unlock();
+    }
+    _music_service_publish_with_failure(sub_type, token, failure);
+}
+
+void music_service_publish_detail(uint32_t sub_type, uint32_t token,
+                                  music_service_failure_t failure)
+{
+    _music_service_publish_with_failure(sub_type, token, failure);
 }
 
 void music_service_set_state_locked(music_service_state_t state,
@@ -95,29 +113,40 @@ uint64_t music_service_next_generation(void)
     return generation;
 }
 
-void music_service_handle_network_result(esp_err_t result)
+static music_service_failure_t _music_service_failure_from_result(
+    esp_err_t result)
 {
-    music_service_failure_t failure = MUSIC_SERVICE_FAILURE_NONE;
     if (result == ESP_ERR_TIMEOUT)
     {
-        failure = MUSIC_SERVICE_FAILURE_NETWORK;
+        return MUSIC_SERVICE_FAILURE_NETWORK;
     }
-    else if (result == ESP_ERR_INVALID_RESPONSE)
+    if (result == ESP_ERR_INVALID_RESPONSE)
     {
-        failure = MUSIC_SERVICE_FAILURE_PARSE;
+        return MUSIC_SERVICE_FAILURE_PARSE;
     }
-    else if (result == ESP_ERR_NO_MEM)
+    if (result == ESP_ERR_NO_MEM)
     {
-        failure = MUSIC_SERVICE_FAILURE_INTERNAL;
+        return MUSIC_SERVICE_FAILURE_INTERNAL;
     }
-    else if (result == ESP_ERR_NOT_FOUND)
+    if (result == ESP_ERR_NOT_FOUND)
     {
-        failure = MUSIC_SERVICE_FAILURE_NO_PERMISSION;
+        return MUSIC_SERVICE_FAILURE_NO_PERMISSION;
     }
-    else if (result != ESP_OK)
+    if (result == ESP_ERR_NOT_SUPPORTED)
     {
-        failure = MUSIC_SERVICE_FAILURE_API;
+        return MUSIC_SERVICE_FAILURE_DECODE;
     }
+    if (result != ESP_OK)
+    {
+        return MUSIC_SERVICE_FAILURE_API;
+    }
+    return MUSIC_SERVICE_FAILURE_NONE;
+}
+
+void music_service_handle_network_result(esp_err_t result)
+{
+    const music_service_failure_t failure =
+        _music_service_failure_from_result(result);
     if (music_service_lock() == ESP_OK)
     {
         s_music.status.failure = failure;
@@ -219,9 +248,11 @@ void music_service_set_login_qr(music_image_t *image)
     s_music.status.state = MUSIC_SERVICE_STATE_QR_READY;
     s_music.status.failure = MUSIC_SERVICE_FAILURE_NONE;
     s_music.status.qr_available = true;
-    s_music.status.login_type = MUSIC_LOGIN_TYPE_WECHAT;
+    s_music.status.login_type = s_music.login_type;
     (void)snprintf(s_music.status.qr_status,
-                   sizeof(s_music.status.qr_status), "请使用微信扫码");
+                   sizeof(s_music.status.qr_status),
+                   s_music.login_type == MUSIC_LOGIN_TYPE_QQ ?
+                   "请使用QQ扫码" : "请使用微信扫码");
     s_music.status.generation = ++s_music.generation;
     music_service_unlock();
     music_service_login_qr_release(old);
@@ -245,8 +276,9 @@ void music_service_set_image(music_image_t *image, uint32_t token)
     s_music.image_token = token;
     s_music.status.generation = ++s_music.generation;
     music_service_unlock();
-    _psram_free(old);
-    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_IMAGE, token);
+    music_service_image_release(old);
+    music_service_publish_detail(MUSIC_SERVICE_MSG_SUB_TYPE_IMAGE, token,
+                                 MUSIC_SERVICE_FAILURE_NONE);
 }
 
 static void _music_service_recheck_time(void)
@@ -290,13 +322,18 @@ static void _music_service_recheck_time(void)
 
 static void _music_service_finish_login(bool success)
 {
+    music_image_t *qr = NULL;
     music_service_lock();
     s_music.login_active = false;
+    qr = s_music.login_qr;
+    s_music.login_qr = NULL;
+    s_music.status.qr_available = false;
     if (!success)
     {
         s_music.status.logged_in = s_music.credential_valid;
     }
     music_service_unlock();
+    music_service_login_qr_release(qr);
 }
 
 static void _music_service_player_error(music_service_failure_t failure)
@@ -347,6 +384,7 @@ static void _api_task(void *argument)
             }
             music_service_lock();
             s_music.login_active = true;
+            s_music.login_type = command.login_type;
             s_music.status.login_type = command.login_type;
             s_music.status.qr_available = false;
             music_service_set_state_locked(MUSIC_SERVICE_STATE_QR_READY,
@@ -380,6 +418,7 @@ static void _api_task(void *argument)
                 vTaskDelay(pdMS_TO_TICKS(1500U));
                 music_login_poll_state_t poll_state = MUSIC_LOGIN_POLL_WAITING;
                 const esp_err_t poll_result = music_net_login_poll(
+                                                  command.login_type,
                                                   &credential, &poll_state);
                 if (poll_result != ESP_OK)
                 {
@@ -458,7 +497,10 @@ static void _api_task(void *argument)
                 s_music.credential = credential;
                 s_music.credential_valid = true;
                 s_music.status.logged_in = true;
-                s_music.status.login_type = MUSIC_LOGIN_TYPE_WECHAT;
+                s_music.login_type = credential.login_type == 2U ?
+                                     MUSIC_LOGIN_TYPE_QQ :
+                                     MUSIC_LOGIN_TYPE_WECHAT;
+                s_music.status.login_type = s_music.login_type;
                 s_music.status.qr_available = false;
                 s_music.status.user_name[0] = '\0';
                 s_music.status.user_avatar[0] = '\0';
@@ -496,6 +538,7 @@ static void _api_task(void *argument)
             memset(&s_music.credential, 0, sizeof(s_music.credential));
             s_music.credential_valid = false;
             s_music.login_active = false;
+            s_music.login_type = MUSIC_LOGIN_TYPE_WECHAT;
             s_music.status.logged_in = false;
             s_music.status.user_name[0] = '\0';
             s_music.status.user_avatar[0] = '\0';
@@ -596,10 +639,9 @@ static void _api_task(void *argument)
             }
             else
             {
-                music_service_handle_network_result(result);
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_IMAGE,
-                                      command.token);
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
+                music_service_publish_detail(
+                    MUSIC_SERVICE_MSG_SUB_TYPE_IMAGE, command.token,
+                    _music_service_failure_from_result(result));
             }
             break;
         }
@@ -636,25 +678,16 @@ static void _api_task(void *argument)
                 break;
             }
             const music_song_t *song = &playlist->songs[local_index];
-            char url[MUSIC_SERVICE_URL_BYTES];
-            const esp_err_t url_result = music_net_fetch_song_url(
-                                             song, s_music.config.default_quality,
-                                             url, sizeof(url));
-            if (url_result != ESP_OK)
-            {
-                music_service_handle_network_result(url_result);
-                _psram_free(playlist);
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
-                                      0U);
-                _music_service_player_error(s_music.status.failure);
-                break;
-            }
             const uint32_t total = playlist->total != 0U ?
                                    playlist->total :
                                    page_offset + playlist->count;
+            /* Publish the song metadata before resolving the stream URL so
+             * the player page can show the title/cover even when the track
+             * has no playable URL (VIP/no permission/network error). */
             music_service_lock();
             s_music.player.state = MUSIC_PLAYBACK_BUFFERING;
             s_music.player.failure = MUSIC_SERVICE_FAILURE_NONE;
+            s_music.status.failure = MUSIC_SERVICE_FAILURE_NONE;
             (void)snprintf(s_music.player.title,
                            sizeof(s_music.player.title), "%s",
                            song->title);
@@ -679,6 +712,21 @@ static void _api_task(void *argument)
             s_music.status.generation = ++s_music.generation;
             s_music.player.generation = s_music.status.generation;
             music_service_unlock();
+            music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
+
+            char url[MUSIC_SERVICE_URL_BYTES];
+            const esp_err_t url_result = music_net_fetch_song_url(
+                                             song, s_music.config.default_quality,
+                                             url, sizeof(url));
+            if (url_result != ESP_OK)
+            {
+                music_service_handle_network_result(url_result);
+                _psram_free(playlist);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
+                                      0U);
+                _music_service_player_error(s_music.status.failure);
+                break;
+            }
             (void)music_stream_stop();
             const esp_err_t stream_result = music_stream_play(
                                                 url, song->duration_ms);
@@ -769,6 +817,10 @@ esp_err_t music_service_init(const music_service_config_t *config)
         {
             s_music.credential = credential;
             s_music.credential_valid = true;
+            s_music.login_type = credential.login_type == 2U ?
+                                 MUSIC_LOGIN_TYPE_QQ :
+                                 MUSIC_LOGIN_TYPE_WECHAT;
+            s_music.status.login_type = s_music.login_type;
             s_music.status.logged_in = true;
         }
     }
@@ -900,10 +952,6 @@ esp_err_t music_service_login_begin(music_login_type_t type)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (type != MUSIC_LOGIN_TYPE_WECHAT)
-    {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     if (!s_music.initialized || s_music.api_queue == NULL)
     {
         return ESP_ERR_INVALID_STATE;
@@ -918,6 +966,8 @@ esp_err_t music_service_login_begin(music_login_type_t type)
     if (allowed)
     {
         s_music.login_active = true;
+        s_music.login_type = type;
+        s_music.status.login_type = type;
         atomic_store_explicit(&s_login_cancel, false, memory_order_release);
     }
     music_service_unlock();
@@ -982,6 +1032,7 @@ esp_err_t music_service_login_cancel(void)
     {
         qr = s_music.login_qr;
         s_music.login_qr = NULL;
+        s_music.login_active = false;
         if (s_music.status.state == MUSIC_SERVICE_STATE_QR_READY ||
                 s_music.status.state == MUSIC_SERVICE_STATE_QR_SCANNED ||
                 s_music.status.state == MUSIC_SERVICE_STATE_AUTHENTICATING ||

@@ -54,7 +54,7 @@ typedef enum
 {
     MUSIC_LOGIN_POLL_WAITING = 0, /**< QR code is still waiting for a scan. */
     MUSIC_LOGIN_POLL_SCANNED,     /**< QR code was scanned and awaits confirmation. */
-    MUSIC_LOGIN_POLL_SUCCESS,     /**< WeChat code was exchanged successfully. */
+    MUSIC_LOGIN_POLL_SUCCESS,     /**< QR login exchanged a credential successfully. */
     MUSIC_LOGIN_POLL_FAILED,      /**< QR code expired or login was rejected. */
 } music_login_poll_state_t;
 
@@ -105,8 +105,10 @@ typedef struct music_service_runtime
     music_image_t *image;
     music_credential_blob_t credential;
     bool credential_valid;
+    music_login_type_t login_type;
     char qr_uuid[96];
-    char qr_qrsig[128];
+    char qr_qrsig[256];
+    char qq_login_sig[160];
     char lyric_songmid[MUSIC_SERVICE_SONGMID_BYTES];
     uint32_t image_token;
     music_playlist_ref_t play_ref;
@@ -122,6 +124,8 @@ extern music_service_runtime_t s_music;
 esp_err_t music_service_lock(void);
 void music_service_unlock(void);
 void music_service_publish(uint32_t sub_type, uint32_t token);
+void music_service_publish_detail(uint32_t sub_type, uint32_t token,
+                                  music_service_failure_t failure);
 void music_service_set_state_locked(music_service_state_t state,
                                     music_service_failure_t failure);
 void music_service_replace_home(music_home_snapshot_t *snapshot);
@@ -138,7 +142,8 @@ esp_err_t music_net_load_credential(music_credential_blob_t *credential);
 esp_err_t music_net_save_credential(const music_credential_blob_t *credential);
 esp_err_t music_net_erase_credential(void);
 esp_err_t music_net_login_begin(music_login_type_t type);
-esp_err_t music_net_login_poll(music_credential_blob_t *credential,
+esp_err_t music_net_login_poll(music_login_type_t type,
+                               music_credential_blob_t *credential,
                                music_login_poll_state_t *state);
 esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot);
 esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
