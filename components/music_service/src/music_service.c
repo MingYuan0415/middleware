@@ -8,6 +8,7 @@
 #include "esp_jpeg_common.h"
 #include "esp_random.h"
 #include "event_bus.h"
+#include "freertos/idf_additions.h"
 #include "nv_storage.h"
 #include "time_service.h"
 
@@ -22,7 +23,7 @@ EVENT_BUS_DEFINE_ID(MUSIC_SERVICE_MSG);
 
 #define MUSIC_SERVICE_PLAYLIST_PAGE_SIZE 30U
 
-music_service_runtime_t s_music;
+MUSIC_SERVICE_EXT_BSS music_service_runtime_t s_music;
 
 static atomic_bool s_playing;
 static atomic_bool s_login_cancel;
@@ -313,6 +314,12 @@ static void _music_service_player_error(music_service_failure_t failure)
     music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
 }
 
+static void _music_log_api_stack(const char *phase)
+{
+    LOG_I("api stack high water=%u B phase=%s",
+          (unsigned)uxTaskGetStackHighWaterMark(NULL), phase);
+}
+
 static void _api_task(void *argument)
 {
     (void)argument;
@@ -463,6 +470,7 @@ static void _api_task(void *argument)
                                "登录成功");
                 terminal_ok = true;
                 music_service_unlock();
+                _music_log_api_stack("login");
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
                 const music_api_command_t refresh =
                 {
@@ -687,6 +695,7 @@ static void _api_task(void *argument)
                 break;
             }
             atomic_store_explicit(&s_playing, true, memory_order_release);
+            _music_log_api_stack("play");
             music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
             _psram_free(playlist);
             break;
@@ -709,15 +718,20 @@ esp_err_t music_service_init(const music_service_config_t *config)
     {
         return ESP_ERR_INVALID_STATE;
     }
+    const size_t internal_before =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     memset(&s_music, 0, sizeof(s_music));
     s_music.lock = xSemaphoreCreateMutex();
-    s_music.api_queue = xQueueCreate(CONFIG_MUSIC_SERVICE_API_QUEUE_DEPTH,
-                                     sizeof(music_api_command_t));
+    /* PSRAM-backed queue; delete it with vQueueDeleteWithCaps(). */
+    s_music.api_queue = xQueueCreateWithCaps(
+                            CONFIG_MUSIC_SERVICE_API_QUEUE_DEPTH,
+                            sizeof(music_api_command_t),
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_music.lock == NULL || s_music.api_queue == NULL)
     {
         if (s_music.api_queue != NULL)
         {
-            vQueueDelete(s_music.api_queue);
+            vQueueDeleteWithCaps(s_music.api_queue);
         }
         if (s_music.lock != NULL)
         {
@@ -761,7 +775,7 @@ esp_err_t music_service_init(const music_service_config_t *config)
     if (music_stream_init(config->audio_task_priority) != ESP_OK)
     {
         s_music.initialized = false;
-        vQueueDelete(s_music.api_queue);
+        vQueueDeleteWithCaps(s_music.api_queue);
         vSemaphoreDelete(s_music.lock);
         memset(&s_music, 0, sizeof(s_music));
         return ESP_ERR_NO_MEM;
@@ -773,11 +787,19 @@ esp_err_t music_service_init(const music_service_config_t *config)
     {
         (void)music_stream_deinit();
         s_music.initialized = false;
-        vQueueDelete(s_music.api_queue);
+        vQueueDeleteWithCaps(s_music.api_queue);
         vSemaphoreDelete(s_music.lock);
         memset(&s_music, 0, sizeof(s_music));
         return ESP_ERR_NO_MEM;
     }
+    const size_t internal_after =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    LOG_I("api queue item=%u B internal cost=%u B free=%u B largest=%u B",
+          (unsigned)sizeof(music_api_command_t),
+          (unsigned)(internal_before > internal_after ?
+                     internal_before - internal_after : 0U),
+          (unsigned)internal_after,
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return ESP_OK;
 }
 
@@ -811,7 +833,7 @@ esp_err_t music_service_deinit(void)
     s_music.api_task = NULL;
     if (s_music.api_queue != NULL)
     {
-        vQueueDelete(s_music.api_queue);
+        vQueueDeleteWithCaps(s_music.api_queue);
         s_music.api_queue = NULL;
     }
     _psram_free(s_music.home);

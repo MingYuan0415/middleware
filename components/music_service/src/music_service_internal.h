@@ -13,6 +13,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Service runtime and cookie state are large enough to keep in PSRAM. */
+#if defined(ESP_PLATFORM) && !defined(HOST_TEST)
+    #include "esp_attr.h"
+    #define MUSIC_SERVICE_EXT_BSS EXT_RAM_BSS_ATTR
+#else
+    #define MUSIC_SERVICE_EXT_BSS
+#endif
+
 #define MUSIC_CREDENTIAL_KEY "music_cred"
 #define MUSIC_CREDENTIAL_MAGIC 0x4D555331U
 #define MUSIC_CREDENTIAL_VERSION 1U

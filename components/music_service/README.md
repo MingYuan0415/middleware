@@ -26,9 +26,11 @@ audio I/O itself.
   returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
 - `music_service_is_playing()` is the lock-free PM guard query.
 
-All large snapshots and audio buffers are allocated in PSRAM. The API worker
-uses an internal-RAM stack; the audio worker receives PCM through the
-`audio_service` exclusive playback lease.
+Snapshots, images, and audio buffers live in PSRAM. The service runtime state,
+cookie jar, and both command queues also live in PSRAM. The API worker stack
+stays in internal RAM because credential save/erase goes through NVS, which
+disables the flash cache; the audio worker runs from a PSRAM stack and receives
+PCM through the `audio_service` exclusive playback lease.
 
 ## Login and catalog
 

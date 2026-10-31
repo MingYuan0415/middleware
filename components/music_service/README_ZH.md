@@ -24,8 +24,10 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
   接口，范围跳转实现前返回 `ESP_ERR_NOT_SUPPORTED`。
 - `music_service_is_playing()` 是供系统 PM 使用的无锁查询。
 
-所有大快照与音频缓冲分配在 PSRAM。API worker 使用内部 RAM 栈；音频 worker
-通过 `audio_service` 的独占播放租约接收 PCM。
+快照、图片与音频缓冲分配在 PSRAM。服务运行状态、Cookie 罐与两个命令队列也
+放在 PSRAM。API worker 栈保留在内部 RAM，因为凭证保存/删除要经过 NVS，而
+NVS 写会关闭 flash cache；音频 worker 使用 PSRAM 栈，并通过 `audio_service`
+的独占播放租约接收 PCM。
 
 ## 登录与曲库
 

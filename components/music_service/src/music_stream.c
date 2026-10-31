@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "esp_audio_simple_dec.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -468,13 +469,16 @@ esp_err_t music_stream_init(uint32_t priority)
     }
     memset(&s_stream, 0, sizeof(s_stream));
     s_stream.lock = xSemaphoreCreateMutex();
-    s_stream.queue = xQueueCreate(MUSIC_STREAM_QUEUE_DEPTH,
-                                  sizeof(music_stream_command_t));
+    /* PSRAM-backed queue; delete it with vQueueDeleteWithCaps(). */
+    s_stream.queue = xQueueCreateWithCaps(
+                         MUSIC_STREAM_QUEUE_DEPTH,
+                         sizeof(music_stream_command_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_stream.lock == NULL || s_stream.queue == NULL)
     {
         if (s_stream.queue != NULL)
         {
-            vQueueDelete(s_stream.queue);
+            vQueueDeleteWithCaps(s_stream.queue);
         }
         if (s_stream.lock != NULL)
         {
@@ -483,6 +487,7 @@ esp_err_t music_stream_init(uint32_t priority)
         memset(&s_stream, 0, sizeof(s_stream));
         return ESP_ERR_NO_MEM;
     }
+    LOG_I("queue item=%u B", (unsigned)sizeof(music_stream_command_t));
     if (audio_service_get_config(&s_stream.default_audio) != ESP_OK)
     {
         memset(&s_stream.default_audio, 0, sizeof(s_stream.default_audio));
@@ -492,7 +497,7 @@ esp_err_t music_stream_init(uint32_t priority)
                                         NULL, priority, &s_stream.task, 0,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
-        vQueueDelete(s_stream.queue);
+        vQueueDeleteWithCaps(s_stream.queue);
         vSemaphoreDelete(s_stream.lock);
         memset(&s_stream, 0, sizeof(s_stream));
         return ESP_ERR_NO_MEM;
@@ -558,7 +563,7 @@ esp_err_t music_stream_deinit(void)
     }
     if (s_stream.queue != NULL)
     {
-        vQueueDelete(s_stream.queue);
+        vQueueDeleteWithCaps(s_stream.queue);
         s_stream.queue = NULL;
     }
     if (s_stream.lock != NULL)

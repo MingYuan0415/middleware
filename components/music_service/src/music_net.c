@@ -42,7 +42,7 @@ typedef struct music_http_context
     bool capture_cookies;
 } music_http_context_t;
 
-static music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
+static MUSIC_SERVICE_EXT_BSS music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
 static size_t s_cookie_count;
 
 static void *_psram_alloc(size_t size)
