@@ -821,11 +821,19 @@ static void _api_task(void *argument)
             {
                 if (stream_status.state == MUSIC_PLAYBACK_PLAYING)
                 {
-                    (void)music_stream_pause(true);
+                    if (music_stream_pause(true) == ESP_OK)
+                    {
+                        atomic_store_explicit(&s_playing, false,
+                                              memory_order_release);
+                    }
                 }
                 else if (stream_status.state == MUSIC_PLAYBACK_PAUSED)
                 {
-                    (void)music_stream_pause(false);
+                    if (music_stream_pause(false) == ESP_OK)
+                    {
+                        atomic_store_explicit(&s_playing, true,
+                                              memory_order_release);
+                    }
                 }
             }
             break;

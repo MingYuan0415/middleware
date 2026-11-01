@@ -55,8 +55,9 @@ flash cache；音频 worker 在首次播放时懒创建，使用 PSRAM 栈，并
 把解码采样率/声道/位深映射到 BSP 支持格式，再通过
 `audio_service_write_leased()` 写入 PCM。PCM 短写会在有界重试内补齐；连续
 写入失败会报告播放错误，而不是静默丢弃音频。若 BSP 没有对应采样率的
-24-bit clock pair，则在写入前把 PCM 转为 16-bit。网络读取与解码在专用音频
-worker 执行；两个 worker 都不调用 LVGL。
+24-bit clock pair，则在写入前把 PCM 转为 16-bit。暂停会释放独占音频租约并
+关闭 codec，让其他音频消费者使用设备；恢复时用保存的 PCM 格式重新申请租约。
+网络读取与解码在专用音频 worker 执行；两个 worker 都不调用 LVGL。
 
 ## 配置
 

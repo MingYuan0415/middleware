@@ -66,8 +66,10 @@ table, and writes PCM through `audio_service_write_leased()`. Partial PCM
 writes are completed with bounded retries; a repeated write failure is reported
 as a playback error instead of silently dropping audio. When the BSP has no
 24-bit clock pair for the decoded rate, PCM is converted to 16-bit before the
-write. Audio decoding and network reads run on the dedicated audio worker; no
-LVGL call is made from either worker.
+write. Pause releases the exclusive audio lease and closes the codec so other
+audio consumers can use the device; resume reconfigures the saved PCM format and
+acquires the lease again. Audio decoding and network reads run on the dedicated
+audio worker; no LVGL call is made from either worker.
 
 ## Configuration
 
