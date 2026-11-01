@@ -5,12 +5,16 @@
 #include "music_http.h"
 #include "music_media.h"
 #include "music_snapshot.h"
+#include "music_api.h"
 #include "music_login_protocol.h"
 
 #include "esp_heap_caps.h"
 #include "esp_jpeg_common.h"
+#include "mbedtls/base64.h"
 #include "esp_jpeg_dec.h"
 #include "png.h"
+
+#include "cJSON.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -259,5 +263,213 @@ esp_err_t music_net_fetch_image(const char *url, uint16_t width,
 {
     return music_media_fetch_image(url, width, height, token, false, NULL,
                                    image);
+}
+
+static size_t _utf8_truncate(const char *text, size_t length)
+{
+    while (length > 0U && (text[length] & 0xC0U) == 0x80U)
+    {
+        --length;
+    }
+    return length;
+}
+
+static void _lyric_append(music_lyric_snapshot_t *lyric, uint32_t offset_ms,
+                          const char *text, size_t length)
+{
+    if (lyric == NULL || text == NULL || length == 0U ||
+            lyric->line_count >= MUSIC_SERVICE_MAX_LYRIC_LINES)
+    {
+        return;
+    }
+    music_lyric_line_t *line = &lyric->lines[lyric->line_count];
+    line->offset_ms = offset_ms;
+    if (length >= sizeof(line->text))
+    {
+        length = sizeof(line->text) - 1U;
+    }
+    length = _utf8_truncate(text, length);
+    memcpy(line->text, text, length);
+    line->text[length] = '\0';
+    if (line->text[0] != '\0')
+    {
+        ++lyric->line_count;
+    }
+}
+
+static void _lyric_sort(music_lyric_snapshot_t *lyric)
+{
+    for (size_t index = 1U; index < lyric->line_count; ++index)
+    {
+        music_lyric_line_t current = lyric->lines[index];
+        size_t position = index;
+        while (position > 0U &&
+                lyric->lines[position - 1U].offset_ms > current.offset_ms)
+        {
+            lyric->lines[position] = lyric->lines[position - 1U];
+            --position;
+        }
+        lyric->lines[position] = current;
+    }
+}
+
+static void _parse_lrc(const char *text, music_lyric_snapshot_t *lyric)
+{
+    if (text == NULL || lyric == NULL)
+    {
+        return;
+    }
+    const char *cursor = text;
+    while (*cursor != '\0' && lyric->line_count < MUSIC_SERVICE_MAX_LYRIC_LINES)
+    {
+        const char *line_end = strchr(cursor, '\n');
+        if (line_end == NULL)
+        {
+            line_end = cursor + strlen(cursor);
+        }
+        const char *text_start = cursor;
+        while (text_start < line_end && *text_start == '[')
+        {
+            const char *close = strchr(text_start, ']');
+            if (close == NULL || close >= line_end)
+            {
+                break;
+            }
+            unsigned minutes = 0U;
+            unsigned seconds = 0U;
+            unsigned hundredths = 0U;
+            if (sscanf(text_start + 1, "%u:%u.%u", &minutes, &seconds,
+                       &hundredths) >= 2)
+            {
+                (void)minutes;
+                (void)seconds;
+                (void)hundredths;
+                /* The text is appended after the last tag below. */
+            }
+            text_start = close + 1;
+        }
+        const char *body = text_start;
+        while (body < line_end && (*body == ' ' || *body == '\r'))
+        {
+            ++body;
+        }
+        size_t body_length = (size_t)(line_end - body);
+        while (body_length > 0U &&
+                (body[body_length - 1U] == '\r' ||
+                 body[body_length - 1U] == ' '))
+        {
+            --body_length;
+        }
+        /* Re-scan the tags to attach the same text to each timestamp. */
+        const char *tag = cursor;
+        while (tag < text_start)
+        {
+            const char *close = strchr(tag, ']');
+            if (close == NULL || close >= text_start)
+            {
+                break;
+            }
+            unsigned minutes = 0U;
+            unsigned seconds = 0U;
+            unsigned hundredths = 0U;
+            if (sscanf(tag + 1, "%u:%u.%u", &minutes, &seconds,
+                       &hundredths) >= 2)
+            {
+                const uint32_t offset_ms = minutes * 60000U +
+                                           seconds * 1000U +
+                                           hundredths * 10U;
+                _lyric_append(lyric, offset_ms, body, body_length);
+            }
+            tag = close + 1;
+        }
+        cursor = *line_end == '\0' ? line_end : line_end + 1;
+    }
+    _lyric_sort(lyric);
+}
+
+esp_err_t music_net_fetch_lyric(const char *songmid,
+                                music_lyric_snapshot_t **snapshot)
+{
+    if (songmid == NULL || songmid[0] == '\0' || snapshot == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *snapshot = NULL;
+    cJSON *param = cJSON_CreateObject();
+    if (param == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(param, "songMid", songmid);
+    /* crypt=1 returns a hex-encoded QRC payload, while this service parses
+     * plain LRC. crypt=0 keeps the lyric field Base64-encoded LRC text. */
+    cJSON_AddNumberToObject(param, "crypt", 0);
+    cJSON_AddNumberToObject(param, "lrc_t", 0);
+    cJSON_AddNumberToObject(param, "qrc", 0);
+    cJSON_AddNumberToObject(param, "qrc_t", 0);
+    cJSON_AddNumberToObject(param, "roma", 0);
+    cJSON_AddNumberToObject(param, "trans", 0);
+    cJSON_AddNumberToObject(param, "type", 1);
+    cJSON *root = NULL;
+    cJSON *data = music_api_post("music.musichallSong.PlayLyricInfo",
+                                 "GetPlayLyricInfo", param, &root);
+    if (data == NULL)
+    {
+        cJSON_Delete(root);
+        return music_api_last_error();
+    }
+    const size_t encoded_size = 256U * 1024U;
+    char *encoded = _psram_alloc(encoded_size);
+    if (encoded == NULL)
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    music_json_string(data, "lyric", encoded, encoded_size);
+    cJSON_Delete(root);
+    if (encoded[0] == '\0')
+    {
+        _psram_free(encoded);
+        return ESP_ERR_NOT_FOUND;
+    }
+    unsigned char *decoded = _psram_alloc(encoded_size);
+    if (decoded == NULL)
+    {
+        _psram_free(encoded);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t decoded_length = 0U;
+    const int base64_result = mbedtls_base64_decode(
+                                  decoded, encoded_size,
+                                  &decoded_length,
+                                  (const unsigned char *)encoded,
+                                  strlen(encoded));
+    if (base64_result != 0)
+    {
+        _psram_free(encoded);
+        _psram_free(decoded);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    _psram_free(encoded);
+    decoded[decoded_length] = '\0';
+    music_lyric_snapshot_t *lyric = music_snapshot_alloc(
+                                        offsetof(music_lyric_snapshot_t, lines) +
+                                        (size_t)MUSIC_SERVICE_MAX_LYRIC_LINES *
+                                        sizeof(music_lyric_line_t), NULL);
+    if (lyric == NULL)
+    {
+        _psram_free(decoded);
+        return ESP_ERR_NO_MEM;
+    }
+    lyric->generation = music_service_next_generation();
+    _parse_lrc((const char *)decoded, lyric);
+    _psram_free(decoded);
+    if (lyric->line_count == 0U)
+    {
+        music_snapshot_release(lyric);
+        return ESP_ERR_NOT_FOUND;
+    }
+    *snapshot = lyric;
+    return ESP_OK;
 }
 

@@ -147,7 +147,7 @@ uint64_t music_service_next_generation(void);
 void music_service_stream_finished(void);
 void music_service_stream_failed(music_service_failure_t failure);
 
-/* music_net.c */
+/* music_catalog.c / music_auth.c */
 esp_err_t music_net_load_credential(music_credential_blob_t *credential);
 esp_err_t music_net_save_credential(const music_credential_blob_t *credential);
 esp_err_t music_net_erase_credential(void);
