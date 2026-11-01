@@ -25,6 +25,11 @@
 #define MUSIC_CREDENTIAL_MAGIC 0x4D555331U
 #define MUSIC_CREDENTIAL_VERSION 1U
 
+/* Transport/API errors that do not have a distinct ESP-IDF code. */
+#define MUSIC_ERR_HTTP_AUTH      ((esp_err_t)0x7101)
+#define MUSIC_ERR_HTTP_RATE_LIMIT ((esp_err_t)0x7102)
+#define MUSIC_ERR_HTTP_API       ((esp_err_t)0x7103)
+
 typedef struct music_credential_blob
 {
     uint32_t magic;
@@ -47,6 +52,7 @@ typedef enum
     MUSIC_API_CMD_LYRIC,
     MUSIC_API_CMD_IMAGE,
     MUSIC_API_CMD_PLAY,
+    MUSIC_API_CMD_PAUSE,
 } music_api_cmd_type_t;
 
 /** @brief Result of one QR-poll iteration. */
@@ -78,6 +84,7 @@ typedef struct music_stream_status
     music_service_failure_t failure;
     uint32_t position_ms;
     uint32_t duration_ms;
+    uint32_t generation;
 } music_stream_status_t;
 
 typedef struct music_http_result
@@ -104,6 +111,7 @@ typedef struct music_service_runtime
     music_image_t *login_qr;
     music_image_t *image;
     music_credential_blob_t credential;
+    music_credential_blob_t login_credential;
     bool credential_valid;
     music_login_type_t login_type;
     char qr_uuid[96];
@@ -114,6 +122,7 @@ typedef struct music_service_runtime
     music_playlist_ref_t play_ref;
     uint32_t play_index;
     uint32_t play_count;
+    uint32_t play_generation;
     bool play_valid;
     bool login_active;
     uint64_t generation;
@@ -136,6 +145,7 @@ void music_service_set_image(music_image_t *image, uint32_t token);
 void music_service_handle_network_result(esp_err_t result);
 uint64_t music_service_next_generation(void);
 void music_service_stream_finished(void);
+void music_service_stream_failed(music_service_failure_t failure);
 
 /* music_net.c */
 esp_err_t music_net_load_credential(music_credential_blob_t *credential);
@@ -156,14 +166,17 @@ esp_err_t music_net_fetch_image(const char *url, uint16_t width,
                                 music_image_t **image);
 esp_err_t music_net_fetch_song_url(const music_song_t *song,
                                    music_quality_t quality,
-                                   char *url, size_t url_size);
+                                   char *url, size_t url_size,
+                                   music_quality_t *actual_quality);
 
 esp_err_t music_stream_init(uint32_t priority);
 esp_err_t music_stream_deinit(void);
-esp_err_t music_stream_play(const char *url, uint32_t duration_ms);
+esp_err_t music_stream_play(const char *url, uint32_t duration_ms,
+                            uint32_t generation);
 esp_err_t music_stream_pause(bool pause);
 esp_err_t music_stream_stop(void);
 bool music_stream_is_playing(void);
+uint32_t music_stream_get_stack_high_water(void);
 esp_err_t music_stream_get_status(music_stream_status_t *status);
 void music_net_cancel_login(void);
 void music_net_clear_session(void);

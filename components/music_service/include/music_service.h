@@ -156,6 +156,8 @@ typedef struct music_home_snapshot
     music_playlist_t my_favorite[MUSIC_SERVICE_MAX_PLAYLISTS];
     music_playlist_t recommended[MUSIC_SERVICE_MAX_PLAYLISTS];
     bool login_required;
+    bool recommended_ok;
+    bool personal_ok;
 } music_home_snapshot_t;
 
 /** @brief Immutable playlist-detail snapshot. */
@@ -166,7 +168,7 @@ typedef struct music_playlist_snapshot
     uint32_t total;
     uint16_t offset;
     uint16_t count;
-    music_song_t songs[MUSIC_SERVICE_MAX_SONGS];
+    music_song_t songs[]; /**< count entries; allocation is exact. */
 } music_playlist_snapshot_t;
 
 /** @brief One parsed LRC line. */
@@ -181,7 +183,7 @@ typedef struct music_lyric_snapshot
 {
     uint64_t generation;
     size_t line_count;
-    music_lyric_line_t lines[MUSIC_SERVICE_MAX_LYRIC_LINES];
+    music_lyric_line_t lines[]; /**< line_count entries; allocation is exact. */
 } music_lyric_snapshot_t;
 
 /** @brief Decoded RGB565 image owned by the service. */
@@ -208,6 +210,7 @@ typedef struct music_player_status
     uint32_t position_ms;
     uint32_t duration_ms;
     uint32_t buffered_ms;
+    uint32_t play_generation;
     char title[MUSIC_SERVICE_TITLE_BYTES];
     char artist[MUSIC_SERVICE_ARTIST_BYTES];
     char cover_url[MUSIC_SERVICE_URL_BYTES];
@@ -230,6 +233,15 @@ typedef struct music_service_status
     char user_avatar[MUSIC_SERVICE_URL_BYTES];
     char qr_status[64];
 } music_service_status_t;
+
+/** @brief Lightweight service diagnostics for debugging and acceptance. */
+typedef struct music_service_diagnostics
+{
+    uint32_t api_stack_high_water;
+    uint32_t stream_stack_high_water;
+    uint32_t api_queue_waiting;
+    bool stream_initialized;
+} music_service_diagnostics_t;
 
 /** @brief Product-owned music service policy. */
 typedef struct music_service_config
@@ -274,6 +286,9 @@ esp_err_t music_service_deinit(void);
 
 /** @brief Inform the service of IPv4 availability. */
 esp_err_t music_service_set_network_ready(bool ready);
+
+/** @brief Inform the service that the system clock is trustworthy. */
+esp_err_t music_service_set_time_ready(bool ready);
 
 /** @brief Start a QR login flow. */
 esp_err_t music_service_login_begin(music_login_type_t type);
@@ -348,6 +363,9 @@ esp_err_t music_service_get_status(music_service_status_t *status);
 
 /** @brief Copy the current player status. */
 esp_err_t music_service_get_player_status(music_player_status_t *status);
+
+/** @brief Copy stack/queue diagnostics for the music workers. */
+esp_err_t music_service_get_diagnostics(music_service_diagnostics_t *diagnostics);
 
 /** @brief Lock-free playback query used by the system PM guard. */
 bool music_service_is_playing(void);

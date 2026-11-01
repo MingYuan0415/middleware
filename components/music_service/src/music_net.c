@@ -2,6 +2,7 @@
 #include "mt_log.h"
 
 #include "music_service_internal.h"
+#include "music_snapshot.h"
 #include "music_login_protocol.h"
 
 #include "cJSON.h"
@@ -18,6 +19,7 @@
 #include "png.h"
 
 #include <ctype.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -49,10 +51,22 @@
 #define MUSIC_QR_POLL_MAX_BYTES (32U * 1024U)
 #define MUSIC_JSON_MAX_BYTES CONFIG_MUSIC_SERVICE_MAX_RESPONSE_BYTES
 
+static _Thread_local esp_err_t s_last_musicu_error = ESP_OK;
+
+static esp_err_t _musicu_last_error(void)
+{
+    return s_last_musicu_error;
+}
+
 typedef struct music_cookie
 {
     char name[32];
     char value[512];
+    char domain[96];
+    char path[96];
+    uint32_t expires_at;
+    uint32_t last_used;
+    bool secure;
 } music_cookie_t;
 
 typedef struct music_http_context
@@ -61,6 +75,7 @@ typedef struct music_http_context
     size_t limit;
     bool overflow;
     bool capture_cookies;
+    char host[128];
 } music_http_context_t;
 
 static MUSIC_SERVICE_EXT_BSS music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
@@ -76,13 +91,64 @@ static void _psram_free(void *pointer)
     heap_caps_free(pointer);
 }
 
+static uint32_t s_cookie_tick;
+
+static void _url_host_path(const char *url, char *host, size_t host_size,
+                           char *path, size_t path_size)
+{
+    host[0] = '\0';
+    path[0] = '/';
+    if (url == NULL)
+    {
+        return;
+    }
+    const char *scheme = strstr(url, "://");
+    const char *start = scheme == NULL ? url : scheme + 3;
+    const char *end = start;
+    while (*end != '\0' && *end != '/' && *end != ':' && *end != '?')
+    {
+        ++end;
+    }
+    size_t length = (size_t)(end - start);
+    if (length >= host_size)
+    {
+        length = host_size - 1U;
+    }
+    memcpy(host, start, length);
+    host[length] = '\0';
+    if (*end == '/')
+    {
+        (void)snprintf(path, path_size, "%s", end);
+    }
+}
+
+static bool _cookie_domain_matches(const music_cookie_t *cookie,
+                                   const char *host)
+{
+    if (cookie->domain[0] == '\0')
+    {
+        return true;
+    }
+    const size_t host_len = strlen(host);
+    const size_t domain_len = strlen(cookie->domain);
+    if (host_len == domain_len)
+    {
+        return strcasecmp(host, cookie->domain) == 0;
+    }
+    return host_len > domain_len &&
+           strcasecmp(host + host_len - domain_len, cookie->domain) == 0 &&
+           host[host_len - domain_len - 1U] == '.';
+}
+
 static void _cookie_clear(void)
 {
     memset(s_cookies, 0, sizeof(s_cookies));
     s_cookie_count = 0U;
 }
 
-static void _cookie_set(const char *name, const char *value)
+static void _cookie_set(const char *name, const char *value,
+                        const char *domain, const char *path,
+                        uint32_t expires_at, bool secure)
 {
     if (name == NULL || value == NULL || name[0] == '\0')
     {
@@ -90,22 +156,46 @@ static void _cookie_set(const char *name, const char *value)
     }
     for (size_t index = 0U; index < s_cookie_count; ++index)
     {
-        if (strcmp(s_cookies[index].name, name) == 0)
+        if (strcmp(s_cookies[index].name, name) == 0 &&
+                strcmp(s_cookies[index].domain, domain) == 0 &&
+                strcmp(s_cookies[index].path, path) == 0)
         {
             (void)snprintf(s_cookies[index].value,
                            sizeof(s_cookies[index].value), "%s", value);
+            s_cookies[index].expires_at = expires_at;
+            s_cookies[index].secure = secure;
+            s_cookies[index].last_used = ++s_cookie_tick;
             return;
         }
     }
+    size_t slot = s_cookie_count;
     if (s_cookie_count == MUSIC_COOKIE_MAX)
     {
-        return;
+        slot = 0U;
+        for (size_t index = 1U; index < s_cookie_count; ++index)
+        {
+            if (s_cookies[index].last_used < s_cookies[slot].last_used)
+            {
+                slot = index;
+            }
+        }
     }
-    (void)snprintf(s_cookies[s_cookie_count].name,
-                   sizeof(s_cookies[s_cookie_count].name), "%s", name);
-    (void)snprintf(s_cookies[s_cookie_count].value,
-                   sizeof(s_cookies[s_cookie_count].value), "%s", value);
-    ++s_cookie_count;
+    else
+    {
+        ++s_cookie_count;
+    }
+    memset(&s_cookies[slot], 0, sizeof(s_cookies[slot]));
+    (void)snprintf(s_cookies[slot].name, sizeof(s_cookies[slot].name),
+                   "%s", name);
+    (void)snprintf(s_cookies[slot].value, sizeof(s_cookies[slot].value),
+                   "%s", value);
+    (void)snprintf(s_cookies[slot].domain, sizeof(s_cookies[slot].domain),
+                   "%s", domain == NULL ? "" : domain);
+    (void)snprintf(s_cookies[slot].path, sizeof(s_cookies[slot].path),
+                   "%s", path == NULL || path[0] == '\0' ? "/" : path);
+    s_cookies[slot].expires_at = expires_at;
+    s_cookies[slot].secure = secure;
+    s_cookies[slot].last_used = ++s_cookie_tick;
 }
 
 static bool _cookie_get(const char *name, char *value, size_t value_size)
@@ -117,32 +207,86 @@ static bool _cookie_get(const char *name, char *value, size_t value_size)
     value[0] = '\0';
     for (size_t index = 0U; index < s_cookie_count; ++index)
     {
-        if (strcmp(s_cookies[index].name, name) == 0)
+        if (strcmp(s_cookies[index].name, name) == 0 &&
+                (s_cookies[index].expires_at == 0U ||
+                 (uint32_t)time(NULL) < s_cookies[index].expires_at))
         {
             (void)snprintf(value, value_size, "%s", s_cookies[index].value);
+            s_cookies[index].last_used = ++s_cookie_tick;
             return true;
         }
     }
     return false;
 }
 
-static void _cookie_from_header(const char *header)
+static void _cookie_from_header(const char *header, const char *host)
 {
     char name[32];
     char value[512];
-    if (music_login_cookie_parse(header, name, sizeof(name),
-                                 value, sizeof(value)))
+    if (!music_login_cookie_parse(header, name, sizeof(name),
+                                  value, sizeof(value)))
     {
-        _cookie_set(name, value);
+        return;
     }
+    char domain[96] = {0};
+    char path[96] = "/";
+    uint32_t expires_at = 0U;
+    bool secure = false;
+    const char *domain_key = strstr(header, "Domain=");
+    if (domain_key != NULL)
+    {
+        const char *domain_start = domain_key + 7;
+        if (*domain_start == '.')
+        {
+            ++domain_start;
+        }
+        (void)snprintf(domain, sizeof(domain), "%s", domain_start);
+        char *end = strchr(domain, ';');
+        if (end != NULL)
+        {
+            *end = '\0';
+        }
+    }
+    const char *path_key = strstr(header, "Path=");
+    if (path_key != NULL)
+    {
+        (void)snprintf(path, sizeof(path), "%s", path_key + 5);
+        char *end = strchr(path, ';');
+        if (end != NULL)
+        {
+            *end = '\0';
+        }
+    }
+    const char *max_age = strstr(header, "Max-Age=");
+    if (max_age != NULL)
+    {
+        expires_at = (uint32_t)time(NULL) +
+                     (uint32_t)strtoul(max_age + 8, NULL, 10);
+    }
+    if (strstr(header, "Secure") != NULL)
+    {
+        secure = true;
+    }
+    _cookie_set(name, value, domain[0] == '\0' ? host : domain,
+                path, expires_at, secure);
 }
 
-static void _cookie_header(char *output, size_t output_size)
+static void _cookie_header(char *output, size_t output_size,
+                           const char *host, const char *request_path)
 {
     output[0] = '\0';
     size_t used = 0U;
     for (size_t index = 0U; index < s_cookie_count; ++index)
     {
+        if (!_cookie_domain_matches(&s_cookies[index], host) ||
+                (s_cookies[index].path[0] != '\0' &&
+                 strncmp(request_path, s_cookies[index].path,
+                         strlen(s_cookies[index].path)) != 0) ||
+                (s_cookies[index].expires_at != 0U &&
+                 (uint32_t)time(NULL) >= s_cookies[index].expires_at))
+        {
+            continue;
+        }
         const int written = snprintf(output + used, output_size - used,
                                      "%s%s=%s", used == 0U ? "" : "; ",
                                      s_cookies[index].name,
@@ -170,7 +314,7 @@ static esp_err_t _http_event(esp_http_client_event_t *event)
             if (context->capture_cookies &&
                     strcasecmp(event->header_key, "Set-Cookie") == 0)
             {
-                _cookie_from_header(event->header_value);
+                _cookie_from_header(event->header_value, context->host);
             }
             else if (strcasecmp(event->header_key, "Location") == 0)
             {
@@ -230,6 +374,11 @@ static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
         .limit = max_body,
         .capture_cookies = with_cookie,
     };
+    char request_host[128];
+    char request_path[128];
+    _url_host_path(url, request_host, sizeof(request_host),
+                   request_path, sizeof(request_path));
+    (void)snprintf(context.host, sizeof(context.host), "%s", request_host);
     const esp_http_client_config_t config =
     {
         .url = url,
@@ -262,7 +411,7 @@ static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
         char *cookie = _psram_alloc(4096U);
         if (cookie != NULL)
         {
-            _cookie_header(cookie, 4096U);
+            _cookie_header(cookie, 4096U, request_host, request_path);
             if (cookie[0] != '\0')
             {
                 (void)esp_http_client_set_header(client, "Cookie", cookie);
@@ -459,8 +608,10 @@ static cJSON *_musicu_post(const char *module, const char *method,
                            cJSON *param, cJSON **root_out)
 {
     *root_out = NULL;
+    s_last_musicu_error = ESP_OK;
     if (module == NULL || method == NULL || param == NULL)
     {
+        s_last_musicu_error = ESP_ERR_INVALID_ARG;
         return NULL;
     }
     cJSON *root = cJSON_CreateObject();
@@ -471,6 +622,7 @@ static cJSON *_musicu_post(const char *module, const char *method,
         cJSON_Delete(root);
         cJSON_Delete(comm);
         cJSON_Delete(request);
+        s_last_musicu_error = ESP_ERR_NO_MEM;
         return NULL;
     }
     const bool logged_in = s_music.credential_valid;
@@ -509,6 +661,7 @@ static cJSON *_musicu_post(const char *module, const char *method,
     cJSON_Delete(root);
     if (body == NULL)
     {
+        s_last_musicu_error = ESP_ERR_NO_MEM;
         return NULL;
     }
     music_http_result_t result;
@@ -518,12 +671,33 @@ static cJSON *_musicu_post(const char *module, const char *method,
     cJSON_free(body);
     if (error != ESP_OK)
     {
+        s_last_musicu_error = error;
+        _result_free(&result);
+        return NULL;
+    }
+    if (result.status == 401 || result.status == 403)
+    {
+        s_last_musicu_error = MUSIC_ERR_HTTP_AUTH;
+        _result_free(&result);
+        return NULL;
+    }
+    if (result.status == 429)
+    {
+        s_last_musicu_error = MUSIC_ERR_HTTP_RATE_LIMIT;
+        _result_free(&result);
+        return NULL;
+    }
+    if (result.status >= 400)
+    {
+        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
+        _result_free(&result);
         return NULL;
     }
     cJSON *response = cJSON_Parse(result.body);
     _result_free(&result);
     if (response == NULL)
     {
+        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
         return NULL;
     }
     cJSON *response_request = cJSON_GetObjectItemCaseSensitive(response,
@@ -538,6 +712,7 @@ static cJSON *_musicu_post(const char *module, const char *method,
         LOG_W("%s/%s failed: code=%d", module, method,
               cJSON_IsNumber(code) ? code->valueint : -1);
         cJSON_Delete(response);
+        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
         return NULL;
     }
     *root_out = response;
@@ -599,6 +774,11 @@ static music_playlist_t *_home_playlist_slot(music_home_snapshot_t *home,
     return slot;
 }
 
+static bool _credential_string_ok(const char *value, size_t capacity)
+{
+    return memchr(value, '\0', capacity) != NULL;
+}
+
 esp_err_t music_net_load_credential(music_credential_blob_t *credential)
 {
     if (credential == NULL)
@@ -616,7 +796,15 @@ esp_err_t music_net_load_credential(music_credential_blob_t *credential)
             credential->magic != MUSIC_CREDENTIAL_MAGIC ||
             credential->version != MUSIC_CREDENTIAL_VERSION ||
             credential->musicid[0] == '\0' ||
-            credential->musickey[0] == '\0')
+            credential->musickey[0] == '\0' ||
+            !_credential_string_ok(credential->musicid,
+                                   sizeof(credential->musicid)) ||
+            !_credential_string_ok(credential->musickey,
+                                   sizeof(credential->musickey)) ||
+            !_credential_string_ok(credential->refresh_key,
+                                   sizeof(credential->refresh_key)) ||
+            !_credential_string_ok(credential->refresh_token,
+                                   sizeof(credential->refresh_token)))
     {
         memset(credential, 0, sizeof(*credential));
         return ESP_ERR_INVALID_STATE;
@@ -653,6 +841,16 @@ void music_net_clear_session(void)
 {
     _cookie_clear();
     music_net_cancel_login();
+}
+
+static void _music_image_destroy(void *payload)
+{
+    music_image_t *image = payload;
+    if (image != NULL && image->pixels != NULL)
+    {
+        jpeg_free_align(image->pixels);
+        image->pixels = NULL;
+    }
 }
 
 static esp_err_t _decode_rgb565(const uint8_t *data, size_t data_size,
@@ -723,7 +921,8 @@ static esp_err_t _decode_rgb565(const uint8_t *data, size_t data_size,
         return ESP_ERR_INVALID_RESPONSE;
     }
     jpeg_dec_close(decoder);
-    music_image_t *image = _psram_alloc(sizeof(*image));
+    music_image_t *image = music_snapshot_alloc(sizeof(*image),
+        _music_image_destroy);
     if (image == NULL)
     {
         jpeg_free_align(pixels);
@@ -811,7 +1010,8 @@ static esp_err_t _decode_png_rgb565(const uint8_t *data, size_t data_size,
     }
     _psram_free(rgba);
 
-    music_image_t *image = _psram_alloc(sizeof(*image));
+    music_image_t *image = music_snapshot_alloc(sizeof(*image),
+        _music_image_destroy);
     if (image == NULL)
     {
         jpeg_free_align(pixels);
@@ -944,7 +1144,7 @@ static esp_err_t _exchange_qq_code(const char *code,
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const esp_err_t result = _credential_from_data(data, 2U, credential);
     cJSON_Delete(root);
@@ -1290,7 +1490,7 @@ static esp_err_t _exchange_wechat_code(const char *code,
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const esp_err_t result = _credential_from_data(data, 1U, credential);
     cJSON_Delete(root);
@@ -1397,7 +1597,7 @@ static esp_err_t _home_recommended(music_home_snapshot_t *home)
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const cJSON *list = cJSON_GetObjectItemCaseSensitive(data, "List");
     if (cJSON_IsArray(list))
@@ -1441,7 +1641,7 @@ static esp_err_t _home_personal(music_home_snapshot_t *home)
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const cJSON *list = cJSON_GetObjectItemCaseSensitive(data, "v_playlist");
     if (!cJSON_IsArray(list))
@@ -1523,23 +1723,30 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
         return ESP_ERR_INVALID_ARG;
     }
     *snapshot = NULL;
-    music_home_snapshot_t *home = _psram_alloc(sizeof(*home));
+    music_home_snapshot_t *home = music_snapshot_alloc(sizeof(*home), NULL);
     if (home == NULL)
     {
         return ESP_ERR_NO_MEM;
     }
     home->generation = music_service_next_generation();
-    esp_err_t result = _home_recommended(home);
-    if (result != ESP_OK)
+    const esp_err_t recommended_result = _home_recommended(home);
+    home->recommended_ok = recommended_result == ESP_OK;
+    const esp_err_t personal_result = _home_personal(home);
+    home->personal_ok = personal_result == ESP_OK;
+    if (personal_result == MUSIC_ERR_HTTP_AUTH)
     {
-        _psram_free(home);
-        return result;
+        music_snapshot_release(home);
+        return personal_result;
     }
-    /* A private/failed personal section must not hide the anonymous
-     * recommendation feed. */
-    if (_home_personal(home) != ESP_OK)
+    if (!home->recommended_ok || !home->personal_ok)
     {
         home->login_required = true;
+    }
+    if (!home->recommended_ok && !home->personal_ok)
+    {
+        music_snapshot_release(home);
+        return recommended_result != ESP_OK ? recommended_result :
+               personal_result;
     }
     *snapshot = home;
     return ESP_OK;
@@ -1662,9 +1869,11 @@ esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
-    music_playlist_snapshot_t *playlist = _psram_alloc(sizeof(*playlist));
+    music_playlist_snapshot_t *playlist = music_snapshot_alloc(
+            offsetof(music_playlist_snapshot_t, songs) +
+            (size_t)count * sizeof(music_song_t), NULL);
     if (playlist == NULL)
     {
         cJSON_Delete(root);
@@ -1735,6 +1944,54 @@ esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
     return ESP_OK;
 }
 
+static size_t _utf8_truncate(const char *text, size_t length)
+{
+    while (length > 0U && (text[length] & 0xC0U) == 0x80U)
+    {
+        --length;
+    }
+    return length;
+}
+
+static void _lyric_append(music_lyric_snapshot_t *lyric, uint32_t offset_ms,
+                          const char *text, size_t length)
+{
+    if (lyric == NULL || text == NULL || length == 0U ||
+            lyric->line_count >= MUSIC_SERVICE_MAX_LYRIC_LINES)
+    {
+        return;
+    }
+    music_lyric_line_t *line = &lyric->lines[lyric->line_count];
+    line->offset_ms = offset_ms;
+    if (length >= sizeof(line->text))
+    {
+        length = sizeof(line->text) - 1U;
+    }
+    length = _utf8_truncate(text, length);
+    memcpy(line->text, text, length);
+    line->text[length] = '\0';
+    if (line->text[0] != '\0')
+    {
+        ++lyric->line_count;
+    }
+}
+
+static void _lyric_sort(music_lyric_snapshot_t *lyric)
+{
+    for (size_t index = 1U; index < lyric->line_count; ++index)
+    {
+        music_lyric_line_t current = lyric->lines[index];
+        size_t position = index;
+        while (position > 0U &&
+                lyric->lines[position - 1U].offset_ms > current.offset_ms)
+        {
+            lyric->lines[position] = lyric->lines[position - 1U];
+            --position;
+        }
+        lyric->lines[position] = current;
+    }
+}
+
 static void _parse_lrc(const char *text, music_lyric_snapshot_t *lyric)
 {
     if (text == NULL || lyric == NULL)
@@ -1749,48 +2006,64 @@ static void _parse_lrc(const char *text, music_lyric_snapshot_t *lyric)
         {
             line_end = cursor + strlen(cursor);
         }
-        const char *open = cursor;
-        while (open < line_end && *open != '[')
+        const char *text_start = cursor;
+        while (text_start < line_end && *text_start == '[')
         {
-            ++open;
-        }
-        if (open < line_end)
-        {
-            const char *close = strchr(open, ']');
-            if (close != NULL && close < line_end)
+            const char *close = strchr(text_start, ']');
+            if (close == NULL || close >= line_end)
             {
-                unsigned minutes = 0U;
-                unsigned seconds = 0U;
-                unsigned hundredths = 0U;
-                if (sscanf(open + 1, "%u:%u.%u", &minutes, &seconds,
-                           &hundredths) >= 2)
-                {
-                    music_lyric_line_t *line =
-                        &lyric->lines[lyric->line_count];
-                    line->offset_ms = minutes * 60000U + seconds * 1000U +
-                                      hundredths * 10U;
-                    const char *text_start = close + 1;
-                    while (text_start < line_end &&
-                            (*text_start == ' ' || *text_start == '\r'))
-                    {
-                        ++text_start;
-                    }
-                    size_t length = (size_t)(line_end - text_start);
-                    if (length >= sizeof(line->text))
-                    {
-                        length = sizeof(line->text) - 1U;
-                    }
-                    memcpy(line->text, text_start, length);
-                    line->text[length] = '\0';
-                    if (line->text[0] != '\0')
-                    {
-                        ++lyric->line_count;
-                    }
-                }
+                break;
             }
+            unsigned minutes = 0U;
+            unsigned seconds = 0U;
+            unsigned hundredths = 0U;
+            if (sscanf(text_start + 1, "%u:%u.%u", &minutes, &seconds,
+                       &hundredths) >= 2)
+            {
+                (void)minutes;
+                (void)seconds;
+                (void)hundredths;
+                /* The text is appended after the last tag below. */
+            }
+            text_start = close + 1;
+        }
+        const char *body = text_start;
+        while (body < line_end && (*body == ' ' || *body == '\r'))
+        {
+            ++body;
+        }
+        size_t body_length = (size_t)(line_end - body);
+        while (body_length > 0U &&
+                (body[body_length - 1U] == '\r' ||
+                 body[body_length - 1U] == ' '))
+        {
+            --body_length;
+        }
+        /* Re-scan the tags to attach the same text to each timestamp. */
+        const char *tag = cursor;
+        while (tag < text_start)
+        {
+            const char *close = strchr(tag, ']');
+            if (close == NULL || close >= text_start)
+            {
+                break;
+            }
+            unsigned minutes = 0U;
+            unsigned seconds = 0U;
+            unsigned hundredths = 0U;
+            if (sscanf(tag + 1, "%u:%u.%u", &minutes, &seconds,
+                       &hundredths) >= 2)
+            {
+                const uint32_t offset_ms = minutes * 60000U +
+                                           seconds * 1000U +
+                                           hundredths * 10U;
+                _lyric_append(lyric, offset_ms, body, body_length);
+            }
+            tag = close + 1;
         }
         cursor = *line_end == '\0' ? line_end : line_end + 1;
     }
+    _lyric_sort(lyric);
 }
 
 esp_err_t music_net_fetch_lyric(const char *songmid,
@@ -1822,7 +2095,7 @@ esp_err_t music_net_fetch_lyric(const char *songmid,
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const size_t encoded_size = 256U * 1024U;
     char *encoded = _psram_alloc(encoded_size);
@@ -1858,7 +2131,10 @@ esp_err_t music_net_fetch_lyric(const char *songmid,
     }
     _psram_free(encoded);
     decoded[decoded_length] = '\0';
-    music_lyric_snapshot_t *lyric = _psram_alloc(sizeof(*lyric));
+    music_lyric_snapshot_t *lyric = music_snapshot_alloc(
+                                        offsetof(music_lyric_snapshot_t, lines) +
+                                        (size_t)MUSIC_SERVICE_MAX_LYRIC_LINES *
+                                        sizeof(music_lyric_line_t), NULL);
     if (lyric == NULL)
     {
         _psram_free(decoded);
@@ -1869,7 +2145,7 @@ esp_err_t music_net_fetch_lyric(const char *songmid,
     _psram_free(decoded);
     if (lyric->line_count == 0U)
     {
-        _psram_free(lyric);
+        music_snapshot_release(lyric);
         return ESP_ERR_NOT_FOUND;
     }
     *snapshot = lyric;
@@ -1897,9 +2173,9 @@ static void _song_filename(const music_song_t *song, music_quality_t quality,
     *extension = suffix;
 }
 
-esp_err_t music_net_fetch_song_url(const music_song_t *song,
-                                   music_quality_t quality,
-                                   char *url, size_t url_size)
+static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
+        music_quality_t quality,
+        char *url, size_t url_size)
 {
     if (song == NULL || url == NULL || url_size == 0U ||
             song->songmid[0] == '\0' || !s_music.credential_valid)
@@ -1943,7 +2219,7 @@ esp_err_t music_net_fetch_song_url(const music_song_t *song,
     if (data == NULL)
     {
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return _musicu_last_error();
     }
     const cJSON *midurlinfo = cJSON_GetObjectItemCaseSensitive(data,
         "midurlinfo");
@@ -2023,4 +2299,53 @@ esp_err_t music_net_fetch_song_url(const music_song_t *song,
     (void)snprintf(url, url_size, "%s%s", domain, purl);
     cJSON_Delete(root);
     return ESP_OK;
+}
+
+esp_err_t music_net_fetch_song_url(const music_song_t *song,
+                                   music_quality_t quality,
+                                   char *url, size_t url_size,
+                                   music_quality_t *actual_quality)
+{
+    if (song == NULL || url == NULL || url_size == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    music_quality_t attempts[3];
+    size_t attempt_count = 0U;
+    if (quality == MUSIC_QUALITY_LOSSLESS)
+    {
+        attempts[attempt_count++] = MUSIC_QUALITY_LOSSLESS;
+        attempts[attempt_count++] = MUSIC_QUALITY_HIGH;
+        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
+    }
+    else if (quality == MUSIC_QUALITY_HIGH)
+    {
+        attempts[attempt_count++] = MUSIC_QUALITY_HIGH;
+        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
+    }
+    else
+    {
+        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
+    }
+
+    esp_err_t last_error = ESP_ERR_NOT_FOUND;
+    for (size_t index = 0U; index < attempt_count; ++index)
+    {
+        url[0] = '\0';
+        last_error = _music_net_fetch_song_url_one(song, attempts[index],
+            url, url_size);
+        if (last_error == ESP_OK)
+        {
+            if (actual_quality != NULL)
+            {
+                *actual_quality = attempts[index];
+            }
+            return ESP_OK;
+        }
+        if (last_error != ESP_ERR_NOT_FOUND)
+        {
+            return last_error;
+        }
+    }
+    return last_error;
 }

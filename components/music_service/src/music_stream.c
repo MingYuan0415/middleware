@@ -11,6 +11,7 @@
 #include "esp_audio_simple_dec.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
+#include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -25,6 +26,7 @@
 #define MUSIC_STREAM_READ_BYTES 4096U
 #define MUSIC_STREAM_PCM_BYTES 16384U
 #define MUSIC_STREAM_PCM_MAX_BYTES (256U * 1024U)
+#define MUSIC_STREAM_EVENT_STATE_CHANGED (1U << 0)
 
 typedef struct music_stream_command
 {
@@ -40,6 +42,7 @@ typedef struct music_stream_runtime
     QueueHandle_t queue;
     TaskHandle_t task;
     SemaphoreHandle_t lock;
+    EventGroupHandle_t state_events;
     music_stream_status_t status;
     audio_service_config_t default_audio;
     audio_service_lease_t lease;
@@ -189,9 +192,38 @@ static esp_err_t _stream_close_audio(void)
     return ESP_OK;
 }
 
-static void _stream_play_url(const char *url, uint32_t duration_ms)
+static size_t _pcm24_to_pcm16(const uint8_t *source, size_t source_bytes,
+                              uint8_t *destination, size_t destination_size)
+{
+    if (source == NULL || destination == NULL ||
+            (source_bytes % 3U) != 0U)
+    {
+        return 0U;
+    }
+    const size_t samples = source_bytes / 3U;
+    const size_t needed = samples * 2U;
+    if (needed > destination_size)
+    {
+        return 0U;
+    }
+    for (size_t index = 0U; index < samples; ++index)
+    {
+        const uint32_t raw = (uint32_t)source[index * 3U] |
+                             ((uint32_t)source[index * 3U + 1U] << 8U) |
+                             ((uint32_t)source[index * 3U + 2U] << 16U);
+        const int32_t sign_extended = (int32_t)(raw << 8U) >> 8U;
+        const int16_t converted = (int16_t)(sign_extended >> 8);
+        destination[index * 2U] = (uint8_t)(converted & 0xFF);
+        destination[index * 2U + 1U] = (uint8_t)((converted >> 8) & 0xFF);
+    }
+    return needed;
+}
+
+static void _stream_play_url(const char *url, uint32_t duration_ms,
+                             uint32_t generation)
 {
     bool failed = false;
+    music_service_failure_t failure_reason = MUSIC_SERVICE_FAILURE_NONE;
     esp_http_client_handle_t client = NULL;
     esp_audio_simple_dec_handle_t decoder = NULL;
     uint8_t *input = NULL;
@@ -203,6 +235,9 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     uint32_t sample_rate = 44100U;
     uint8_t channels = 2U;
     uint8_t bits = 16U;
+    uint8_t source_bits = 16U;
+    bool convert_24_to_16 = false;
+    uint8_t *pcm16 = NULL;
 
     _stream_set_status(MUSIC_PLAYBACK_BUFFERING,
                        MUSIC_SERVICE_FAILURE_NONE);
@@ -210,6 +245,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
             xSemaphoreTake(s_stream.lock, portMAX_DELAY) == pdTRUE)
     {
         s_stream.status.duration_ms = duration_ms;
+        s_stream.status.generation = generation;
         (void)xSemaphoreGive(s_stream.lock);
     }
     esp_http_client_config_t config =
@@ -227,6 +263,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     {
         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                            MUSIC_SERVICE_FAILURE_INTERNAL);
+        failure_reason = MUSIC_SERVICE_FAILURE_INTERNAL;
         failed = true;
         goto cleanup;
     }
@@ -241,6 +278,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     {
         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                            MUSIC_SERVICE_FAILURE_NETWORK);
+        failure_reason = MUSIC_SERVICE_FAILURE_NETWORK;
         failed = true;
         goto cleanup;
     }
@@ -257,6 +295,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     {
         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                            MUSIC_SERVICE_FAILURE_DECODE);
+        failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
         failed = true;
         goto cleanup;
     }
@@ -269,6 +308,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
     {
         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                            MUSIC_SERVICE_FAILURE_INTERNAL);
+        failure_reason = MUSIC_SERVICE_FAILURE_INTERNAL;
         failed = true;
         goto cleanup;
     }
@@ -280,7 +320,13 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
         {
             _stream_set_status(MUSIC_PLAYBACK_PAUSED,
                                MUSIC_SERVICE_FAILURE_NONE);
-            vTaskDelay(pdMS_TO_TICKS(50U));
+            if (s_stream.state_events != NULL)
+            {
+                (void)xEventGroupWaitBits(
+                    s_stream.state_events,
+                    MUSIC_STREAM_EVENT_STATE_CHANGED, pdTRUE, pdFALSE,
+                    portMAX_DELAY);
+            }
             continue;
         }
         const int read_length = esp_http_client_read(client, (char *)input,
@@ -290,6 +336,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
             LOG_E("HTTP read failed: %d", read_length);
             _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                MUSIC_SERVICE_FAILURE_NETWORK);
+            failure_reason = MUSIC_SERVICE_FAILURE_NETWORK;
             failed = true;
             break;
         }
@@ -331,6 +378,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                 {
                     _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                        MUSIC_SERVICE_FAILURE_DECODE);
+                    failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
                     failed = true;
                     fatal = true;
                     break;
@@ -342,6 +390,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                 {
                     _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                        MUSIC_SERVICE_FAILURE_DECODE);
+                    failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
                     failed = true;
                     fatal = true;
                     break;
@@ -358,6 +407,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                       (unsigned)output.decoded_size);
                 _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                    MUSIC_SERVICE_FAILURE_DECODE);
+                failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
                 failed = true;
                 fatal = true;
                 break;
@@ -375,46 +425,142 @@ static void _stream_play_url(const char *url, uint32_t duration_ms)
                         bits = info.bits_per_sample == 0U ? 16U :
                                info.bits_per_sample;
                     }
-                    if (_stream_open_audio(sample_rate, bits, channels) !=
-                            ESP_OK)
+                    source_bits = bits;
+                    esp_err_t audio_result = _stream_open_audio(
+                                                 sample_rate, bits, channels);
+                    if (audio_result != ESP_OK && bits == 24U)
+                    {
+                        /* The BSP has no 24-bit clock pair for some common
+                         * sample rates. Decode is still 24-bit; convert the
+                         * PCM to 16-bit rather than reporting the misleading
+                         * AUDIO_BUSY error. */
+                        audio_result = _stream_open_audio(sample_rate, 16U,
+                                                          channels);
+                        if (audio_result == ESP_OK)
+                        {
+                            bits = 16U;
+                            convert_24_to_16 = true;
+                            pcm16 = heap_caps_malloc(
+                                        (MUSIC_STREAM_PCM_MAX_BYTES / 3U) * 2U,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                            if (pcm16 == NULL)
+                            {
+                                audio_result = ESP_ERR_NO_MEM;
+                            }
+                        }
+                    }
+                    if (audio_result != ESP_OK)
                     {
                         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                            MUSIC_SERVICE_FAILURE_AUDIO_BUSY);
+                        failure_reason = MUSIC_SERVICE_FAILURE_AUDIO_BUSY;
                         failed = true;
                         fatal = true;
                         break;
                     }
                     audio_ready = true;
                 }
-                size_t written = 0U;
-                const esp_err_t write_result = audio_service_write_leased(
-                                                   s_stream.lease, output.buffer,
-                                                   output.decoded_size, &written,
-                                                   1000U);
-                played_bytes += written;
-                if (write_result != ESP_OK && !write_failure_logged)
+                size_t offset = 0U;
+                size_t chunk_written = 0U;
+                uint32_t write_retries = 0U;
+                esp_err_t write_result = ESP_OK;
+                const uint8_t *write_data = output.buffer;
+                size_t write_size = output.decoded_size;
+                if (convert_24_to_16)
                 {
-                    write_failure_logged = true;
-                    LOG_W("audio write failed: %s written=%u/%u",
-                          esp_err_to_name(write_result), (unsigned)written,
-                          (unsigned)output.decoded_size);
+                    const size_t converted = _pcm24_to_pcm16(
+                                                 output.buffer,
+                                                 output.decoded_size, pcm16,
+                                                 (MUSIC_STREAM_PCM_MAX_BYTES /
+                                                  3U) * 2U);
+                    if (converted == 0U)
+                    {
+                        _stream_set_status(MUSIC_PLAYBACK_ERROR,
+                                           MUSIC_SERVICE_FAILURE_DECODE);
+                        failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
+                        failed = true;
+                        fatal = true;
+                        break;
+                    }
+                    write_data = pcm16;
+                    write_size = converted;
                 }
-                if (write_result != ESP_OK && write_result != ESP_ERR_TIMEOUT)
+                while (offset < write_size)
                 {
+                    size_t written = 0U;
+                    write_result = audio_service_write_leased(
+                                       s_stream.lease,
+                                       (uint8_t *)write_data + offset,
+                                       write_size - offset,
+                                       &written, 1000U);
+                    chunk_written += written;
+                    offset += written;
+                    if (write_result == ESP_OK)
+                    {
+                        write_retries = 0U;
+                        if (written == 0U)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (write_result == ESP_ERR_TIMEOUT && written > 0U)
+                    {
+                        write_retries = 0U;
+                        continue;
+                    }
                     if (write_result == ESP_ERR_INVALID_STATE &&
                             atomic_load_explicit(&s_stream.pause,
                                                  memory_order_acquire))
                     {
                         break;
                     }
+                    if (write_result == ESP_ERR_TIMEOUT &&
+                            write_retries < 2U)
+                    {
+                        ++write_retries;
+                        continue;
+                    }
+                    break;
+                }
+                if (convert_24_to_16)
+                {
+                    played_bytes += (chunk_written / 2U) * 3U;
+                }
+                else
+                {
+                    played_bytes += chunk_written;
+                }
+                if (write_result != ESP_OK && !write_failure_logged)
+                {
+                    write_failure_logged = true;
+                    LOG_W("audio write failed: %s written=%u/%u",
+                          esp_err_to_name(write_result),
+                          (unsigned)chunk_written, (unsigned)write_size);
+                }
+                if (write_result != ESP_OK && write_result != ESP_ERR_TIMEOUT &&
+                        !(write_result == ESP_ERR_INVALID_STATE &&
+                          atomic_load_explicit(&s_stream.pause,
+                                               memory_order_acquire)))
+                {
                     _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                        MUSIC_SERVICE_FAILURE_DECODE);
+                    failure_reason = MUSIC_SERVICE_FAILURE_DECODE;
+                    failed = true;
+                    fatal = true;
+                    break;
+                }
+                if (write_result == ESP_ERR_TIMEOUT && offset < write_size)
+                {
+                    _stream_set_status(MUSIC_PLAYBACK_ERROR,
+                                       MUSIC_SERVICE_FAILURE_AUDIO_BUSY);
+                    failure_reason = MUSIC_SERVICE_FAILURE_AUDIO_BUSY;
                     failed = true;
                     fatal = true;
                     break;
                 }
                 const uint64_t bytes_per_second =
-                    (uint64_t)sample_rate * channels * (bits / 8U);
+                    (uint64_t)sample_rate * channels * (source_bits / 8U);
                 if (bytes_per_second > 0U)
                 {
                     _stream_update_position((uint32_t)(played_bytes * 1000U /
@@ -448,6 +594,7 @@ cleanup:
         if (_stream_close_audio() != ESP_OK)
         {
             failed = true;
+            failure_reason = MUSIC_SERVICE_FAILURE_AUDIO_BUSY;
             _stream_set_status(MUSIC_PLAYBACK_ERROR,
                                MUSIC_SERVICE_FAILURE_AUDIO_BUSY);
         }
@@ -463,6 +610,10 @@ cleanup:
     if (pcm != NULL)
     {
         heap_caps_free(pcm);
+    }
+    if (pcm16 != NULL)
+    {
+        heap_caps_free(pcm16);
     }
     if (client != NULL)
     {
@@ -482,6 +633,12 @@ cleanup:
     if (natural_end)
     {
         music_service_stream_finished();
+    }
+    else if (failed && failure_reason != MUSIC_SERVICE_FAILURE_NONE &&
+             !atomic_load_explicit(&s_stream.stop, memory_order_acquire) &&
+             !atomic_load_explicit(&s_stream.shutdown, memory_order_acquire))
+    {
+        music_service_stream_failed(failure_reason);
     }
 }
 
@@ -507,7 +664,7 @@ static void _stream_task(void *argument)
         }
         atomic_store_explicit(&s_stream.stop, false, memory_order_release);
         atomic_store_explicit(&s_stream.pause, false, memory_order_release);
-        _stream_play_url(command.url, command.duration_ms);
+        _stream_play_url(command.url, command.duration_ms, command.generation);
         if (atomic_load_explicit(&s_stream.shutdown, memory_order_acquire))
         {
             break;
@@ -560,16 +717,22 @@ esp_err_t music_stream_init(uint32_t priority)
         return ESP_ERR_NOT_SUPPORTED;
     }
     s_stream.lock = xSemaphoreCreateMutex();
+    s_stream.state_events = xEventGroupCreate();
     /* PSRAM-backed queue; delete it with vQueueDeleteWithCaps(). */
     s_stream.queue = xQueueCreateWithCaps(
                          MUSIC_STREAM_QUEUE_DEPTH,
                          sizeof(music_stream_command_t),
                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_stream.lock == NULL || s_stream.queue == NULL)
+    if (s_stream.lock == NULL || s_stream.queue == NULL ||
+            s_stream.state_events == NULL)
     {
         if (s_stream.queue != NULL)
         {
             vQueueDeleteWithCaps(s_stream.queue);
+        }
+        if (s_stream.state_events != NULL)
+        {
+            vEventGroupDelete(s_stream.state_events);
         }
         if (s_stream.lock != NULL)
         {
@@ -590,6 +753,8 @@ esp_err_t music_stream_init(uint32_t priority)
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         vQueueDeleteWithCaps(s_stream.queue);
+        vEventGroupDelete(s_stream.state_events);
+        s_stream.state_events = NULL;
         vSemaphoreDelete(s_stream.lock);
         _stream_unregister_decoders();
         memset(&s_stream, 0, sizeof(s_stream));
@@ -611,6 +776,11 @@ esp_err_t music_stream_deinit(void)
                           atomic_load_explicit(&s_stream.play_generation,
                                   memory_order_acquire),
                           memory_order_release);
+    if (s_stream.state_events != NULL)
+    {
+        (void)xEventGroupSetBits(s_stream.state_events,
+                                 MUSIC_STREAM_EVENT_STATE_CHANGED);
+    }
     _stream_abort_http();
     music_stream_command_t wake;
     memset(&wake, 0, sizeof(wake));
@@ -636,12 +806,10 @@ esp_err_t music_stream_deinit(void)
         }
     }
     esp_err_t result = ESP_OK;
-    if (!atomic_load_explicit(&s_stream.exited, memory_order_acquire) &&
-            s_stream.task != NULL)
+    if (!atomic_load_explicit(&s_stream.exited, memory_order_acquire))
     {
-        LOG_E("stream task did not stop; forcing deletion");
-        vTaskDelete(s_stream.task);
-        s_stream.task = NULL;
+        LOG_E("stream task did not stop cooperatively");
+        return ESP_ERR_TIMEOUT;
     }
     if (s_stream.lease_held)
     {
@@ -659,6 +827,11 @@ esp_err_t music_stream_deinit(void)
         vQueueDeleteWithCaps(s_stream.queue);
         s_stream.queue = NULL;
     }
+    if (s_stream.state_events != NULL)
+    {
+        vEventGroupDelete(s_stream.state_events);
+        s_stream.state_events = NULL;
+    }
     if (s_stream.lock != NULL)
     {
         vSemaphoreDelete(s_stream.lock);
@@ -669,7 +842,8 @@ esp_err_t music_stream_deinit(void)
     return result;
 }
 
-esp_err_t music_stream_play(const char *url, uint32_t duration_ms)
+esp_err_t music_stream_play(const char *url, uint32_t duration_ms,
+                            uint32_t generation)
 {
     if (!s_stream.initialized || url == NULL || url[0] == '\0')
     {
@@ -679,9 +853,9 @@ esp_err_t music_stream_play(const char *url, uint32_t duration_ms)
     memset(&command, 0, sizeof(command));
     (void)snprintf(command.url, sizeof(command.url), "%s", url);
     command.duration_ms = duration_ms;
-    command.generation = atomic_fetch_add_explicit(
-                             &s_stream.play_generation, 1U,
-                             memory_order_acq_rel) + 1U;
+    command.generation = generation;
+    atomic_store_explicit(&s_stream.play_generation, generation,
+                          memory_order_release);
     return xQueueSend(s_stream.queue, &command, pdMS_TO_TICKS(100U)) ==
            pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -695,6 +869,11 @@ esp_err_t music_stream_pause(bool pause)
     if (pause)
     {
         atomic_store_explicit(&s_stream.pause, true, memory_order_release);
+        if (s_stream.state_events != NULL)
+        {
+            (void)xEventGroupSetBits(s_stream.state_events,
+                                     MUSIC_STREAM_EVENT_STATE_CHANGED);
+        }
         if (s_stream.lease_held && !s_stream.pause_suspended)
         {
             bool resume_required = false;
@@ -714,6 +893,11 @@ esp_err_t music_stream_pause(bool pause)
     else
     {
         atomic_store_explicit(&s_stream.pause, false, memory_order_release);
+        if (s_stream.state_events != NULL)
+        {
+            (void)xEventGroupSetBits(s_stream.state_events,
+                                     MUSIC_STREAM_EVENT_STATE_CHANGED);
+        }
         if (s_stream.pause_suspended)
         {
             const esp_err_t result = audio_service_resume(1000U);
@@ -741,8 +925,19 @@ esp_err_t music_stream_stop(void)
                                   memory_order_acquire),
                           memory_order_release);
     atomic_store_explicit(&s_stream.stop, true, memory_order_release);
+    if (s_stream.state_events != NULL)
+    {
+        (void)xEventGroupSetBits(s_stream.state_events,
+                                 MUSIC_STREAM_EVENT_STATE_CHANGED);
+    }
     _stream_abort_http();
     return ESP_OK;
+}
+
+uint32_t music_stream_get_stack_high_water(void)
+{
+    return s_stream.task != NULL ? (uint32_t)uxTaskGetStackHighWaterMark(
+               s_stream.task) : 0U;
 }
 
 bool music_stream_is_playing(void)

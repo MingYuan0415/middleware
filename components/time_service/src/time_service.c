@@ -41,6 +41,14 @@
 
 EVENT_BUS_DEFINE_ID(TIME_SERVICE_MSG);
 
+static void _publish_quality_event(time_service_quality_t quality)
+{
+    (void)event_bus_publish(TIME_SERVICE_MSG,
+                            TIME_SERVICE_MSG_SUB_TYPE_QUALITY,
+                            &quality, sizeof(quality),
+                            EVENT_BUS_PUBLISH_FLAG_UI_LATEST);
+}
+
 typedef enum time_service_sleep_state
 {
     TIME_SERVICE_SLEEP_STOPPED = 0,
@@ -281,7 +289,10 @@ static bool _process_sync_notification(void)
     }
 
     esp_err_t completion_result = sync_result;
+    time_service_quality_t previous_quality;
+    time_service_quality_t current_quality;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    previous_quality = s_quality;
     if (!s_stopping && s_ntp_initialized &&
             generation == (uint32_t)atomic_load(&s_active_generation))
     {
@@ -297,8 +308,13 @@ static bool _process_sync_notification(void)
         }
         _complete_generation_locked(generation, completion_result);
     }
+    current_quality = s_quality;
     xSemaphoreGive(s_state_mutex);
     xSemaphoreGive(s_update_mutex);
+    if (previous_quality != current_quality)
+    {
+        _publish_quality_event(current_quality);
+    }
     return true;
 }
 
@@ -1180,9 +1196,14 @@ static esp_err_t _apply_local_time(const struct tm *local_time,
 
     *rtc_result = _write_rtc_epoch((int64_t)native_epoch);
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const time_service_quality_t previous_quality = s_quality;
     s_quality = TIME_SERVICE_QUALITY_MANUAL;
     s_last_rtc_error = *rtc_result;
     xSemaphoreGive(s_state_mutex);
+    if (previous_quality != TIME_SERVICE_QUALITY_MANUAL)
+    {
+        _publish_quality_event(TIME_SERVICE_QUALITY_MANUAL);
+    }
 
 exit:
     xSemaphoreGive(s_update_mutex);

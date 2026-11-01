@@ -11,8 +11,8 @@ audio I/O itself.
 
 `include/music_service.h` provides:
 
-- `music_service_init()` / `music_service_deinit()` and
-  `music_service_set_network_ready()`.
+- `music_service_init()` / `music_service_deinit()`,
+  `music_service_set_network_ready()`, and `music_service_set_time_ready()`.
 - QR login: `music_service_login_begin()`, `music_service_login_qr_acquire()`,
   `music_service_login_cancel()`, `music_service_logout()`, and
   `music_service_reset_persisted_state()`.
@@ -24,13 +24,20 @@ audio I/O itself.
   `prev()`, `set_mode()`, `stop()`, and
   `music_service_get_player_status()`. `seek()` is reserved and currently
   returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
-- `music_service_is_playing()` is the lock-free PM guard query.
+- `music_service_is_playing()` is the PM guard query; it includes the interval
+  between accepting a play command and the stream task actually starting.
+- `music_service_get_diagnostics()` returns API/stream stack watermarks and API
+  queue depth for acceptance and debugging.
 
-Snapshots, images, and audio buffers live in PSRAM. The service runtime state,
-cookie jar, and both command queues also live in PSRAM. The API worker stack
-stays in internal RAM because credential save/erase goes through NVS, which
-disables the flash cache; the audio worker runs from a PSRAM stack and receives
-PCM through the `audio_service` exclusive playback lease.
+Snapshots, images, and audio buffers live in PSRAM. All snapshot/image
+`acquire()` calls are reference-counted borrows: the service keeps its own
+reference, `release()` only drops the caller reference, and replacing a cache
+entry never invalidates a page that still holds a reference. The service
+runtime state, cookie jar, and both command queues also live in PSRAM. The API
+worker stack stays in internal RAM because credential save/erase goes through
+NVS, which disables the flash cache; the audio worker is created lazily on the
+first playback and runs from a PSRAM stack through the `audio_service` exclusive
+playback lease.
 
 ## Login and catalog
 
@@ -42,20 +49,25 @@ PCM through the `audio_service` exclusive playback lease.
 - Credentials are stored in the `music_cred` NVS blob and erasing them is part
   of the factory-reset sequence.
 - Home data combines the anonymous recommendation feed with the logged-in
-  user's created and favorite playlists. Playlist detail and lyric requests are
-  bounded by the public header limits.
+  user's created and favorite playlists. Home is requested lazily when the App
+  root page mounts, not on every network-ready transition. Playlist detail and
+  lyric requests are bounded by the public header limits.
 - Catalog parsers accept current (`mid`, `file.media_mid`, `dirinfo`) and legacy
   (`songmid`, `strMediaMid`, `dissname`) response names. Song URL requests use
   `CgiGetVkey` array parameters and `media_mid` filenames; lyrics use `crypt: 0`
-  plain LRC.
+  plain LRC. When the requested quality is unavailable, playback falls back to
+  the next lower quality and reports the actual quality used.
 
 ## Audio
 
 `music_stream.c` reads the CDN stream, uses `esp_audio_simple_dec` for
 MP3/FLAC, maps the decoded sample rate/channel/bit depth to the BSP format
-table, and writes PCM through `audio_service_write_leased()`. Audio decoding
-and network reads run on the dedicated audio worker; no LVGL call is made from
-either worker.
+table, and writes PCM through `audio_service_write_leased()`. Partial PCM
+writes are completed with bounded retries; a repeated write failure is reported
+as a playback error instead of silently dropping audio. When the BSP has no
+24-bit clock pair for the decoded rate, PCM is converted to 16-bit before the
+write. Audio decoding and network reads run on the dedicated audio worker; no
+LVGL call is made from either worker.
 
 ## Configuration
 
@@ -65,6 +77,8 @@ quality through `music_service_config_t`.
 
 ## Test Boundary
 
-The pure QQ login protocol parsers have a standalone host suite. Network, TLS,
-credential storage, and playback still require on-device validation; Wi-Fi,
-I2S/DMA, ES8311, and battery behavior are outside host-test scope.
+The pure QQ login protocol parsers and the reference-counted snapshot allocator
+have standalone host tests. Network, TLS, credential storage, and playback still
+require on-device validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are
+outside host-test scope. The simulator real backend is an integration aid, not
+a replacement for device audio and power measurements.

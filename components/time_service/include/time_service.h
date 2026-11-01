@@ -73,6 +73,7 @@ EVENT_BUS_DECLARE_ID(TIME_SERVICE_MSG);
 typedef enum
 {
     TIME_SERVICE_MSG_SUB_TYPE_RTC_ALARM = 1, /**< One non-coalesced RTC alarm edge. */
+    TIME_SERVICE_MSG_SUB_TYPE_QUALITY = 2,   /**< Clock quality changed. */
 } time_service_msg_sub_type_t;
 
 /**
