@@ -2,6 +2,8 @@
 #include "mt_log.h"
 
 #include "music_service_internal.h"
+#include "music_http.h"
+#include "music_media.h"
 #include "music_snapshot.h"
 #include "music_login_protocol.h"
 
@@ -26,8 +28,6 @@
 #include <string.h>
 #include <time.h>
 
-#define MUSIC_HTTP_TIMEOUT_MS 10000
-#define MUSIC_HTTP_MAX_REDIRECTS 8
 #define MUSIC_COOKIE_MAX 24
 #define MUSIC_QQ_REFERER "https://xui.ptlogin2.qq.com/"
 #define MUSIC_QQ_XLOGIN_URL \
@@ -53,34 +53,6 @@
 
 static _Thread_local esp_err_t s_last_musicu_error = ESP_OK;
 
-static esp_err_t _musicu_last_error(void)
-{
-    return s_last_musicu_error;
-}
-
-typedef struct music_cookie
-{
-    char name[32];
-    char value[512];
-    char domain[96];
-    char path[96];
-    uint32_t expires_at;
-    uint32_t last_used;
-    bool secure;
-} music_cookie_t;
-
-typedef struct music_http_context
-{
-    music_http_result_t *result;
-    size_t limit;
-    bool overflow;
-    bool capture_cookies;
-    char host[128];
-} music_http_context_t;
-
-static MUSIC_SERVICE_EXT_BSS music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
-static size_t s_cookie_count;
-
 static void *_psram_alloc(size_t size)
 {
     return heap_caps_calloc(1U, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -91,453 +63,9 @@ static void _psram_free(void *pointer)
     heap_caps_free(pointer);
 }
 
-static uint32_t s_cookie_tick;
-
-static void _url_host_path(const char *url, char *host, size_t host_size,
-                           char *path, size_t path_size)
+static esp_err_t _musicu_last_error(void)
 {
-    host[0] = '\0';
-    path[0] = '/';
-    if (url == NULL)
-    {
-        return;
-    }
-    const char *scheme = strstr(url, "://");
-    const char *start = scheme == NULL ? url : scheme + 3;
-    const char *end = start;
-    while (*end != '\0' && *end != '/' && *end != ':' && *end != '?')
-    {
-        ++end;
-    }
-    size_t length = (size_t)(end - start);
-    if (length >= host_size)
-    {
-        length = host_size - 1U;
-    }
-    memcpy(host, start, length);
-    host[length] = '\0';
-    if (*end == '/')
-    {
-        (void)snprintf(path, path_size, "%s", end);
-    }
-}
-
-static bool _cookie_domain_matches(const music_cookie_t *cookie,
-                                   const char *host)
-{
-    if (cookie->domain[0] == '\0')
-    {
-        return true;
-    }
-    const size_t host_len = strlen(host);
-    const size_t domain_len = strlen(cookie->domain);
-    if (host_len == domain_len)
-    {
-        return strcasecmp(host, cookie->domain) == 0;
-    }
-    return host_len > domain_len &&
-           strcasecmp(host + host_len - domain_len, cookie->domain) == 0 &&
-           host[host_len - domain_len - 1U] == '.';
-}
-
-static void _cookie_clear(void)
-{
-    memset(s_cookies, 0, sizeof(s_cookies));
-    s_cookie_count = 0U;
-}
-
-static void _cookie_set(const char *name, const char *value,
-                        const char *domain, const char *path,
-                        uint32_t expires_at, bool secure)
-{
-    if (name == NULL || value == NULL || name[0] == '\0')
-    {
-        return;
-    }
-    for (size_t index = 0U; index < s_cookie_count; ++index)
-    {
-        if (strcmp(s_cookies[index].name, name) == 0 &&
-                strcmp(s_cookies[index].domain, domain) == 0 &&
-                strcmp(s_cookies[index].path, path) == 0)
-        {
-            (void)snprintf(s_cookies[index].value,
-                           sizeof(s_cookies[index].value), "%s", value);
-            s_cookies[index].expires_at = expires_at;
-            s_cookies[index].secure = secure;
-            s_cookies[index].last_used = ++s_cookie_tick;
-            return;
-        }
-    }
-    size_t slot = s_cookie_count;
-    if (s_cookie_count == MUSIC_COOKIE_MAX)
-    {
-        slot = 0U;
-        for (size_t index = 1U; index < s_cookie_count; ++index)
-        {
-            if (s_cookies[index].last_used < s_cookies[slot].last_used)
-            {
-                slot = index;
-            }
-        }
-    }
-    else
-    {
-        ++s_cookie_count;
-    }
-    memset(&s_cookies[slot], 0, sizeof(s_cookies[slot]));
-    (void)snprintf(s_cookies[slot].name, sizeof(s_cookies[slot].name),
-                   "%s", name);
-    (void)snprintf(s_cookies[slot].value, sizeof(s_cookies[slot].value),
-                   "%s", value);
-    (void)snprintf(s_cookies[slot].domain, sizeof(s_cookies[slot].domain),
-                   "%s", domain == NULL ? "" : domain);
-    (void)snprintf(s_cookies[slot].path, sizeof(s_cookies[slot].path),
-                   "%s", path == NULL || path[0] == '\0' ? "/" : path);
-    s_cookies[slot].expires_at = expires_at;
-    s_cookies[slot].secure = secure;
-    s_cookies[slot].last_used = ++s_cookie_tick;
-}
-
-static bool _cookie_get(const char *name, char *value, size_t value_size)
-{
-    if (name == NULL || value == NULL || value_size == 0U)
-    {
-        return false;
-    }
-    value[0] = '\0';
-    for (size_t index = 0U; index < s_cookie_count; ++index)
-    {
-        if (strcmp(s_cookies[index].name, name) == 0 &&
-                (s_cookies[index].expires_at == 0U ||
-                 (uint32_t)time(NULL) < s_cookies[index].expires_at))
-        {
-            (void)snprintf(value, value_size, "%s", s_cookies[index].value);
-            s_cookies[index].last_used = ++s_cookie_tick;
-            return true;
-        }
-    }
-    return false;
-}
-
-static void _cookie_from_header(const char *header, const char *host)
-{
-    char name[32];
-    char value[512];
-    if (!music_login_cookie_parse(header, name, sizeof(name),
-                                  value, sizeof(value)))
-    {
-        return;
-    }
-    char domain[96] = {0};
-    char path[96] = "/";
-    uint32_t expires_at = 0U;
-    bool secure = false;
-    const char *domain_key = strstr(header, "Domain=");
-    if (domain_key != NULL)
-    {
-        const char *domain_start = domain_key + 7;
-        if (*domain_start == '.')
-        {
-            ++domain_start;
-        }
-        (void)snprintf(domain, sizeof(domain), "%s", domain_start);
-        char *end = strchr(domain, ';');
-        if (end != NULL)
-        {
-            *end = '\0';
-        }
-    }
-    const char *path_key = strstr(header, "Path=");
-    if (path_key != NULL)
-    {
-        (void)snprintf(path, sizeof(path), "%s", path_key + 5);
-        char *end = strchr(path, ';');
-        if (end != NULL)
-        {
-            *end = '\0';
-        }
-    }
-    const char *max_age = strstr(header, "Max-Age=");
-    if (max_age != NULL)
-    {
-        expires_at = (uint32_t)time(NULL) +
-                     (uint32_t)strtoul(max_age + 8, NULL, 10);
-    }
-    if (strstr(header, "Secure") != NULL)
-    {
-        secure = true;
-    }
-    _cookie_set(name, value, domain[0] == '\0' ? host : domain,
-                path, expires_at, secure);
-}
-
-static void _cookie_header(char *output, size_t output_size,
-                           const char *host, const char *request_path)
-{
-    output[0] = '\0';
-    size_t used = 0U;
-    for (size_t index = 0U; index < s_cookie_count; ++index)
-    {
-        if (!_cookie_domain_matches(&s_cookies[index], host) ||
-                (s_cookies[index].path[0] != '\0' &&
-                 strncmp(request_path, s_cookies[index].path,
-                         strlen(s_cookies[index].path)) != 0) ||
-                (s_cookies[index].expires_at != 0U &&
-                 (uint32_t)time(NULL) >= s_cookies[index].expires_at))
-        {
-            continue;
-        }
-        const int written = snprintf(output + used, output_size - used,
-                                     "%s%s=%s", used == 0U ? "" : "; ",
-                                     s_cookies[index].name,
-                                     s_cookies[index].value);
-        if (written < 0 || (size_t)written >= output_size - used)
-        {
-            output[output_size - 1U] = '\0';
-            return;
-        }
-        used += (size_t)written;
-    }
-}
-
-static esp_err_t _http_event(esp_http_client_event_t *event)
-{
-    music_http_context_t *context = event->user_data;
-    if (context == NULL || context->result == NULL)
-    {
-        return ESP_OK;
-    }
-    if (event->event_id == HTTP_EVENT_ON_HEADER)
-    {
-        if (event->header_key != NULL && event->header_value != NULL)
-        {
-            if (context->capture_cookies &&
-                    strcasecmp(event->header_key, "Set-Cookie") == 0)
-            {
-                _cookie_from_header(event->header_value, context->host);
-            }
-            else if (strcasecmp(event->header_key, "Location") == 0)
-            {
-                (void)snprintf(context->result->location,
-                               sizeof(context->result->location), "%s",
-                               event->header_value);
-            }
-            else if (strcasecmp(event->header_key, "Content-Type") == 0)
-            {
-                (void)snprintf(context->result->content_type,
-                               sizeof(context->result->content_type), "%s",
-                               event->header_value);
-            }
-        }
-    }
-    else if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0)
-    {
-        if (context->limit == 0U)
-        {
-            return ESP_OK;
-        }
-        if (context->result->length + (size_t)event->data_len >
-                context->limit)
-        {
-            context->overflow = true;
-            return ESP_OK;
-        }
-        memcpy(context->result->body + context->result->length,
-               event->data, (size_t)event->data_len);
-        context->result->length += (size_t)event->data_len;
-        context->result->body[context->result->length] = '\0';
-    }
-    return ESP_OK;
-}
-
-static void _result_free(music_http_result_t *result);
-
-static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
-                            const char *body, const char *content_type,
-                            const char *referer, bool with_cookie,
-                            music_http_result_t *result, size_t max_body)
-{
-    if (url == NULL || result == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    memset(result, 0, sizeof(*result));
-    result->body = _psram_alloc(max_body + 1U);
-    if (result->body == NULL)
-    {
-        return ESP_ERR_NO_MEM;
-    }
-
-    music_http_context_t context =
-    {
-        .result = result,
-        .limit = max_body,
-        .capture_cookies = with_cookie,
-    };
-    char request_host[128];
-    char request_path[128];
-    _url_host_path(url, request_host, sizeof(request_host),
-                   request_path, sizeof(request_path));
-    (void)snprintf(context.host, sizeof(context.host), "%s", request_host);
-    const esp_http_client_config_t config =
-    {
-        .url = url,
-        .method = method,
-        .event_handler = _http_event,
-        .user_data = &context,
-        .timeout_ms = MUSIC_HTTP_TIMEOUT_MS,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .disable_auto_redirect = true,
-        .buffer_size = 4096,
-        .buffer_size_tx = 2048,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL)
-    {
-        _psram_free(result->body);
-        result->body = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    (void)esp_http_client_set_header(client, "User-Agent",
-                                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                     "Chrome/120.0.0.0 Safari/537.36");
-    (void)esp_http_client_set_header(client, "Referer",
-                                     referer == NULL ? "https://y.qq.com/" :
-                                     referer);
-    (void)esp_http_client_set_header(client, "Accept", "*/*");
-    if (with_cookie)
-    {
-        char *cookie = _psram_alloc(4096U);
-        if (cookie != NULL)
-        {
-            _cookie_header(cookie, 4096U, request_host, request_path);
-            if (cookie[0] != '\0')
-            {
-                (void)esp_http_client_set_header(client, "Cookie", cookie);
-            }
-            _psram_free(cookie);
-        }
-    }
-    if (body != NULL)
-    {
-        (void)esp_http_client_set_header(client, "Content-Type",
-                                         content_type == NULL ?
-                                         "application/json" : content_type);
-        (void)esp_http_client_set_post_field(client, body, strlen(body));
-    }
-
-    esp_err_t error = esp_http_client_perform(client);
-    if (error == ESP_OK)
-    {
-        result->status = esp_http_client_get_status_code(client);
-    }
-    (void)esp_http_client_cleanup(client);
-    if (error != ESP_OK || context.overflow)
-    {
-        _psram_free(result->body);
-        result->body = NULL;
-        result->length = 0U;
-        return error == ESP_OK ? ESP_ERR_INVALID_SIZE : error;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t _http_request(esp_http_client_method_t method, const char *url,
-                               const char *body, const char *content_type,
-                               const char *referer, bool with_cookie,
-                               music_http_result_t *result, size_t max_body)
-{
-    char current_url[1024];
-    (void)snprintf(current_url, sizeof(current_url), "%s", url);
-    esp_http_client_method_t current_method = method;
-    const char *current_body = body;
-    const char *current_content_type = content_type;
-    for (int redirect = 0; redirect <= MUSIC_HTTP_MAX_REDIRECTS; ++redirect)
-    {
-        esp_err_t error = _http_once(current_method, current_url,
-                                     current_body, current_content_type,
-                                     referer, with_cookie, result, max_body);
-        if (error != ESP_OK)
-        {
-            return error;
-        }
-        if (result->status >= 300 && result->status < 400 &&
-                result->location[0] != '\0')
-        {
-            if (strncmp(result->location, "https://", 8) != 0)
-            {
-                _result_free(result);
-                return ESP_ERR_INVALID_RESPONSE;
-            }
-            (void)snprintf(current_url, sizeof(current_url), "%s",
-                           result->location);
-            if (result->status == 301 || result->status == 302 ||
-                    result->status == 303)
-            {
-                current_method = HTTP_METHOD_GET;
-                current_body = NULL;
-                current_content_type = NULL;
-            }
-            _psram_free(result->body);
-            result->body = NULL;
-            result->length = 0U;
-            result->location[0] = '\0';
-            continue;
-        }
-        return ESP_OK;
-    }
-    _result_free(result);
-    return ESP_ERR_INVALID_RESPONSE;
-}
-
-static esp_err_t _http_get_referer(const char *url, bool with_cookie,
-                                   const char *referer,
-                                   music_http_result_t *result,
-                                   size_t max_body)
-{
-    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer,
-                         with_cookie, result, max_body);
-}
-
-static esp_err_t _http_get(const char *url, bool with_cookie,
-                           music_http_result_t *result, size_t max_body)
-{
-    return _http_get_referer(url, with_cookie, NULL, result, max_body);
-}
-
-static esp_err_t _http_get_headers(const char *url, bool with_cookie,
-                                   const char *referer,
-                                   music_http_result_t *result)
-{
-    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer,
-                         with_cookie, result, 0U);
-}
-
-static esp_err_t _http_post(const char *url, const char *body,
-                            music_http_result_t *result, size_t max_body)
-{
-    return _http_request(HTTP_METHOD_POST, url, body, "application/json",
-                         NULL, true, result, max_body);
-}
-
-static esp_err_t _http_post_form_no_redirect(const char *url,
-        const char *body, const char *referer,
-        music_http_result_t *result, size_t max_body)
-{
-    return _http_once(HTTP_METHOD_POST, url, body,
-                      "application/x-www-form-urlencoded", referer,
-                      true, result, max_body);
-}
-
-static void _result_free(music_http_result_t *result)
-{
-    if (result != NULL && result->body != NULL)
-    {
-        _psram_free(result->body);
-        result->body = NULL;
-        result->length = 0U;
-    }
+    return s_last_musicu_error;
 }
 
 static void _json_string(const cJSON *object, const char *key,
@@ -665,36 +193,36 @@ static cJSON *_musicu_post(const char *module, const char *method,
         return NULL;
     }
     music_http_result_t result;
-    const esp_err_t error = _http_post(
+    const esp_err_t error = music_http_post(
                                 "https://u.y.qq.com/cgi-bin/musicu.fcg", body, &result,
                                 MUSIC_JSON_MAX_BYTES);
     cJSON_free(body);
     if (error != ESP_OK)
     {
         s_last_musicu_error = error;
-        _result_free(&result);
+        music_http_result_free(&result);
         return NULL;
     }
     if (result.status == 401 || result.status == 403)
     {
         s_last_musicu_error = MUSIC_ERR_HTTP_AUTH;
-        _result_free(&result);
+        music_http_result_free(&result);
         return NULL;
     }
     if (result.status == 429)
     {
         s_last_musicu_error = MUSIC_ERR_HTTP_RATE_LIMIT;
-        _result_free(&result);
+        music_http_result_free(&result);
         return NULL;
     }
     if (result.status >= 400)
     {
         s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
-        _result_free(&result);
+        music_http_result_free(&result);
         return NULL;
     }
     cJSON *response = cJSON_Parse(result.body);
-    _result_free(&result);
+    music_http_result_free(&result);
     if (response == NULL)
     {
         s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
@@ -839,240 +367,8 @@ void music_net_cancel_login(void)
 
 void music_net_clear_session(void)
 {
-    _cookie_clear();
+    music_http_cookie_clear();
     music_net_cancel_login();
-}
-
-static void _music_image_destroy(void *payload)
-{
-    music_image_t *image = payload;
-    if (image != NULL && image->pixels != NULL)
-    {
-        jpeg_free_align(image->pixels);
-        image->pixels = NULL;
-    }
-}
-
-static esp_err_t _decode_rgb565(const uint8_t *data, size_t data_size,
-                                uint16_t requested_width,
-                                uint16_t requested_height,
-                                music_image_t **image_out)
-{
-    if (data == NULL || data_size == 0U || image_out == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    jpeg_dec_config_t config =
-    {
-        .output_type = JPEG_PIXEL_FORMAT_RGB565_LE,
-        .scale = { 0, 0 },
-        .clipper = { 0, 0 },
-        .rotate = JPEG_ROTATE_0D,
-        .block_enable = false,
-    };
-    if (requested_width >= 8U && requested_height >= 8U)
-    {
-        /* The decoder requires scale dimensions to be multiples of 8. */
-        config.scale.width = (uint16_t)(requested_width & 0xFFF8U);
-        config.scale.height = (uint16_t)(requested_height & 0xFFF8U);
-    }
-    jpeg_dec_handle_t decoder = NULL;
-    if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK)
-    {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    jpeg_dec_io_t io =
-    {
-        .inbuf = (uint8_t *)data,
-        .inbuf_len = (int)data_size,
-        .inbuf_remain = 0,
-    };
-    jpeg_dec_header_info_t header;
-    if (jpeg_dec_parse_header(decoder, &io, &header) != JPEG_ERR_OK)
-    {
-        jpeg_dec_close(decoder);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (header.width == 0U || header.height == 0U ||
-            header.width > 1024U || header.height > 1024U)
-    {
-        jpeg_dec_close(decoder);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    int output_size = 0;
-    if (jpeg_dec_get_outbuf_len(decoder, &output_size) != JPEG_ERR_OK ||
-            output_size <= 0 || output_size > (2 * 1024 * 1024))
-    {
-        jpeg_dec_close(decoder);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    uint8_t *pixels = jpeg_calloc_align((size_t)output_size, 16);
-    if (pixels == NULL)
-    {
-        jpeg_dec_close(decoder);
-        return ESP_ERR_NO_MEM;
-    }
-    io.outbuf = pixels;
-    io.out_size = output_size;
-    if (jpeg_dec_process(decoder, &io) != JPEG_ERR_OK)
-    {
-        jpeg_free_align(pixels);
-        jpeg_dec_close(decoder);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    jpeg_dec_close(decoder);
-    music_image_t *image = music_snapshot_alloc(sizeof(*image),
-        _music_image_destroy);
-    if (image == NULL)
-    {
-        jpeg_free_align(pixels);
-        return ESP_ERR_NO_MEM;
-    }
-    image->width = config.scale.width != 0U ? config.scale.width :
-                   header.width;
-    image->height = config.scale.height != 0U ? config.scale.height :
-                    header.height;
-    image->data_size = (size_t)output_size;
-    image->pixels = pixels;
-    image->token = 0U;
-    *image_out = image;
-    return ESP_OK;
-}
-
-static esp_err_t _decode_png_rgb565(const uint8_t *data, size_t data_size,
-                                    music_image_t **image_out)
-{
-    if (data == NULL || data_size == 0U || image_out == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    png_image png;
-    memset(&png, 0, sizeof(png));
-    png.version = PNG_IMAGE_VERSION;
-    if (!png_image_begin_read_from_memory(&png, data, data_size))
-    {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (png.width == 0U || png.height == 0U ||
-            png.width > 1024U || png.height > 1024U ||
-            (uint64_t)png.width * png.height > 1024U * 1024U)
-    {
-        png_image_free(&png);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    png.format = PNG_FORMAT_RGBA;
-    const size_t rgba_size = PNG_IMAGE_SIZE(png);
-    if (rgba_size == 0U || rgba_size > (2U * 1024U * 1024U))
-    {
-        png_image_free(&png);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    uint8_t *rgba = _psram_alloc(rgba_size);
-    if (rgba == NULL)
-    {
-        png_image_free(&png);
-        return ESP_ERR_NO_MEM;
-    }
-    if (!png_image_finish_read(&png, NULL, rgba, 0, NULL))
-    {
-        _psram_free(rgba);
-        png_image_free(&png);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const uint16_t width = (uint16_t)png.width;
-    const uint16_t height = (uint16_t)png.height;
-    png_image_free(&png);
-
-    const size_t pixel_bytes = (size_t)width * (size_t)height * 2U;
-    uint8_t *pixels = jpeg_calloc_align(pixel_bytes, 16);
-    if (pixels == NULL)
-    {
-        _psram_free(rgba);
-        return ESP_ERR_NO_MEM;
-    }
-    uint16_t *output = (uint16_t *)pixels;
-    for (size_t index = 0U; index < (size_t)width * height; ++index)
-    {
-        const uint32_t red = rgba[index * 4U];
-        const uint32_t green = rgba[index * 4U + 1U];
-        const uint32_t blue = rgba[index * 4U + 2U];
-        const uint32_t alpha = rgba[index * 4U + 3U];
-        const uint32_t inverse = 255U - alpha;
-        const uint8_t mixed_red =
-            (uint8_t)((red * alpha + 255U * inverse) / 255U);
-        const uint8_t mixed_green =
-            (uint8_t)((green * alpha + 255U * inverse) / 255U);
-        const uint8_t mixed_blue =
-            (uint8_t)((blue * alpha + 255U * inverse) / 255U);
-        output[index] = (uint16_t)(((uint16_t)mixed_red & 0xF8U) << 8) |
-                        (uint16_t)(((uint16_t)mixed_green & 0xFCU) << 3) |
-                        (uint16_t)(mixed_blue >> 3);
-    }
-    _psram_free(rgba);
-
-    music_image_t *image = music_snapshot_alloc(sizeof(*image),
-        _music_image_destroy);
-    if (image == NULL)
-    {
-        jpeg_free_align(pixels);
-        return ESP_ERR_NO_MEM;
-    }
-    image->width = width;
-    image->height = height;
-    image->data_size = pixel_bytes;
-    image->pixels = pixels;
-    image->token = 0U;
-    *image_out = image;
-    return ESP_OK;
-}
-
-static esp_err_t _fetch_image(const char *url, uint16_t width,
-                              uint16_t height, uint32_t token,
-                              bool with_cookie, const char *referer,
-                              music_image_t **image)
-{
-    if (url == NULL || url[0] == '\0' || image == NULL)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *image = NULL;
-    music_http_result_t result;
-    const esp_err_t error = _http_get_referer(url, with_cookie, referer,
-        &result, MUSIC_QR_MAX_BYTES);
-    if (error != ESP_OK)
-    {
-        return error;
-    }
-    music_image_t *decoded = NULL;
-    esp_err_t decode_result;
-    if (music_login_png_signature((const uint8_t *)result.body,
-                                  result.length))
-    {
-        decode_result = _decode_png_rgb565((const uint8_t *)result.body,
-                                           result.length, &decoded);
-    }
-    else
-    {
-        decode_result = _decode_rgb565((const uint8_t *)result.body,
-                                       result.length, width, height,
-                                       &decoded);
-    }
-    _result_free(&result);
-    if (decode_result != ESP_OK)
-    {
-        return decode_result;
-    }
-    decoded->token = token;
-    (void)snprintf(decoded->url, sizeof(decoded->url), "%s", url);
-    *image = decoded;
-    return ESP_OK;
-}
-
-esp_err_t music_net_fetch_image(const char *url, uint16_t width,
-                                uint16_t height, uint32_t token,
-                                music_image_t **image)
-{
-    return _fetch_image(url, width, height, token, false, NULL, image);
 }
 
 static void _random_uuid(char output[37])
@@ -1168,20 +464,20 @@ static esp_err_t _qq_authorize(const char *auth_url,
     }
 
     music_http_result_t auth_result;
-    result = _http_get_headers(auth_url, true, MUSIC_QQ_REFERER,
-                               &auth_result);
+    result = music_http_get_headers(auth_url, true, MUSIC_QQ_REFERER,
+                                    &auth_result);
     if (result != ESP_OK)
     {
         goto done;
     }
     const int status = auth_result.status;
-    _result_free(&auth_result);
+    music_http_result_free(&auth_result);
     if (status < 200 || status >= 300)
     {
         result = ESP_ERR_INVALID_RESPONSE;
         goto done;
     }
-    if (!_cookie_get("p_skey", p_skey, 512U))
+    if (!music_http_cookie_get("p_skey", p_skey, 512U))
     {
         result = ESP_ERR_INVALID_RESPONSE;
         goto done;
@@ -1227,10 +523,10 @@ static esp_err_t _qq_authorize(const char *auth_url,
     }
 
     music_http_result_t code_result;
-    result = _http_post_form_no_redirect(MUSIC_QQ_AUTHORIZE_URL, body,
-                                         MUSIC_QQ_AUTHORIZE_REFERER,
-                                         &code_result,
-                                         MUSIC_QR_POLL_MAX_BYTES);
+    result = music_http_post_form_no_redirect(MUSIC_QQ_AUTHORIZE_URL, body,
+        MUSIC_QQ_AUTHORIZE_REFERER,
+        &code_result,
+        MUSIC_QR_POLL_MAX_BYTES);
     if (result != ESP_OK)
     {
         goto done;
@@ -1243,7 +539,7 @@ static esp_err_t _qq_authorize(const char *auth_url,
         code_ok = music_login_query_value(code_result.body, "code",
                                           code, sizeof(code));
     }
-    _result_free(&code_result);
+    music_http_result_free(&code_result);
     if (!code_ok)
     {
         result = ESP_ERR_INVALID_RESPONSE;
@@ -1260,22 +556,22 @@ done:
 static esp_err_t _qq_login_begin(void)
 {
     music_http_result_t result;
-    esp_err_t error = _http_get_headers(MUSIC_QQ_XLOGIN_URL, true,
-                                        MUSIC_QQ_REFERER, &result);
+    esp_err_t error = music_http_get_headers(MUSIC_QQ_XLOGIN_URL, true,
+        MUSIC_QQ_REFERER, &result);
     if (error != ESP_OK)
     {
         LOG_W("qq xlogin failed: %s", esp_err_to_name(error));
         return error;
     }
     const int status = result.status;
-    _result_free(&result);
+    music_http_result_free(&result);
     if (status < 200 || status >= 300)
     {
         LOG_W("qq xlogin status=%d", status);
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (!_cookie_get("pt_login_sig", s_music.qq_login_sig,
-                     sizeof(s_music.qq_login_sig)))
+    if (!music_http_cookie_get("pt_login_sig", s_music.qq_login_sig,
+                               sizeof(s_music.qq_login_sig)))
     {
         LOG_W("qq xlogin missing pt_login_sig");
         return ESP_ERR_INVALID_RESPONSE;
@@ -1288,15 +584,15 @@ static esp_err_t _qq_login_begin(void)
                    "&daid=383&pt_3rd_aid=100497308",
                    (unsigned)(esp_random() % 1000000U));
     music_image_t *qr = NULL;
-    error = _fetch_image(qr_url, 240U, 240U, 1U, true,
-                         MUSIC_QQ_REFERER, &qr);
+    error = music_media_fetch_image(qr_url, 240U, 240U, 1U, true,
+                                    MUSIC_QQ_REFERER, &qr);
     if (error != ESP_OK)
     {
         LOG_W("qq qr image failed: %s", esp_err_to_name(error));
         return error;
     }
-    if (!_cookie_get("qrsig", s_music.qr_qrsig,
-                     sizeof(s_music.qr_qrsig)))
+    if (!music_http_cookie_get("qrsig", s_music.qr_qrsig,
+                               sizeof(s_music.qr_qrsig)))
     {
         LOG_W("qq qr response missing qrsig");
         music_service_login_qr_release(qr);
@@ -1362,8 +658,8 @@ static esp_err_t _qq_login_poll(music_credential_blob_t *credential,
     (void)snprintf(url, 1536U, "https://ssl.ptlogin2.qq.com/ptqrlogin?%s",
                    query);
     music_http_result_t http_result;
-    result = _http_get_referer(url, true, MUSIC_QQ_REFERER, &http_result,
-                               MUSIC_QR_POLL_MAX_BYTES);
+    result = music_http_get_referer(url, true, MUSIC_QQ_REFERER, &http_result,
+                                    MUSIC_QR_POLL_MAX_BYTES);
     if (result != ESP_OK)
     {
         goto done;
@@ -1373,7 +669,7 @@ static esp_err_t _qq_login_poll(music_credential_blob_t *credential,
             http_result.body, musicid,
             sizeof(musicid), auth_url,
             1024U);
-    _result_free(&http_result);
+    music_http_result_free(&http_result);
     if (qq_state == MUSIC_LOGIN_QQ_WAITING)
     {
         *state = MUSIC_LOGIN_POLL_WAITING;
@@ -1394,7 +690,7 @@ static esp_err_t _qq_login_poll(music_credential_blob_t *credential,
     {
         goto done;
     }
-    _cookie_clear();
+    music_http_cookie_clear();
     *state = MUSIC_LOGIN_POLL_SUCCESS;
 
 done:
@@ -1406,7 +702,7 @@ done:
 
 esp_err_t music_net_login_begin(music_login_type_t type)
 {
-    _cookie_clear();
+    music_http_cookie_clear();
     music_net_cancel_login();
     if (type == MUSIC_LOGIN_TYPE_QQ)
     {
@@ -1417,7 +713,7 @@ esp_err_t music_net_login_begin(music_login_type_t type)
         return ESP_ERR_NOT_SUPPORTED;
     }
     music_http_result_t result;
-    const esp_err_t error = _http_get(
+    const esp_err_t error = music_http_get(
                                 "https://open.weixin.qq.com/connect/qrconnect"
                                 "?appid=wx48db31d50e334801"
                                 "&redirect_uri=https%3A%2F%2Fy.qq.com%2Fportal"
@@ -1435,7 +731,7 @@ esp_err_t music_net_login_begin(music_login_type_t type)
     const char *uuid_key = strstr(result.body, "uuid=");
     if (uuid_key == NULL)
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     uuid_key += strlen("uuid=");
@@ -1448,12 +744,12 @@ esp_err_t music_net_login_begin(music_login_type_t type)
     const size_t uuid_length = (size_t)(uuid_end - uuid_key);
     if (uuid_length == 0U || uuid_length >= sizeof(s_music.qr_uuid))
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     memcpy(s_music.qr_uuid, uuid_key, uuid_length);
     s_music.qr_uuid[uuid_length] = '\0';
-    _result_free(&result);
+    music_http_result_free(&result);
 
     char qr_url[256];
     (void)snprintf(qr_url, sizeof(qr_url),
@@ -1520,8 +816,8 @@ esp_err_t music_net_login_poll(music_login_type_t type,
                    "?uuid=%s&_=%lld", s_music.qr_uuid,
                    (long long)(esp_timer_get_time() / 1000LL));
     music_http_result_t result;
-    const esp_err_t error = _http_get(url, true, &result,
-                                      MUSIC_QR_POLL_MAX_BYTES);
+    const esp_err_t error = music_http_get(url, true, &result,
+                                           MUSIC_QR_POLL_MAX_BYTES);
     if (error != ESP_OK)
     {
         return error;
@@ -1529,51 +825,51 @@ esp_err_t music_net_login_poll(music_login_type_t type,
     const char *error_key = strstr(result.body, "wx_errcode=");
     if (error_key == NULL)
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     const int error_code = atoi(error_key + strlen("wx_errcode="));
     if (error_code == 408)
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_OK;
     }
     if (error_code == 404)
     {
         *state = MUSIC_LOGIN_POLL_SCANNED;
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_OK;
     }
     if (error_code != 405)
     {
         *state = MUSIC_LOGIN_POLL_FAILED;
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_OK;
     }
     const char *code_key = strstr(result.body, "wx_code='");
     if (code_key == NULL)
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     code_key += strlen("wx_code='");
     const char *code_end = strchr(code_key, '\'');
     if (code_end == NULL || code_end == code_key)
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     char code[256];
     const size_t code_length = (size_t)(code_end - code_key);
     if (code_length >= sizeof(code))
     {
-        _result_free(&result);
+        music_http_result_free(&result);
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(code, code_key, code_length);
     code[code_length] = '\0';
     const esp_err_t exchange = _exchange_wechat_code(code, credential);
-    _result_free(&result);
+    music_http_result_free(&result);
     if (exchange != ESP_OK)
     {
         return exchange;
