@@ -20,6 +20,8 @@
 #include <string.h>
 #include <time.h>
 
+/* QQ Music web login endpoints are unofficial and can change independently of
+ * the public OpenAPI. Re-verify fields and status codes when behavior drifts. */
 #define MUSIC_QQ_REFERER "https://xui.ptlogin2.qq.com/"
 #define MUSIC_QQ_XLOGIN_URL \
     "https://xui.ptlogin2.qq.com/cgi-bin/xlogin" \
@@ -578,6 +580,7 @@ esp_err_t music_net_login_poll(music_login_type_t type,
         return ESP_ERR_INVALID_RESPONSE;
     }
     const int error_code = atoi(error_key + strlen("wx_errcode="));
+    /* 408: waiting; 404: scanned; 405: confirmed and carries wx_code. */
     if (error_code == 408)
     {
         music_http_result_free(&result);
