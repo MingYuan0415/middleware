@@ -239,6 +239,91 @@ static esp_err_t _home_personal(music_home_snapshot_t *home)
     return ESP_OK;
 }
 
+static esp_err_t _home_collected(music_home_snapshot_t *home)
+{
+    if (!s_music.credential_valid)
+    {
+        home->collected_ok = true;
+        return ESP_OK;
+    }
+    char url[384];
+    (void)snprintf(url, sizeof(url),
+                   "https://c.y.qq.com/fav/fcgi-bin/"
+                   "fcg_get_profile_order_asset.fcg"
+                   "?ct=20&cid=205360956&userid=%s&reqtype=3&sin=0&ein=%u"
+                   "&format=json",
+                   s_music.credential.musicid,
+                   (unsigned)MUSIC_SERVICE_MAX_PLAYLISTS);
+    music_http_result_t result;
+    const esp_err_t get_result = music_http_get(
+                                     url, true, &result,
+                                     CONFIG_MUSIC_SERVICE_MAX_RESPONSE_BYTES);
+    if (get_result != ESP_OK)
+    {
+        music_http_result_free(&result);
+        return get_result;
+    }
+    cJSON *root = cJSON_Parse(result.body);
+    music_http_result_free(&result);
+    if (root == NULL)
+    {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    const cJSON *list = data == NULL ? NULL :
+                        cJSON_GetObjectItemCaseSensitive(data, "cdlist");
+    if (!cJSON_IsArray(list))
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, list)
+    {
+        if (home->my_collected_count >= MUSIC_SERVICE_MAX_PLAYLISTS)
+        {
+            break;
+        }
+        music_playlist_t *slot =
+            &home->my_collected[home->my_collected_count];
+        memset(slot, 0, sizeof(*slot));
+        slot->ref.kind = (uint8_t)MUSIC_PLAYLIST_KIND_MY_COLLECTED;
+        slot->ref.id = music_json_u64(item, "dissid");
+        if (slot->ref.id == 0U)
+        {
+            slot->ref.id = music_json_u64(item, "tid");
+        }
+        slot->ref.tid = music_json_u32(item, "tid");
+        music_json_string(item, "dissname", slot->title,
+                          sizeof(slot->title));
+        if (slot->title[0] == '\0')
+        {
+            music_json_string(item, "title", slot->title,
+                              sizeof(slot->title));
+        }
+        music_json_string(item, "logo", slot->cover_url,
+                          sizeof(slot->cover_url));
+        if (slot->cover_url[0] == '\0')
+        {
+            music_json_string(item, "imgurl", slot->cover_url,
+                              sizeof(slot->cover_url));
+        }
+        slot->track_count = music_json_u32(item, "songnum");
+        if (slot->track_count == 0U)
+        {
+            slot->track_count = music_json_u32(item, "song_cnt");
+        }
+        if (slot->ref.id == 0U || slot->title[0] == '\0')
+        {
+            continue;
+        }
+        ++home->my_collected_count;
+    }
+    cJSON_Delete(root);
+    home->collected_ok = true;
+    return ESP_OK;
+}
+
 esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
 {
     if (snapshot == NULL)
@@ -256,6 +341,8 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
     home->recommended_ok = recommended_result == ESP_OK;
     const esp_err_t personal_result = _home_personal(home);
     home->personal_ok = personal_result == ESP_OK;
+    const esp_err_t collected_result = _home_collected(home);
+    home->collected_ok = collected_result == ESP_OK;
     if (personal_result == MUSIC_ERR_HTTP_AUTH)
     {
         music_snapshot_release(home);

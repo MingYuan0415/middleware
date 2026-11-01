@@ -24,6 +24,11 @@ audio I/O itself.
   `prev()`, `set_mode()`, `stop()`, and
   `music_service_get_player_status()`. `seek()` is reserved and currently
   returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
+- Queue: `music_service_queue_acquire()` / `release()` expose the immutable
+  current queue (bounded by `MUSIC_SERVICE_MAX_SONGS`);
+  `music_service_queue_play()` switches to one entry and
+  `music_service_queue_remove()` commits one removal and publishes
+  `MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE`.
 - `music_service_is_playing()` is the PM guard query; it includes the interval
   between accepting a play command and the stream task actually starting.
 - `music_service_get_diagnostics()` returns API/stream stack watermarks and API
@@ -49,9 +54,11 @@ playback lease.
 - Credentials are stored in the `music_cred` NVS blob and erasing them is part
   of the factory-reset sequence.
 - Home data combines the anonymous recommendation feed with the logged-in
-  user's created and favorite playlists. Home is requested lazily when the App
-  root page mounts, not on every network-ready transition. Playlist detail and
-  lyric requests are bounded by the public header limits.
+  user's created playlists, dirId 201 liked playlist, and collected playlists
+  from `CgiGetPlaylistFavInfo`-compatible account catalog. Home is requested
+  lazily when the App sidebar mounts, not on every network-ready transition.
+  Playlist detail, lyric and queue requests are bounded by the public header
+  limits.
 - Catalog parsers accept current (`mid`, `file.media_mid`, `dirinfo`) and legacy
   (`songmid`, `strMediaMid`, `dissname`) response names. Song URL requests use
   `CgiGetVkey` array parameters and `media_mid` filenames; lyrics use `crypt: 0`
@@ -79,8 +86,8 @@ quality through `music_service_config_t`.
 
 ## Test Boundary
 
-The pure QQ login protocol parsers and the reference-counted snapshot allocator
-have standalone host tests. Network, TLS, credential storage, and playback still
+The pure QQ login protocol parsers, the reference-counted snapshot allocator,
+and the queue removal transition table have standalone host tests. Network, TLS, credential storage, and playback still
 require on-device validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are
 outside host-test scope. The simulator real backend is an integration aid, not
 a replacement for device audio and power measurements.

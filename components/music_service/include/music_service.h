@@ -105,8 +105,9 @@ typedef enum
 typedef enum
 {
     MUSIC_PLAYLIST_KIND_MY_CREATED = 0,
-    MUSIC_PLAYLIST_KIND_MY_FAVORITE,
+    MUSIC_PLAYLIST_KIND_MY_FAVORITE, /**< dirId 201 "liked songs" playlist. */
     MUSIC_PLAYLIST_KIND_RECOMMENDED,
+    MUSIC_PLAYLIST_KIND_MY_COLLECTED, /**< Collected playlist from the account. */
 } music_playlist_kind_t;
 
 /** @brief Stable identity of one playlist. */
@@ -150,14 +151,17 @@ typedef struct music_home_snapshot
 {
     uint64_t generation;
     size_t my_created_count;
-    size_t my_favorite_count;
+    size_t my_favorite_count; /**< dirId 201 "liked songs" playlist. */
     size_t recommended_count;
+    size_t my_collected_count; /**< Collected playlists from the account. */
     music_playlist_t my_created[MUSIC_SERVICE_MAX_PLAYLISTS];
     music_playlist_t my_favorite[MUSIC_SERVICE_MAX_PLAYLISTS];
     music_playlist_t recommended[MUSIC_SERVICE_MAX_PLAYLISTS];
+    music_playlist_t my_collected[MUSIC_SERVICE_MAX_PLAYLISTS];
     bool login_required;
     bool recommended_ok;
     bool personal_ok;
+    bool collected_ok;
 } music_home_snapshot_t;
 
 /** @brief Immutable playlist-detail snapshot. */
@@ -170,6 +174,14 @@ typedef struct music_playlist_snapshot
     uint16_t count;
     music_song_t songs[]; /**< count entries; allocation is exact. */
 } music_playlist_snapshot_t;
+
+/** @brief Immutable current playback-queue snapshot. */
+typedef struct music_queue_snapshot
+{
+    uint64_t generation;
+    uint16_t count;
+    music_song_t songs[]; /**< count entries; allocation is exact. */
+} music_queue_snapshot_t;
 
 /** @brief One parsed LRC line. */
 typedef struct music_lyric_line
@@ -272,6 +284,7 @@ typedef enum
     MUSIC_SERVICE_MSG_SUB_TYPE_LYRIC,
     MUSIC_SERVICE_MSG_SUB_TYPE_IMAGE,
     MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER,
+    MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE,
 } music_service_msg_sub_type_t;
 
 /**
@@ -324,6 +337,30 @@ esp_err_t music_service_playlist_acquire(const music_playlist_ref_t *ref,
         uint16_t offset, uint16_t count,
         const music_playlist_snapshot_t **snapshot);
 void music_service_playlist_release(const music_playlist_snapshot_t *snapshot);
+
+/**
+ * @brief Acquire the immutable snapshot of the current playback queue.
+ *
+ * The queue is built when a playlist starts playing and is bounded by
+ * MUSIC_SERVICE_MAX_SONGS. A missing queue returns ESP_ERR_NOT_FOUND.
+ */
+esp_err_t music_service_queue_acquire(const music_queue_snapshot_t **snapshot);
+
+/** @brief Release a queue snapshot acquired from the service. */
+void music_service_queue_release(const music_queue_snapshot_t *snapshot);
+
+/** @brief Switch playback to one entry of the current queue. */
+esp_err_t music_service_queue_play(uint16_t index);
+
+/**
+ * @brief Remove one entry from the current queue.
+ *
+ * Removing the current entry advances to the same slot after the shift and
+ * starts the replacement when playback is active. Removing the only entry
+ * stops playback. The change is asynchronous; MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE
+ * marks the committed result.
+ */
+esp_err_t music_service_queue_remove(uint16_t index);
 
 /** @brief Load and acquire parsed lyrics for one song. */
 esp_err_t music_service_lyric_acquire(const char *songmid,

@@ -3,6 +3,7 @@ idf_component_register(
         "src/music_service.c"
         "src/music_service_cache.c"
         "src/music_snapshot.c"
+        "src/music_queue_model.c"
         "src/music_http.c"
         "src/music_media.c"
         "src/music_api.c"

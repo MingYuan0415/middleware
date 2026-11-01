@@ -22,6 +22,10 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
 - 播放：`music_service_play_playlist()`、`play_pause()`、`next()`、`prev()`、
   `set_mode()`、`stop()` 与 `music_service_get_player_status()`。`seek()` 为保留
   接口，范围跳转实现前返回 `ESP_ERR_NOT_SUPPORTED`。
+- 队列：`music_service_queue_acquire()` / `release()` 暴露不可变当前队列
+  （上限 `MUSIC_SERVICE_MAX_SONGS`）；`music_service_queue_play()` 切换队列项，
+  `music_service_queue_remove()` 提交删除并发布
+  `MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE`。
 - `music_service_is_playing()` 是供系统 PM 使用的查询；它覆盖“已接受播放命令但
   流任务尚未启动”的窗口。
 - `music_service_get_diagnostics()` 返回 API/音频任务栈水位与 API 队列深度，
@@ -42,8 +46,10 @@ flash cache；音频 worker 在首次播放时懒创建，使用 PSRAM 栈，并
 - 二维码可能是 JPEG 或 PNG，两种格式都会解码为 RGB565；当前版本不实现
   QQ 音乐 App 的 MQTT 登录。
 - 凭证保存在 NVS 的 `music_cred` Blob；删除凭证是工厂重置流程的一部分。
-- 首页数据合并匿名推荐流与登录用户的自建/收藏歌单。首页在 App 根页面挂载
-  时按需请求，不在每次网络就绪时预取；歌单详情与歌词请求受公共头文件上限约束。
+- 首页数据合并匿名推荐流、登录用户的自建歌单、dirId 201 的“我喜欢”歌单与
+  `CgiGetPlaylistFavInfo` 兼容账号接口返回的收藏歌单。首页在 App 侧边栏挂载时
+  按需请求，不在每次网络就绪时预取；歌单详情、歌词与队列请求受公共头文件上限
+  约束。
 - 曲库解析同时兼容当前字段（`mid`、`file.media_mid`、`dirinfo`）与旧字段
   （`songmid`、`strMediaMid`、`dissname`）；歌曲 URL 请求使用 `CgiGetVkey`
   数组参数和 `media_mid` 文件名，歌词使用 `crypt: 0` 的普通 LRC。请求音质
@@ -66,6 +72,6 @@ flash cache；音频 worker 在首次播放时懒创建，使用 PSRAM 栈，并
 
 ## 测试边界
 
-QQ 登录协议解析与引用计数快照分配器已有独立 host 测试；网络、TLS、凭证
+QQ 登录协议解析、引用计数快照分配器与队列删除状态转移已有独立 host 测试；网络、TLS、凭证
 存储与播放仍需在板端验证。Wi-Fi、I2S/DMA、ES8311 与电池行为不在 host
 测试范围内；模拟器真后端是集成辅助，不替代板端音频与功耗测量。

@@ -53,6 +53,8 @@ typedef enum
     MUSIC_API_CMD_IMAGE,
     MUSIC_API_CMD_PLAY,
     MUSIC_API_CMD_PAUSE,
+    MUSIC_API_CMD_QUEUE_PLAY,
+    MUSIC_API_CMD_QUEUE_REMOVE,
 } music_api_cmd_type_t;
 
 /** @brief Result of one QR-poll iteration. */
@@ -107,6 +109,7 @@ typedef struct music_service_runtime
     music_player_status_t player;
     music_home_snapshot_t *home;
     music_playlist_snapshot_t *playlist;
+    music_queue_snapshot_t *queue;
     music_lyric_snapshot_t *lyric;
     music_image_t *login_qr;
     music_image_t *image;
@@ -119,9 +122,6 @@ typedef struct music_service_runtime
     char qq_login_sig[160];
     char lyric_songmid[MUSIC_SERVICE_SONGMID_BYTES];
     uint32_t image_token;
-    music_playlist_ref_t play_ref;
-    uint32_t play_index;
-    uint32_t play_count;
     uint32_t play_generation;
     bool play_valid;
     bool login_active;
@@ -139,6 +139,7 @@ void music_service_set_state_locked(music_service_state_t state,
                                     music_service_failure_t failure);
 void music_service_replace_home(music_home_snapshot_t *snapshot);
 void music_service_replace_playlist(music_playlist_snapshot_t *snapshot);
+void music_service_replace_queue(music_queue_snapshot_t *snapshot);
 void music_service_replace_lyric(music_lyric_snapshot_t *snapshot);
 void music_service_set_login_qr(music_image_t *image);
 void music_service_set_image(music_image_t *image, uint32_t token);
