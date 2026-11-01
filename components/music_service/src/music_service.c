@@ -2,6 +2,7 @@
 #include "mt_log.h"
 
 #include "music_service_internal.h"
+#include "music_service_cache.h"
 #include "music_snapshot.h"
 
 #include "audio_service.h"
@@ -1263,13 +1264,8 @@ esp_err_t music_service_playlist_acquire(const music_playlist_ref_t *ref,
     if (music_service_lock() == ESP_OK)
     {
         music_playlist_snapshot_t *playlist = s_music.playlist;
-        if (playlist != NULL && playlist->playlist.ref.id == ref->id &&
-                playlist->playlist.ref.dirid == ref->dirid &&
-                playlist->playlist.ref.tid == ref->tid &&
-                playlist->playlist.ref.kind == ref->kind &&
-                playlist->offset == offset &&
-                (playlist->count >= count ||
-                 (playlist->total != 0U && playlist->total <= playlist->count)))
+        if (music_service_playlist_cache_matches(playlist, ref, offset,
+                count))
         {
             playlist = music_snapshot_retain(playlist);
             music_service_unlock();
@@ -1349,8 +1345,8 @@ esp_err_t music_service_image_acquire(const char *url, uint16_t width,
     if (music_service_lock() == ESP_OK)
     {
         music_image_t *current = s_music.image;
-        if (current != NULL && current->token == token &&
-                strcmp(current->url, url) == 0)
+        if (music_service_image_cache_matches(current, url, width, height,
+                                              token))
         {
             current = music_snapshot_retain(current);
             music_service_unlock();

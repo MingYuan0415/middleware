@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/music_service.c"
+        "src/music_service_cache.c"
         "src/music_snapshot.c"
         "src/music_http.c"
         "src/music_media.c"

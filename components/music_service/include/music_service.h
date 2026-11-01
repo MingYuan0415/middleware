@@ -191,6 +191,8 @@ typedef struct music_image
 {
     uint16_t width;
     uint16_t height;
+    uint16_t requested_width;
+    uint16_t requested_height;
     size_t data_size;
     uint8_t *pixels;
     uint32_t token;

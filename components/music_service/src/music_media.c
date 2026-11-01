@@ -251,6 +251,8 @@ esp_err_t music_media_fetch_image(const char *url, uint16_t width,
     {
         return decode_result;
     }
+    decoded->requested_width = width;
+    decoded->requested_height = height;
     decoded->token = token;
     (void)snprintf(decoded->url, sizeof(decoded->url), "%s", url);
     *image = decoded;

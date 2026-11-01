@@ -50,6 +50,19 @@ configure_music_host_target(music_login_protocol_test)
 
 add_test(NAME music_login_protocol_test COMMAND music_login_protocol_test)
 
+add_executable(music_service_cache_test
+    music_service_cache_test.c
+    ../../src/music_service_cache.c
+)
+target_include_directories(music_service_cache_test PRIVATE
+    ../../include
+    ../../src
+    ../../../event_bus/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../../../../../sim/stubs/include
+)
+configure_music_host_target(music_service_cache_test)
+add_test(NAME music_service_cache_test COMMAND music_service_cache_test)
+
 add_executable(music_snapshot_test
     music_snapshot_test.c
     ../../src/music_snapshot.c
