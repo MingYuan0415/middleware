@@ -82,6 +82,39 @@ static void test_window_start(void)
     assert(music_queue_window_count(5U, 0U, 0U) == 0U);
 }
 
+static void test_next_after_failure(void)
+{
+    uint16_t next = UINT16_MAX;
+    assert(music_queue_next_after_failure(5U, 0U, MUSIC_PLAY_MODE_SEQUENTIAL,
+                                          0U, &next));
+    assert(next == 1U);
+    assert(music_queue_next_after_failure(5U, 3U, MUSIC_PLAY_MODE_SEQUENTIAL,
+                                          0U, &next));
+    assert(next == 4U);
+    assert(!music_queue_next_after_failure(5U, 4U,
+                                           MUSIC_PLAY_MODE_SEQUENTIAL,
+                                           0U, &next));
+    assert(music_queue_next_after_failure(5U, 4U, MUSIC_PLAY_MODE_REPEAT_ALL,
+                                          0U, &next));
+    assert(next == 0U);
+    assert(music_queue_next_after_failure(5U, 2U, MUSIC_PLAY_MODE_REPEAT_ONE,
+                                          0U, &next));
+    assert(next == 3U);
+    assert(music_queue_next_after_failure(5U, 4U, MUSIC_PLAY_MODE_REPEAT_ONE,
+                                          0U, &next));
+    assert(next == 0U);
+    assert(music_queue_next_after_failure(5U, 2U, MUSIC_PLAY_MODE_SHUFFLE,
+                                          7U, &next));
+    assert(next == 2U || next == 3U);
+    assert(next != 2U);
+    assert(!music_queue_next_after_failure(1U, 0U, MUSIC_PLAY_MODE_REPEAT_ALL,
+                                           0U, &next));
+    assert(!music_queue_next_after_failure(2U, 2U, MUSIC_PLAY_MODE_SEQUENTIAL,
+                                           0U, &next));
+    assert(!music_queue_next_after_failure(2U, 0U, MUSIC_PLAY_MODE_SEQUENTIAL,
+                                           0U, NULL));
+}
+
 static void test_page_math(void)
 {
     assert(music_queue_page_count(0U, 20U) == 0U);
@@ -140,6 +173,7 @@ int main(void)
     test_remove_only_entry();
     test_invalid_input();
     test_window_start();
+    test_next_after_failure();
     test_page_math();
     test_removal_mapping();
     (void)printf("music_queue_model_test: ok\n");

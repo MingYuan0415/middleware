@@ -76,6 +76,40 @@ uint16_t music_queue_window_count(uint16_t total, uint16_t offset,
     return remaining > window_size ? window_size : remaining;
 }
 
+bool music_queue_next_after_failure(uint16_t count, uint16_t current,
+                                    music_play_mode_t mode,
+                                    uint32_t random_value, uint16_t *next)
+{
+    if (count < 2U || current >= count || next == NULL)
+    {
+        return false;
+    }
+    uint16_t candidate = 0U;
+    if (mode == MUSIC_PLAY_MODE_SHUFFLE)
+    {
+        candidate = (uint16_t)(random_value % count);
+        if (candidate == current)
+        {
+            candidate = (uint16_t)((candidate + 1U) % count);
+        }
+    }
+    else if (current + 1U < count)
+    {
+        candidate = (uint16_t)(current + 1U);
+    }
+    else if (mode == MUSIC_PLAY_MODE_REPEAT_ALL ||
+             mode == MUSIC_PLAY_MODE_REPEAT_ONE)
+    {
+        candidate = 0U;
+    }
+    else
+    {
+        return false;
+    }
+    *next = candidate;
+    return true;
+}
+
 uint16_t music_queue_page_count(uint16_t total, uint16_t page_size)
 {
     if (total == 0U || page_size == 0U)

@@ -2,6 +2,7 @@
 #define __MUSIC_QUEUE_MODEL_H__
 
 #include "esp_err.h"
+#include "music_service.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -56,6 +57,24 @@ bool music_queue_window_contains(uint16_t offset, uint16_t count,
  */
 uint16_t music_queue_window_count(uint16_t total, uint16_t offset,
                                   uint16_t window_size);
+
+/**
+ * @brief Pick the next queue entry after the current one cannot play.
+ *
+ * Sequential playback stops at the queue end; repeat-all wraps; repeat-one
+ * advances instead of retrying the unavailable entry; shuffle avoids the
+ * current entry when more than one entry exists.
+ *
+ * @param count is the logical queue length.
+ * @param current is the index that failed.
+ * @param mode is the active play mode.
+ * @param random_value seeds shuffle selection.
+ * @param next receives the next index.
+ * @return true when another entry can be tried.
+ */
+bool music_queue_next_after_failure(uint16_t count, uint16_t current,
+                                    music_play_mode_t mode,
+                                    uint32_t random_value, uint16_t *next);
 
 /** @brief Number of provider pages needed for a queue length. */
 uint16_t music_queue_page_count(uint16_t total, uint16_t page_size);

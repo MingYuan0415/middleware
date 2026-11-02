@@ -25,6 +25,7 @@
 #define MUSIC_CREDENTIAL_MAGIC 0x4D555331U
 #define MUSIC_CREDENTIAL_VERSION 1U
 #define MUSIC_PLAYLIST_CACHE_SLOTS 5U
+#define MUSIC_IMAGE_CACHE_SLOTS 3U
 #define MUSIC_SERVICE_QUEUE_WINDOW_SONGS 30U
 #define MUSIC_SERVICE_QUEUE_PAGE_SONGS 20U
 #define MUSIC_SERVICE_QUEUE_FETCH_PAGE 10U
@@ -133,21 +134,24 @@ typedef struct music_service_runtime
     music_queue_snapshot_t *queue_view;
     music_lyric_snapshot_t *lyric;
     music_image_t *login_qr;
-    music_image_t *image;
+    music_image_t *image[MUSIC_IMAGE_CACHE_SLOTS];
     music_credential_blob_t credential;
     music_credential_blob_t login_credential;
     bool credential_valid;
     bool profile_loaded;
+    bool profile_requested;
     music_login_type_t login_type;
     char qr_uuid[96];
     char qr_qrsig[256];
     char qq_login_sig[160];
     char lyric_songmid[MUSIC_SERVICE_SONGMID_BYTES];
     char lyric_request_songmid[MUSIC_SERVICE_SONGMID_BYTES];
-    uint32_t image_token;
+    uint32_t image_used[MUSIC_IMAGE_CACHE_SLOTS];
+    uint32_t image_clock;
     uint32_t play_generation;
     uint32_t login_session;
     uint32_t lyric_request_id;
+    uint16_t play_skip_count;
     uint16_t queue_source_total;
     uint16_t queue_total;
     uint16_t queue_removed_count;

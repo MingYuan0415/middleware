@@ -36,6 +36,10 @@ static atomic_bool s_api_stop;
 static atomic_bool s_api_exited;
 static atomic_bool s_login_exited;
 
+static esp_err_t _music_service_queue_play_internal(uint16_t index,
+        bool reset_skip);
+static bool _music_service_skip_unavailable(uint32_t play_generation);
+
 static bool _login_session_current(uint32_t session)
 {
     return atomic_load_explicit(&s_login_generation,
@@ -112,6 +116,7 @@ static void _music_service_set_account_locked(
     const music_credential_blob_t *credential)
 {
     s_music.profile_loaded = false;
+    s_music.profile_requested = false;
     s_music.status.user_id[0] = '\0';
     s_music.status.user_name[0] = '\0';
     s_music.status.user_avatar[0] = '\0';
@@ -130,12 +135,20 @@ static void _music_service_set_account_locked(
     }
 }
 
-static void _music_service_refresh_profile(void)
+static void _music_service_refresh_profile(bool from_command)
 {
     bool needed = false;
     if (music_service_lock() == ESP_OK)
     {
-        needed = s_music.credential_valid && !s_music.profile_loaded;
+        if (!s_music.credential_valid || s_music.profile_loaded)
+        {
+            s_music.profile_requested = false;
+        }
+        else if (from_command || !s_music.profile_requested)
+        {
+            s_music.profile_requested = true;
+            needed = true;
+        }
         music_service_unlock();
     }
     if (!needed)
@@ -150,6 +163,11 @@ static void _music_service_refresh_profile(void)
                                  name, sizeof(name), avatar, sizeof(avatar));
     if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
     {
+        if (music_service_lock() == ESP_OK)
+        {
+            s_music.profile_requested = false;
+            music_service_unlock();
+        }
         return;
     }
     if (music_service_lock() != ESP_OK)
@@ -159,6 +177,7 @@ static void _music_service_refresh_profile(void)
     if (!s_music.credential_valid ||
             strcmp(s_music.credential.musicid, account) != 0)
     {
+        s_music.profile_requested = false;
         music_service_unlock();
         return;
     }
@@ -181,6 +200,7 @@ static void _music_service_refresh_profile(void)
         }
     }
     s_music.profile_loaded = true;
+    s_music.profile_requested = false;
     if (changed)
     {
         s_music.status.generation = ++s_music.generation;
@@ -396,9 +416,31 @@ void music_service_set_image(music_image_t *image, uint32_t token)
         music_service_image_release(image);
         return;
     }
-    music_image_t *old = s_music.image;
-    s_music.image = image;
-    s_music.image_token = token;
+    size_t slot = MUSIC_IMAGE_CACHE_SLOTS;
+    uint32_t oldest = UINT32_MAX;
+    for (size_t index = 0U; index < MUSIC_IMAGE_CACHE_SLOTS; ++index)
+    {
+        if (s_music.image[index] == NULL)
+        {
+            slot = index;
+            break;
+        }
+        if (music_service_image_cache_matches(
+                    s_music.image[index], image->url,
+                    image->requested_width, image->requested_height, token))
+        {
+            slot = index;
+            break;
+        }
+        if (s_music.image_used[index] < oldest)
+        {
+            oldest = s_music.image_used[index];
+            slot = index;
+        }
+    }
+    music_image_t *old = s_music.image[slot];
+    s_music.image[slot] = image;
+    s_music.image_used[slot] = ++s_music.image_clock;
     s_music.status.generation = ++s_music.generation;
     music_service_unlock();
     music_service_image_release(old);
@@ -831,6 +873,12 @@ static esp_err_t _music_service_start_queue_index(
         {
             return ESP_ERR_INVALID_STATE;
         }
+        if (url_result == ESP_ERR_NOT_FOUND)
+        {
+            /* Let the caller try the next queue entry before reporting the
+             * track as unplayable. */
+            return url_result;
+        }
         (void)music_service_handle_network_result(url_result);
         music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
         _music_service_player_error(s_music.status.failure);
@@ -885,8 +933,46 @@ static void _music_service_report_start_failure(esp_err_t result,
     {
         return;
     }
+    if (result == ESP_ERR_NOT_FOUND &&
+            _music_service_skip_unavailable(play_generation))
+    {
+        return;
+    }
     music_service_handle_network_result(result);
     _music_service_player_error(_music_service_failure_from_result(result));
+}
+
+static bool _music_service_skip_unavailable(uint32_t play_generation)
+{
+    if (music_service_lock() != ESP_OK)
+    {
+        return false;
+    }
+    const bool current = s_music.play_valid &&
+                         s_music.play_generation == play_generation &&
+                         s_music.queue != NULL;
+    const uint16_t count = s_music.player.queue_count;
+    const uint16_t index = s_music.player.queue_index;
+    const uint16_t skipped = s_music.play_skip_count;
+    const music_play_mode_t mode = s_music.player.mode;
+    music_service_unlock();
+    if (!current || count < 2U || (uint16_t)(skipped + 1U) >= count)
+    {
+        return false;
+    }
+    uint16_t next = 0U;
+    if (!music_queue_next_after_failure(count, index, mode, esp_random(),
+                                        &next))
+    {
+        return false;
+    }
+    if (music_service_lock() != ESP_OK)
+    {
+        return false;
+    }
+    s_music.play_skip_count = (uint16_t)(skipped + 1U);
+    music_service_unlock();
+    return _music_service_queue_play_internal(next, false) == ESP_OK;
 }
 
 static void _music_service_replace_queue_if_current(
@@ -1257,7 +1343,7 @@ static void _api_task(void *argument)
             music_queue_snapshot_t *old_queue = NULL;
             music_queue_snapshot_t *old_queue_view = NULL;
             music_lyric_snapshot_t *old_lyric = NULL;
-            music_image_t *old_image = NULL;
+            music_image_t *old_images[MUSIC_IMAGE_CACHE_SLOTS] = {0};
             music_image_t *old_qr = NULL;
             music_service_lock();
             memset(&s_music.credential, 0, sizeof(s_music.credential));
@@ -1274,7 +1360,7 @@ static void _api_task(void *argument)
             old_queue = s_music.queue;
             old_queue_view = _music_service_detach_queue_view_locked();
             old_lyric = s_music.lyric;
-            old_image = s_music.image;
+            memcpy(old_images, s_music.image, sizeof(old_images));
             old_qr = s_music.login_qr;
             s_music.home = NULL;
             memset(s_music.playlist, 0, sizeof(s_music.playlist));
@@ -1292,7 +1378,8 @@ static void _api_task(void *argument)
             s_music.lyric_songmid[0] = '\0';
             s_music.lyric_request_songmid[0] = '\0';
             s_music.lyric_request_id = 0U;
-            s_music.image = NULL;
+            memset(s_music.image, 0, sizeof(s_music.image));
+            memset(s_music.image_used, 0, sizeof(s_music.image_used));
             s_music.login_qr = NULL;
             s_music.play_valid = false;
             s_music.player.state = MUSIC_PLAYBACK_IDLE;
@@ -1317,7 +1404,10 @@ static void _api_task(void *argument)
             music_snapshot_release(old_queue);
             music_snapshot_release(old_queue_view);
             music_snapshot_release(old_lyric);
-            music_service_image_release(old_image);
+            for (size_t slot = 0U; slot < MUSIC_IMAGE_CACHE_SLOTS; ++slot)
+            {
+                music_service_image_release(old_images[slot]);
+            }
             music_service_login_qr_release(old_qr);
             music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
             music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_HOME, 0U);
@@ -1328,7 +1418,7 @@ static void _api_task(void *argument)
         }
         case MUSIC_API_CMD_REFRESH_PROFILE:
         {
-            _music_service_refresh_profile();
+            _music_service_refresh_profile(true);
             break;
         }
         case MUSIC_API_CMD_REFRESH_HOME:
@@ -1345,7 +1435,7 @@ static void _api_task(void *argument)
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
                                       0U);
             }
-            _music_service_refresh_profile();
+            _music_service_refresh_profile(false);
             break;
         }
         case MUSIC_API_CMD_PLAYLIST:
@@ -2182,7 +2272,10 @@ esp_err_t music_service_deinit(void)
     music_snapshot_release(s_music.queue_view);
     music_snapshot_release(s_music.lyric);
     music_service_login_qr_release(s_music.login_qr);
-    music_service_image_release(s_music.image);
+    for (size_t slot = 0U; slot < MUSIC_IMAGE_CACHE_SLOTS; ++slot)
+    {
+        music_service_image_release(s_music.image[slot]);
+    }
     music_net_clear_session();
     music_http_deinit();
     if (s_music.lock != NULL)
@@ -2518,7 +2611,12 @@ esp_err_t music_service_refresh_home(bool force)
     {
         const bool cached = s_music.home != NULL;
         const bool profile_missing = s_music.credential_valid &&
-                                     !s_music.profile_loaded;
+                                     !s_music.profile_loaded &&
+                                     !s_music.profile_requested;
+        if (cached && profile_missing)
+        {
+            s_music.profile_requested = true;
+        }
         music_service_unlock();
         if (cached)
         {
@@ -2530,9 +2628,17 @@ esp_err_t music_service_refresh_home(bool force)
             {
                 .type = MUSIC_API_CMD_REFRESH_PROFILE,
             };
-            return xQueueSend(s_music.api_queue, &profile_command,
-                              pdMS_TO_TICKS(100U)) == pdTRUE ?
-                   ESP_OK : ESP_ERR_TIMEOUT;
+            if (xQueueSend(s_music.api_queue, &profile_command,
+                           pdMS_TO_TICKS(100U)) == pdTRUE)
+            {
+                return ESP_OK;
+            }
+            if (music_service_lock() == ESP_OK)
+            {
+                s_music.profile_requested = false;
+                music_service_unlock();
+            }
+            return ESP_ERR_TIMEOUT;
         }
     }
     const music_api_command_t command =
@@ -2728,11 +2834,16 @@ esp_err_t music_service_image_acquire(const char *url, uint16_t width,
     *image = NULL;
     if (music_service_lock() == ESP_OK)
     {
-        music_image_t *current = s_music.image;
-        if (music_service_image_cache_matches(current, url, width, height,
-                                              token))
+        for (size_t slot = 0U; slot < MUSIC_IMAGE_CACHE_SLOTS; ++slot)
         {
+            music_image_t *current = s_music.image[slot];
+            if (!music_service_image_cache_matches(current, url, width,
+                                                   height, token))
+            {
+                continue;
+            }
             current = music_snapshot_retain(current);
+            s_music.image_used[slot] = ++s_music.image_clock;
             music_service_unlock();
             *image = current;
             return ESP_OK;
@@ -2887,6 +2998,7 @@ esp_err_t music_service_play_playlist(const music_playlist_ref_t *ref,
     const uint32_t play_generation =
         _music_service_next_play_generation_locked();
     s_music.player.play_generation = play_generation;
+    s_music.play_skip_count = 0U;
     music_service_unlock();
     const music_api_command_t command =
     {
@@ -2942,6 +3054,7 @@ esp_err_t music_service_play_playlist_snapshot(
     const uint32_t play_generation =
         _music_service_next_play_generation_locked();
     s_music.player.play_generation = play_generation;
+    s_music.play_skip_count = 0U;
     music_service_unlock();
     const music_api_command_t command =
     {
@@ -2975,7 +3088,8 @@ esp_err_t music_service_play_playlist_snapshot(
     return ESP_OK;
 }
 
-esp_err_t music_service_queue_play(uint16_t index)
+static esp_err_t _music_service_queue_play_internal(uint16_t index,
+        bool reset_skip)
 {
     if (s_music.api_queue == NULL)
     {
@@ -2989,6 +3103,10 @@ esp_err_t music_service_queue_play(uint16_t index)
     {
         music_service_unlock();
         return ESP_ERR_INVALID_ARG;
+    }
+    if (reset_skip)
+    {
+        s_music.play_skip_count = 0U;
     }
     const uint64_t queue_generation = s_music.queue_epoch;
     const uint32_t previous_play_generation = s_music.play_generation;
@@ -3030,6 +3148,11 @@ esp_err_t music_service_queue_play(uint16_t index)
         music_service_unlock();
     }
     return ESP_OK;
+}
+
+esp_err_t music_service_queue_play(uint16_t index)
+{
+    return _music_service_queue_play_internal(index, true);
 }
 
 esp_err_t music_service_queue_remove(uint16_t index)
@@ -3211,6 +3334,7 @@ esp_err_t music_service_stop(void)
     }
     s_music.play_valid = false;
     s_music.status.failure = MUSIC_SERVICE_FAILURE_NONE;
+    s_music.play_skip_count = 0U;
     s_music.player.play_generation = 0U;
     s_music.player.state = MUSIC_PLAYBACK_IDLE;
     s_music.player.failure = MUSIC_SERVICE_FAILURE_NONE;

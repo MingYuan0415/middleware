@@ -79,7 +79,9 @@ add_executable(music_queue_model_test
     ../../src/music_queue_model.c
 )
 target_include_directories(music_queue_model_test PRIVATE
+    ../../include
     ../../src
+    ../../../event_bus/include
     ${CMAKE_CURRENT_LIST_DIR}/../../../../../../sim/stubs/include
 )
 configure_music_host_target(music_queue_model_test)

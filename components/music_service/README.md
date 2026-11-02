@@ -23,12 +23,18 @@ audio I/O itself.
   `music_service_lyric_failed()` / `music_service_lyric_retry()`. A pending
   lyric request is deduplicated per song; a completed empty result is reported
   until the caller retries or the song changes.
-- Images: `music_service_image_acquire()` / `release()`.
+- Images: `music_service_image_acquire()` / `release()`. The service keeps a
+  small LRU of decoded images (player cover, playlist cover, and account
+  avatar) so revisiting a page reuses the decoded frame instead of downloading
+  it again.
 - Playback: `music_service_play_playlist()`, `music_service_play_playlist_snapshot()`
   (uses a playlist snapshot already held by the caller), `play_pause()`, `next()`,
   `prev()`, `set_mode()`, `stop()`, and
-  `music_service_get_player_status()`. `seek()` is reserved and currently
-  returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
+  `music_service_get_player_status()`. When a track has no playable URL, the
+  service advances to the next queue entry (repeat-one also advances) up to the
+  queue length; if every candidate is unavailable it reports `NO_PERMISSION`.
+  `seek()` is reserved and currently returns `ESP_ERR_NOT_SUPPORTED` until range
+  seeking is implemented.
 - Queue: `music_service_queue_acquire()` / `release()` expose the bounded
   materialized window around the current playback position. The snapshot
   carries the source playlist reference, logical `total`, window `offset`,
@@ -81,7 +87,9 @@ HTTP/cookie state is serialized by a dedicated mutex.
   limits. The dirId 201 liked bucket is requested with `disstid: 0` and
   `dirid: 201`; ordinary playlists send their numeric playlist id as
   `disstid`. Playlist pages are cached by reference and offset, so prefetching
-  a neighbouring page does not evict the page currently displayed.
+  a neighbouring page does not evict the page currently displayed. Playlist
+  detail requests retry once on a transient timeout or invalid response; an
+  empty page for a non-empty playlist is treated as invalid.
 - The playback queue is a logical view of the source playlist: the service
   stores the playlist reference, logical total, and a bounded materialized
   window around the current track. When playback approaches a window edge it
@@ -115,7 +123,8 @@ audio worker; no LVGL call is made from either worker.
 and maximum JSON response size. The shipped defaults are 12 KiB for the API
 worker and 16 KiB for the login worker; they reflect measured peaks of about
 8.2 KiB and 10.7 KiB. The product supplies task priorities and the default
-quality through `music_service_config_t`.
+quality through `music_service_config_t`; the shipped product requests standard
+quality (128 kbps) so first playback starts faster on constrained networks.
 
 ## Test Boundary
 

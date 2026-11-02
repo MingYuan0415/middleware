@@ -22,11 +22,15 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
   `music_service_lyric_failed()` / `music_service_lyric_retry()` 查询或清除
   已完成的空结果。同一歌曲的待处理歌词请求会去重；空结果保持到调用方重试或
   歌曲切换。
-- 图片：`music_service_image_acquire()` / `release()`。
+- 图片：`music_service_image_acquire()` / `release()`。服务保留一个小型 LRU
+  （播放器封面、歌单封面与账号头像），重新进入页面时复用已解码图片，避免重复
+  下载。
 - 播放：`music_service_play_playlist()`、
   `music_service_play_playlist_snapshot()`（复用调用方已持有的歌单快照）、
   `play_pause()`、`next()`、`prev()`、`set_mode()`、`stop()` 与
-  `music_service_get_player_status()`。`seek()` 为保留接口，范围跳转实现前返回
+  `music_service_get_player_status()`。歌曲没有可用播放 URL 时，服务会尝试
+  下一条队列项（单曲循环也会前进），最多尝试整个队列；全部不可用时报告
+  `NO_PERMISSION`。`seek()` 为保留接口，范围跳转实现前返回
   `ESP_ERR_NOT_SUPPORTED`。
 - 队列：`music_service_queue_acquire()` / `release()` 暴露当前播放位置附近
   有界物化窗口；快照携带来源歌单引用、逻辑 `total`、窗口 `offset` 与窗口
@@ -68,7 +72,8 @@ API 与登录 worker 栈保留在内部 RAM，因为凭证保存/删除要经过
   按需请求，不在每次网络就绪时预取；歌单详情、歌词与队列请求受公共头文件上限
   约束。dirId 201 的“我喜欢”以 `disstid: 0`、`dirid: 201` 请求，普通歌单以数字
   playlist id 作为 `disstid`。歌单页按引用与 offset 缓存，预取相邻页不会挤掉当前
-  正在显示的页面。
+  正在显示的页面。歌单详情请求遇到瞬时超时或无效响应会重试一次；非空歌单返回
+  空页面时按无效响应处理。
 - 播放队列是来源歌单的逻辑视图：服务保存歌单引用、逻辑总数以及当前歌曲附近
   的有界物化窗口。播放接近窗口边界时预取服务端下一页；`next`、`prev`、自动
   续播和 `queue_play` 在需要时按需拉取缺失页。本地队列移除用位图记录，并在后续
@@ -93,7 +98,8 @@ API 与登录 worker 栈保留在内部 RAM，因为凭证保存/删除要经过
 
 `Kconfig` 定义 API/登录/音频 worker 栈、命令队列深度与最大 JSON 响应；发布默认
 为 API 12 KiB、登录 16 KiB，对应实测峰值约 8.2 KiB 与 10.7 KiB。产品通过
-`music_service_config_t` 提供任务优先级与默认音质。
+`music_service_config_t` 提供任务优先级与默认音质；发布产品默认请求标准音质
+（128 kbps），以改善受限网络下的首次播放启动时间。
 
 ## 测试边界
 

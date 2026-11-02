@@ -491,9 +491,10 @@ static uint64_t _playlist_disstid(const music_playlist_ref_t *ref)
     return ref->id;
 }
 
-esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
-                                   uint16_t offset, uint16_t count,
-                                   music_playlist_snapshot_t **snapshot)
+static esp_err_t _music_net_fetch_playlist_once(
+    const music_playlist_ref_t *ref,
+    uint16_t offset, uint16_t count,
+    music_playlist_snapshot_t **snapshot)
 {
     if (ref == NULL || snapshot == NULL || count == 0U ||
             count > MUSIC_SERVICE_MAX_SONGS)
@@ -593,6 +594,45 @@ esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
     cJSON_Delete(root);
     *snapshot = playlist;
     return ESP_OK;
+}
+
+esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
+                                   uint16_t offset, uint16_t count,
+                                   music_playlist_snapshot_t **snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *snapshot = NULL;
+    esp_err_t result = ESP_ERR_INVALID_RESPONSE;
+    for (unsigned attempt = 0U; attempt < 2U; ++attempt)
+    {
+        music_playlist_snapshot_t *page = NULL;
+        result = _music_net_fetch_playlist_once(ref, offset, count, &page);
+        if (result == ESP_OK && page != NULL &&
+                (page->count > 0U || page->total <= offset))
+        {
+            *snapshot = page;
+            return ESP_OK;
+        }
+        if (result == ESP_OK)
+        {
+            /* A missing song list for a non-empty playlist is a transient
+             * provider response, not an empty playlist. */
+            music_snapshot_release(page);
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        if (attempt == 0U &&
+                (result == ESP_ERR_TIMEOUT ||
+                 result == ESP_ERR_INVALID_RESPONSE))
+        {
+            LOG_W("playlist fetch retry after %s", esp_err_to_name(result));
+            continue;
+        }
+        return result;
+    }
+    return result;
 }
 
 static void _song_filename(const music_song_t *song, music_quality_t quality,
@@ -755,21 +795,15 @@ esp_err_t music_net_fetch_song_url(const music_song_t *song,
     }
     music_quality_t attempts[3];
     size_t attempt_count = 0U;
-    if (quality == MUSIC_QUALITY_LOSSLESS)
+    if (quality == MUSIC_QUALITY_LOSSLESS && song->size_flac > 0U)
     {
         attempts[attempt_count++] = MUSIC_QUALITY_LOSSLESS;
-        attempts[attempt_count++] = MUSIC_QUALITY_HIGH;
-        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
     }
-    else if (quality == MUSIC_QUALITY_HIGH)
+    if (quality >= MUSIC_QUALITY_HIGH && song->size_320 > 0U)
     {
         attempts[attempt_count++] = MUSIC_QUALITY_HIGH;
-        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
     }
-    else
-    {
-        attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
-    }
+    attempts[attempt_count++] = MUSIC_QUALITY_STANDARD;
 
     esp_err_t last_error = ESP_ERR_NOT_FOUND;
     for (size_t index = 0U; index < attempt_count; ++index)
