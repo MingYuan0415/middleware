@@ -27,4 +27,71 @@ esp_err_t music_queue_after_remove(uint16_t count, uint16_t current,
                                    uint16_t removed,
                                    music_queue_transition_t *result);
 
+/**
+ * @brief Compute a bounded window start that contains one queue index.
+ *
+ * The window prefers one page of context before the focused index and clamps
+ * itself to the queue tail so the returned window never exceeds the queue.
+ *
+ * @param index is the logical queue index that must be covered.
+ * @param total is the logical queue length.
+ * @param window_size is the maximum number of entries in one window.
+ * @param page_size is the provider page size used to keep the window aligned.
+ * @return Window start index, or 0 for invalid/empty input.
+ */
+uint16_t music_queue_window_start(uint16_t index, uint16_t total,
+                                  uint16_t window_size, uint16_t page_size);
+
+/** @brief Whether [offset, offset + count) contains one queue index. */
+bool music_queue_window_contains(uint16_t offset, uint16_t count,
+                                 uint16_t index);
+
+/** @brief Number of provider pages needed for a queue length. */
+uint16_t music_queue_page_count(uint16_t total, uint16_t page_size);
+
+/** @brief Provider page containing one logical queue index. */
+uint16_t music_queue_page_for_index(uint16_t index, uint16_t page_size);
+
+/**
+ * @brief Whether one source playlist index has been removed from the queue.
+ *
+ * @param removed is the removal bitmap, least-significant bit first.
+ * @param source_total is the original playlist length.
+ * @param source_index is the source playlist index.
+ */
+bool music_queue_source_is_removed(const uint8_t *removed,
+                                   uint16_t source_total,
+                                   uint16_t source_index);
+
+/**
+ * @brief Map a logical queue index to its source playlist index.
+ *
+ * Removed source entries are skipped. Returns false when the logical index is
+ * outside the remaining queue.
+ *
+ * @param source_total is the original playlist length.
+ * @param removed is the removal bitmap.
+ * @param logical is the logical queue index.
+ * @param source receives the source playlist index.
+ */
+bool music_queue_logical_to_source(uint16_t source_total,
+                                   const uint8_t *removed,
+                                   uint16_t logical,
+                                   uint16_t *source);
+
+/**
+ * @brief Map a source playlist index to its logical queue index.
+ *
+ * Returns false when the source entry is removed or outside the source range.
+ *
+ * @param source_total is the original playlist length.
+ * @param removed is the removal bitmap.
+ * @param source is the source playlist index.
+ * @param logical receives the logical queue index.
+ */
+bool music_queue_source_to_logical(uint16_t source_total,
+                                   const uint8_t *removed,
+                                   uint16_t source,
+                                   uint16_t *logical);
+
 #endif /* __MUSIC_QUEUE_MODEL_H__ */

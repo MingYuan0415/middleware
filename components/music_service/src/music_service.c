@@ -434,27 +434,55 @@ static esp_err_t _music_service_ensure_stream(void)
     return result == ESP_ERR_INVALID_STATE ? ESP_OK : result;
 }
 
-static music_queue_snapshot_t *_music_service_queue_alloc(uint16_t count)
+static music_queue_snapshot_t *_music_service_queue_alloc(
+    const music_playlist_ref_t *ref, uint16_t total, uint16_t offset,
+    uint16_t count)
 {
+    if (ref == NULL || count == 0U || total == 0U || offset >= total ||
+            count > (uint16_t)(total - offset))
+    {
+        return NULL;
+    }
     const size_t bytes = offsetof(music_queue_snapshot_t, songs) +
                          (size_t)count * sizeof(music_song_t);
     music_queue_snapshot_t *queue = music_snapshot_alloc(bytes, NULL);
     if (queue != NULL)
     {
         queue->generation = music_service_next_generation();
+        queue->ref = *ref;
+        queue->total = total;
+        queue->offset = offset;
         queue->count = count;
     }
     return queue;
 }
 
-static music_queue_snapshot_t *_music_service_queue_from_playlist(
-    const music_playlist_snapshot_t *playlist, uint16_t count)
+static music_queue_snapshot_t *_music_service_queue_from_playlist_snapshot(
+    const music_playlist_snapshot_t *playlist)
 {
-    if (playlist == NULL || count == 0U || count > playlist->count)
+    if (playlist == NULL || playlist->count == 0U)
     {
         return NULL;
     }
-    music_queue_snapshot_t *queue = _music_service_queue_alloc(count);
+    uint32_t total = playlist->total;
+    if (total == 0U)
+    {
+        total = (uint32_t)playlist->offset + playlist->count;
+    }
+    if (total > MUSIC_SERVICE_MAX_QUEUE_TRACKS ||
+            playlist->offset >= total)
+    {
+        return NULL;
+    }
+    uint16_t count = playlist->count;
+    if ((uint32_t)playlist->offset + count > total)
+    {
+        count = (uint16_t)(total - playlist->offset);
+    }
+    music_queue_snapshot_t *queue = _music_service_queue_alloc(
+                                        &playlist->playlist.ref,
+                                        (uint16_t)total, playlist->offset,
+                                        count);
     if (queue != NULL)
     {
         memcpy(queue->songs, playlist->songs,
@@ -463,35 +491,181 @@ static music_queue_snapshot_t *_music_service_queue_from_playlist(
     return queue;
 }
 
-static music_queue_snapshot_t *_music_service_queue_without(
-    const music_queue_snapshot_t *queue, uint16_t removed)
+/**
+ * @brief Materialize a logical queue range from the source playlist.
+ *
+ * The provider is paged by source playlist offset. Removed source entries are
+ * filtered before they enter the returned snapshot.
+ */
+static esp_err_t _music_service_queue_build_view(
+    const music_playlist_ref_t *ref, uint16_t source_total,
+    const uint8_t *removed, uint16_t removed_count, uint16_t total,
+    uint16_t offset, uint16_t count, music_queue_snapshot_t **snapshot)
 {
-    if (queue == NULL || removed >= queue->count)
+    if (ref == NULL || removed == NULL || snapshot == NULL || count == 0U ||
+            offset >= total || total > source_total)
     {
-        return NULL;
+        return ESP_ERR_INVALID_ARG;
     }
-    const uint16_t count = (uint16_t)(queue->count - 1U);
-    music_queue_snapshot_t *next = _music_service_queue_alloc(count);
-    if (next == NULL)
+    *snapshot = NULL;
+    if (count > (uint16_t)(total - offset))
     {
-        return NULL;
+        count = (uint16_t)(total - offset);
     }
-    if (removed > 0U)
+    uint16_t source_cursor = 0U;
+    if (!music_queue_logical_to_source(source_total, removed, offset,
+                                       &source_cursor))
     {
-        memcpy(next->songs, queue->songs,
-               (size_t)removed * sizeof(next->songs[0]));
+        return ESP_ERR_INVALID_ARG;
     }
-    if (removed + 1U < queue->count)
+    music_queue_snapshot_t *view = _music_service_queue_alloc(
+                                       ref, total, offset, count);
+    if (view == NULL)
     {
-        memcpy(&next->songs[removed], &queue->songs[removed + 1U],
-               (size_t)(queue->count - removed - 1U) *
-               sizeof(next->songs[0]));
+        return ESP_ERR_NO_MEM;
     }
-    return next;
+    uint16_t produced = 0U;
+    uint32_t pages = 0U;
+    while (produced < count && source_cursor < source_total)
+    {
+        uint32_t fetch = (uint32_t)(count - produced) + removed_count;
+        if (fetch > MUSIC_SERVICE_MAX_SONGS)
+        {
+            fetch = MUSIC_SERVICE_MAX_SONGS;
+        }
+        music_playlist_snapshot_t *page = NULL;
+        const esp_err_t fetch_result = music_net_fetch_playlist(
+                                           ref, source_cursor,
+                                           (uint16_t)fetch, &page);
+        if (fetch_result != ESP_OK)
+        {
+            music_snapshot_release(view);
+            return fetch_result;
+        }
+        if (page == NULL || page->count == 0U)
+        {
+            const uint32_t page_total = page != NULL ? page->total : 0U;
+            music_snapshot_release(page);
+            if (page_total <= source_cursor ||
+                    source_cursor >= source_total)
+            {
+                break;
+            }
+            music_snapshot_release(view);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        for (uint16_t index = 0U; index < page->count &&
+                produced < count; ++index)
+        {
+            const uint32_t source_index = (uint32_t)page->offset + index;
+            if (source_index >= source_total)
+            {
+                break;
+            }
+            if (music_queue_source_is_removed(removed, source_total,
+                                              (uint16_t)source_index))
+            {
+                continue;
+            }
+            view->songs[produced++] = page->songs[index];
+        }
+        source_cursor = (uint16_t)(page->offset + page->count);
+        music_snapshot_release(page);
+        if (++pages > 32U)
+        {
+            music_snapshot_release(view);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    if (produced == 0U ||
+            ((uint32_t)offset + produced < total &&
+             source_cursor >= source_total))
+    {
+        music_snapshot_release(view);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    view->count = produced;
+    *snapshot = view;
+    return ESP_OK;
+}
+
+static music_queue_snapshot_t *_music_service_detach_queue_view_locked(void)
+{
+    music_queue_snapshot_t *old = s_music.queue_view;
+    s_music.queue_view = NULL;
+    s_music.queue_view_offset = 0U;
+    s_music.queue_view_count = 0U;
+    s_music.queue_view_pending_offset = 0U;
+    s_music.queue_view_pending_count = 0U;
+    s_music.queue_view_epoch = 0U;
+    s_music.queue_view_pending = false;
+    return old;
+}
+
+static void _music_service_queue_install_source(music_queue_snapshot_t *queue,
+        uint16_t source_total)
+{
+    if (queue == NULL)
+    {
+        return;
+    }
+    music_queue_snapshot_t *old_queue = NULL;
+    music_queue_snapshot_t *old_view = NULL;
+    if (music_service_lock() != ESP_OK)
+    {
+        music_snapshot_release(queue);
+        return;
+    }
+    old_queue = s_music.queue;
+    old_view = _music_service_detach_queue_view_locked();
+    s_music.queue = queue;
+    s_music.queue_source_total = source_total;
+    s_music.queue_total = source_total;
+    s_music.queue_removed_count = 0U;
+    memset(s_music.queue_removed, 0, sizeof(s_music.queue_removed));
+    ++s_music.queue_epoch;
+    if (s_music.queue_epoch == 0U)
+    {
+        ++s_music.queue_epoch;
+    }
+    music_service_unlock();
+    music_snapshot_release(old_queue);
+    music_snapshot_release(old_view);
+    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
+}
+
+void music_service_replace_queue_view(music_queue_snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return;
+    }
+    if (music_service_lock() != ESP_OK)
+    {
+        music_snapshot_release(snapshot);
+        return;
+    }
+    if (s_music.queue == NULL || snapshot->total != s_music.queue_total)
+    {
+        music_service_unlock();
+        music_snapshot_release(snapshot);
+        return;
+    }
+    music_queue_snapshot_t *old = s_music.queue_view;
+    s_music.queue_view = snapshot;
+    s_music.queue_view_offset = snapshot->offset;
+    s_music.queue_view_count = snapshot->count;
+    s_music.queue_view_pending_offset = 0U;
+    s_music.queue_view_pending_count = 0U;
+    s_music.queue_view_epoch = s_music.queue_epoch;
+    s_music.queue_view_pending = false;
+    music_service_unlock();
+    music_snapshot_release(old);
+    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
 }
 
 static void _music_service_set_queue_player(const music_song_t *song,
-        uint16_t index, uint16_t count, uint32_t play_generation)
+        uint16_t index, uint16_t total, uint32_t play_generation)
 {
     music_service_lock();
     if (!s_music.play_valid ||
@@ -514,7 +688,7 @@ static void _music_service_set_queue_player(const music_song_t *song,
     s_music.player.duration_ms = song->duration_ms;
     s_music.player.quality = s_music.config.default_quality;
     s_music.player.queue_index = index;
-    s_music.player.queue_count = count;
+    s_music.player.queue_count = total;
     s_music.player.play_generation = play_generation;
     s_music.status.generation = ++s_music.generation;
     s_music.player.generation = s_music.status.generation;
@@ -549,14 +723,16 @@ static esp_err_t _music_service_start_queue_index(
     const music_queue_snapshot_t *queue, uint16_t index,
     uint32_t play_generation)
 {
-    if (queue == NULL || index >= queue->count ||
+    if (queue == NULL || !music_queue_window_contains(queue->offset,
+            queue->count, index) ||
             play_generation == 0U || !_music_service_playback_current(play_generation))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    const music_song_t *song = &queue->songs[index];
+    const uint16_t local_index = (uint16_t)(index - queue->offset);
+    const music_song_t *song = &queue->songs[local_index];
     (void)music_stream_stop();
-    _music_service_set_queue_player(song, index, queue->count,
+    _music_service_set_queue_player(song, index, queue->total,
                                     play_generation);
     char url[MUSIC_SERVICE_URL_BYTES];
     music_quality_t actual_quality = s_music.config.default_quality;
@@ -613,6 +789,86 @@ static esp_err_t _music_service_start_queue_index(
     _music_log_api_stack("play");
     music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
     return ESP_OK;
+}
+
+static void _music_service_replace_queue_if_current(
+    music_queue_snapshot_t *queue, uint64_t queue_epoch,
+    uint32_t play_generation)
+{
+    if (queue == NULL)
+    {
+        return;
+    }
+    if (music_service_lock() != ESP_OK)
+    {
+        music_snapshot_release(queue);
+        return;
+    }
+    if (!s_music.play_valid || s_music.play_generation != play_generation ||
+            s_music.queue_epoch != queue_epoch)
+    {
+        music_service_unlock();
+        music_snapshot_release(queue);
+        return;
+    }
+    music_queue_snapshot_t *old = s_music.queue;
+    s_music.queue = queue;
+    music_service_unlock();
+    music_snapshot_release(old);
+    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
+}
+
+static void _music_service_queue_prefetch_window(uint32_t play_generation)
+{
+    music_playlist_ref_t ref = {0};
+    uint16_t source_total = 0U;
+    uint16_t total = 0U;
+    uint16_t removed_count = 0U;
+    uint16_t index = 0U;
+    uint64_t queue_epoch = 0U;
+    if (music_service_lock() != ESP_OK)
+    {
+        return;
+    }
+    if (!s_music.play_valid || s_music.queue == NULL ||
+            s_music.play_generation != play_generation)
+    {
+        music_service_unlock();
+        return;
+    }
+    ref = s_music.queue->ref;
+    source_total = s_music.queue_source_total;
+    total = s_music.queue_total;
+    removed_count = s_music.queue_removed_count;
+    index = s_music.player.queue_index;
+    queue_epoch = s_music.queue_epoch;
+    const uint16_t window_end = (uint16_t)(s_music.queue->offset +
+                                           s_music.queue->count);
+    if (window_end >= total || index + 5U < window_end)
+    {
+        music_service_unlock();
+        return;
+    }
+    music_service_unlock();
+
+    const uint16_t focus = index + 5U < total ? (uint16_t)(index + 5U) : index;
+    const uint16_t offset = music_queue_window_start(
+                                focus, total, MUSIC_SERVICE_QUEUE_WINDOW_SONGS,
+                                MUSIC_SERVICE_QUEUE_FETCH_PAGE);
+    const uint16_t count = total - offset > MUSIC_SERVICE_QUEUE_WINDOW_SONGS ?
+                           MUSIC_SERVICE_QUEUE_WINDOW_SONGS :
+                           (uint16_t)(total - offset);
+    music_queue_snapshot_t *window = NULL;
+    const esp_err_t result = _music_service_queue_build_view(
+                                 &ref, source_total, s_music.queue_removed,
+                                 removed_count, total, offset, count, &window);
+    if (result != ESP_OK)
+    {
+        LOG_W("queue prefetch failed: %s", esp_err_to_name(result));
+        return;
+    }
+    _music_service_replace_queue_if_current(window, queue_epoch,
+                                            play_generation);
 }
 
 static bool _music_service_login_set_state(uint32_t session,
@@ -893,6 +1149,7 @@ static void _api_task(void *argument)
             music_playlist_snapshot_t *old_playlists[MUSIC_PLAYLIST_CACHE_SLOTS] =
             {0};
             music_queue_snapshot_t *old_queue = NULL;
+            music_queue_snapshot_t *old_queue_view = NULL;
             music_lyric_snapshot_t *old_lyric = NULL;
             music_image_t *old_image = NULL;
             music_image_t *old_qr = NULL;
@@ -910,12 +1167,22 @@ static void _api_task(void *argument)
             old_home = s_music.home;
             memcpy(old_playlists, s_music.playlist, sizeof(old_playlists));
             old_queue = s_music.queue;
+            old_queue_view = _music_service_detach_queue_view_locked();
             old_lyric = s_music.lyric;
             old_image = s_music.image;
             old_qr = s_music.login_qr;
             s_music.home = NULL;
             memset(s_music.playlist, 0, sizeof(s_music.playlist));
             s_music.queue = NULL;
+            s_music.queue_total = 0U;
+            s_music.queue_source_total = 0U;
+            s_music.queue_removed_count = 0U;
+            memset(s_music.queue_removed, 0, sizeof(s_music.queue_removed));
+            ++s_music.queue_epoch;
+            if (s_music.queue_epoch == 0U)
+            {
+                ++s_music.queue_epoch;
+            }
             s_music.lyric = NULL;
             s_music.image = NULL;
             s_music.login_qr = NULL;
@@ -940,6 +1207,7 @@ static void _api_task(void *argument)
                 music_snapshot_release(old_playlists[slot]);
             }
             music_snapshot_release(old_queue);
+            music_snapshot_release(old_queue_view);
             music_snapshot_release(old_lyric);
             music_service_image_release(old_image);
             music_service_login_qr_release(old_qr);
@@ -1036,10 +1304,14 @@ static void _api_task(void *argument)
             {
                 break;
             }
+            const uint16_t fetch_offset = (uint16_t)(
+                                              requested_index -
+                                              requested_index %
+                                              MUSIC_SERVICE_QUEUE_FETCH_PAGE);
             music_playlist_snapshot_t *playlist = NULL;
             const esp_err_t fetch_result = music_net_fetch_playlist(
-                                               &command->playlist, 0U,
-                                               MUSIC_SERVICE_MAX_SONGS,
+                                               &command->playlist, fetch_offset,
+                                               MUSIC_SERVICE_QUEUE_WINDOW_SONGS,
                                                &playlist);
             if (fetch_result != ESP_OK || playlist == NULL ||
                     playlist->count == 0U)
@@ -1058,7 +1330,11 @@ static void _api_task(void *argument)
                 music_snapshot_release(playlist);
                 break;
             }
-            if (requested_index >= playlist->count)
+            const uint32_t total = playlist->total != 0U ? playlist->total :
+                                   (uint32_t)playlist->offset +
+                                   playlist->count;
+            if (requested_index >= total ||
+                    total > MUSIC_SERVICE_MAX_QUEUE_TRACKS)
             {
                 music_snapshot_release(playlist);
                 music_service_handle_network_result(ESP_ERR_INVALID_ARG);
@@ -1068,7 +1344,7 @@ static void _api_task(void *argument)
                 break;
             }
             music_queue_snapshot_t *queue =
-                _music_service_queue_from_playlist(playlist, playlist->count);
+                _music_service_queue_from_playlist_snapshot(playlist);
             music_snapshot_release(playlist);
             if (queue == NULL)
             {
@@ -1078,12 +1354,17 @@ static void _api_task(void *argument)
                 _music_service_player_error(MUSIC_SERVICE_FAILURE_INTERNAL);
                 break;
             }
-            music_service_replace_queue(queue);
+            _music_service_queue_install_source(queue, (uint16_t)total);
             music_service_lock();
             s_music.play_valid = true;
             music_service_unlock();
-            (void)_music_service_start_queue_index(queue, requested_index,
-                                                   play_generation);
+            const esp_err_t start_result = _music_service_start_queue_index(
+                                               queue, requested_index,
+                                               play_generation);
+            if (start_result == ESP_OK)
+            {
+                _music_service_queue_prefetch_window(play_generation);
+            }
             break;
         }
         case MUSIC_API_CMD_PLAY_SNAPSHOT:
@@ -1105,8 +1386,21 @@ static void _api_task(void *argument)
                 _music_service_player_error(MUSIC_SERVICE_FAILURE_API);
                 break;
             }
+            const uint32_t total = playlist->total != 0U ? playlist->total :
+                                   (uint32_t)playlist->offset +
+                                   playlist->count;
+            const uint32_t absolute = (uint32_t)playlist->offset +
+                                      requested_index;
+            if (total > MUSIC_SERVICE_MAX_QUEUE_TRACKS || absolute >= total)
+            {
+                music_snapshot_release(playlist);
+                music_service_handle_network_result(ESP_ERR_INVALID_ARG);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
+                _music_service_player_error(MUSIC_SERVICE_FAILURE_API);
+                break;
+            }
             music_queue_snapshot_t *queue =
-                _music_service_queue_from_playlist(playlist, playlist->count);
+                _music_service_queue_from_playlist_snapshot(playlist);
             music_snapshot_release(playlist);
             if (queue == NULL)
             {
@@ -1115,12 +1409,17 @@ static void _api_task(void *argument)
                 _music_service_player_error(MUSIC_SERVICE_FAILURE_INTERNAL);
                 break;
             }
-            music_service_replace_queue(queue);
+            _music_service_queue_install_source(queue, (uint16_t)total);
             music_service_lock();
             s_music.play_valid = true;
             music_service_unlock();
-            (void)_music_service_start_queue_index(queue, requested_index,
-                                                   play_generation);
+            const esp_err_t start_result = _music_service_start_queue_index(
+                                               queue, (uint16_t)absolute,
+                                               play_generation);
+            if (start_result == ESP_OK)
+            {
+                _music_service_queue_prefetch_window(play_generation);
+            }
             break;
         }
         case MUSIC_API_CMD_QUEUE_PLAY:
@@ -1135,22 +1434,71 @@ static void _api_task(void *argument)
             music_service_lock();
             music_queue_snapshot_t *queue =
                 music_snapshot_retain(s_music.queue);
+            const uint16_t total = s_music.queue_total;
+            const uint16_t source_total = s_music.queue_source_total;
+            const uint16_t removed_count = s_music.queue_removed_count;
+            const uint64_t queue_epoch = s_music.queue_epoch;
+            music_playlist_ref_t ref = {0};
+            if (queue != NULL)
+            {
+                ref = queue->ref;
+            }
             music_service_unlock();
-            if (queue == NULL || index >= queue->count ||
+            if (queue == NULL || index >= total ||
                     (command->queue_generation != 0U &&
-                     queue->generation != command->queue_generation))
+                     command->queue_generation != queue_epoch))
             {
                 music_snapshot_release(queue);
                 music_service_handle_network_result(ESP_ERR_INVALID_STATE);
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
                 break;
             }
+            if (!music_queue_window_contains(queue->offset, queue->count, index))
+            {
+                music_snapshot_release(queue);
+                const uint16_t offset = music_queue_window_start(
+                                            index, total,
+                                            MUSIC_SERVICE_QUEUE_WINDOW_SONGS,
+                                            MUSIC_SERVICE_QUEUE_FETCH_PAGE);
+                const uint16_t count = total - offset >
+                                       MUSIC_SERVICE_QUEUE_WINDOW_SONGS ?
+                                       MUSIC_SERVICE_QUEUE_WINDOW_SONGS :
+                                       (uint16_t)(total - offset);
+                music_queue_snapshot_t *window = NULL;
+                const esp_err_t fetch_result =
+                    _music_service_queue_build_view(
+                        &ref, source_total, s_music.queue_removed, removed_count,
+                        total, offset, count, &window);
+                if (fetch_result != ESP_OK)
+                {
+                    music_service_handle_network_result(fetch_result);
+                    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
+                                          0U);
+                    _music_service_player_error(
+                        _music_service_failure_from_result(fetch_result));
+                    break;
+                }
+                if (music_service_lock() != ESP_OK ||
+                        s_music.queue_epoch != queue_epoch)
+                {
+                    music_service_unlock();
+                    music_snapshot_release(window);
+                    break;
+                }
+                music_service_unlock();
+                queue = music_snapshot_retain(window);
+                music_service_replace_queue(window);
+            }
             music_service_lock();
             s_music.play_valid = true;
             music_service_unlock();
-            (void)_music_service_start_queue_index(queue, index,
-                                                   play_generation);
+            const esp_err_t start_result = _music_service_start_queue_index(
+                                               queue, index, play_generation);
             music_snapshot_release(queue);
+            if (start_result == ESP_OK)
+            {
+                _music_service_queue_prefetch_window(play_generation);
+            }
             break;
         }
         case MUSIC_API_CMD_QUEUE_REMOVE:
@@ -1163,41 +1511,60 @@ static void _api_task(void *argument)
                 break;
             }
             music_service_lock();
-            music_queue_snapshot_t *queue =
-                music_snapshot_retain(s_music.queue);
+            const uint16_t source_total = s_music.queue_source_total;
+            const uint16_t old_total = s_music.queue_total;
+            const uint16_t old_removed_count = s_music.queue_removed_count;
             const uint16_t current = s_music.player.queue_index;
             const bool play_valid = s_music.play_valid;
             const music_playback_state_t player_state = s_music.player.state;
+            const uint64_t queue_epoch = s_music.queue_epoch;
+            music_playlist_ref_t ref = {0};
+            if (s_music.queue != NULL)
+            {
+                ref = s_music.queue->ref;
+            }
             music_service_unlock();
             music_queue_transition_t transition;
-            if (queue == NULL ||
-                    (command->queue_generation != 0U &&
-                     queue->generation != command->queue_generation) ||
-                    music_queue_after_remove(queue->count, current, removed,
+            uint16_t removed_source = 0U;
+            if ((command->queue_generation != 0U &&
+                    command->queue_generation != queue_epoch) ||
+                    removed >= old_total ||
+                    !music_queue_logical_to_source(source_total,
+                                                   s_music.queue_removed, removed,
+                                                   &removed_source) ||
+                    music_queue_after_remove(old_total, current, removed,
                                              &transition) != ESP_OK)
             {
-                music_snapshot_release(queue);
                 music_service_handle_network_result(ESP_ERR_INVALID_STATE);
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
                 break;
             }
-            music_queue_snapshot_t *next =
-                _music_service_queue_without(queue, removed);
-            music_snapshot_release(queue);
-            if (next == NULL)
-            {
-                music_service_handle_network_result(ESP_ERR_NO_MEM);
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
-                                      0U);
-                break;
-            }
-            music_service_replace_queue(next);
             if (transition.count == 0U)
             {
                 (void)music_stream_stop();
                 atomic_store_explicit(&s_playing, false,
                                       memory_order_release);
+                music_queue_snapshot_t *old_queue = NULL;
+                music_queue_snapshot_t *old_view = NULL;
                 music_service_lock();
+                if (s_music.queue_epoch != queue_epoch)
+                {
+                    music_service_unlock();
+                    break;
+                }
+                old_queue = s_music.queue;
+                old_view = _music_service_detach_queue_view_locked();
+                s_music.queue = NULL;
+                s_music.queue_total = 0U;
+                s_music.queue_source_total = 0U;
+                s_music.queue_removed_count = 0U;
+                memset(s_music.queue_removed, 0, sizeof(s_music.queue_removed));
+                ++s_music.queue_epoch;
+                if (s_music.queue_epoch == 0U)
+                {
+                    ++s_music.queue_epoch;
+                }
+                s_music.play_valid = false;
                 s_music.player.state = MUSIC_PLAYBACK_IDLE;
                 s_music.player.failure = MUSIC_SERVICE_FAILURE_NONE;
                 s_music.player.position_ms = 0U;
@@ -1209,22 +1576,91 @@ static void _api_task(void *argument)
                 s_music.player.cover_url[0] = '\0';
                 s_music.player.songmid[0] = '\0';
                 s_music.player.play_generation = 0U;
-                s_music.play_valid = false;
                 music_service_unlock();
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER,
-                                      0U);
+                music_snapshot_release(old_queue);
+                music_snapshot_release(old_view);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
+                break;
+            }
+
+            uint8_t *removed_map = heap_caps_malloc(
+                                       MUSIC_SERVICE_QUEUE_REMOVAL_BYTES,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (removed_map == NULL)
+            {
+                music_service_handle_network_result(ESP_ERR_NO_MEM);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
                 break;
             }
             music_service_lock();
+            memcpy(removed_map, s_music.queue_removed,
+                   sizeof(s_music.queue_removed));
+            music_service_unlock();
+            removed_map[removed_source / 8U] |=
+                (uint8_t)(1U << (removed_source % 8U));
+            const uint16_t offset = music_queue_window_start(
+                                        transition.index, transition.count,
+                                        MUSIC_SERVICE_QUEUE_WINDOW_SONGS,
+                                        MUSIC_SERVICE_QUEUE_FETCH_PAGE);
+            const uint16_t count = transition.count - offset >
+                                   MUSIC_SERVICE_QUEUE_WINDOW_SONGS ?
+                                   MUSIC_SERVICE_QUEUE_WINDOW_SONGS :
+                                   (uint16_t)(transition.count - offset);
+            music_queue_snapshot_t *next = NULL;
+            const esp_err_t build_result = _music_service_queue_build_view(
+                                               &ref, source_total, removed_map,
+                                               (uint16_t)(old_removed_count + 1U),
+                                               transition.count, offset, count,
+                                               &next);
+            if (build_result != ESP_OK)
+            {
+                heap_caps_free(removed_map);
+                music_service_handle_network_result(build_result);
+                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
+                break;
+            }
+            music_queue_snapshot_t *old_queue = NULL;
+            music_queue_snapshot_t *old_view = NULL;
+            music_service_lock();
+            if (s_music.queue_epoch != queue_epoch)
+            {
+                music_service_unlock();
+                heap_caps_free(removed_map);
+                music_snapshot_release(next);
+                break;
+            }
+            memcpy(s_music.queue_removed, removed_map,
+                   sizeof(s_music.queue_removed));
+            s_music.queue_removed_count = (uint16_t)(old_removed_count + 1U);
+            s_music.queue_total = transition.count;
+            ++s_music.queue_epoch;
+            if (s_music.queue_epoch == 0U)
+            {
+                ++s_music.queue_epoch;
+            }
+            old_queue = s_music.queue;
+            old_view = _music_service_detach_queue_view_locked();
+            s_music.queue = next;
             s_music.player.queue_index = transition.index;
             s_music.player.queue_count = transition.count;
             music_service_unlock();
+            heap_caps_free(removed_map);
+            music_snapshot_release(old_queue);
+            music_snapshot_release(old_view);
+            music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
+            music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
             if (transition.restart && play_valid &&
                     (player_state == MUSIC_PLAYBACK_PLAYING ||
                      player_state == MUSIC_PLAYBACK_BUFFERING))
             {
-                (void)_music_service_start_queue_index(
-                    next, transition.index, play_generation);
+                const esp_err_t start_result =
+                    _music_service_start_queue_index(next, transition.index,
+                                                     play_generation);
+                if (start_result == ESP_OK)
+                {
+                    _music_service_queue_prefetch_window(play_generation);
+                }
             }
             else if (transition.restart && play_valid &&
                      player_state == MUSIC_PLAYBACK_PAUSED)
@@ -1247,10 +1683,72 @@ static void _api_task(void *argument)
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER,
                                       0U);
             }
+            break;
+        }
+        case MUSIC_API_CMD_QUEUE_VIEW:
+        {
+            const uint16_t offset = (uint16_t)command->offset;
+            const uint16_t count = (uint16_t)command->count;
+            const uint64_t queue_epoch = command->queue_generation;
+            music_playlist_ref_t ref = {0};
+            const uint8_t *removed = NULL;
+            uint16_t source_total = 0U;
+            uint16_t removed_count = 0U;
+            uint16_t total = 0U;
+            bool epoch_ok = false;
+            music_service_lock();
+            if (s_music.queue_epoch == queue_epoch)
+            {
+                epoch_ok = true;
+                if (s_music.queue != NULL)
+                {
+                    ref = s_music.queue->ref;
+                    source_total = s_music.queue_source_total;
+                    removed_count = s_music.queue_removed_count;
+                    total = s_music.queue_total;
+                    removed = s_music.queue_removed;
+                }
+            }
+            music_service_unlock();
+            if (!epoch_ok)
+            {
+                break;
+            }
+            if (removed == NULL || offset >= total)
+            {
+                music_service_publish_detail(
+                    MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U,
+                    MUSIC_SERVICE_FAILURE_INTERNAL);
+                break;
+            }
+            music_queue_snapshot_t *view = NULL;
+            const esp_err_t result = _music_service_queue_build_view(
+                                         &ref, source_total, removed,
+                                         removed_count, total, offset, count,
+                                         &view);
+            if (result == ESP_OK)
+            {
+                if (music_service_lock() != ESP_OK ||
+                        s_music.queue_epoch != queue_epoch)
+                {
+                    music_service_unlock();
+                    music_snapshot_release(view);
+                    break;
+                }
+                music_service_unlock();
+                music_service_replace_queue_view(view);
+            }
             else
             {
-                music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER,
-                                      0U);
+                music_service_lock();
+                if (s_music.queue_epoch == queue_epoch)
+                {
+                    s_music.queue_view_pending = false;
+                }
+                music_service_unlock();
+                music_service_publish_detail(
+                    MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U,
+                    _music_service_failure_from_result(result));
             }
             break;
         }
@@ -1456,6 +1954,7 @@ esp_err_t music_service_deinit(void)
         music_snapshot_release(s_music.playlist[slot]);
     }
     music_snapshot_release(s_music.queue);
+    music_snapshot_release(s_music.queue_view);
     music_snapshot_release(s_music.lyric);
     music_service_login_qr_release(s_music.login_qr);
     music_service_image_release(s_music.image);
@@ -1987,6 +2486,75 @@ void music_service_queue_release(const music_queue_snapshot_t *snapshot)
     music_snapshot_release((void *)snapshot);
 }
 
+esp_err_t music_service_queue_view_acquire(uint16_t offset, uint16_t count,
+        const music_queue_snapshot_t **snapshot)
+{
+    if (snapshot == NULL || count == 0U || count > MUSIC_SERVICE_MAX_SONGS)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *snapshot = NULL;
+    if (music_service_lock() != ESP_OK)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_music.queue == NULL || s_music.queue_total == 0U)
+    {
+        music_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (offset >= s_music.queue_total)
+    {
+        music_service_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_music.queue_view != NULL &&
+            s_music.queue_view_epoch == s_music.queue_epoch &&
+            s_music.queue_view_offset == offset &&
+            s_music.queue_view_count <= count &&
+            (s_music.queue_view_count == count ||
+             (uint32_t)s_music.queue_view_offset +
+             s_music.queue_view_count >= s_music.queue_total))
+    {
+        music_queue_snapshot_t *view = music_snapshot_retain(
+                                           s_music.queue_view);
+        music_service_unlock();
+        *snapshot = view;
+        return view != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    if (s_music.queue_view_pending &&
+            s_music.queue_view_pending_offset == offset &&
+            s_music.queue_view_pending_count == count)
+    {
+        music_service_unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    const uint64_t queue_epoch = s_music.queue_epoch;
+    s_music.queue_view_pending = true;
+    s_music.queue_view_pending_offset = offset;
+    s_music.queue_view_pending_count = count;
+    music_service_unlock();
+    const music_api_command_t command =
+    {
+        .type = MUSIC_API_CMD_QUEUE_VIEW,
+        .queue_generation = queue_epoch,
+        .offset = offset,
+        .count = count,
+    };
+    if (s_music.api_queue == NULL ||
+            xQueueSend(s_music.api_queue, &command, pdMS_TO_TICKS(100U)) != pdTRUE)
+    {
+        music_service_lock();
+        if (s_music.queue_epoch == queue_epoch)
+        {
+            s_music.queue_view_pending = false;
+        }
+        music_service_unlock();
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
 static uint32_t _music_service_next_play_generation_locked(void)
 {
     uint32_t generation = ++s_music.play_generation;
@@ -2116,18 +2684,20 @@ esp_err_t music_service_queue_play(uint16_t index)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_music.queue == NULL || index >= s_music.queue->count)
+    if (s_music.queue == NULL || index >= s_music.queue_total)
     {
         music_service_unlock();
         return ESP_ERR_INVALID_ARG;
     }
-    const uint64_t queue_generation = s_music.queue->generation;
+    const uint64_t queue_generation = s_music.queue_epoch;
     const uint32_t previous_play_generation = s_music.play_generation;
     const uint32_t previous_player_generation =
         s_music.player.play_generation;
+    const uint16_t previous_queue_index = s_music.player.queue_index;
     const uint32_t play_generation =
         _music_service_next_play_generation_locked();
     s_music.player.play_generation = play_generation;
+    s_music.player.queue_index = index;
     music_service_unlock();
     const music_api_command_t command =
     {
@@ -2141,6 +2711,7 @@ esp_err_t music_service_queue_play(uint16_t index)
         music_service_lock();
         s_music.play_generation = previous_play_generation;
         s_music.player.play_generation = previous_player_generation;
+        s_music.player.queue_index = previous_queue_index;
         music_service_unlock();
         return ESP_ERR_TIMEOUT;
     }
@@ -2170,12 +2741,12 @@ esp_err_t music_service_queue_remove(uint16_t index)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_music.queue == NULL || index >= s_music.queue->count)
+    if (s_music.queue == NULL || index >= s_music.queue_total)
     {
         music_service_unlock();
         return ESP_ERR_INVALID_ARG;
     }
-    const uint64_t queue_generation = s_music.queue->generation;
+    const uint64_t queue_generation = s_music.queue_epoch;
     const uint32_t previous_play_generation = s_music.play_generation;
     const uint32_t previous_player_generation =
         s_music.player.play_generation;
@@ -2338,10 +2909,24 @@ esp_err_t music_service_stop(void)
     s_music.player.songmid[0] = '\0';
     s_music.player.queue_index = 0U;
     s_music.player.queue_count = 0U;
+    music_queue_snapshot_t *old_queue = s_music.queue;
+    music_queue_snapshot_t *old_view = _music_service_detach_queue_view_locked();
+    s_music.queue = NULL;
+    s_music.queue_total = 0U;
+    s_music.queue_source_total = 0U;
+    s_music.queue_removed_count = 0U;
+    memset(s_music.queue_removed, 0, sizeof(s_music.queue_removed));
+    ++s_music.queue_epoch;
+    if (s_music.queue_epoch == 0U)
+    {
+        ++s_music.queue_epoch;
+    }
     music_service_unlock();
     (void)music_stream_stop();
     atomic_store_explicit(&s_playing, false, memory_order_release);
-    music_service_replace_queue(NULL);
+    music_snapshot_release(old_queue);
+    music_snapshot_release(old_view);
+    music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE, 0U);
     music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
     return ESP_OK;
 }

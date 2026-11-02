@@ -21,17 +21,19 @@ audio I/O itself.
   `release()`, `music_service_playlist_acquire()` / `release()`, and
   `music_service_lyric_acquire()` / `release()`.
 - Images: `music_service_image_acquire()` / `release()`.
-- Playback: `music_service_play_playlist()`,
-  `music_service_play_playlist_snapshot()` (uses a playlist snapshot already
-  held by the caller), `play_pause()`, `next()`,
+- Playback: `music_service_play_playlist()`, `music_service_play_playlist_snapshot()`
+  (uses a playlist snapshot already held by the caller), `play_pause()`, `next()`,
   `prev()`, `set_mode()`, `stop()`, and
   `music_service_get_player_status()`. `seek()` is reserved and currently
   returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
-- Queue: `music_service_queue_acquire()` / `release()` expose the immutable
-  current queue (bounded by `MUSIC_SERVICE_MAX_SONGS`);
-  `music_service_queue_play()` switches to one entry and
-  `music_service_queue_remove()` commits one removal and publishes
-  `MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE`.
+- Queue: `music_service_queue_acquire()` / `release()` expose the bounded
+  materialized window around the current playback position. The snapshot
+  carries the source playlist reference, logical `total`, window `offset`,
+  and window `count`; `music_service_queue_view_acquire()` materializes a
+  paged view of the full logical queue. `music_service_queue_play()` and
+  `music_service_queue_remove()` take absolute logical queue indices. The
+  logical queue is capped by `MUSIC_SERVICE_MAX_QUEUE_TRACKS`, while a single
+  materialized window stays bounded by `MUSIC_SERVICE_MAX_SONGS`.
 - `music_service_is_playing()` is the PM guard query; it includes the interval
   between accepting a play command and the stream task actually starting.
 - `music_service_get_diagnostics()` returns API/stream stack watermarks and API
@@ -66,6 +68,14 @@ playback lease. HTTP/cookie state is serialized by a dedicated mutex.
   `dirid: 201`; ordinary playlists send their numeric playlist id as
   `disstid`. Playlist pages are cached by reference and offset, so prefetching
   a neighbouring page does not evict the page currently displayed.
+- The playback queue is a logical view of the source playlist: the service
+  stores the playlist reference, logical total, and a bounded materialized
+  window around the current track. When playback approaches a window edge it
+  prefetches the next provider page; `next`, `prev`, auto-advance, and
+  `queue_play` fetch a missing page on demand. Local queue removals are tracked
+  as a bitmap and filtered from later windows; the source playlist is not
+  modified. This keeps memory independent of playlist length while allowing
+  playback to cross provider pages.
 - Catalog parsers accept current (`mid`, `file.media_mid`, `dirinfo`) and legacy
   (`songmid`, `strMediaMid`, `dissname`) response names. Song URL requests use
   `CgiGetVkey` array parameters and `media_mid` filenames; lyrics use `crypt: 0`
@@ -94,7 +104,8 @@ quality through `music_service_config_t`.
 ## Test Boundary
 
 The pure QQ login protocol parsers, the reference-counted snapshot allocator,
-and the queue removal transition table have standalone host tests. Network, TLS, credential storage, and playback still
-require on-device validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are
+the queue removal transition table, and the queue window/page/removal mapping
+helpers have standalone host tests. Network, TLS, credential storage, and
+playback still require on-device validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are
 outside host-test scope. The simulator real backend is an integration aid, not
 a replacement for device audio and power measurements.

@@ -23,6 +23,7 @@ extern "C" {
 #define MUSIC_SERVICE_WAIT_FOREVER          UINT32_MAX
 #define MUSIC_SERVICE_MAX_PLAYLISTS         12U
 #define MUSIC_SERVICE_MAX_SONGS             100U
+#define MUSIC_SERVICE_MAX_QUEUE_TRACKS      65535U
 #define MUSIC_SERVICE_MAX_LYRIC_LINES       256U
 #define MUSIC_SERVICE_TITLE_BYTES           128U
 #define MUSIC_SERVICE_ARTIST_BYTES          128U
@@ -178,12 +179,15 @@ typedef struct music_playlist_snapshot
     music_song_t songs[]; /**< count entries; allocation is exact. */
 } music_playlist_snapshot_t;
 
-/** @brief Immutable current playback-queue snapshot. */
+/** @brief Immutable playback-queue window or queue-page view. */
 typedef struct music_queue_snapshot
 {
     uint64_t generation;
-    uint16_t count;
-    music_song_t songs[]; /**< count entries; allocation is exact. */
+    music_playlist_ref_t ref; /**< Playlist that produced this queue. */
+    uint16_t total;           /**< Logical queue length. */
+    uint16_t offset;          /**< Global queue index of songs[0]. */
+    uint16_t count;           /**< Entries materialized in this snapshot. */
+    music_song_t songs[];     /**< count entries; allocation is exact. */
 } music_queue_snapshot_t;
 
 /** @brief One parsed LRC line. */
@@ -222,9 +226,8 @@ typedef struct music_player_status
     music_service_failure_t failure;
     music_play_mode_t mode;
     music_quality_t quality;
-    uint16_t queue_index;
-    uint16_t queue_count;
-    uint32_t position_ms;
+    uint16_t queue_index; /**< Absolute logical queue index, zero-based. */
+    uint16_t queue_count; /**< Logical queue length. */    uint32_t position_ms;
     uint32_t duration_ms;
     uint32_t buffered_ms;
     uint32_t play_generation;
@@ -345,26 +348,43 @@ esp_err_t music_service_playlist_acquire(const music_playlist_ref_t *ref,
 void music_service_playlist_release(const music_playlist_snapshot_t *snapshot);
 
 /**
- * @brief Acquire the immutable snapshot of the current playback queue.
+ * @brief Acquire the materialized window around the current playback position.
  *
- * The queue is built when a playlist starts playing and is bounded by
- * MUSIC_SERVICE_MAX_SONGS. A missing queue returns ESP_ERR_NOT_FOUND.
+ * The queue is a logical playlist view backed by a bounded song window. The
+ * returned snapshot covers at most MUSIC_SERVICE_MAX_SONGS entries, while
+ * `total` remains the full logical queue length. A missing queue returns
+ * ESP_ERR_NOT_FOUND.
  */
 esp_err_t music_service_queue_acquire(const music_queue_snapshot_t **snapshot);
 
 /** @brief Release a queue snapshot acquired from the service. */
 void music_service_queue_release(const music_queue_snapshot_t *snapshot);
 
-/** @brief Switch playback to one entry of the current queue. */
+/**
+ * @brief Acquire a paged view of the logical playback queue.
+ *
+ * A cached view at the same offset returns ESP_OK. Otherwise the request is
+ * queued and MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE announces its result. A missing
+ * queue returns ESP_ERR_INVALID_STATE.
+ *
+ * @param offset is the logical queue index of the first requested entry.
+ * @param count is the maximum number of entries; must not exceed
+ *              MUSIC_SERVICE_MAX_SONGS.
+ * @param snapshot receives the retained view on success.
+ */
+esp_err_t music_service_queue_view_acquire(uint16_t offset, uint16_t count,
+        const music_queue_snapshot_t **snapshot);
+
+/** @brief Switch playback to one absolute index of the logical queue. */
 esp_err_t music_service_queue_play(uint16_t index);
 
 /**
- * @brief Remove one entry from the current queue.
+ * @brief Remove one entry from the logical queue.
  *
- * Removing the current entry advances to the same slot after the shift and
- * starts the replacement when playback is active. Removing the only entry
- * stops playback. The change is asynchronous; MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE
- * marks the committed result.
+ * `index` is an absolute logical queue index. Removing the current entry
+ * advances to the same slot after the shift and starts the replacement when
+ * playback is active. Removing the only entry stops playback. The change is
+ * asynchronous; MUSIC_SERVICE_MSG_SUB_TYPE_QUEUE marks the committed result.
  */
 esp_err_t music_service_queue_remove(uint16_t index);
 
@@ -379,7 +399,7 @@ esp_err_t music_service_image_acquire(const char *url, uint16_t width,
                                       const music_image_t **image);
 void music_service_image_release(const music_image_t *image);
 
-/** @brief Start a playlist queue at the requested index. */
+/** @brief Start a playlist queue at the absolute requested playlist index. */
 esp_err_t music_service_play_playlist(const music_playlist_ref_t *ref,
                                       uint16_t start_index);
 
@@ -387,7 +407,9 @@ esp_err_t music_service_play_playlist(const music_playlist_ref_t *ref,
  * @brief Start a queue from a playlist snapshot already held by the caller.
  *
  * The service retains the snapshot until the request is consumed, so the
- * caller may release it immediately after this call returns.
+ * caller may release it immediately after this call returns. `start_index` is
+ * relative to the snapshot: the absolute playlist index is
+ * `playlist->offset + start_index`.
  */
 esp_err_t music_service_play_playlist_snapshot(
     const music_playlist_snapshot_t *playlist, uint16_t start_index);

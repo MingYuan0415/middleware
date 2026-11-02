@@ -25,6 +25,11 @@
 #define MUSIC_CREDENTIAL_MAGIC 0x4D555331U
 #define MUSIC_CREDENTIAL_VERSION 1U
 #define MUSIC_PLAYLIST_CACHE_SLOTS 5U
+#define MUSIC_SERVICE_QUEUE_WINDOW_SONGS 30U
+#define MUSIC_SERVICE_QUEUE_PAGE_SONGS 20U
+#define MUSIC_SERVICE_QUEUE_FETCH_PAGE 10U
+#define MUSIC_SERVICE_QUEUE_REMOVAL_BYTES \
+    ((MUSIC_SERVICE_MAX_QUEUE_TRACKS + 7U) / 8U)
 
 /* Transport/API errors that do not have a distinct ESP-IDF code. */
 #define MUSIC_ERR_HTTP_AUTH      ((esp_err_t)0x7101)
@@ -55,6 +60,7 @@ typedef enum
     MUSIC_API_CMD_PAUSE,
     MUSIC_API_CMD_QUEUE_PLAY,
     MUSIC_API_CMD_QUEUE_REMOVE,
+    MUSIC_API_CMD_QUEUE_VIEW,
     MUSIC_API_CMD_ERASE_CREDENTIAL,
 } music_api_cmd_type_t;
 
@@ -122,6 +128,7 @@ typedef struct music_service_runtime
     music_home_snapshot_t *home;
     music_playlist_snapshot_t *playlist[MUSIC_PLAYLIST_CACHE_SLOTS];
     music_queue_snapshot_t *queue;
+    music_queue_snapshot_t *queue_view;
     music_lyric_snapshot_t *lyric;
     music_image_t *login_qr;
     music_image_t *image;
@@ -136,9 +143,20 @@ typedef struct music_service_runtime
     uint32_t image_token;
     uint32_t play_generation;
     uint32_t login_session;
+    uint16_t queue_source_total;
+    uint16_t queue_total;
+    uint16_t queue_removed_count;
+    uint16_t queue_view_offset;
+    uint16_t queue_view_count;
+    uint16_t queue_view_pending_offset;
+    uint16_t queue_view_pending_count;
+    uint64_t queue_epoch;
+    uint64_t queue_view_epoch;
+    uint8_t queue_removed[MUSIC_SERVICE_QUEUE_REMOVAL_BYTES];
     bool play_valid;
     bool login_active;
     bool credential_erase_pending;
+    bool queue_view_pending;
     uint64_t generation;
 } music_service_runtime_t;
 
@@ -154,6 +172,7 @@ void music_service_set_state_locked(music_service_state_t state,
 void music_service_replace_home(music_home_snapshot_t *snapshot);
 void music_service_replace_playlist(music_playlist_snapshot_t *snapshot);
 void music_service_replace_queue(music_queue_snapshot_t *snapshot);
+void music_service_replace_queue_view(music_queue_snapshot_t *snapshot);
 void music_service_replace_lyric(music_lyric_snapshot_t *snapshot);
 void music_service_set_login_qr(music_image_t *image);
 void music_service_set_image(music_image_t *image, uint32_t token);
