@@ -18,7 +18,10 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
   `music_service_reset_persisted_state()`。
 - 曲库：`music_service_refresh_home()`、`music_service_home_acquire()` /
   `release()`、`music_service_playlist_acquire()` / `release()` 与
-  `music_service_lyric_acquire()` / `release()`。
+  `music_service_lyric_acquire()` / `release()`，并由
+  `music_service_lyric_failed()` / `music_service_lyric_retry()` 查询或清除
+  已完成的空结果。同一歌曲的待处理歌词请求会去重；空结果保持到调用方重试或
+  歌曲切换。
 - 图片：`music_service_image_acquire()` / `release()`。
 - 播放：`music_service_play_playlist()`、
   `music_service_play_playlist_snapshot()`（复用调用方已持有的歌单快照）、
@@ -40,9 +43,10 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
 借用：服务保留自己的引用，`release()` 只减少调用方引用；替换缓存项不会使仍
 持有引用的页面失效。服务运行状态、Cookie 罐与两个命令队列也放在 PSRAM。
 API 与登录 worker 栈保留在内部 RAM，因为凭证保存/删除要经过 NVS，而 NVS 写会
-关闭 flash cache；登录 worker 独立于目录/播放 API worker。音频 worker 在首次
-播放时懒创建，使用 PSRAM 栈，并通过 `audio_service` 的独占播放租约接收 PCM。
-HTTP/Cookie 状态由独立互斥锁串行化。
+关闭 flash cache；登录 worker 独立于目录/播放 API worker，并为 HTTPS/OAuth
+与二维码图片解码路径使用更大的栈。音频 worker 在首次播放时懒创建，使用 PSRAM
+栈，并通过 `audio_service` 的独占播放租约接收 PCM。HTTP/Cookie 状态由独立互斥
+锁串行化。
 
 ## 登录与曲库
 
@@ -80,7 +84,8 @@ HTTP/Cookie 状态由独立互斥锁串行化。
 
 ## 配置
 
-`Kconfig` 定义 API/音频 worker 栈、命令队列深度与最大 JSON 响应；产品通过
+`Kconfig` 定义 API/登录/音频 worker 栈、命令队列深度与最大 JSON 响应；发布默认
+为 API 12 KiB、登录 16 KiB，对应实测峰值约 8.2 KiB 与 10.7 KiB。产品通过
 `music_service_config_t` 提供任务优先级与默认音质。
 
 ## 测试边界

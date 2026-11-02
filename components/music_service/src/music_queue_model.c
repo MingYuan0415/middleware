@@ -65,6 +65,17 @@ bool music_queue_window_contains(uint16_t offset, uint16_t count,
            (uint32_t)index - offset < count;
 }
 
+uint16_t music_queue_window_count(uint16_t total, uint16_t offset,
+                                  uint16_t window_size)
+{
+    if (offset >= total || window_size == 0U)
+    {
+        return 0U;
+    }
+    const uint16_t remaining = (uint16_t)(total - offset);
+    return remaining > window_size ? window_size : remaining;
+}
+
 uint16_t music_queue_page_count(uint16_t total, uint16_t page_size)
 {
     if (total == 0U || page_size == 0U)

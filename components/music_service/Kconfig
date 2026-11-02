@@ -3,7 +3,12 @@ menu "Music service"
     config MUSIC_SERVICE_API_TASK_STACK_SIZE
         int "Music API task stack size"
         range 6144 32768
-        default 10240
+        default 12288
+
+    config MUSIC_SERVICE_LOGIN_TASK_STACK_SIZE
+        int "Music login task stack size"
+        range 16384 32768
+        default 16384
 
     config MUSIC_SERVICE_AUDIO_TASK_STACK_SIZE
         int "Music audio task stack size"

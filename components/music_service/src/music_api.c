@@ -96,6 +96,18 @@ cJSON *music_api_post(const char *module, const char *method,
         s_last_musicu_error = ESP_ERR_INVALID_ARG;
         return NULL;
     }
+    char credential_musicid[sizeof(s_music.credential.musicid)] = {0};
+    char credential_musickey[sizeof(s_music.credential.musickey)] = {0};
+    bool logged_in = false;
+    if (music_service_lock() == ESP_OK)
+    {
+        logged_in = s_music.credential_valid;
+        (void)snprintf(credential_musicid, sizeof(credential_musicid), "%s",
+                       s_music.credential.musicid);
+        (void)snprintf(credential_musickey, sizeof(credential_musickey), "%s",
+                       s_music.credential.musickey);
+        music_service_unlock();
+    }
     cJSON *root = cJSON_CreateObject();
     cJSON *comm = cJSON_CreateObject();
     cJSON *request = cJSON_CreateObject();
@@ -107,9 +119,8 @@ cJSON *music_api_post(const char *module, const char *method,
         s_last_musicu_error = ESP_ERR_NO_MEM;
         return NULL;
     }
-    const bool logged_in = s_music.credential_valid;
     cJSON_AddStringToObject(comm, "uin",
-                            logged_in ? s_music.credential.musicid : "0");
+                            logged_in ? credential_musicid : "0");
     cJSON_AddStringToObject(comm, "format", "json");
     cJSON_AddNumberToObject(comm, "ct", 24);
     cJSON_AddNumberToObject(comm, "cv", 0);
@@ -129,9 +140,9 @@ cJSON *music_api_post(const char *module, const char *method,
         char g_tk[24];
         (void)snprintf(g_tk, sizeof(g_tk), "%u",
                        (unsigned)music_login_hash33(
-                           s_music.credential.musickey, 5381U));
+                           credential_musickey, 5381U));
         cJSON_AddStringToObject(comm, "g_tk", g_tk);
-        cJSON_AddStringToObject(comm, "authst", s_music.credential.musickey);
+        cJSON_AddStringToObject(comm, "authst", credential_musickey);
     }
     cJSON_AddItemToObject(root, "comm", comm);
     cJSON_AddStringToObject(request, "module", module);

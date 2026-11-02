@@ -391,6 +391,12 @@ static void _stream_play_url(const char *url, uint32_t duration_ms,
                     MUSIC_STREAM_EVENT_STATE_CHANGED, pdTRUE, pdFALSE,
                     portMAX_DELAY);
             }
+            if (!atomic_load_explicit(&s_stream.pause,
+                                      memory_order_acquire))
+            {
+                _stream_set_status(MUSIC_PLAYBACK_PLAYING,
+                                   MUSIC_SERVICE_FAILURE_NONE);
+            }
             continue;
         }
         if (atomic_load_explicit(&s_stream.audio_released,
@@ -975,6 +981,7 @@ esp_err_t music_stream_pause(bool pause)
     if (pause)
     {
         atomic_store_explicit(&s_stream.pause, true, memory_order_release);
+        _stream_set_status(MUSIC_PLAYBACK_PAUSED, MUSIC_SERVICE_FAILURE_NONE);
         if (s_stream.state_events != NULL)
         {
             (void)xEventGroupSetBits(s_stream.state_events,
@@ -990,6 +997,7 @@ esp_err_t music_stream_pause(bool pause)
     }
 
     atomic_store_explicit(&s_stream.pause, false, memory_order_release);
+    _stream_set_status(MUSIC_PLAYBACK_BUFFERING, MUSIC_SERVICE_FAILURE_NONE);
     if (s_stream.state_events != NULL)
     {
         (void)xEventGroupSetBits(s_stream.state_events,

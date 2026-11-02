@@ -227,7 +227,8 @@ typedef struct music_player_status
     music_play_mode_t mode;
     music_quality_t quality;
     uint16_t queue_index; /**< Absolute logical queue index, zero-based. */
-    uint16_t queue_count; /**< Logical queue length. */    uint32_t position_ms;
+    uint16_t queue_count; /**< Logical queue length. */
+    uint32_t position_ms;
     uint32_t duration_ms;
     uint32_t buffered_ms;
     uint32_t play_generation;
@@ -392,6 +393,17 @@ esp_err_t music_service_queue_remove(uint16_t index);
 esp_err_t music_service_lyric_acquire(const char *songmid,
                                       const music_lyric_snapshot_t **snapshot);
 void music_service_lyric_release(const music_lyric_snapshot_t *snapshot);
+
+/**
+ * @brief Whether the latest lyric request for one song completed without data.
+ *
+ * Returns false while the request is still pending or when the cached result
+ * belongs to another song.
+ */
+bool music_service_lyric_failed(const char *songmid);
+
+/** @brief Clear a completed lyric failure so a later acquire retries it. */
+void music_service_lyric_retry(const char *songmid);
 
 /** @brief Download and decode one cover into RGB565 PSRAM. */
 esp_err_t music_service_image_acquire(const char *url, uint16_t width,

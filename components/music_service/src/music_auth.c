@@ -308,7 +308,7 @@ done:
     return result;
 }
 
-static esp_err_t _qq_login_begin(void)
+static esp_err_t _qq_login_begin(uint32_t session)
 {
     music_http_result_t result;
     esp_err_t error = music_http_get_headers(MUSIC_QQ_XLOGIN_URL, true,
@@ -353,7 +353,7 @@ static esp_err_t _qq_login_begin(void)
         music_service_login_qr_release(qr);
         return ESP_ERR_INVALID_RESPONSE;
     }
-    music_service_set_login_qr(qr);
+    music_service_set_login_qr(qr, session);
     return ESP_OK;
 }
 
@@ -455,13 +455,13 @@ done:
     return result;
 }
 
-esp_err_t music_net_login_begin(music_login_type_t type)
+esp_err_t music_net_login_begin(music_login_type_t type, uint32_t session)
 {
     music_http_cookie_clear();
     music_net_cancel_login();
     if (type == MUSIC_LOGIN_TYPE_QQ)
     {
-        return _qq_login_begin();
+        return _qq_login_begin(session);
     }
     if (type != MUSIC_LOGIN_TYPE_WECHAT)
     {
@@ -517,7 +517,7 @@ esp_err_t music_net_login_begin(music_login_type_t type)
     {
         return qr_result;
     }
-    music_service_set_login_qr(qr);
+    music_service_set_login_qr(qr, session);
     return ESP_OK;
 }
 

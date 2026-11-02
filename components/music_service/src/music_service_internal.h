@@ -62,6 +62,7 @@ typedef enum
     MUSIC_API_CMD_QUEUE_REMOVE,
     MUSIC_API_CMD_QUEUE_VIEW,
     MUSIC_API_CMD_ERASE_CREDENTIAL,
+    MUSIC_API_CMD_WAKE,
 } music_api_cmd_type_t;
 
 /** @brief One serialized QR-login request handled outside the API worker. */
@@ -140,9 +141,11 @@ typedef struct music_service_runtime
     char qr_qrsig[256];
     char qq_login_sig[160];
     char lyric_songmid[MUSIC_SERVICE_SONGMID_BYTES];
+    char lyric_request_songmid[MUSIC_SERVICE_SONGMID_BYTES];
     uint32_t image_token;
     uint32_t play_generation;
     uint32_t login_session;
+    uint32_t lyric_request_id;
     uint16_t queue_source_total;
     uint16_t queue_total;
     uint16_t queue_removed_count;
@@ -173,8 +176,7 @@ void music_service_replace_home(music_home_snapshot_t *snapshot);
 void music_service_replace_playlist(music_playlist_snapshot_t *snapshot);
 void music_service_replace_queue(music_queue_snapshot_t *snapshot);
 void music_service_replace_queue_view(music_queue_snapshot_t *snapshot);
-void music_service_replace_lyric(music_lyric_snapshot_t *snapshot);
-void music_service_set_login_qr(music_image_t *image);
+void music_service_set_login_qr(music_image_t *image, uint32_t session);
 void music_service_set_image(music_image_t *image, uint32_t token);
 void music_service_handle_network_result(esp_err_t result);
 uint64_t music_service_next_generation(void);
@@ -185,7 +187,7 @@ void music_service_stream_failed(music_service_failure_t failure);
 esp_err_t music_net_load_credential(music_credential_blob_t *credential);
 esp_err_t music_net_save_credential(const music_credential_blob_t *credential);
 esp_err_t music_net_erase_credential(void);
-esp_err_t music_net_login_begin(music_login_type_t type);
+esp_err_t music_net_login_begin(music_login_type_t type, uint32_t session);
 esp_err_t music_net_login_poll(music_login_type_t type,
                                music_credential_blob_t *credential,
                                music_login_poll_state_t *state);

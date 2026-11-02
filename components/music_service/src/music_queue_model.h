@@ -46,6 +46,17 @@ uint16_t music_queue_window_start(uint16_t index, uint16_t total,
 bool music_queue_window_contains(uint16_t offset, uint16_t count,
                                  uint16_t index);
 
+/**
+ * @brief Number of entries available from one window offset.
+ *
+ * @param total is the logical queue length.
+ * @param offset is the first logical index of the window.
+ * @param window_size is the maximum number of entries in one window.
+ * @return Entry count clamped to the queue tail, or 0 for invalid input.
+ */
+uint16_t music_queue_window_count(uint16_t total, uint16_t offset,
+                                  uint16_t window_size);
+
 /** @brief Number of provider pages needed for a queue length. */
 uint16_t music_queue_page_count(uint16_t total, uint16_t page_size);
 

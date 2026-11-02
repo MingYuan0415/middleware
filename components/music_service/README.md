@@ -19,7 +19,10 @@ audio I/O itself.
   `music_service_reset_persisted_state()`.
 - Catalog: `music_service_refresh_home()`, `music_service_home_acquire()` /
   `release()`, `music_service_playlist_acquire()` / `release()`, and
-  `music_service_lyric_acquire()` / `release()`.
+  `music_service_lyric_acquire()` / `release()` with
+  `music_service_lyric_failed()` / `music_service_lyric_retry()`. A pending
+  lyric request is deduplicated per song; a completed empty result is reported
+  until the caller retries or the song changes.
 - Images: `music_service_image_acquire()` / `release()`.
 - Playback: `music_service_play_playlist()`, `music_service_play_playlist_snapshot()`
   (uses a playlist snapshot already held by the caller), `play_pause()`, `next()`,
@@ -46,9 +49,10 @@ entry never invalidates a page that still holds a reference. The service
 runtime state, cookie jar, and both command queues also live in PSRAM. The API
 and login worker stacks stay in internal RAM because credential save/erase
 goes through NVS, which disables the flash cache; the login worker is separate
-from the catalog/playback API worker. The audio worker is created lazily on the
-first playback and runs from a PSRAM stack through the `audio_service` exclusive
-playback lease. HTTP/cookie state is serialized by a dedicated mutex.
+from the catalog/playback API worker and uses a larger stack for the HTTPS/OAuth
+and QR image path. The audio worker is created lazily on the first playback and
+runs from a PSRAM stack through the `audio_service` exclusive playback lease.
+HTTP/cookie state is serialized by a dedicated mutex.
 
 ## Login and catalog
 
@@ -97,8 +101,10 @@ audio worker; no LVGL call is made from either worker.
 
 ## Configuration
 
-`Kconfig` defines the API/audio worker stack sizes, command queue depth, and
-maximum JSON response size. The product supplies task priorities and the default
+`Kconfig` defines the API/login/audio worker stack sizes, command queue depth,
+and maximum JSON response size. The shipped defaults are 12 KiB for the API
+worker and 16 KiB for the login worker; they reflect measured peaks of about
+8.2 KiB and 10.7 KiB. The product supplies task priorities and the default
 quality through `music_service_config_t`.
 
 ## Test Boundary

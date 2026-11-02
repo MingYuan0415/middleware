@@ -73,6 +73,13 @@ static void test_window_start(void)
     assert(music_queue_window_contains(30U, 30U, 52U));
     assert(!music_queue_window_contains(30U, 30U, 60U));
     assert(!music_queue_window_contains(30U, 0U, 30U));
+    assert(music_queue_window_count(137U, 0U, 30U) == 30U);
+    assert(music_queue_window_count(137U, 107U, 30U) == 30U);
+    assert(music_queue_window_count(137U, 136U, 30U) == 1U);
+    assert(music_queue_window_count(5U, 0U, 30U) == 5U);
+    assert(music_queue_window_count(0U, 0U, 30U) == 0U);
+    assert(music_queue_window_count(5U, 5U, 30U) == 0U);
+    assert(music_queue_window_count(5U, 0U, 0U) == 0U);
 }
 
 static void test_page_math(void)
