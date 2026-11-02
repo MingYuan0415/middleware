@@ -104,9 +104,13 @@ esp_err_t music_net_save_credential(const music_credential_blob_t *credential)
 
 esp_err_t music_net_erase_credential(void)
 {
-    music_net_clear_session();
     const esp_err_t result = nv_storage_erase_key(MUSIC_CREDENTIAL_KEY);
-    return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
+    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND)
+    {
+        music_net_clear_session();
+        return ESP_OK;
+    }
+    return result;
 }
 
 void music_net_cancel_login(void)

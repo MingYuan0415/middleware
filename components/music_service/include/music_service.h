@@ -30,6 +30,8 @@ extern "C" {
 #define MUSIC_SERVICE_PLAYLIST_TITLE_BYTES  96U
 #define MUSIC_SERVICE_CREATOR_BYTES         64U
 #define MUSIC_SERVICE_URL_BYTES             512U
+#define MUSIC_SERVICE_SONG_COVER_BYTES      160U
+#define MUSIC_SERVICE_PLAYLIST_COVER_BYTES  256U
 #define MUSIC_SERVICE_SONGMID_BYTES         32U
 #define MUSIC_SERVICE_LYRIC_TEXT_BYTES      192U
 
@@ -44,6 +46,7 @@ typedef enum
     MUSIC_SERVICE_STATE_LOGGED_OUT,
     MUSIC_SERVICE_STATE_QR_READY,
     MUSIC_SERVICE_STATE_QR_SCANNED,
+    MUSIC_SERVICE_STATE_QR_EXPIRED,
     MUSIC_SERVICE_STATE_AUTHENTICATING,
     MUSIC_SERVICE_STATE_READY,
     MUSIC_SERVICE_STATE_AUTH_REQUIRED,
@@ -125,7 +128,7 @@ typedef struct music_playlist
     music_playlist_ref_t ref;
     char title[MUSIC_SERVICE_PLAYLIST_TITLE_BYTES];
     char creator[MUSIC_SERVICE_CREATOR_BYTES];
-    char cover_url[MUSIC_SERVICE_URL_BYTES];
+    char cover_url[MUSIC_SERVICE_PLAYLIST_COVER_BYTES];
     uint32_t track_count;
 } music_playlist_t;
 
@@ -138,7 +141,7 @@ typedef struct music_song
     char title[MUSIC_SERVICE_TITLE_BYTES];
     char artist[MUSIC_SERVICE_ARTIST_BYTES];
     char album[MUSIC_SERVICE_ALBUM_BYTES];
-    char cover_url[MUSIC_SERVICE_URL_BYTES];
+    char cover_url[MUSIC_SERVICE_SONG_COVER_BYTES];
     uint32_t duration_ms;
     uint32_t size_128;
     uint32_t size_320;
@@ -305,6 +308,9 @@ esp_err_t music_service_set_network_ready(bool ready);
 /** @brief Inform the service that the system clock is trustworthy. */
 esp_err_t music_service_set_time_ready(bool ready);
 
+/** @brief Clear a transient service error and re-evaluate account state. */
+esp_err_t music_service_retry(void);
+
 /** @brief Start a QR login flow. */
 esp_err_t music_service_login_begin(music_login_type_t type);
 
@@ -376,6 +382,15 @@ void music_service_image_release(const music_image_t *image);
 /** @brief Start a playlist queue at the requested index. */
 esp_err_t music_service_play_playlist(const music_playlist_ref_t *ref,
                                       uint16_t start_index);
+
+/**
+ * @brief Start a queue from a playlist snapshot already held by the caller.
+ *
+ * The service retains the snapshot until the request is consumed, so the
+ * caller may release it immediately after this call returns.
+ */
+esp_err_t music_service_play_playlist_snapshot(
+    const music_playlist_snapshot_t *playlist, uint16_t start_index);
 
 /** @brief Toggle pause/resume of the current queue. */
 esp_err_t music_service_play_pause(void);

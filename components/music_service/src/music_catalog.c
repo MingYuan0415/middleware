@@ -4,52 +4,15 @@
 #include "music_service_internal.h"
 #include "music_api.h"
 #include "music_http.h"
-#include "music_media.h"
 #include "music_snapshot.h"
-#include "music_login_protocol.h"
 
 #include "cJSON.h"
-#include "esp_crt_bundle.h"
-#include "esp_heap_caps.h"
-#include "esp_http_client.h"
-#include "esp_jpeg_common.h"
-#include "esp_timer.h"
 #include "esp_random.h"
-#include "esp_jpeg_dec.h"
-#include "mbedtls/base64.h"
-#include "nvs.h"
-#include "nv_storage.h"
-#include "png.h"
 
-#include <ctype.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <strings.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#define MUSIC_COOKIE_MAX 24
-#define MUSIC_QQ_REFERER "https://xui.ptlogin2.qq.com/"
-#define MUSIC_QQ_XLOGIN_URL \
-    "https://xui.ptlogin2.qq.com/cgi-bin/xlogin" \
-    "?appid=716027609&daid=383&style=33" \
-    "&login_text=%E7%99%BB%E5%BD%95" \
-    "&hide_title_bar=1&hide_border=1&target=self" \
-    "&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump" \
-    "&pt_3rd_aid=100497308" \
-    "&pt_feedback_link=https%3A%2F%2Fsupport.qq.com%2Fproducts%2F77942" \
-    "%3FcustomInfo%3D.appid100497308&theme=2&verify_theme="
-#define MUSIC_QQ_AUTHORIZE_URL "https://graph.qq.com/oauth2.0/authorize"
-#define MUSIC_QQ_AUTHORIZE_REFERER \
-    "https://graph.qq.com/oauth2.0/show?which=Login&display=pc" \
-    "&response_type=code&client_id=100497308" \
-    "&redirect_uri=https://y.qq.com/portal/wx_redirect.html" \
-    "?login_type=1&surl=https://y.qq.com/portal/profile.html" \
-    "#stat=y_new.top.user_pic&stat=y_new.top.pop.logout" \
-    "&use_customer_cb=0&state=state&display=pc"
-#define MUSIC_QR_MAX_BYTES (256U * 1024U)
-#define MUSIC_QR_POLL_MAX_BYTES (32U * 1024U)
 static void _parse_playlist_basic(const cJSON *playlist,
                                   music_playlist_t *output,
                                   music_playlist_kind_t kind)

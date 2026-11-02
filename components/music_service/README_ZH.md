@@ -11,7 +11,8 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
 `include/music_service.h` 提供：
 
 - `music_service_init()` / `music_service_deinit()`、
-  `music_service_set_network_ready()` 与 `music_service_set_time_ready()`。
+  `music_service_set_network_ready()`、`music_service_set_time_ready()` 与
+  `music_service_retry()`。
 - 扫码登录：`music_service_login_begin()`、`music_service_login_qr_acquire()`、
   `music_service_login_cancel()`、`music_service_logout()` 与
   `music_service_reset_persisted_state()`。
@@ -19,9 +20,11 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
   `release()`、`music_service_playlist_acquire()` / `release()` 与
   `music_service_lyric_acquire()` / `release()`。
 - 图片：`music_service_image_acquire()` / `release()`。
-- 播放：`music_service_play_playlist()`、`play_pause()`、`next()`、`prev()`、
-  `set_mode()`、`stop()` 与 `music_service_get_player_status()`。`seek()` 为保留
-  接口，范围跳转实现前返回 `ESP_ERR_NOT_SUPPORTED`。
+- 播放：`music_service_play_playlist()`、
+  `music_service_play_playlist_snapshot()`（复用调用方已持有的歌单快照）、
+  `play_pause()`、`next()`、`prev()`、`set_mode()`、`stop()` 与
+  `music_service_get_player_status()`。`seek()` 为保留接口，范围跳转实现前返回
+  `ESP_ERR_NOT_SUPPORTED`。
 - 队列：`music_service_queue_acquire()` / `release()` 暴露不可变当前队列
   （上限 `MUSIC_SERVICE_MAX_SONGS`）；`music_service_queue_play()` 切换队列项，
   `music_service_queue_remove()` 提交删除并发布
@@ -34,9 +37,10 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
 快照、图片与音频缓冲分配在 PSRAM。所有快照/图片的 `acquire()` 都是引用计数
 借用：服务保留自己的引用，`release()` 只减少调用方引用；替换缓存项不会使仍
 持有引用的页面失效。服务运行状态、Cookie 罐与两个命令队列也放在 PSRAM。
-API worker 栈保留在内部 RAM，因为凭证保存/删除要经过 NVS，而 NVS 写会关闭
-flash cache；音频 worker 在首次播放时懒创建，使用 PSRAM 栈，并通过
-`audio_service` 的独占播放租约接收 PCM。
+API 与登录 worker 栈保留在内部 RAM，因为凭证保存/删除要经过 NVS，而 NVS 写会
+关闭 flash cache；登录 worker 独立于目录/播放 API worker。音频 worker 在首次
+播放时懒创建，使用 PSRAM 栈，并通过 `audio_service` 的独占播放租约接收 PCM。
+HTTP/Cookie 状态由独立互斥锁串行化。
 
 ## 登录与曲库
 

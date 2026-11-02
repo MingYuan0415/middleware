@@ -44,18 +44,25 @@ typedef struct music_credential_blob
 
 typedef enum
 {
-    MUSIC_API_CMD_LOGIN_BEGIN = 0,
-    MUSIC_API_CMD_LOGIN_CANCEL,
-    MUSIC_API_CMD_LOGOUT,
+    MUSIC_API_CMD_LOGOUT = 0,
     MUSIC_API_CMD_REFRESH_HOME,
     MUSIC_API_CMD_PLAYLIST,
     MUSIC_API_CMD_LYRIC,
     MUSIC_API_CMD_IMAGE,
     MUSIC_API_CMD_PLAY,
+    MUSIC_API_CMD_PLAY_SNAPSHOT,
     MUSIC_API_CMD_PAUSE,
     MUSIC_API_CMD_QUEUE_PLAY,
     MUSIC_API_CMD_QUEUE_REMOVE,
+    MUSIC_API_CMD_ERASE_CREDENTIAL,
 } music_api_cmd_type_t;
+
+/** @brief One serialized QR-login request handled outside the API worker. */
+typedef struct music_login_command
+{
+    music_login_type_t type;
+    uint32_t session;
+} music_login_command_t;
 
 /** @brief Result of one QR-poll iteration. */
 typedef enum
@@ -71,6 +78,8 @@ typedef struct music_api_command
     music_api_cmd_type_t type;
     music_login_type_t login_type;
     music_playlist_ref_t playlist;
+    music_playlist_snapshot_t *playlist_snapshot;
+    uint64_t queue_generation;
     uint16_t offset;
     uint16_t count;
     uint32_t token;
@@ -105,6 +114,8 @@ typedef struct music_service_runtime
     SemaphoreHandle_t lock;
     QueueHandle_t api_queue;
     TaskHandle_t api_task;
+    QueueHandle_t login_queue;
+    TaskHandle_t login_task;
     music_service_status_t status;
     music_player_status_t player;
     music_home_snapshot_t *home;
@@ -123,8 +134,10 @@ typedef struct music_service_runtime
     char lyric_songmid[MUSIC_SERVICE_SONGMID_BYTES];
     uint32_t image_token;
     uint32_t play_generation;
+    uint32_t login_session;
     bool play_valid;
     bool login_active;
+    bool credential_erase_pending;
     uint64_t generation;
 } music_service_runtime_t;
 

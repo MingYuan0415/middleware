@@ -230,7 +230,22 @@ esp_err_t music_media_fetch_image(const char *url, uint16_t width,
         &result, MUSIC_QR_MAX_BYTES);
     if (error != ESP_OK)
     {
+        music_http_result_free(&result);
         return error;
+    }
+    if (result.status < 200 || result.status >= 300)
+    {
+        const int status = result.status;
+        music_http_result_free(&result);
+        if (status == 401 || status == 403)
+        {
+            return MUSIC_ERR_HTTP_AUTH;
+        }
+        if (status == 429)
+        {
+            return MUSIC_ERR_HTTP_RATE_LIMIT;
+        }
+        return ESP_ERR_INVALID_RESPONSE;
     }
     music_image_t *decoded = NULL;
     esp_err_t decode_result;

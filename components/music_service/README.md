@@ -12,7 +12,8 @@ audio I/O itself.
 `include/music_service.h` provides:
 
 - `music_service_init()` / `music_service_deinit()`,
-  `music_service_set_network_ready()`, and `music_service_set_time_ready()`.
+  `music_service_set_network_ready()`, `music_service_set_time_ready()`, and
+  `music_service_retry()`.
 - QR login: `music_service_login_begin()`, `music_service_login_qr_acquire()`,
   `music_service_login_cancel()`, `music_service_logout()`, and
   `music_service_reset_persisted_state()`.
@@ -20,7 +21,9 @@ audio I/O itself.
   `release()`, `music_service_playlist_acquire()` / `release()`, and
   `music_service_lyric_acquire()` / `release()`.
 - Images: `music_service_image_acquire()` / `release()`.
-- Playback: `music_service_play_playlist()`, `play_pause()`, `next()`,
+- Playback: `music_service_play_playlist()`,
+  `music_service_play_playlist_snapshot()` (uses a playlist snapshot already
+  held by the caller), `play_pause()`, `next()`,
   `prev()`, `set_mode()`, `stop()`, and
   `music_service_get_player_status()`. `seek()` is reserved and currently
   returns `ESP_ERR_NOT_SUPPORTED` until range seeking is implemented.
@@ -39,10 +42,11 @@ Snapshots, images, and audio buffers live in PSRAM. All snapshot/image
 reference, `release()` only drops the caller reference, and replacing a cache
 entry never invalidates a page that still holds a reference. The service
 runtime state, cookie jar, and both command queues also live in PSRAM. The API
-worker stack stays in internal RAM because credential save/erase goes through
-NVS, which disables the flash cache; the audio worker is created lazily on the
+and login worker stacks stay in internal RAM because credential save/erase
+goes through NVS, which disables the flash cache; the login worker is separate
+from the catalog/playback API worker. The audio worker is created lazily on the
 first playback and runs from a PSRAM stack through the `audio_service` exclusive
-playback lease.
+playback lease. HTTP/cookie state is serialized by a dedicated mutex.
 
 ## Login and catalog
 

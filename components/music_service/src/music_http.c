@@ -40,6 +40,40 @@ typedef struct music_http_context
 
 static MUSIC_SERVICE_EXT_BSS music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
 static size_t s_cookie_count;
+static SemaphoreHandle_t s_http_lock;
+
+esp_err_t music_http_init(void)
+{
+    if (s_http_lock != NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_http_lock = xSemaphoreCreateMutex();
+    return s_http_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+void music_http_deinit(void)
+{
+    if (s_http_lock != NULL)
+    {
+        vSemaphoreDelete(s_http_lock);
+        s_http_lock = NULL;
+    }
+}
+
+static bool _http_lock_take(void)
+{
+    return s_http_lock != NULL &&
+           xSemaphoreTake(s_http_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void _http_lock_give(void)
+{
+    if (s_http_lock != NULL)
+    {
+        (void)xSemaphoreGive(s_http_lock);
+    }
+}
 
 static void *_psram_alloc(size_t size)
 {
@@ -300,7 +334,7 @@ static esp_err_t _http_event(esp_http_client_event_t *event)
                 context->limit)
         {
             context->overflow = true;
-            return ESP_OK;
+            return ESP_FAIL;
         }
         memcpy(context->result->body + context->result->length,
                event->data, (size_t)event->data_len);
@@ -503,43 +537,106 @@ void music_http_result_free(music_http_result_t *result)
 
 bool music_http_cookie_get(const char *name, char *value, size_t value_size)
 {
-    return _cookie_get(name, value, value_size);
+    if (!_http_lock_take())
+    {
+        return false;
+    }
+    const bool found = _cookie_get(name, value, value_size);
+    _http_lock_give();
+    return found;
 }
 
 void music_http_cookie_clear(void)
 {
-    _cookie_clear();
+    if (_http_lock_take())
+    {
+        _cookie_clear();
+        _http_lock_give();
+    }
 }
 
 esp_err_t music_http_get_referer(const char *url, bool with_cookie,
                                  const char *referer,
                                  music_http_result_t *result, size_t max_body)
 {
-    return _http_get_referer(url, with_cookie, referer, result, max_body);
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t error = _http_get_referer(url, with_cookie, referer,
+        result, max_body);
+    _http_lock_give();
+    return error;
 }
 
 esp_err_t music_http_get(const char *url, bool with_cookie,
                          music_http_result_t *result, size_t max_body)
 {
-    return _http_get(url, with_cookie, result, max_body);
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t error = _http_get(url, with_cookie, result, max_body);
+    _http_lock_give();
+    return error;
 }
 
 esp_err_t music_http_get_headers(const char *url, bool with_cookie,
                                  const char *referer,
                                  music_http_result_t *result)
 {
-    return _http_get_headers(url, with_cookie, referer, result);
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t error = _http_get_headers(url, with_cookie, referer,
+        result);
+    _http_lock_give();
+    return error;
 }
 
 esp_err_t music_http_post(const char *url, const char *body,
                           music_http_result_t *result, size_t max_body)
 {
-    return _http_post(url, body, result, max_body);
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t error = _http_post(url, body, result, max_body);
+    _http_lock_give();
+    return error;
 }
 
 esp_err_t music_http_post_form_no_redirect(const char *url,
         const char *body, const char *referer,
         music_http_result_t *result, size_t max_body)
 {
-    return _http_post_form_no_redirect(url, body, referer, result, max_body);
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t error = _http_post_form_no_redirect(url, body, referer,
+        result, max_body);
+    _http_lock_give();
+    return error;
 }

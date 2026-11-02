@@ -10,6 +10,8 @@
 extern "C" {
 #endif
 
+esp_err_t music_http_init(void);
+void music_http_deinit(void);
 bool music_http_cookie_get(const char *name, char *value, size_t value_size);
 void music_http_cookie_clear(void);
 esp_err_t music_http_get_referer(const char *url, bool with_cookie,

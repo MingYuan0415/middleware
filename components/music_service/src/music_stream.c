@@ -179,6 +179,7 @@ static esp_err_t _stream_open_audio(uint32_t sample_rate, uint8_t bits,
     if (result != ESP_OK)
     {
         LOG_E("audio acquire failed: %s", esp_err_to_name(result));
+        (void)audio_service_configure(&s_stream.default_audio);
         (void)xSemaphoreGive(s_stream.audio_lock);
         return result;
     }
@@ -331,6 +332,17 @@ static void _stream_play_url(const char *url, uint32_t duration_ms,
         _stream_set_status(MUSIC_PLAYBACK_ERROR,
                            MUSIC_SERVICE_FAILURE_NETWORK);
         failure_reason = MUSIC_SERVICE_FAILURE_NETWORK;
+        failed = true;
+        goto cleanup;
+    }
+    const int http_status = esp_http_client_get_status_code(client);
+    if (http_status < 200 || http_status >= 300)
+    {
+        const music_service_failure_t status_failure =
+            (http_status == 401 || http_status == 403) ?
+            MUSIC_SERVICE_FAILURE_AUTH : MUSIC_SERVICE_FAILURE_NETWORK;
+        _stream_set_status(MUSIC_PLAYBACK_ERROR, status_failure);
+        failure_reason = status_failure;
         failed = true;
         goto cleanup;
     }
@@ -666,7 +678,7 @@ static void _stream_play_url(const char *url, uint32_t duration_ms,
     }
 
 cleanup:
-    if (audio_ready)
+    if (s_stream.lease_held)
     {
         if (_stream_close_audio() != ESP_OK)
         {
@@ -933,7 +945,8 @@ esp_err_t music_stream_deinit(void)
 esp_err_t music_stream_play(const char *url, uint32_t duration_ms,
                             uint32_t generation)
 {
-    if (!s_stream.initialized || url == NULL || url[0] == '\0')
+    if (!s_stream.initialized || url == NULL || url[0] == '\0' ||
+            generation == 0U)
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -942,10 +955,15 @@ esp_err_t music_stream_play(const char *url, uint32_t duration_ms,
     (void)snprintf(command.url, sizeof(command.url), "%s", url);
     command.duration_ms = duration_ms;
     command.generation = generation;
-    atomic_store_explicit(&s_stream.play_generation, generation,
-                          memory_order_release);
-    return xQueueSend(s_stream.queue, &command, pdMS_TO_TICKS(100U)) ==
-           pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+    const uint32_t previous_generation = atomic_exchange_explicit(
+            &s_stream.play_generation, generation, memory_order_acq_rel);
+    if (xQueueSend(s_stream.queue, &command, pdMS_TO_TICKS(100U)) != pdTRUE)
+    {
+        atomic_store_explicit(&s_stream.play_generation, previous_generation,
+                              memory_order_release);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
 }
 
 esp_err_t music_stream_pause(bool pause)
