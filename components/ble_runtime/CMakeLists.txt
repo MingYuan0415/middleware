@@ -1,3 +1,11 @@
+idf_build_get_property(_ble_target IDF_TARGET)
+set(_ble_radio_requires)
+if(_ble_target STREQUAL "esp32p4")
+    # The CP owns the BT controller; the host runs NimBLE and the hosted
+    # stack adapter binds it to the SDIO HCI byte pipe.
+    list(APPEND _ble_radio_requires esp_hosted)
+endif()
+
 idf_component_register(
     SRCS
     "src/ble_runtime.c"
@@ -29,6 +37,7 @@ idf_component_register(
     REQUIRES
     bt
     device_link
+    ${_ble_radio_requires}
     PRIV_REQUIRES
     freertos
     mt_log

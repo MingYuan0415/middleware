@@ -13,6 +13,10 @@
 
 #include "sdkconfig.h"
 
+#if CONFIG_ESP_HOSTED_HOST_FEAT_BT
+    #include "esp_hosted_bt_host_stack.h"
+#endif
+
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -61,6 +65,11 @@
 #include "ble_tx_scheduler.h"
 static ble_nimble_smp_io_t s_smp_io;
 static bool s_smp_io_initialized;
+#if CONFIG_ESP_HOSTED_HOST_FEAT_BT
+    /* The hosted CP controller is brought up before nimble_port_init() and torn
+    * down after nimble_port_deinit(); it must survive BLE runtime restarts. */
+    static bool s_hosted_bt_ready;
+#endif
 static atomic_bool s_acl_pairing_attempted = false;
 static void _ble_nimble_port_smp_wake_owner(void *arg);
 
@@ -6068,6 +6077,13 @@ static esp_err_t _ble_nimble_port_rollback_init(
         s_port.deinit_error = cleanup;
         return cleanup;
     }
+#if CONFIG_ESP_HOSTED_HOST_FEAT_BT
+    if (s_hosted_bt_ready)
+    {
+        (void)esp_hosted_bt_host_stack_teardown();
+        s_hosted_bt_ready = false;
+    }
+#endif
     return original_error;
 }
 
@@ -6242,6 +6258,18 @@ static esp_err_t _ble_nimble_port_init(void)
                        result, false, false, false);
         }
     }
+#if CONFIG_ESP_HOSTED_HOST_FEAT_BT
+    {
+        esp_hosted_bt_host_stack_cfg_t hosted_config =
+            ESP_HOSTED_BT_HOST_STACK_CONFIG_DEFAULT();
+        result = esp_hosted_bt_host_stack_setup(&hosted_config);
+        if (result != ESP_OK)
+        {
+            return _ble_nimble_port_rollback_init(result, false, false, false);
+        }
+        s_hosted_bt_ready = true;
+    }
+#endif
     result = nimble_port_init();
     if (result != ESP_OK)
     {
@@ -6519,6 +6547,20 @@ static esp_err_t _ble_nimble_port_deinit(void)
             s_port.deinit_error = result;
             return result;
         }
+#if CONFIG_ESP_HOSTED_HOST_FEAT_BT
+        if (s_hosted_bt_ready)
+        {
+            const esp_err_t hosted_result =
+                esp_hosted_bt_host_stack_teardown();
+            if (hosted_result != ESP_OK)
+            {
+                s_port.deinit_failed = true;
+                s_port.deinit_error = hosted_result;
+                return hosted_result;
+            }
+            s_hosted_bt_ready = false;
+        }
+#endif
     }
     if (s_port.sync_semaphore != NULL)
     {

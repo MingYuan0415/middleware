@@ -2,3 +2,7 @@ version: "0.1.0"
 description: "MicroTech BLE runtime: lifecycle owner for the Device Link stack"
 dependencies:
   idf: ">=6.0"
+  espressif/esp_hosted:
+    version: '3.0.10'
+    rules:
+      - if: "target == esp32p4"
