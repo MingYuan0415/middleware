@@ -413,6 +413,20 @@ static void _parse_song(const cJSON *item, music_song_t *song)
     }
 }
 
+static uint64_t _playlist_disstid(const music_playlist_ref_t *ref)
+{
+    /* The liked-songs bucket is addressed by dirId 201; its tid is not a
+     * playlist disstid. Sending the bucket tid makes CgiGetDiss return a
+     * different or inaccessible list even though the metadata came from the
+     * account catalog. */
+    if (ref->kind == MUSIC_PLAYLIST_KIND_MY_FAVORITE ||
+            ref->dirid == 201U)
+    {
+        return 0U;
+    }
+    return ref->id;
+}
+
 esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
                                    uint16_t offset, uint16_t count,
                                    music_playlist_snapshot_t **snapshot)
@@ -428,7 +442,7 @@ esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
     {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddNumberToObject(param, "disstid", (double)ref->id);
+    cJSON_AddNumberToObject(param, "disstid", (double)_playlist_disstid(ref));
     cJSON_AddNumberToObject(param, "dirid", (double)ref->dirid);
     cJSON_AddBoolToObject(param, "tag", true);
     cJSON_AddNumberToObject(param, "song_begin", offset);

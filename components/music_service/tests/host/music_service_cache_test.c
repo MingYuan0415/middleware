@@ -51,6 +51,14 @@ int main(void)
     assert(!music_service_playlist_cache_matches(
                &cached, &ref, 0U, 30U));
 
+    cached = _snapshot(ref, 12U, 0U, 12U);
+    assert(music_service_playlist_cache_matches(
+               &cached, &ref, 12U, 10U));
+
+    cached = _snapshot(ref, 0U, 0U, 0U);
+    assert(music_service_playlist_cache_matches(
+               &cached, &ref, 0U, 30U));
+
     music_playlist_ref_t other = ref;
     other.tid = 14U;
     cached = _snapshot(ref, 0U, 2U, 12U);

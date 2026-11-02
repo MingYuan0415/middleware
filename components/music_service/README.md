@@ -62,7 +62,10 @@ playback lease. HTTP/cookie state is serialized by a dedicated mutex.
   from `CgiGetPlaylistFavInfo`-compatible account catalog. Home is requested
   lazily when the App sidebar mounts, not on every network-ready transition.
   Playlist detail, lyric and queue requests are bounded by the public header
-  limits.
+  limits. The dirId 201 liked bucket is requested with `disstid: 0` and
+  `dirid: 201`; ordinary playlists send their numeric playlist id as
+  `disstid`. Playlist pages are cached by reference and offset, so prefetching
+  a neighbouring page does not evict the page currently displayed.
 - Catalog parsers accept current (`mid`, `file.media_mid`, `dirinfo`) and legacy
   (`songmid`, `strMediaMid`, `dissname`) response names. Song URL requests use
   `CgiGetVkey` array parameters and `media_mid` filenames; lyrics use `crypt: 0`

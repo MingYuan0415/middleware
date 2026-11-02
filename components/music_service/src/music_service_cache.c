@@ -10,12 +10,16 @@ bool music_service_playlist_cache_matches(
     {
         return false;
     }
+    if (cached->count == 0U && cached->offset < cached->total)
+    {
+        return false;
+    }
     return cached->playlist.ref.id == ref->id &&
            cached->playlist.ref.dirid == ref->dirid &&
            cached->playlist.ref.tid == ref->tid &&
            cached->playlist.ref.kind == ref->kind &&
            cached->offset == offset &&
-           cached->count != 0U;
+           cached->count <= count;
 }
 
 bool music_service_image_cache_matches(

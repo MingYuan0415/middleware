@@ -24,6 +24,7 @@
 #define MUSIC_CREDENTIAL_KEY "music_cred"
 #define MUSIC_CREDENTIAL_MAGIC 0x4D555331U
 #define MUSIC_CREDENTIAL_VERSION 1U
+#define MUSIC_PLAYLIST_CACHE_SLOTS 5U
 
 /* Transport/API errors that do not have a distinct ESP-IDF code. */
 #define MUSIC_ERR_HTTP_AUTH      ((esp_err_t)0x7101)
@@ -119,7 +120,7 @@ typedef struct music_service_runtime
     music_service_status_t status;
     music_player_status_t player;
     music_home_snapshot_t *home;
-    music_playlist_snapshot_t *playlist;
+    music_playlist_snapshot_t *playlist[MUSIC_PLAYLIST_CACHE_SLOTS];
     music_queue_snapshot_t *queue;
     music_lyric_snapshot_t *lyric;
     music_image_t *login_qr;

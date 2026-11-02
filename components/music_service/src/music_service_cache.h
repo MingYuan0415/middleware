@@ -12,9 +12,10 @@ extern "C" {
 /**
  * @brief Whether a cached playlist page satisfies an acquire request.
  *
- * A non-empty response is complete for caching purposes even when it is shorter
- * than the requested page: the snapshot total distinguishes a final page from a
- * partial response, and the App renders both without issuing an endless retry.
+ * A response at the requested offset is complete for caching purposes even
+ * when it is shorter than requested: the App advances by the rows actually
+ * returned. An empty page is accepted only at or after the provider total;
+ * an empty non-terminal page is incomplete and must be requested again.
  */
 bool music_service_playlist_cache_matches(
     const music_playlist_snapshot_t *cached, const music_playlist_ref_t *ref,

@@ -53,7 +53,9 @@ HTTP/Cookie 状态由独立互斥锁串行化。
 - 首页数据合并匿名推荐流、登录用户的自建歌单、dirId 201 的“我喜欢”歌单与
   `CgiGetPlaylistFavInfo` 兼容账号接口返回的收藏歌单。首页在 App 侧边栏挂载时
   按需请求，不在每次网络就绪时预取；歌单详情、歌词与队列请求受公共头文件上限
-  约束。
+  约束。dirId 201 的“我喜欢”以 `disstid: 0`、`dirid: 201` 请求，普通歌单以数字
+  playlist id 作为 `disstid`。歌单页按引用与 offset 缓存，预取相邻页不会挤掉当前
+  正在显示的页面。
 - 曲库解析同时兼容当前字段（`mid`、`file.media_mid`、`dirinfo`）与旧字段
   （`songmid`、`strMediaMid`、`dissname`）；歌曲 URL 请求使用 `CgiGetVkey`
   数组参数和 `media_mid` 文件名，歌词使用 `crypt: 0` 的普通 LRC。请求音质

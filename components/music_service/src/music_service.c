@@ -201,6 +201,27 @@ void music_service_replace_home(music_home_snapshot_t *snapshot)
     music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_HOME, 0U);
 }
 
+static size_t _music_service_playlist_cache_slot_locked(
+    const music_playlist_snapshot_t *snapshot)
+{
+    size_t victim = 0U;
+    for (size_t slot = 0U; slot < MUSIC_PLAYLIST_CACHE_SLOTS; ++slot)
+    {
+        if (s_music.playlist[slot] == NULL)
+        {
+            victim = slot;
+            continue;
+        }
+        if (music_service_playlist_cache_matches(
+                    s_music.playlist[slot], &snapshot->playlist.ref,
+                    snapshot->offset, snapshot->count))
+        {
+            return slot;
+        }
+    }
+    return victim;
+}
+
 void music_service_replace_playlist(music_playlist_snapshot_t *snapshot)
 {
     if (snapshot == NULL)
@@ -212,13 +233,14 @@ void music_service_replace_playlist(music_playlist_snapshot_t *snapshot)
         music_snapshot_release(snapshot);
         return;
     }
-    music_playlist_snapshot_t *old = s_music.playlist;
-    s_music.playlist = snapshot;
+    size_t slot = _music_service_playlist_cache_slot_locked(snapshot);
+    const music_playlist_snapshot_t *old = s_music.playlist[slot];
+    s_music.playlist[slot] = snapshot;
     s_music.status.failure = MUSIC_SERVICE_FAILURE_NONE;
     s_music.status.generation = ++s_music.generation;
     s_music.player.generation = s_music.status.generation;
     music_service_unlock();
-    music_snapshot_release(old);
+    music_snapshot_release((void *)old);
     music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYLIST, 0U);
 }
 
@@ -868,7 +890,8 @@ static void _api_task(void *argument)
             (void)music_stream_stop();
             atomic_store_explicit(&s_playing, false, memory_order_release);
             music_home_snapshot_t *old_home = NULL;
-            music_playlist_snapshot_t *old_playlist = NULL;
+            music_playlist_snapshot_t *old_playlists[MUSIC_PLAYLIST_CACHE_SLOTS] =
+            {0};
             music_queue_snapshot_t *old_queue = NULL;
             music_lyric_snapshot_t *old_lyric = NULL;
             music_image_t *old_image = NULL;
@@ -885,13 +908,13 @@ static void _api_task(void *argument)
             s_music.status.qr_available = false;
             s_music.status.login_type = MUSIC_LOGIN_TYPE_WECHAT;
             old_home = s_music.home;
-            old_playlist = s_music.playlist;
+            memcpy(old_playlists, s_music.playlist, sizeof(old_playlists));
             old_queue = s_music.queue;
             old_lyric = s_music.lyric;
             old_image = s_music.image;
             old_qr = s_music.login_qr;
             s_music.home = NULL;
-            s_music.playlist = NULL;
+            memset(s_music.playlist, 0, sizeof(s_music.playlist));
             s_music.queue = NULL;
             s_music.lyric = NULL;
             s_music.image = NULL;
@@ -912,7 +935,10 @@ static void _api_task(void *argument)
                                            MUSIC_SERVICE_FAILURE_NONE);
             music_service_unlock();
             music_snapshot_release(old_home);
-            music_snapshot_release(old_playlist);
+            for (size_t slot = 0U; slot < MUSIC_PLAYLIST_CACHE_SLOTS; ++slot)
+            {
+                music_snapshot_release(old_playlists[slot]);
+            }
             music_snapshot_release(old_queue);
             music_snapshot_release(old_lyric);
             music_service_image_release(old_image);
@@ -951,9 +977,13 @@ static void _api_task(void *argument)
             }
             else
             {
+                const music_service_failure_t failure =
+                    _music_service_failure_from_result(result);
                 music_service_handle_network_result(result);
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
                                       0U);
+                music_service_publish_detail(
+                    MUSIC_SERVICE_MSG_SUB_TYPE_PLAYLIST, 0U, failure);
             }
             break;
         }
@@ -1421,7 +1451,10 @@ esp_err_t music_service_deinit(void)
         s_music.login_queue = NULL;
     }
     music_snapshot_release(s_music.home);
-    music_snapshot_release(s_music.playlist);
+    for (size_t slot = 0U; slot < MUSIC_PLAYLIST_CACHE_SLOTS; ++slot)
+    {
+        music_snapshot_release(s_music.playlist[slot]);
+    }
     music_snapshot_release(s_music.queue);
     music_snapshot_release(s_music.lyric);
     music_service_login_qr_release(s_music.login_qr);
@@ -1811,14 +1844,17 @@ esp_err_t music_service_playlist_acquire(const music_playlist_ref_t *ref,
     *snapshot = NULL;
     if (music_service_lock() == ESP_OK)
     {
-        music_playlist_snapshot_t *playlist = s_music.playlist;
-        if (music_service_playlist_cache_matches(playlist, ref, offset,
-                count))
+        for (size_t slot = 0U; slot < MUSIC_PLAYLIST_CACHE_SLOTS; ++slot)
         {
-            playlist = music_snapshot_retain(playlist);
-            music_service_unlock();
-            *snapshot = playlist;
-            return ESP_OK;
+            music_playlist_snapshot_t *playlist = s_music.playlist[slot];
+            if (music_service_playlist_cache_matches(playlist, ref, offset,
+                    count))
+            {
+                playlist = music_snapshot_retain(playlist);
+                music_service_unlock();
+                *snapshot = playlist;
+                return ESP_OK;
+            }
         }
         music_service_unlock();
     }
@@ -1964,7 +2000,11 @@ static uint32_t _music_service_next_play_generation_locked(void)
 esp_err_t music_service_play_playlist(const music_playlist_ref_t *ref,
                                       uint16_t start_index)
 {
-    if (ref == NULL || ref->id == 0U || s_music.api_queue == NULL)
+    const bool liked = ref != NULL &&
+                       ref->kind == MUSIC_PLAYLIST_KIND_MY_FAVORITE &&
+                       ref->dirid == 201U;
+    if (ref == NULL || (ref->id == 0U && !liked) ||
+            s_music.api_queue == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
