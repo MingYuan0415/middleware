@@ -52,6 +52,7 @@ typedef enum
 {
     MUSIC_API_CMD_LOGOUT = 0,
     MUSIC_API_CMD_REFRESH_HOME,
+    MUSIC_API_CMD_REFRESH_PROFILE,
     MUSIC_API_CMD_PLAYLIST,
     MUSIC_API_CMD_LYRIC,
     MUSIC_API_CMD_IMAGE,
@@ -136,6 +137,7 @@ typedef struct music_service_runtime
     music_credential_blob_t credential;
     music_credential_blob_t login_credential;
     bool credential_valid;
+    bool profile_loaded;
     music_login_type_t login_type;
     char qr_uuid[96];
     char qr_qrsig[256];
@@ -192,6 +194,9 @@ esp_err_t music_net_login_poll(music_login_type_t type,
                                music_credential_blob_t *credential,
                                music_login_poll_state_t *state);
 esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot);
+esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
+                                  char *name, size_t name_size,
+                                  char *avatar, size_t avatar_size);
 esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
                                    uint16_t offset, uint16_t count,
                                    music_playlist_snapshot_t **snapshot);

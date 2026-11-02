@@ -34,6 +34,8 @@ MicroTech 的 QQ 音乐账号、曲库、封面、歌词与流媒体播放服务
   `music_service_queue_play()` 与 `music_service_queue_remove()` 使用逻辑队列
   绝对下标。逻辑队列上限为 `MUSIC_SERVICE_MAX_QUEUE_TRACKS`，单个物化窗口
   不超过 `MUSIC_SERVICE_MAX_SONGS`。
+- `music_service_get_status()` 复制账号状态，包括 `user_id` 以及服务当前已知的
+  `user_name` / `user_avatar`。
 - `music_service_is_playing()` 是供系统 PM 使用的查询；它覆盖“已接受播放命令但
   流任务尚未启动”的窗口。
 - `music_service_get_diagnostics()` 返回 API/音频任务栈水位与 API 队列深度，
@@ -56,6 +58,11 @@ API 与登录 worker 栈保留在内部 RAM，因为凭证保存/删除要经过
 - 二维码可能是 JPEG 或 PNG，两种格式都会解码为 RGB565；当前版本不实现
   QQ 音乐 App 的 MQTT 登录。
 - 凭证保存在 NVS 的 `music_cred` Blob；删除凭证是工厂重置流程的一部分。
+- 凭证加载或登录完成后的下一次首页刷新中，服务通过
+  `userInfo.BaseUserInfoServer/get_user_baseinfo_v2` 读取当前账号资料；昵称与
+  头像通过 `music_service_get_status()` 暴露，`user_id` 保持为回退身份标识。
+  同一凭证的资料成功读取后不再重复；首页快照已缓存但资料缺失时，
+  `music_service_refresh_home()` 只排队资料刷新。
 - 首页数据合并匿名推荐流、登录用户的自建歌单、dirId 201 的“我喜欢”歌单与
   `CgiGetPlaylistFavInfo` 兼容账号接口返回的收藏歌单。首页在 App 侧边栏挂载时
   按需请求，不在每次网络就绪时预取；歌单详情、歌词与队列请求受公共头文件上限

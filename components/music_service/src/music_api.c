@@ -86,9 +86,14 @@ bool music_json_bool(const cJSON *object, const char *key)
     return cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint != 0);
 }
 
-cJSON *music_api_post(const char *module, const char *method,
-                      cJSON *param, cJSON **root_out)
+static cJSON *_music_api_post(const char *module, const char *method,
+                              cJSON *param, cJSON **root_out,
+                              const char *uin, const char *musickey)
 {
+    if (root_out == NULL)
+    {
+        return NULL;
+    }
     *root_out = NULL;
     s_last_musicu_error = ESP_OK;
     if (module == NULL || method == NULL || param == NULL)
@@ -96,18 +101,8 @@ cJSON *music_api_post(const char *module, const char *method,
         s_last_musicu_error = ESP_ERR_INVALID_ARG;
         return NULL;
     }
-    char credential_musicid[sizeof(s_music.credential.musicid)] = {0};
-    char credential_musickey[sizeof(s_music.credential.musickey)] = {0};
-    bool logged_in = false;
-    if (music_service_lock() == ESP_OK)
-    {
-        logged_in = s_music.credential_valid;
-        (void)snprintf(credential_musicid, sizeof(credential_musicid), "%s",
-                       s_music.credential.musicid);
-        (void)snprintf(credential_musickey, sizeof(credential_musickey), "%s",
-                       s_music.credential.musickey);
-        music_service_unlock();
-    }
+    const bool logged_in = uin != NULL && uin[0] != '\0' &&
+                           musickey != NULL && musickey[0] != '\0';
     cJSON *root = cJSON_CreateObject();
     cJSON *comm = cJSON_CreateObject();
     cJSON *request = cJSON_CreateObject();
@@ -119,8 +114,7 @@ cJSON *music_api_post(const char *module, const char *method,
         s_last_musicu_error = ESP_ERR_NO_MEM;
         return NULL;
     }
-    cJSON_AddStringToObject(comm, "uin",
-                            logged_in ? credential_musicid : "0");
+    cJSON_AddStringToObject(comm, "uin", logged_in ? uin : "0");
     cJSON_AddStringToObject(comm, "format", "json");
     cJSON_AddNumberToObject(comm, "ct", 24);
     cJSON_AddNumberToObject(comm, "cv", 0);
@@ -139,10 +133,9 @@ cJSON *music_api_post(const char *module, const char *method,
     {
         char g_tk[24];
         (void)snprintf(g_tk, sizeof(g_tk), "%u",
-                       (unsigned)music_login_hash33(
-                           credential_musickey, 5381U));
+                       (unsigned)music_login_hash33(musickey, 5381U));
         cJSON_AddStringToObject(comm, "g_tk", g_tk);
-        cJSON_AddStringToObject(comm, "authst", credential_musickey);
+        cJSON_AddStringToObject(comm, "authst", musickey);
     }
     cJSON_AddItemToObject(root, "comm", comm);
     cJSON_AddStringToObject(request, "module", module);
@@ -210,5 +203,32 @@ cJSON *music_api_post(const char *module, const char *method,
     }
     *root_out = response;
     return data;
+}
+
+cJSON *music_api_post(const char *module, const char *method,
+                      cJSON *param, cJSON **root_out)
+{
+    char credential_musicid[sizeof(s_music.credential.musicid)] = {0};
+    char credential_musickey[sizeof(s_music.credential.musickey)] = {0};
+    bool credential_valid = false;
+    if (music_service_lock() == ESP_OK)
+    {
+        credential_valid = s_music.credential_valid;
+        (void)snprintf(credential_musicid, sizeof(credential_musicid), "%s",
+                       s_music.credential.musicid);
+        (void)snprintf(credential_musickey, sizeof(credential_musickey), "%s",
+                       s_music.credential.musickey);
+        music_service_unlock();
+    }
+    return _music_api_post(module, method, param, root_out,
+                           credential_valid ? credential_musicid : NULL,
+                           credential_valid ? credential_musickey : NULL);
+}
+
+cJSON *music_api_post_with_credentials(const char *uin, const char *musickey,
+                                       const char *module, const char *method,
+                                       cJSON *param, cJSON **root_out)
+{
+    return _music_api_post(module, method, param, root_out, uin, musickey);
 }
 

@@ -108,6 +108,90 @@ void music_service_set_state_locked(music_service_state_t state,
     s_music.player.generation = s_music.status.generation;
 }
 
+static void _music_service_set_account_locked(
+    const music_credential_blob_t *credential)
+{
+    s_music.profile_loaded = false;
+    s_music.status.user_id[0] = '\0';
+    s_music.status.user_name[0] = '\0';
+    s_music.status.user_avatar[0] = '\0';
+    if (credential != NULL)
+    {
+        (void)snprintf(s_music.status.user_id,
+                       sizeof(s_music.status.user_id), "%s",
+                       credential->musicid);
+        if (credential->login_type == 2U)
+        {
+            (void)snprintf(s_music.status.user_avatar,
+                           sizeof(s_music.status.user_avatar),
+                           "https://q.qlogo.cn/headimg_dl?dst_uin=%s&spec=140",
+                           credential->musicid);
+        }
+    }
+}
+
+static void _music_service_refresh_profile(void)
+{
+    bool needed = false;
+    if (music_service_lock() == ESP_OK)
+    {
+        needed = s_music.credential_valid && !s_music.profile_loaded;
+        music_service_unlock();
+    }
+    if (!needed)
+    {
+        return;
+    }
+    char account[MUSIC_SERVICE_USER_ID_BYTES] = {0};
+    char name[MUSIC_SERVICE_CREATOR_BYTES] = {0};
+    char avatar[MUSIC_SERVICE_URL_BYTES] = {0};
+    const esp_err_t result = music_net_fetch_profile(
+                                 account, sizeof(account),
+                                 name, sizeof(name), avatar, sizeof(avatar));
+    if (result != ESP_OK && result != ESP_ERR_NOT_FOUND)
+    {
+        return;
+    }
+    if (music_service_lock() != ESP_OK)
+    {
+        return;
+    }
+    if (!s_music.credential_valid ||
+            strcmp(s_music.credential.musicid, account) != 0)
+    {
+        music_service_unlock();
+        return;
+    }
+    bool changed = false;
+    if (result == ESP_OK)
+    {
+        if (name[0] != '\0' &&
+                strcmp(s_music.status.user_name, name) != 0)
+        {
+            (void)snprintf(s_music.status.user_name,
+                           sizeof(s_music.status.user_name), "%s", name);
+            changed = true;
+        }
+        if (avatar[0] != '\0' &&
+                strcmp(s_music.status.user_avatar, avatar) != 0)
+        {
+            (void)snprintf(s_music.status.user_avatar,
+                           sizeof(s_music.status.user_avatar), "%s", avatar);
+            changed = true;
+        }
+    }
+    s_music.profile_loaded = true;
+    if (changed)
+    {
+        s_music.status.generation = ++s_music.generation;
+    }
+    music_service_unlock();
+    if (changed)
+    {
+        music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS, 0U);
+    }
+}
+
 uint64_t music_service_next_generation(void)
 {
     if (music_service_lock() != ESP_OK)
@@ -169,6 +253,7 @@ void music_service_handle_network_result(esp_err_t result)
         {
             s_music.credential_valid = false;
             s_music.status.logged_in = false;
+            _music_service_set_account_locked(NULL);
             music_service_set_state_locked(MUSIC_SERVICE_STATE_AUTH_REQUIRED,
                                            failure);
         }
@@ -1039,8 +1124,7 @@ static void _music_service_run_login(music_login_type_t type, uint32_t session)
                              MUSIC_LOGIN_TYPE_QQ : MUSIC_LOGIN_TYPE_WECHAT;
         s_music.status.login_type = s_music.login_type;
         s_music.status.qr_available = false;
-        s_music.status.user_name[0] = '\0';
-        s_music.status.user_avatar[0] = '\0';
+        _music_service_set_account_locked(&credential);
         music_service_set_state_locked(MUSIC_SERVICE_STATE_READY,
                                        MUSIC_SERVICE_FAILURE_NONE);
         (void)snprintf(s_music.status.qr_status,
@@ -1181,8 +1265,7 @@ static void _api_task(void *argument)
             s_music.login_active = false;
             s_music.login_type = MUSIC_LOGIN_TYPE_WECHAT;
             s_music.status.logged_in = false;
-            s_music.status.user_name[0] = '\0';
-            s_music.status.user_avatar[0] = '\0';
+            _music_service_set_account_locked(NULL);
             s_music.status.qr_status[0] = '\0';
             s_music.status.qr_available = false;
             s_music.status.login_type = MUSIC_LOGIN_TYPE_WECHAT;
@@ -1243,6 +1326,11 @@ static void _api_task(void *argument)
             music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_PLAYER, 0U);
             break;
         }
+        case MUSIC_API_CMD_REFRESH_PROFILE:
+        {
+            _music_service_refresh_profile();
+            break;
+        }
         case MUSIC_API_CMD_REFRESH_HOME:
         {
             music_home_snapshot_t *snapshot = NULL;
@@ -1257,6 +1345,7 @@ static void _api_task(void *argument)
                 music_service_publish(MUSIC_SERVICE_MSG_SUB_TYPE_STATUS,
                                       0U);
             }
+            _music_service_refresh_profile();
             break;
         }
         case MUSIC_API_CMD_PLAYLIST:
@@ -1980,6 +2069,7 @@ esp_err_t music_service_init(const music_service_config_t *config)
                                  MUSIC_LOGIN_TYPE_WECHAT;
             s_music.status.login_type = s_music.login_type;
             s_music.status.logged_in = true;
+            _music_service_set_account_locked(&credential);
         }
     }
     if (xTaskCreatePinnedToCore(_api_task, "music_api",
@@ -2203,6 +2293,7 @@ esp_err_t music_service_set_time_ready(bool ready)
     {
         s_music.credential_valid = false;
         s_music.status.logged_in = false;
+        _music_service_set_account_locked(NULL);
         music_service_set_state_locked(MUSIC_SERVICE_STATE_AUTH_REQUIRED,
                                        MUSIC_SERVICE_FAILURE_AUTH);
         expired = true;
@@ -2426,10 +2517,22 @@ esp_err_t music_service_refresh_home(bool force)
     if (!force && music_service_lock() == ESP_OK)
     {
         const bool cached = s_music.home != NULL;
+        const bool profile_missing = s_music.credential_valid &&
+                                     !s_music.profile_loaded;
         music_service_unlock();
         if (cached)
         {
-            return ESP_OK;
+            if (!profile_missing)
+            {
+                return ESP_OK;
+            }
+            const music_api_command_t profile_command =
+            {
+                .type = MUSIC_API_CMD_REFRESH_PROFILE,
+            };
+            return xQueueSend(s_music.api_queue, &profile_command,
+                              pdMS_TO_TICKS(100U)) == pdTRUE ?
+                   ESP_OK : ESP_ERR_TIMEOUT;
         }
     }
     const music_api_command_t command =

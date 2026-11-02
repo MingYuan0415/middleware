@@ -15,6 +15,9 @@ extern "C" {
 
 cJSON *music_api_post(const char *module, const char *method,
                       cJSON *param, cJSON **root_out);
+cJSON *music_api_post_with_credentials(const char *uin, const char *musickey,
+                                       const char *module, const char *method,
+                                       cJSON *param, cJSON **root_out);
 esp_err_t music_api_last_error(void);
 void music_json_string(const cJSON *object, const char *key,
                        char *output, size_t output_size);

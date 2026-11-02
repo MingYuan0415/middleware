@@ -30,6 +30,7 @@ extern "C" {
 #define MUSIC_SERVICE_ALBUM_BYTES           96U
 #define MUSIC_SERVICE_PLAYLIST_TITLE_BYTES  96U
 #define MUSIC_SERVICE_CREATOR_BYTES         64U
+#define MUSIC_SERVICE_USER_ID_BYTES         24U
 #define MUSIC_SERVICE_URL_BYTES             512U
 #define MUSIC_SERVICE_SONG_COVER_BYTES      160U
 #define MUSIC_SERVICE_PLAYLIST_COVER_BYTES  256U
@@ -250,8 +251,9 @@ typedef struct music_service_status
     bool audio_available;
     bool qr_available;
     music_login_type_t login_type;
-    char user_name[MUSIC_SERVICE_CREATOR_BYTES];
-    char user_avatar[MUSIC_SERVICE_URL_BYTES];
+    char user_id[MUSIC_SERVICE_USER_ID_BYTES]; /**< Login account id. */
+    char user_name[MUSIC_SERVICE_CREATOR_BYTES]; /**< Profile nickname. */
+    char user_avatar[MUSIC_SERVICE_URL_BYTES]; /**< Profile avatar URL. */
     char qr_status[64];
 } music_service_status_t;
 
@@ -335,7 +337,11 @@ esp_err_t music_service_logout(void);
  */
 esp_err_t music_service_reset_persisted_state(void);
 
-/** @brief Request a home refresh; cached data remains visible until replaced. */
+/**
+ * @brief Request a home or missing-profile refresh.
+ *
+ * Cached data remains visible until replaced.
+ */
 esp_err_t music_service_refresh_home(bool force);
 
 /** @brief Acquire/release the latest home snapshot. */

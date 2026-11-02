@@ -10,6 +10,7 @@ idf_component_register(
         "src/music_auth.c"
         "src/music_catalog.c"
         "src/music_login_protocol.c"
+        "src/music_profile.c"
         "src/music_stream.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"

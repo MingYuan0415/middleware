@@ -37,6 +37,8 @@ audio I/O itself.
   `music_service_queue_remove()` take absolute logical queue indices. The
   logical queue is capped by `MUSIC_SERVICE_MAX_QUEUE_TRACKS`, while a single
   materialized window stays bounded by `MUSIC_SERVICE_MAX_SONGS`.
+- `music_service_get_status()` copies the account state, including `user_id`
+  and any `user_name`/`user_avatar` currently known by the service.
 - `music_service_is_playing()` is the PM guard query; it includes the interval
   between accepting a play command and the stream task actually starting.
 - `music_service_get_diagnostics()` returns API/stream stack watermarks and API
@@ -63,6 +65,14 @@ HTTP/cookie state is serialized by a dedicated mutex.
   MQTT login is not implemented in this version.
 - Credentials are stored in the `music_cred` NVS blob and erasing them is part
   of the factory-reset sequence.
+- On the next home refresh after a credential is loaded or a login completes,
+  the service reads the current account profile with
+  `userInfo.BaseUserInfoServer/get_user_baseinfo_v2`. The nickname and avatar
+  are exposed through `music_service_get_status()`; `user_id` remains available
+  as the fallback identity. A successful profile read is not repeated for the
+  same credential; when the home snapshot is already cached,
+  `music_service_refresh_home()` with a missing profile queues only the profile
+  refresh.
 - Home data combines the anonymous recommendation feed with the logged-in
   user's created playlists, dirId 201 liked playlist, and collected playlists
   from `CgiGetPlaylistFavInfo`-compatible account catalog. Home is requested

@@ -4,6 +4,7 @@
 #include "music_service_internal.h"
 #include "music_api.h"
 #include "music_http.h"
+#include "music_profile.h"
 #include "music_snapshot.h"
 
 #include "cJSON.h"
@@ -323,6 +324,69 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
     }
     *snapshot = home;
     return ESP_OK;
+}
+
+esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
+                                  char *name, size_t name_size,
+                                  char *avatar, size_t avatar_size)
+{
+    if (account_id == NULL || account_id_size == 0U || name == NULL ||
+            name_size == 0U || avatar == NULL || avatar_size == 0U)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    account_id[0] = '\0';
+    name[0] = '\0';
+    avatar[0] = '\0';
+    char uin[sizeof(s_music.credential.musicid)] = {0};
+    char musickey[sizeof(s_music.credential.musickey)] = {0};
+    music_login_type_t login_type = MUSIC_LOGIN_TYPE_WECHAT;
+    bool credential_valid = false;
+    if (music_service_lock() == ESP_OK)
+    {
+        credential_valid = s_music.credential_valid;
+        login_type = s_music.login_type;
+        (void)snprintf(uin, sizeof(uin), "%s", s_music.credential.musicid);
+        (void)snprintf(musickey, sizeof(musickey), "%s",
+                       s_music.credential.musickey);
+        music_service_unlock();
+    }
+    if (!credential_valid || uin[0] == '\0')
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    (void)snprintf(account_id, account_id_size, "%s", uin);
+
+    cJSON *param = cJSON_CreateObject();
+    if (param == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *vec_uin = cJSON_AddArrayToObject(param, "vec_uin");
+    cJSON *uin_item = vec_uin == NULL ? NULL : cJSON_CreateString(uin);
+    if (vec_uin == NULL || uin_item == NULL)
+    {
+        cJSON_Delete(param);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToArray(vec_uin, uin_item);
+    cJSON_AddNumberToObject(param, "need_profile", 1);
+    cJSON *root = NULL;
+    cJSON *data = music_api_post_with_credentials(uin, musickey,
+        "userInfo.BaseUserInfoServer",
+        "get_user_baseinfo_v2", param, &root);
+    if (data == NULL)
+    {
+        cJSON_Delete(root);
+        return music_api_last_error();
+    }
+
+    const bool found = music_profile_parse(data, uin,
+                                           login_type == MUSIC_LOGIN_TYPE_QQ,
+                                           name, name_size, avatar,
+                                           avatar_size);
+    cJSON_Delete(root);
+    return found ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 static void _parse_song(const cJSON *item, music_song_t *song)
