@@ -695,6 +695,36 @@ static void test_radio_unavailable_keeps_saved_profile(void)
     device_link_wifi_adapter_bridge_stop();
 }
 
+static void test_connect_requires_saved_profile(void)
+{
+    connectivity_manager_status_snapshot_t status;
+
+    memset(&status, 0, sizeof(status));
+    status.generation = 9U;
+    status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
+    status.available = true;
+    status.radio_available = true;
+    status.saved_profile = false;
+    status.wifi_enabled = true;
+    connectivity_manager_fake_reset();
+    ble_link_service_fake_reset();
+    connectivity_manager_fake_set_status(&status);
+    assert(device_link_wifi_adapter_bridge_start() == ESP_OK);
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_CONNECT,
+                                           NULL, 51U, NULL) ==
+           DEVICE_LINK_V1_STATUS_NOT_FOUND);
+
+    status.generation = 10U;
+    status.saved_profile = true;
+    event_bus_fake_publish(CONNECTIVITY_MANAGER_MSG,
+                           CONNECTIVITY_MANAGER_MSG_SUB_TYPE_STATUS_SNAPSHOT,
+                           &status, sizeof(status));
+    assert(device_link_wifi_adapter_submit(DEVICE_LINK_V1_OPERATION_CONNECT,
+                                           NULL, 52U, NULL) ==
+           DEVICE_LINK_V1_STATUS_ACCEPTED);
+    device_link_wifi_adapter_bridge_stop();
+}
+
 int main(void)
 {
     test_request_mapping_is_atomic_for_all_operations();
@@ -702,6 +732,7 @@ int main(void)
     test_fill_info();
     test_submit_scan();
     test_submit_save_credentials();
+    test_connect_requires_saved_profile();
     test_status_event_observes_snapshot();
     test_scan_event_completes_operation();
     test_status_event_completes_save();

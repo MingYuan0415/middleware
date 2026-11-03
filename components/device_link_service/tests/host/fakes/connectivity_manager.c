@@ -12,6 +12,7 @@ static connectivity_manager_status_snapshot_t s_status =
     .failure = CONNECTIVITY_MANAGER_FAILURE_NONE,
     .available = true,
     .radio_available = true,
+    .saved_profile = true,
     .profile_persisted = true,
     .wifi_enabled = true,
     .profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL,
@@ -54,6 +55,7 @@ void connectivity_manager_fake_reset(void)
     s_status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
     s_status.available = true;
     s_status.radio_available = true;
+    s_status.saved_profile = true;
     s_status.profile_persisted = true;
     s_status.wifi_enabled = true;
     s_status.profile_revision = CONNECTIVITY_MANAGER_PROFILE_REVISION_INITIAL;
@@ -154,6 +156,12 @@ esp_err_t connectivity_manager_request_sync_profile(
 }
 
 esp_err_t connectivity_manager_request_wifi_disable(
+    connectivity_manager_operation_id_t *operation_id)
+{
+    return _admit(operation_id);
+}
+
+esp_err_t connectivity_manager_request_wifi_power_on(
     connectivity_manager_operation_id_t *operation_id)
 {
     return _admit(operation_id);

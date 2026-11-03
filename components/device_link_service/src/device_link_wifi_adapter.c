@@ -26,6 +26,9 @@ typedef struct device_link_wifi_bridge
 {
     bool started;
     bool status_seen;
+    /* Latest snapshot facts used to reject CONNECT without a saved profile
+     * before the manager ever touches the radio. */
+    bool saved_profile;
     uint32_t ble_operation_id;
     connectivity_manager_operation_id_t manager_operation_id;
     device_link_v1_operation_t operation;
@@ -284,6 +287,7 @@ static void _device_link_wifi_on_status(
         return;
     }
     s_bridge.status_seen = true;
+    s_bridge.saved_profile = status->saved_profile;
     s_bridge.last_status_generation = status->generation;
     _device_link_wifi_unlock();
     _device_link_wifi_map_snapshot(status, &snapshot);
@@ -517,6 +521,20 @@ device_link_v1_status_t device_link_wifi_adapter_submit(
         }
         break;
     case DEVICE_LINK_V1_OPERATION_CONNECT:
+        /* CONNECT means "connect the saved network": without a profile the
+         * contract allows NOT_FOUND, and the manager's cycle must not be
+         * started just to power the radio. Before the first snapshot the
+         * caller is told to retry instead of guessing. */
+        if (!s_bridge.status_seen)
+        {
+            _device_link_wifi_unlock();
+            return DEVICE_LINK_V1_STATUS_BUSY;
+        }
+        if (!s_bridge.saved_profile)
+        {
+            _device_link_wifi_unlock();
+            return DEVICE_LINK_V1_STATUS_NOT_FOUND;
+        }
         result = connectivity_manager_request_wifi_enable(&manager_id);
         break;
     case DEVICE_LINK_V1_OPERATION_DISCONNECT:
