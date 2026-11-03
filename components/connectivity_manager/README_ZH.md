@@ -7,7 +7,8 @@ Wi-Fi 连接策略 owner：策略 worker 持有已保存网络列表，并在每
 
 ## 连接策略
 
-`connectivity_manager_request_wifi_enable()` 启动一个周期：
+`connectivity_manager_request_wifi_enable()` 是严格的“连接已保存网络”：启动一个周期；
+没有保存档位时不碰射频并返回 `NOT_FOUND`。Device Link 的 CONNECT 映射到它。
 
 1. 射频按需初始化，然后启动（或恢复）；
 2. 扫描已保存网络，并由 `wifi_service` 返回每个保存档位的存在位图；
@@ -24,14 +25,29 @@ Wi-Fi 连接策略 owner：策略 worker 持有已保存网络列表，并在每
 并结束周期。连接尝试期间提交的前台 `request_scan()` 会在该次尝试终态后立即执行，
 然后恢复周期。
 
-`connectivity_manager_request_wifi_disable()` 取消正在进行的扫描/连接周期、停止射频，
-并保留已保存列表。`wifi_enabled` 是持久化用户意图；`manual_hold` 表示当前主动停止
-射频，不是持久化设置。Wi-Fi 保持开启期间链路丢失会重新开始扫描周期。
+`connectivity_manager_request_wifi_disable()` 取消正在进行的扫描/连接周期、停止射频、
+清除无档位窗口，并保留已保存列表。`wifi_enabled` 是当前策略位；`manual_hold` 表示当前
+主动停止射频，不是持久化设置。Wi-Fi 保持开启期间链路丢失会重新开始扫描周期。
 
-原“自动连接”开关已删除。`wifi_enabled` 是唯一的持久化策略，随 profile 记录保存并在
-启动时恢复；射频不在 boot 阶段初始化，持久化为开启的周期在首帧和 startup commit
-之后才开始。`request_save_profile()` 只保存凭据，不会自动发起连接；
-`request_forget()` 会清除所有保存档位和持久化记录。
+## 开关与无档位窗口
+
+`connectivity_manager_request_wifi_power_on()` 是用户开关。存在已保存网络时，它与
+`request_wifi_enable()` 走完全相同的周期；没有任何已保存网络时，它只给射频上电、
+停在 `IDLE`、返回 `ESP_OK`，并按产品配置的 `no_profile_radio_window_ms` 启动窗口。
+前台扫描或保存 profile 会续期；成功 `IP_READY`、`request_wifi_disable()`、
+`request_forget()` 或一次连接尝试会解除窗口。窗口到期后管理器自行停射频，置
+`manual_hold` 与 `radio_idle_timeout`，发布 `IDLE`；这不是客户端请求，因此不产生操作终态。
+窗口为 0 表示不自动关闭。
+
+开关关闭时仍允许前台 `request_scan()`：BLE 配网在任何档位存在之前就要能列网络，
+此时射频短暂上电并在扫描完成后停止。设置页会先提示用户打开 Wi-Fi 开关，但那是交互
+约束，不是管理器策略。
+
+原“自动连接”开关已删除。`wifi_enabled` 是唯一的策略位：随 profile 记录保存并在启动时
+恢复；没有已保存档位时启动会钳制为关。`radio_idle_timeout` 记录最后一次关闭来自无档位
+窗口。射频不在 boot 阶段初始化，持久化为开启的周期在首帧和 startup commit 之后才开始。
+`request_save_profile()` 只保存凭据，不会自动发起连接；`request_forget()` 会清除所有
+保存档位和持久化记录。
 
 ## 对外 API
 
@@ -39,11 +55,11 @@ Wi-Fi 连接策略 owner：策略 worker 持有已保存网络列表，并在每
 
 - `connectivity_manager_init()` / `deinit()` / `suspend()` / `resume()`：生命周期与待机。
 - `connectivity_manager_clear_persisted_profile()`：初始化前幂等擦除持久化 profile。
-- 前台命令：`request_scan()`、`request_wifi_enable()`、`request_wifi_disable()`、
-  `request_connect()`、`request_sync_profile()`、`request_save_profile()`、
-  `request_connect_network()`、`request_forget_network()`、`request_forget()`、
-  `cancel()`；均返回非零 `operation_id`。每个已接纳操作都有且只有一个终态，
-  包括存储和射频失败路径。
+- 前台命令：`request_scan()`、`request_wifi_power_on()`、`request_wifi_enable()`、
+  `request_wifi_disable()`、`request_connect()`、`request_sync_profile()`、
+  `request_save_profile()`、`request_connect_network()`、`request_forget_network()`、
+  `request_forget()`、`cancel()`；均返回非零 `operation_id`。每个已接纳操作都有且
+  只有一个终态，包括存储和射频失败路径。
 - `connectivity_manager_get_status()` / `get_scan_snapshot()` / `get_profiles()`：
   读取不含密码的不可变状态、扫描或已保存网络快照。
 - 通过 `EVENT_BUS_DECLARE_ID(CONNECTIVITY_MANAGER_MSG)` 发布状态、扫描和网络列表事件。
@@ -74,7 +90,8 @@ profile 下标，`status.attempt_ordinal` 是候选的 1-based 序号，
   `CONNECTIVITY_MANAGER_QUEUE_DEPTH`（默认 8）。
 - `CONNECTIVITY_MANAGER_MAX_CONNECT_FAILURES` 为编译期常量（3）。
 - CMake：`REQUIRES event_bus`；`PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`。
-- 运行时由 `connectivity_manager_config_t` 配置。
+- 运行时由 `connectivity_manager_config_t` 配置；`no_profile_radio_window_ms` 是无档位
+  开关窗口（0 表示关闭自动断电）。
 
 ## 状态与并发
 
@@ -82,8 +99,9 @@ profile 下标，`status.attempt_ordinal` 是候选的 1-based 序号，
 - 前台操作带非零 `operation_id`，且每个操作都有终态；失败周期只发布一次终态并清除操作，
   不会把前台操作停在长时间退避中。
 - 策略持久化和射频停止是两个步骤；NVS 写失败报告 `STORAGE`，但不能跳过射频停止。
-- `wifi_enabled` 是持久化意图，`manual_hold` 是当前主动停止状态，`radio_available`
-  是执行器健康状态，三者不能互相替代。
+- `wifi_enabled` 是当前策略位，`manual_hold` 是当前主动停止状态，
+  `radio_idle_timeout` 表示最后一次关闭来自无档位窗口，`radio_available` 是执行器
+  健康状态，四者不能互相替代。
 - manager 由 Wi-Fi service 事件和命令提交唤醒；空闲等待使用 deadline 或
   `portMAX_DELAY`，不再固定 20 ms 轮询。
 - 系统待机使用 `connectivity_manager_suspend()` / `resume()`，与用户关闭 Wi-Fi 分离；

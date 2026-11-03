@@ -79,6 +79,7 @@ typedef enum
     MANAGER_COMMAND_SAVE_PROFILE,
     MANAGER_COMMAND_DISCONNECT,
     MANAGER_COMMAND_RECONNECT,
+    MANAGER_COMMAND_POWER_ON,
     MANAGER_COMMAND_FORGET,
     MANAGER_COMMAND_CONNECT_NETWORK,
     MANAGER_COMMAND_FORGET_NETWORK,
@@ -303,6 +304,10 @@ typedef struct manager_worker
     bool pending_command_valid;
     manager_command_t pending_command;
     TickType_t retry_deadline;
+    /* Deadline of the no-profile radio window; armed only while the switch is
+     * on and no connection has completed yet. */
+    bool radio_idle_window_armed;
+    TickType_t radio_idle_deadline;
     uint8_t retry_count;
     UBaseType_t reported_stack_minimum_free;
     bool stack_minimum_reported;
@@ -1680,8 +1685,9 @@ static void _manager_set_target_status(manager_worker_t *worker)
 
     worker->status.saved_profile = worker->profile_count > 0U;
     worker->status.profile_count = worker->profile_count;
-    worker->status.wifi_enabled = worker->profile_count > 0U &&
-                                  worker->wifi_enabled != 0U;
+    /* The switch owns the radio, not the saved-network list: a device with no
+     * stored profile must still be able to power Wi-Fi on and scan. */
+    worker->status.wifi_enabled = worker->wifi_enabled != 0U;
     worker->status.profile_persisted = worker->target_valid &&
                                        worker->target_persisted;
     worker->status.profile_revision = worker->profile_count > 0U ?
@@ -1796,6 +1802,7 @@ static unsigned _manager_command_priority(manager_command_type_t type)
     case MANAGER_COMMAND_SYNC_PROFILE:
     case MANAGER_COMMAND_SAVE_PROFILE:
     case MANAGER_COMMAND_RECONNECT:
+    case MANAGER_COMMAND_POWER_ON:
         return 2U;
     case MANAGER_COMMAND_SCAN:
         return 1U;
@@ -1809,6 +1816,9 @@ static void _manager_process_command(manager_worker_t *worker,
                                      const manager_command_t *command,
                                      bool *stop);
 static void _manager_continue_policy(manager_worker_t *worker);
+static void _manager_clear_cycle_tracking(manager_worker_t *worker);
+static void _manager_arm_idle_window(manager_worker_t *worker);
+static void _manager_refresh_idle_window(manager_worker_t *worker);
 static void _manager_cycle_start(manager_worker_t *worker,
                                  connectivity_manager_operation_id_t operation_id,
                                  manager_command_type_t command_type,
@@ -2156,6 +2166,9 @@ static esp_err_t _manager_start_connect(manager_worker_t *worker,
                                         connectivity_manager_operation_id_t operation_id,
                                         manager_command_type_t command_type)
 {
+    /* A real connection attempt supersedes the no-profile idle window. */
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
     worker->operation_kind = MANAGER_OPERATION_CONNECT;
     worker->active_command = command_type;
     worker->operation_id = operation_id;
@@ -2406,6 +2419,8 @@ static esp_err_t _manager_erase_all_profiles(manager_worker_t *worker)
     }
     _manager_worker_clear_profiles(worker);
     _manager_clear_target(worker);
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
     worker->wifi_enabled = 0U;
     worker->status.manual_hold = true;
     worker->status.state = CONNECTIVITY_MANAGER_STATE_IDLE;
@@ -2618,6 +2633,11 @@ static void _manager_poll_status(manager_worker_t *worker)
                                    status.session_id == worker->session_id &&
                                    status.operation_id == worker->service_operation_id &&
                                    status.operation_complete;
+    if (status.state == WIFI_SERVICE_STATE_IP_READY)
+    {
+        worker->radio_idle_window_armed = false;
+        worker->status.radio_idle_timeout = false;
+    }
     if (status.state == WIFI_SERVICE_STATE_IP_READY &&
             worker->operation_kind == MANAGER_OPERATION_NONE)
     {
@@ -2861,6 +2881,9 @@ static void _manager_cycle_start(manager_worker_t *worker,
                                  manager_command_type_t command_type,
                                  uint8_t start_index)
 {
+    /* A saved-network cycle replaces the no-profile idle window. */
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
     /* Install the operation before any fallible policy or radio work. A
      * storage failure below must be able to publish this operation's terminal. */
     worker->operation_kind = MANAGER_OPERATION_SCAN;
@@ -3029,6 +3052,9 @@ static void _manager_command_scan(manager_worker_t *worker,
     {
         return;
     }
+    /* A user scan is foreground activity: keep the no-profile window alive
+     * while the switch is on but nothing has connected yet. */
+    _manager_refresh_idle_window(worker);
     if (worker->cycle_active)
     {
         worker->resume_cycle_after_scan = true;
@@ -3193,6 +3219,9 @@ static void _manager_command_save_profile(
     {
         return;
     }
+    /* Provisioning is foreground activity too: a user typing credentials in
+     * the Setup flow must not lose the radio mid-entry. */
+    _manager_refresh_idle_window(worker);
     manager_profile_entry_t entry = command->credentials;
     const uint8_t index = _manager_find_profile(worker, entry.ssid,
         entry.ssid_length);
@@ -3283,6 +3312,46 @@ static void _manager_command_save_profile(
     _manager_secure_zero(&entry, sizeof(entry));
 }
 
+static void _manager_clear_cycle_tracking(manager_worker_t *worker)
+{
+    worker->resume_cycle_after_scan = false;
+    worker->retry_pending = false;
+    worker->cycle_active = false;
+    worker->cycle_scan_pending = false;
+    worker->cycle_scan_retry_pending = false;
+    _manager_attempt_end(worker);
+    _manager_clear_candidate(worker);
+}
+
+/** @brief Re-arm the no-profile radio window from the product policy. */
+static void _manager_arm_idle_window(manager_worker_t *worker)
+{
+    const uint32_t window_ms = s_manager.config.no_profile_radio_window_ms;
+
+    if (window_ms == 0U)
+    {
+        worker->radio_idle_window_armed = false;
+        return;
+    }
+    TickType_t window_ticks = pdMS_TO_TICKS(window_ms);
+
+    if (window_ticks == 0U)
+    {
+        window_ticks = 1U;
+    }
+    worker->radio_idle_deadline = xTaskGetTickCount() + window_ticks;
+    worker->radio_idle_window_armed = true;
+}
+
+/** @brief Extend an armed window after user-visible foreground activity. */
+static void _manager_refresh_idle_window(manager_worker_t *worker)
+{
+    if (worker->radio_idle_window_armed)
+    {
+        _manager_arm_idle_window(worker);
+    }
+}
+
 static void _manager_command_wifi_disable(manager_worker_t *worker,
         const manager_command_t *command)
 {
@@ -3299,14 +3368,10 @@ static void _manager_command_wifi_disable(manager_worker_t *worker,
         return;
     }
     worker->wifi_enabled = 0U;
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
     worker->status.manual_hold = true;
-    worker->resume_cycle_after_scan = false;
-    worker->retry_pending = false;
-    worker->cycle_active = false;
-    worker->cycle_scan_pending = false;
-    worker->cycle_scan_retry_pending = false;
-    _manager_attempt_end(worker);
-    _manager_clear_candidate(worker);
+    _manager_clear_cycle_tracking(worker);
     /* Radio safety is independent of policy persistence: a failed NVS write
      * must never leave an authorized radio running while the UI says "off". */
     const esp_err_t stop_result =
@@ -3353,6 +3418,8 @@ static void _manager_command_wifi_enable(manager_worker_t *worker,
     }
     if (worker->profile_count == 0U)
     {
+        /* Strict saved-network connect: no profile means no radio work, so
+         * Device Link CONNECT can report NOT_FOUND without powering anything. */
         worker->status.last_error = ESP_ERR_NOT_FOUND;
         worker->status.failure = CONNECTIVITY_MANAGER_FAILURE_NONE;
         _manager_publish_status_terminal(
@@ -3360,8 +3427,66 @@ static void _manager_command_wifi_enable(manager_worker_t *worker,
             CONNECTIVITY_MANAGER_FAILURE_NONE);
         return;
     }
+    /* A connection attempt owns the radio; the no-profile idle window no
+     * longer applies once a saved network is being tried. */
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
     _manager_cycle_start(worker, command->operation_id,
                          command->type, worker->active_index);
+}
+
+static void _manager_command_wifi_power_on(manager_worker_t *worker,
+        const manager_command_t *command)
+{
+    const manager_defer_result_t defer_result =
+        _manager_defer_foreground(worker, command);
+    if (defer_result == MANAGER_DEFER_REJECTED)
+    {
+        return;
+    }
+    if (defer_result == MANAGER_DEFER_QUEUED)
+    {
+        return;
+    }
+    if (worker->status.state == CONNECTIVITY_MANAGER_STATE_IP_READY &&
+            worker->status.radio_available && !worker->status.manual_hold &&
+            worker->wifi_enabled != 0U)
+    {
+        _manager_publish_status_terminal(
+            worker, command->operation_id, ESP_OK,
+            CONNECTIVITY_MANAGER_FAILURE_NONE);
+        return;
+    }
+    worker->radio_idle_window_armed = false;
+    worker->status.radio_idle_timeout = false;
+    if (worker->profile_count > 0U)
+    {
+        _manager_cycle_start(worker, command->operation_id,
+                             command->type, worker->active_index);
+        return;
+    }
+    /* No saved network to connect: power the radio and stop at IDLE so the
+     * switch reflects a real state and a scan can follow. */
+    _manager_clear_cycle_tracking(worker);
+    const esp_err_t start_result = _manager_radio_start(worker);
+    worker->wifi_enabled = start_result == ESP_OK ? 1U : 0U;
+    worker->status.manual_hold = false;
+    worker->status.state = start_result == ESP_OK ?
+                           CONNECTIVITY_MANAGER_STATE_IDLE :
+                           CONNECTIVITY_MANAGER_STATE_OFFLINE;
+    worker->status.ipv4_address = 0U;
+    worker->status.last_error = start_result;
+    worker->status.failure = start_result == ESP_OK ?
+                             CONNECTIVITY_MANAGER_FAILURE_NONE :
+                             CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
+    _manager_set_target_status(worker);
+    _manager_publish_status_terminal(
+        worker, command->operation_id, start_result,
+        worker->status.failure);
+    if (start_result == ESP_OK)
+    {
+        _manager_arm_idle_window(worker);
+    }
 }
 
 static void _manager_command_forget(manager_worker_t *worker,
@@ -3817,12 +3942,51 @@ static void _manager_run_pending(manager_worker_t *worker)
     _manager_secure_zero(&command, sizeof(command));
 }
 
+/**
+ * @brief Turn the radio off when a no-profile window expires.
+ *
+ * The switch is the only owner of the radio in this state, so this applies the
+ * same policy as a manual disable: stop the executor, drop the policy bit and
+ * publish IDLE. No operation terminal is produced because the elapsed window
+ * is not a client request.
+ */
+static void _manager_auto_disable_radio(manager_worker_t *worker)
+{
+    worker->radio_idle_window_armed = false;
+    worker->wifi_enabled = 0U;
+    worker->status.manual_hold = true;
+    worker->status.radio_idle_timeout = true;
+    _manager_clear_cycle_tracking(worker);
+    const esp_err_t stop_result =
+        _manager_radio_stop(worker, CONNECTIVITY_MANAGER_RADIO_STOP_WAIT_MS);
+    worker->status.state = stop_result == ESP_OK ?
+                           CONNECTIVITY_MANAGER_STATE_IDLE :
+                           CONNECTIVITY_MANAGER_STATE_OFFLINE;
+    worker->status.ipv4_address = 0U;
+    worker->status.failure = stop_result == ESP_OK ?
+                             CONNECTIVITY_MANAGER_FAILURE_NONE :
+                             CONNECTIVITY_MANAGER_FAILURE_RADIO_UNAVAILABLE;
+    worker->status.last_error = stop_result;
+    _manager_set_target_status(worker);
+    _manager_cache_status(worker);
+    LOG_I("no profile connected within %u ms; Wi-Fi turned off",
+          (unsigned)s_manager.config.no_profile_radio_window_ms);
+}
+
 static void _manager_continue_policy(manager_worker_t *worker)
 {
     if (s_manager.terminal_outbox_count > 0U || worker->suspended ||
             atomic_load_explicit(&s_manager_lifecycle, memory_order_acquire) !=
             MANAGER_LIFECYCLE_RUNNING)
     {
+        return;
+    }
+    if (worker->radio_idle_window_armed &&
+            worker->operation_kind == MANAGER_OPERATION_NONE &&
+            _manager_tick_reached(xTaskGetTickCount(),
+                                  worker->radio_idle_deadline))
+    {
+        _manager_auto_disable_radio(worker);
         return;
     }
     if (worker->cycle_active &&
@@ -4037,6 +4201,13 @@ static esp_err_t _manager_worker_resume(manager_worker_t *worker,
                 }
             }
         }
+        if (!resumed_connect && worker->radio_idle_window_armed &&
+                worker->profile_count == 0U)
+        {
+            /* Standby time does not count against the no-profile window, so a
+             * wake must not turn the radio off the moment the user returns. */
+            _manager_arm_idle_window(worker);
+        }
         _manager_cache_status(worker);
         if (!resumed_connect && worker->resume_cycle_after_scan &&
                 worker->wifi_enabled != 0U && worker->profile_count > 0U)
@@ -4156,6 +4327,9 @@ static void _manager_process_command(manager_worker_t *worker,
         break;
     case MANAGER_COMMAND_RECONNECT:
         _manager_command_wifi_enable(worker, command);
+        break;
+    case MANAGER_COMMAND_POWER_ON:
+        _manager_command_wifi_power_on(worker, command);
         break;
     case MANAGER_COMMAND_FORGET:
         _manager_command_forget(worker, command);
@@ -4911,6 +5085,13 @@ esp_err_t connectivity_manager_request_wifi_disable(
     connectivity_manager_operation_id_t *out_operation_id)
 {
     return _manager_submit_simple(MANAGER_COMMAND_DISCONNECT,
+                                  out_operation_id);
+}
+
+esp_err_t connectivity_manager_request_wifi_power_on(
+    connectivity_manager_operation_id_t *out_operation_id)
+{
+    return _manager_submit_simple(MANAGER_COMMAND_POWER_ON,
                                   out_operation_id);
 }
 

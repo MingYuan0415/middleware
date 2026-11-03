@@ -8,7 +8,9 @@ radio operations are delegated to `wifi_service`.
 
 ## Connection policy
 
-`connectivity_manager_request_wifi_enable()` starts one cycle:
+`connectivity_manager_request_wifi_enable()` is the strict saved-network
+connect: it starts one cycle and reports `NOT_FOUND` without touching the radio
+when no profile is saved. Device Link CONNECT maps to it.
 
 1. the radio is initialized lazily, then started (or resumed);
 2. the manager scans for the saved networks and receives one presence bit per
@@ -33,17 +35,38 @@ cycle. A foreground `request_scan()` requested during a connect attempt runs
 immediately after that attempt's terminal and then resumes the cycle.
 
 `connectivity_manager_request_wifi_disable()` cancels an active scan/connect
-cycle, stops the radio, and leaves the saved list untouched. `wifi_enabled` is
-the persistent user intent; `manual_hold` describes a deliberately stopped
-radio and is not a persisted setting. A connected link lost while Wi-Fi is
-enabled starts a fresh scan cycle.
+cycle, stops the radio, clears the no-profile window, and leaves the saved list
+untouched. `wifi_enabled` is the current policy bit; `manual_hold` describes a
+deliberately stopped radio and is not a persisted setting. A connected link lost
+while Wi-Fi is enabled starts a fresh scan cycle.
+
+## Switch and no-profile window
+
+`connectivity_manager_request_wifi_power_on()` is the user switch. With a saved
+network it runs exactly the same bounded cycle as `request_wifi_enable()`.
+With no saved network it powers the radio, stops at `IDLE`, reports `ESP_OK`,
+and arms `no_profile_radio_window_ms` from the product configuration. A
+foreground scan or a profile save extends the window; a successful `IP_READY`
+link, `request_wifi_disable()`, `request_forget()`, or a connection attempt
+clears it. When the window expires the manager stops the radio by itself, sets
+`manual_hold` and `radio_idle_timeout`, and publishes `IDLE`; no operation
+terminal is produced because the elapsed window is not a client request. A
+window of zero disables the automatic power-off.
+
+A foreground `request_scan()` while the switch is off is still allowed: BLE
+provisioning must be able to list networks before any profile exists. The radio
+is powered transiently and stopped when the scan completes. The Settings page
+asks the user to turn Wi-Fi on first, but that guard is presentation, not a
+manager policy.
 
 The former automatic-connection switch is removed. `wifi_enabled` is the single
-persistent policy: it is saved with the profile record and restored on boot.
-The radio is not initialized during boot; a persisted-on cycle starts only after
-the first frame and startup commit. A save (`request_save_profile()`) only
-stores credentials and never starts a connection. `request_forget()` clears
-every saved entry and the persisted record.
+policy bit: it is saved with the profile record and restored on boot, while a
+boot with no saved profile clamps it off. `radio_idle_timeout` records that the
+last off transition came from the no-profile window. The radio is not
+initialized during boot; a persisted-on cycle starts only after the first frame
+and startup commit. A save (`request_save_profile()`) only stores credentials
+and never starts a connection. `request_forget()` clears every saved entry and
+the persisted record.
 
 ## Public API
 
@@ -53,12 +76,12 @@ Public header `include/connectivity_manager.h`:
   lifecycle and standby.
 - `connectivity_manager_clear_persisted_profile()`: idempotently erase the
   persisted profile before initialization (reset domain).
-- Foreground commands: `request_scan()`, `request_wifi_enable()`,
-  `request_wifi_disable()`, `request_connect()`, `request_sync_profile()`,
-  `request_save_profile()`, `request_connect_network()`,
-  `request_forget_network()`, `request_forget()`, `cancel()`; all return a
-  nonzero `operation_id`. Every admitted operation has exactly one terminal,
-  including storage and radio failure paths.
+- Foreground commands: `request_scan()`, `request_wifi_power_on()`,
+  `request_wifi_enable()`, `request_wifi_disable()`, `request_connect()`,
+  `request_sync_profile()`, `request_save_profile()`,
+  `request_connect_network()`, `request_forget_network()`, `request_forget()`,
+  `cancel()`; all return a nonzero `operation_id`. Every admitted operation has
+  exactly one terminal, including storage and radio failure paths.
 - `connectivity_manager_get_status()` / `get_scan_snapshot()` /
   `get_profiles()`: read the immutable state, scan, or saved-network snapshot;
   none contains a password.
@@ -100,7 +123,9 @@ index, `status.attempt_ordinal` is its 1-based candidate number, and
   `CONNECTIVITY_MANAGER_QUEUE_DEPTH` (default 8).
 - `CONNECTIVITY_MANAGER_MAX_CONNECT_FAILURES` is a compile-time constant (3).
 - CMake: `REQUIRES event_bus`; `PRIV_REQUIRES freertos mbedtls mt_log nvs_flash nv_storage wifi_service`.
-- Runtime configuration is `connectivity_manager_config_t`.
+- Runtime configuration is `connectivity_manager_config_t`; its
+  `no_profile_radio_window_ms` is the no-profile switch window (0 disables the
+  automatic power-off).
 
 ## State and Concurrency
 
@@ -111,9 +136,9 @@ index, `status.attempt_ordinal` is its 1-based candidate number, and
   operation instead of parking a foreground operation in a long backoff.
 - Policy persistence and radio stopping are separate steps. A failed NVS write
   is reported as `STORAGE`; it cannot skip the radio stop.
-- `wifi_enabled` is the persistent intent, `manual_hold` the current deliberate
-  stop state, and `radio_available` the executor health. They are not
-  interchangeable.
+- `wifi_enabled` is the current policy bit, `manual_hold` the current deliberate
+  stop state, `radio_idle_timeout` the last no-profile window expiry, and
+  `radio_available` the executor health. They are not interchangeable.
 - The manager is woken by Wi-Fi service events and command submission; idle
   waits use a deadline or `portMAX_DELAY`, not a fixed 20 ms poll.
 - System standby uses `connectivity_manager_suspend()` / `resume()` separately

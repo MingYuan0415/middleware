@@ -29,6 +29,10 @@ typedef struct connectivity_manager_config
 {
     uint32_t task_priority;       /**< Connectivity policy worker priority. */
     uint32_t wifi_task_priority;  /**< Low-level Wi-Fi worker priority. */
+    /* Policy window that starts when power_on() turns the radio on without a
+     * saved network. A completed connection, power-off, or erase ends it; a
+     * value of zero disables the automatic power-off. */
+    uint32_t no_profile_radio_window_ms;
 } connectivity_manager_config_t;
 
 /** @brief Nonzero generation identifying one admitted foreground operation. */
@@ -158,8 +162,11 @@ typedef struct connectivity_manager_status_snapshot
     bool radio_available;                           /**< Radio executor is ready. */
     bool saved_profile;                             /**< A valid profile exists. */
     bool profile_persisted;                         /**< Current target is saved. */
-    bool wifi_enabled;                              /**< Persistent Wi-Fi on/off policy. */
+    /* Current radio on/off policy bit. It is persisted together with a saved
+     * profile and clamped to off when the device boots with none. */
+    bool wifi_enabled;                              /**< Current Wi-Fi on/off policy. */
     bool manual_hold;                               /**< Radio deliberately stopped. */
+    bool radio_idle_timeout;                        /**< Last off came from the no-profile window. */
     bool operation_complete;                        /**< Foreground terminal event. */
     bool operation_canceled;                        /**< Owner confirmed cancellation. */
     bool operation_conflict;                        /**< Sync identity conflict. */
@@ -299,10 +306,11 @@ esp_err_t connectivity_manager_request_forget_network(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Turn Wi-Fi off and stop the radio.
+ * @brief Turn the radio off and keep it off.
  *
  * Cancels any scan or connection cycle, clears the pending attempt, suspends
- * the radio, and leaves the saved-network list untouched.
+ * the radio, clears the no-profile idle window, and leaves the saved-network
+ * list untouched.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
@@ -311,13 +319,32 @@ esp_err_t connectivity_manager_request_wifi_disable(
     connectivity_manager_operation_id_t *out_operation_id);
 
 /**
- * @brief Turn Wi-Fi on and run one bounded connection cycle.
+ * @brief User switch: turn the radio on and connect a saved network if any.
+ *
+ * With saved networks this is exactly the bounded connection cycle of
+ * connectivity_manager_request_wifi_enable(). With none it powers the radio,
+ * stops at IDLE, and arms the no-profile idle window from the product config;
+ * the terminal reports ESP_OK and the switch can scan right away. Consumers
+ * that specifically mean "connect the saved network" must use
+ * connectivity_manager_request_wifi_enable().
+ *
+ * @param out_operation_id receives the admitted operation generation.
+ * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
+ */
+esp_err_t connectivity_manager_request_wifi_power_on(
+    connectivity_manager_operation_id_t *out_operation_id);
+
+/**
+ * @brief Connect the saved network through one bounded connection cycle.
  *
  * The cycle scans for saved networks, attempts only the ones that are present,
  * gives each one up to CONNECTIVITY_MANAGER_MAX_CONNECT_FAILURES attempts, and
  * stops the radio when no candidate connects. When the selected profile
  * fails, the remaining saved profiles in attempt order are tried before the
  * cycle reports a terminal failure.
+ *
+ * With no saved network the operation reports ESP_ERR_NOT_FOUND and leaves the
+ * radio untouched. Device Link CONNECT maps to this strict operation.
  *
  * @param out_operation_id receives the admitted operation generation.
  * @return ESP_OK when queued; otherwise an argument, lifecycle, or queue error.
