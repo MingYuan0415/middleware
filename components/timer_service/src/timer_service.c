@@ -483,6 +483,8 @@ esp_err_t timer_service_focus_start(uint32_t work_ms, uint32_t break_ms)
     s_timer.snapshot.focus_state = TIMER_SERVICE_RUNNING;
     s_timer.snapshot.focus_phase = TIMER_SERVICE_FOCUS_WORK;
     s_timer.snapshot.focus_remaining_ms = work_ms;
+    s_timer.snapshot.focus_work_ms = work_ms;
+    s_timer.snapshot.focus_break_ms = break_ms;
     s_timer.snapshot.focus_completed_cycles = 0U;
     s_timer.focus_started_us = s_timer.config.monotonic_time_us();
     ++s_timer.snapshot.generation;
@@ -538,6 +540,8 @@ esp_err_t timer_service_focus_reset(void)
     s_timer.snapshot.focus_state = TIMER_SERVICE_IDLE;
     s_timer.snapshot.focus_phase = TIMER_SERVICE_FOCUS_WORK;
     s_timer.snapshot.focus_remaining_ms = 0U;
+    s_timer.snapshot.focus_work_ms = 0U;
+    s_timer.snapshot.focus_break_ms = 0U;
     s_timer.snapshot.focus_completed_cycles = 0U;
     ++s_timer.snapshot.generation;
     _timer_unlock();

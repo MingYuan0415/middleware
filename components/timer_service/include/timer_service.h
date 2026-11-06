@@ -61,6 +61,8 @@ typedef struct timer_service_snapshot
     timer_service_state_t focus_state;
     timer_service_focus_phase_t focus_phase;
     uint32_t focus_remaining_ms;
+    uint32_t focus_work_ms;
+    uint32_t focus_break_ms;
     uint32_t focus_completed_cycles;
 } timer_service_snapshot_t;
 

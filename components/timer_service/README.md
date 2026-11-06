@@ -13,7 +13,8 @@ Public header `include/timer_service.h`:
   configuration provides `monotonic_time_us` and an optional completion
   callback.
 - `timer_service_get_snapshot()`: reads the unified snapshot (state of the three
-  timers, remaining or elapsed time, focus cycle count).
+  timers, remaining or elapsed time, focus work/break durations, and focus
+  cycle count).
 - `timer_service_countdown_start()` / `pause()` / `resume()` / `reset()`:
   countdown control.
 - `timer_service_stopwatch_start()` / `pause()` / `reset()`: stopwatch control.

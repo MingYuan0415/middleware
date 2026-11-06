@@ -63,6 +63,9 @@ int main(void)
     assert(timer_service_focus_start(5000U, 2000U) == ESP_OK);
     assert(timer_service_focus_start(5000U, 2000U) == ESP_ERR_INVALID_STATE);
     assert(timer_service_countdown_start(1000U) == ESP_ERR_INVALID_STATE);
+    assert(timer_service_get_snapshot(&snapshot) == ESP_OK);
+    assert(snapshot.focus_work_ms == 5000U);
+    assert(snapshot.focus_break_ms == 2000U);
     s_now_us = 50000000;
     assert(timer_service_get_snapshot(&snapshot) == ESP_OK);
     assert(snapshot.focus_phase == TIMER_SERVICE_FOCUS_WORK);

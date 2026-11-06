@@ -9,7 +9,7 @@
 公共头 `include/timer_service.h`：
 
 - `timer_service_init()` / `deinit()`：初始化或停止服务；配置提供 `monotonic_time_us` 与可选完成回调。
-- `timer_service_get_snapshot()`：读取统一快照（三种计时器状态、剩余或已用时间、专注周期数）。
+- `timer_service_get_snapshot()`：读取统一快照（三种计时器状态、剩余或已用时间、专注工作/休息时长与周期数）。
 - `timer_service_countdown_start()` / `pause()` / `resume()` / `reset()`：倒计时控制。
 - `timer_service_stopwatch_start()` / `pause()` / `reset()`：秒表控制。
 - `timer_service_focus_start()` / `pause()` / `resume()` / `reset()`：专注周期控制。
