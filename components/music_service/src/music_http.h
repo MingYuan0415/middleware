@@ -19,6 +19,9 @@ esp_err_t music_http_get_referer(const char *url, bool with_cookie,
                                  music_http_result_t *result, size_t max_body);
 esp_err_t music_http_get(const char *url, bool with_cookie,
                          music_http_result_t *result, size_t max_body);
+esp_err_t music_http_get_with_cookie_header(const char *url,
+        const char *cookie_header,
+        music_http_result_t *result, size_t max_body);
 esp_err_t music_http_get_headers(const char *url, bool with_cookie,
                                  const char *referer,
                                  music_http_result_t *result);

@@ -41,15 +41,31 @@ typedef struct music_http_context
 static MUSIC_SERVICE_EXT_BSS music_cookie_t s_cookies[MUSIC_COOKIE_MAX];
 static size_t s_cookie_count;
 static SemaphoreHandle_t s_http_lock;
+static SemaphoreHandle_t s_cookie_lock;
 
 esp_err_t music_http_init(void)
 {
-    if (s_http_lock != NULL)
+    if (s_http_lock != NULL || s_cookie_lock != NULL)
     {
         return ESP_ERR_INVALID_STATE;
     }
     s_http_lock = xSemaphoreCreateMutex();
-    return s_http_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+    s_cookie_lock = xSemaphoreCreateMutex();
+    if (s_http_lock == NULL || s_cookie_lock == NULL)
+    {
+        if (s_http_lock != NULL)
+        {
+            vSemaphoreDelete(s_http_lock);
+            s_http_lock = NULL;
+        }
+        if (s_cookie_lock != NULL)
+        {
+            vSemaphoreDelete(s_cookie_lock);
+            s_cookie_lock = NULL;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 void music_http_deinit(void)
@@ -58,6 +74,11 @@ void music_http_deinit(void)
     {
         vSemaphoreDelete(s_http_lock);
         s_http_lock = NULL;
+    }
+    if (s_cookie_lock != NULL)
+    {
+        vSemaphoreDelete(s_cookie_lock);
+        s_cookie_lock = NULL;
     }
 }
 
@@ -72,6 +93,20 @@ static void _http_lock_give(void)
     if (s_http_lock != NULL)
     {
         (void)xSemaphoreGive(s_http_lock);
+    }
+}
+
+static bool _cookie_lock_take(void)
+{
+    return s_cookie_lock != NULL &&
+           xSemaphoreTake(s_cookie_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void _cookie_lock_give(void)
+{
+    if (s_cookie_lock != NULL)
+    {
+        (void)xSemaphoreGive(s_cookie_lock);
     }
 }
 
@@ -308,7 +343,11 @@ static esp_err_t _http_event(esp_http_client_event_t *event)
             if (context->capture_cookies &&
                     strcasecmp(event->header_key, "Set-Cookie") == 0)
             {
-                _cookie_from_header(event->header_value, context->host);
+                if (_cookie_lock_take())
+                {
+                    _cookie_from_header(event->header_value, context->host);
+                    _cookie_lock_give();
+                }
             }
             else if (strcasecmp(event->header_key, "Location") == 0)
             {
@@ -348,7 +387,8 @@ void music_http_result_free(music_http_result_t *result);
 
 static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
                             const char *body, const char *content_type,
-                            const char *referer, bool with_cookie,
+                            const char *referer, const char *cookie_header,
+                            bool with_cookie,
                             music_http_result_t *result, size_t max_body)
 {
     if (url == NULL || result == NULL)
@@ -392,33 +432,68 @@ static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
         result->body = NULL;
         return ESP_ERR_NO_MEM;
     }
-    (void)esp_http_client_set_header(client, "User-Agent",
-                                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                     "Chrome/120.0.0.0 Safari/537.36");
-    (void)esp_http_client_set_header(client, "Referer",
-                                     referer == NULL ? "https://y.qq.com/" :
-                                     referer);
-    (void)esp_http_client_set_header(client, "Accept", "*/*");
-    if (with_cookie)
+    esp_err_t setup_error = esp_http_client_set_header(
+                                client, "User-Agent",
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36");
+    if (setup_error == ESP_OK)
+    {
+        setup_error = esp_http_client_set_header(
+                          client, "Referer",
+                          referer == NULL ? "https://y.qq.com/" : referer);
+    }
+    if (setup_error == ESP_OK)
+    {
+        setup_error = esp_http_client_set_header(client, "Accept", "*/*");
+    }
+    if (setup_error == ESP_OK &&
+            cookie_header != NULL && cookie_header[0] != '\0')
+    {
+        setup_error = esp_http_client_set_header(client, "Cookie",
+            cookie_header);
+    }
+    else if (setup_error == ESP_OK && with_cookie)
     {
         char *cookie = _psram_alloc(4096U);
-        if (cookie != NULL)
+        if (cookie == NULL)
+        {
+            setup_error = ESP_ERR_NO_MEM;
+        }
+        else if (!_cookie_lock_take())
+        {
+            setup_error = ESP_ERR_INVALID_STATE;
+        }
+        else
         {
             _cookie_header(cookie, 4096U, request_host, request_path);
+            _cookie_lock_give();
             if (cookie[0] != '\0')
             {
-                (void)esp_http_client_set_header(client, "Cookie", cookie);
+                setup_error = esp_http_client_set_header(client, "Cookie",
+                    cookie);
             }
-            _psram_free(cookie);
+        }
+        _psram_free(cookie);
+    }
+    if (setup_error == ESP_OK && body != NULL)
+    {
+        setup_error = esp_http_client_set_header(
+                          client, "Content-Type",
+                          content_type == NULL ?
+                          "application/json" : content_type);
+        if (setup_error == ESP_OK)
+        {
+            setup_error = esp_http_client_set_post_field(
+                              client, body, (int)strlen(body));
         }
     }
-    if (body != NULL)
+    if (setup_error != ESP_OK)
     {
-        (void)esp_http_client_set_header(client, "Content-Type",
-                                         content_type == NULL ?
-                                         "application/json" : content_type);
-        (void)esp_http_client_set_post_field(client, body, strlen(body));
+        (void)esp_http_client_cleanup(client);
+        _psram_free(result->body);
+        result->body = NULL;
+        return setup_error;
     }
 
     esp_err_t error = esp_http_client_perform(client);
@@ -439,7 +514,8 @@ static esp_err_t _http_once(esp_http_client_method_t method, const char *url,
 
 static esp_err_t _http_request(esp_http_client_method_t method, const char *url,
                                const char *body, const char *content_type,
-                               const char *referer, bool with_cookie,
+                               const char *referer, const char *cookie_header,
+                               bool with_cookie,
                                music_http_result_t *result, size_t max_body)
 {
     char current_url[1024];
@@ -451,7 +527,8 @@ static esp_err_t _http_request(esp_http_client_method_t method, const char *url,
     {
         esp_err_t error = _http_once(current_method, current_url,
                                      current_body, current_content_type,
-                                     referer, with_cookie, result, max_body);
+                                     referer, cookie_header, with_cookie,
+                                     result, max_body);
         if (error != ESP_OK)
         {
             return error;
@@ -490,7 +567,7 @@ static esp_err_t _http_get_referer(const char *url, bool with_cookie,
                                    music_http_result_t *result,
                                    size_t max_body)
 {
-    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer,
+    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer, NULL,
                          with_cookie, result, max_body);
 }
 
@@ -504,7 +581,7 @@ static esp_err_t _http_get_headers(const char *url, bool with_cookie,
                                    const char *referer,
                                    music_http_result_t *result)
 {
-    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer,
+    return _http_request(HTTP_METHOD_GET, url, NULL, NULL, referer, NULL,
                          with_cookie, result, 0U);
 }
 
@@ -512,7 +589,7 @@ static esp_err_t _http_post(const char *url, const char *body,
                             music_http_result_t *result, size_t max_body)
 {
     return _http_request(HTTP_METHOD_POST, url, body, "application/json",
-                         NULL, true, result, max_body);
+                         NULL, NULL, true, result, max_body);
 }
 
 static esp_err_t _http_post_form_no_redirect(const char *url,
@@ -520,7 +597,7 @@ static esp_err_t _http_post_form_no_redirect(const char *url,
         music_http_result_t *result, size_t max_body)
 {
     return _http_once(HTTP_METHOD_POST, url, body,
-                      "application/x-www-form-urlencoded", referer,
+                      "application/x-www-form-urlencoded", referer, NULL,
                       true, result, max_body);
 }
 
@@ -534,23 +611,28 @@ void music_http_result_free(music_http_result_t *result)
     }
 }
 
-
 bool music_http_cookie_get(const char *name, char *value, size_t value_size)
 {
-    if (!_http_lock_take())
+    if (!_cookie_lock_take())
     {
         return false;
     }
     const bool found = _cookie_get(name, value, value_size);
-    _http_lock_give();
+    _cookie_lock_give();
     return found;
 }
 
 void music_http_cookie_clear(void)
 {
+    /* Drain the active transfer before clearing. The HTTP lock is the request
+     * fence; hold it until the cookie mutation completes. */
     if (_http_lock_take())
     {
-        _cookie_clear();
+        if (_cookie_lock_take())
+        {
+            _cookie_clear();
+            _cookie_lock_give();
+        }
         _http_lock_give();
     }
 }
@@ -585,6 +667,26 @@ esp_err_t music_http_get(const char *url, bool with_cookie,
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t error = _http_get(url, with_cookie, result, max_body);
+    _http_lock_give();
+    return error;
+}
+
+esp_err_t music_http_get_with_cookie_header(const char *url,
+        const char *cookie_header,
+        music_http_result_t *result, size_t max_body)
+{
+    if (!_http_lock_take())
+    {
+        if (result != NULL)
+        {
+            memset(result, 0, sizeof(*result));
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Keep the caller-supplied credential header pinned to the first host. */
+    const esp_err_t error = _http_once(HTTP_METHOD_GET, url, NULL, NULL,
+                                       NULL, cookie_header, false, result,
+                                       max_body);
     _http_lock_give();
     return error;
 }

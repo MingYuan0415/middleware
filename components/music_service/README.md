@@ -56,11 +56,14 @@ reference, `release()` only drops the caller reference, and replacing a cache
 entry never invalidates a page that still holds a reference. The service
 runtime state, cookie jar, and both command queues also live in PSRAM. The API
 and login worker stacks stay in internal RAM because credential save/erase
-goes through NVS, which disables the flash cache; the login worker is separate
-from the catalog/playback API worker and uses a larger stack for the HTTPS/OAuth
-and QR image path. The audio worker is created lazily on the first playback and
-runs from a PSRAM stack through the `audio_service` exclusive playback lease.
-HTTP/cookie state is serialized by a dedicated mutex.
+goes through NVS, which disables the flash cache. The login worker is the
+account worker: it owns QR login and serialized server-session validation, so
+the probe does not occupy the catalog/playback worker task; HTTP requests still
+share the transport mutex. Credential save/erase uses a separate persistence
+mutex so logout cannot be undone by a late QR save. The audio worker is created
+lazily on the first playback and runs from a PSRAM stack through the
+`audio_service` exclusive playback lease. Cookie state has its own mutex, while
+clearing waits for the active HTTP transfer to finish.
 
 ## Login and catalog
 
@@ -71,6 +74,25 @@ HTTP/cookie state is serialized by a dedicated mutex.
   MQTT login is not implemented in this version.
 - Credentials are stored in the `music_cred` NVS blob and erasing them is part
   of the factory-reset sequence.
+- A credential loaded from NVS is only a validation candidate. After network
+  and time are ready the service reports `VALIDATING_SESSION`, validates it
+  against `fcg_get_profile_homepage.fcg` with the credential cookies, and only
+  then publishes `READY` and `logged_in`. Validation retries transport, HTTP,
+  rate-limit and parse failures with backoff; known authentication-expired codes
+  move the service to `AUTH_REQUIRED`. While `READY`, validation repeats every
+  ten minutes. Readiness edge notifications and successful QR login trigger the
+  validator, while duplicate connectivity snapshots do not restart its timer.
+  `expires_at` remains in the credential blob for compatibility but is not used
+  as the `musickey` lifetime.
+- Every account-bearing request captures the credential generation when it is
+  queued. The worker rejects stale commands, and every network result is checked
+  again before it may install a snapshot or change account state. Authentication
+  business codes are interpreted only for requests that actually carried a
+  validated credential; QR code-exchange errors remain ordinary login failures.
+  Session invalidation atomically removes the credential, home/playlist/queue/
+  lyric/image caches, and pending account work before entering `AUTH_REQUIRED`.
+  A credential-save failure uses `AUTH_REQUIRED` with `FAILURE_STORAGE`, which is
+  distinct from an expired session.
 - On the next home refresh after a credential is loaded or a login completes,
   the service reads the current account profile with
   `userInfo.BaseUserInfoServer/get_user_baseinfo_v2`. The nickname and avatar
@@ -128,9 +150,12 @@ quality (128 kbps) so first playback starts faster on constrained networks.
 
 ## Test Boundary
 
-The pure QQ login protocol parsers, the reference-counted snapshot allocator,
-the queue removal transition table, and the queue window/page/removal mapping
-helpers have standalone host tests. Network, TLS, credential storage, and
-playback still require on-device validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are
-outside host-test scope. The simulator real backend is an integration aid, not
-a replacement for device audio and power measurements.
+The pure QQ login protocol parsers, credential syntax checks, the
+reference-counted snapshot allocator, the queue removal transition table, and
+the queue window/page/removal mapping helpers have standalone host tests. The
+simulator exercises login, session expiry, late-page cleanup and the UI states
+for validating and storage-failed credentials. Network, TLS, NVS, the real
+server validation response and playback still require real-account/on-device
+validation; Wi-Fi, I2S/DMA, ES8311, and battery behavior are outside host-test
+scope. The simulator real backend is an integration aid, not a replacement for
+device audio and power measurements.

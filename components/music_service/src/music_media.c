@@ -404,7 +404,8 @@ static void _parse_lrc(const char *text, music_lyric_snapshot_t *lyric)
     _lyric_sort(lyric);
 }
 
-esp_err_t music_net_fetch_lyric(const char *songmid,
+esp_err_t music_net_fetch_lyric(uint32_t credential_generation,
+                                const char *songmid,
                                 music_lyric_snapshot_t **snapshot)
 {
     if (songmid == NULL || songmid[0] == '\0' || snapshot == NULL)
@@ -427,23 +428,25 @@ esp_err_t music_net_fetch_lyric(const char *songmid,
     cJSON_AddNumberToObject(param, "roma", 0);
     cJSON_AddNumberToObject(param, "trans", 0);
     cJSON_AddNumberToObject(param, "type", 1);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("music.musichallSong.PlayLyricInfo",
-                                 "GetPlayLyricInfo", param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_AUTHENTICATED,
+                                         credential_generation,
+                                         "music.musichallSong.PlayLyricInfo",
+                                         "GetPlayLyricInfo", param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
     const size_t encoded_size = 256U * 1024U;
     char *encoded = _psram_alloc(encoded_size);
     if (encoded == NULL)
     {
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         return ESP_ERR_NO_MEM;
     }
-    music_json_string(data, "lyric", encoded, encoded_size);
-    cJSON_Delete(root);
+    music_json_string(result.data, "lyric", encoded, encoded_size);
+    music_api_result_release(&result);
     if (encoded[0] == '\0')
     {
         _psram_free(encoded);

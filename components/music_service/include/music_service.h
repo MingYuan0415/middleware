@@ -53,6 +53,7 @@ typedef enum
     MUSIC_SERVICE_STATE_READY,
     MUSIC_SERVICE_STATE_AUTH_REQUIRED,
     MUSIC_SERVICE_STATE_ERROR,
+    MUSIC_SERVICE_STATE_VALIDATING_SESSION, /**< Loaded credential is unverified. */
 } music_service_state_t;
 
 /** @brief Stable failure classification for UI copy. */

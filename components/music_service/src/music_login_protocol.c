@@ -351,3 +351,88 @@ bool music_login_form_add(char *buffer, size_t buffer_size, size_t *used,
     buffer[*used] = '\0';
     return true;
 }
+
+bool music_login_code_is_auth_expired(int code)
+{
+    return code == 1000 || code == 104400 || code == 104401;
+}
+
+static bool _credential_id_valid(const char *musicid)
+{
+    if (musicid == NULL || musicid[0] == '\0')
+    {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)musicid;
+            *cursor != '\0'; ++cursor)
+    {
+        if (*cursor < '0' || *cursor > '9')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool _credential_key_valid(const char *musickey)
+{
+    if (musickey == NULL || musickey[0] == '\0')
+    {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)musickey;
+            *cursor != '\0'; ++cursor)
+    {
+        if (*cursor <= 0x20U || *cursor >= 0x7FU ||
+                *cursor == ';' || *cursor == '&' ||
+                *cursor == '=' || *cursor == '\'' ||
+                *cursor == '"')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool music_login_build_session_check_url(char *output, size_t output_size,
+        const char *musicid,
+        const char *musickey)
+{
+    if (output == NULL || output_size == 0U ||
+            !_credential_id_valid(musicid) ||
+            !_credential_key_valid(musickey))
+    {
+        return false;
+    }
+    char g_tk[24];
+    (void)snprintf(g_tk, sizeof(g_tk), "%u",
+                   (unsigned)music_login_hash33(musickey, 5381U));
+    const int written = snprintf(
+                            output, output_size,
+                            "https://c6.y.qq.com/rsc/fcgi-bin/"
+                            "fcg_get_profile_homepage.fcg"
+                            "?g_tk=%s&format=json&inCharset=utf-8"
+                            "&outCharset=utf-8&notice=0&cid=205360838"
+                            "&needNewCode=0&loginUin=%s&hostUin=0"
+                            "&userid=%s&reqfrom=1",
+                            g_tk, musicid, musicid);
+    return written > 0 && (size_t)written < output_size;
+}
+
+bool music_login_build_credential_cookie(char *output, size_t output_size,
+        const char *musicid,
+        const char *musickey)
+{
+    if (output == NULL || output_size == 0U ||
+            !_credential_id_valid(musicid) ||
+            !_credential_key_valid(musickey))
+    {
+        return false;
+    }
+    const int written = snprintf(
+                            output, output_size,
+                            "uin=%s; qqmusic_uin=%s; qm_keyst=%s; "
+                            "qqmusic_key=%s",
+                            musicid, musicid, musickey, musickey);
+    return written > 0 && (size_t)written < output_size;
+}

@@ -31,6 +31,9 @@
 #define MUSIC_SERVICE_QUEUE_FETCH_PAGE 10U
 #define MUSIC_SERVICE_QUEUE_REMOVAL_BYTES \
     ((MUSIC_SERVICE_MAX_QUEUE_TRACKS + 7U) / 8U)
+#define MUSIC_SERVICE_SESSION_CHECK_INTERVAL_MS (10U * 60U * 1000U)
+#define MUSIC_SERVICE_SESSION_RETRY_MS (30U * 1000U)
+#define MUSIC_SERVICE_SESSION_CHECK_POLL_MS (10U * 1000U)
 
 /* Transport/API errors that do not have a distinct ESP-IDF code. */
 #define MUSIC_ERR_HTTP_AUTH      ((esp_err_t)0x7101)
@@ -51,6 +54,13 @@ typedef struct music_credential_blob
 
 typedef enum
 {
+    MUSIC_CREDENTIAL_NONE = 0,
+    MUSIC_CREDENTIAL_PENDING_VALIDATION,
+    MUSIC_CREDENTIAL_VALIDATED,
+} music_credential_state_t;
+
+typedef enum
+{
     MUSIC_API_CMD_LOGOUT = 0,
     MUSIC_API_CMD_REFRESH_HOME,
     MUSIC_API_CMD_REFRESH_PROFILE,
@@ -63,15 +73,23 @@ typedef enum
     MUSIC_API_CMD_QUEUE_PLAY,
     MUSIC_API_CMD_QUEUE_REMOVE,
     MUSIC_API_CMD_QUEUE_VIEW,
-    MUSIC_API_CMD_ERASE_CREDENTIAL,
     MUSIC_API_CMD_WAKE,
 } music_api_cmd_type_t;
 
-/** @brief One serialized QR-login request handled outside the API worker. */
+typedef enum
+{
+    MUSIC_LOGIN_COMMAND_NONE = 0,
+    MUSIC_LOGIN_COMMAND_LOGIN,
+    MUSIC_LOGIN_COMMAND_CHECK_SESSION,
+} music_login_command_type_t;
+
+/** @brief One serialized login or session-validation request. */
 typedef struct music_login_command
 {
+    music_login_command_type_t command_type;
     music_login_type_t type;
     uint32_t session;
+    uint32_t credential_generation;
 } music_login_command_t;
 
 /** @brief Result of one QR-poll iteration. */
@@ -86,7 +104,7 @@ typedef enum
 typedef struct music_api_command
 {
     music_api_cmd_type_t type;
-    music_login_type_t login_type;
+    uint32_t credential_generation;
     music_playlist_ref_t playlist;
     music_playlist_snapshot_t *playlist_snapshot;
     uint64_t queue_generation;
@@ -122,6 +140,7 @@ typedef struct music_service_runtime
     bool initialized;
     music_service_config_t config;
     SemaphoreHandle_t lock;
+    SemaphoreHandle_t credential_lock;
     QueueHandle_t api_queue;
     TaskHandle_t api_task;
     QueueHandle_t login_queue;
@@ -137,9 +156,13 @@ typedef struct music_service_runtime
     music_image_t *image[MUSIC_IMAGE_CACHE_SLOTS];
     music_credential_blob_t credential;
     music_credential_blob_t login_credential;
-    bool credential_valid;
+    music_credential_state_t credential_state;
     bool profile_loaded;
     bool profile_requested;
+    bool session_check_pending;
+    uint32_t credential_generation;
+    uint32_t last_session_check_ms;
+    uint32_t session_retry_ms;
     music_login_type_t login_type;
     char qr_uuid[96];
     char qr_qrsig[256];
@@ -164,7 +187,6 @@ typedef struct music_service_runtime
     uint8_t queue_removed[MUSIC_SERVICE_QUEUE_REMOVAL_BYTES];
     bool play_valid;
     bool login_active;
-    bool credential_erase_pending;
     bool queue_view_pending;
     uint64_t generation;
 } music_service_runtime_t;
@@ -178,42 +200,60 @@ void music_service_publish_detail(uint32_t sub_type, uint32_t token,
                                   music_service_failure_t failure);
 void music_service_set_state_locked(music_service_state_t state,
                                     music_service_failure_t failure);
-void music_service_replace_home(music_home_snapshot_t *snapshot);
-void music_service_replace_playlist(music_playlist_snapshot_t *snapshot);
-void music_service_replace_queue(music_queue_snapshot_t *snapshot);
-void music_service_replace_queue_view(music_queue_snapshot_t *snapshot);
+void music_service_replace_home(music_home_snapshot_t *snapshot,
+                                uint32_t credential_generation);
+void music_service_replace_playlist(music_playlist_snapshot_t *snapshot,
+                                    uint32_t credential_generation);
+void music_service_replace_queue_view(music_queue_snapshot_t *snapshot,
+                                      uint32_t credential_generation);
 void music_service_set_login_qr(music_image_t *image, uint32_t session);
-void music_service_set_image(music_image_t *image, uint32_t token);
+void music_service_set_image(music_image_t *image, uint32_t token,
+                             uint32_t credential_generation);
 void music_service_handle_network_result(esp_err_t result);
+void music_service_handle_network_result_for_generation(
+    esp_err_t result, uint32_t credential_generation);
+void music_service_handle_auth_result(esp_err_t result,
+                                      uint32_t credential_generation);
 uint64_t music_service_next_generation(void);
-void music_service_stream_finished(void);
-void music_service_stream_failed(music_service_failure_t failure);
+void music_service_stream_finished(uint32_t play_generation);
+void music_service_stream_failed(music_service_failure_t failure,
+                                 uint32_t play_generation);
 
 /* music_catalog.c / music_auth.c */
 esp_err_t music_net_load_credential(music_credential_blob_t *credential);
 esp_err_t music_net_save_credential(const music_credential_blob_t *credential);
 esp_err_t music_net_erase_credential(void);
+esp_err_t music_net_save_credential_if_current(
+    const music_credential_blob_t *credential, uint32_t login_session);
+esp_err_t music_net_check_session(const char *musicid, const char *musickey);
 esp_err_t music_net_login_begin(music_login_type_t type, uint32_t session);
 esp_err_t music_net_login_poll(music_login_type_t type,
                                music_credential_blob_t *credential,
                                music_login_poll_state_t *state);
 esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot);
-esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
+esp_err_t music_net_fetch_profile(uint32_t credential_generation,
+                                  char *account_id, size_t account_id_size,
                                   char *name, size_t name_size,
                                   char *avatar, size_t avatar_size);
-esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
+esp_err_t music_net_fetch_playlist(uint32_t credential_generation,
+                                   const music_playlist_ref_t *ref,
                                    uint16_t offset, uint16_t count,
                                    music_playlist_snapshot_t **snapshot);
-esp_err_t music_net_fetch_lyric(const char *songmid,
+esp_err_t music_net_fetch_lyric(uint32_t credential_generation,
+                                const char *songmid,
                                 music_lyric_snapshot_t **snapshot);
 esp_err_t music_net_fetch_image(const char *url, uint16_t width,
                                 uint16_t height, uint32_t token,
                                 music_image_t **image);
-esp_err_t music_net_fetch_song_url(const music_song_t *song,
+esp_err_t music_net_fetch_song_url(uint32_t credential_generation,
+                                   const music_song_t *song,
                                    music_quality_t quality,
                                    char *url, size_t url_size,
                                    music_quality_t *actual_quality);
 
+esp_err_t music_service_credential_lock(void);
+void music_service_credential_unlock(void);
+bool music_service_login_session_current(uint32_t login_session);
 esp_err_t music_stream_init(uint32_t priority);
 esp_err_t music_stream_deinit(void);
 esp_err_t music_stream_play(const char *url, uint32_t duration_ms,

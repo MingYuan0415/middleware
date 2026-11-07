@@ -78,15 +78,16 @@ static esp_err_t _home_recommended(music_home_snapshot_t *home)
     }
     cJSON_AddNumberToObject(param, "From", 0);
     cJSON_AddNumberToObject(param, "Size", MUSIC_SERVICE_MAX_PLAYLISTS);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("music.playlist.PlaylistSquare",
-                                 "GetRecommendFeed", param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_PUBLIC, 0U,
+                                         "music.playlist.PlaylistSquare",
+                                         "GetRecommendFeed", param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
-    const cJSON *list = cJSON_GetObjectItemCaseSensitive(data, "List");
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(result.data, "List");
     if (cJSON_IsArray(list))
     {
         const cJSON *item = NULL;
@@ -105,13 +106,15 @@ static esp_err_t _home_recommended(music_home_snapshot_t *home)
                                   MUSIC_PLAYLIST_KIND_RECOMMENDED);
         }
     }
-    cJSON_Delete(root);
+    music_api_result_release(&result);
     return ESP_OK;
 }
 
-static esp_err_t _home_personal(music_home_snapshot_t *home)
+static esp_err_t _home_personal(music_home_snapshot_t *home,
+                                uint32_t credential_generation,
+                                const char *uin)
 {
-    if (!s_music.credential_valid)
+    if (uin == NULL || uin[0] == '\0')
     {
         home->login_required = true;
         return ESP_OK;
@@ -121,19 +124,22 @@ static esp_err_t _home_personal(music_home_snapshot_t *home)
     {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddStringToObject(param, "uin", s_music.credential.musicid);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("music.musicasset.PlaylistBaseRead",
-                                 "GetPlaylistByUin", param, &root);
-    if (data == NULL)
+    cJSON_AddStringToObject(param, "uin", uin);
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_AUTHENTICATED,
+                                         credential_generation,
+                                         "music.musicasset.PlaylistBaseRead",
+                                         "GetPlaylistByUin", param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
-    const cJSON *list = cJSON_GetObjectItemCaseSensitive(data, "v_playlist");
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(result.data,
+        "v_playlist");
     if (!cJSON_IsArray(list))
     {
-        list = cJSON_GetObjectItemCaseSensitive(data, "disslist");
+        list = cJSON_GetObjectItemCaseSensitive(result.data, "disslist");
     }
     if (cJSON_IsArray(list))
     {
@@ -199,13 +205,14 @@ static esp_err_t _home_personal(music_home_snapshot_t *home)
             }
         }
     }
-    cJSON_Delete(root);
+    music_api_result_release(&result);
     return ESP_OK;
 }
 
-static esp_err_t _home_collected(music_home_snapshot_t *home)
+static esp_err_t _home_collected(music_home_snapshot_t *home,
+                                 const char *uin)
 {
-    if (!s_music.credential_valid)
+    if (uin == NULL || uin[0] == '\0')
     {
         home->collected_ok = true;
         return ESP_OK;
@@ -216,8 +223,7 @@ static esp_err_t _home_collected(music_home_snapshot_t *home)
                    "fcg_get_profile_order_asset.fcg"
                    "?ct=20&cid=205360956&userid=%s&reqtype=3&sin=0&ein=%u"
                    "&format=json",
-                   s_music.credential.musicid,
-                   (unsigned)MUSIC_SERVICE_MAX_PLAYLISTS);
+                   uin, (unsigned)MUSIC_SERVICE_MAX_PLAYLISTS);
     music_http_result_t result;
     const esp_err_t get_result = music_http_get(
                                      url, true, &result,
@@ -295,6 +301,18 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
         return ESP_ERR_INVALID_ARG;
     }
     *snapshot = NULL;
+    char uin[sizeof(s_music.credential.musicid)] = {0};
+    uint32_t credential_generation = 0U;
+    if (music_service_lock() != ESP_OK)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_music.credential_state == MUSIC_CREDENTIAL_VALIDATED)
+    {
+        credential_generation = s_music.credential_generation;
+        (void)snprintf(uin, sizeof(uin), "%s", s_music.credential.musicid);
+    }
+    music_service_unlock();
     music_home_snapshot_t *home = music_snapshot_alloc(sizeof(*home), NULL);
     if (home == NULL)
     {
@@ -303,9 +321,10 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
     home->generation = music_service_next_generation();
     const esp_err_t recommended_result = _home_recommended(home);
     home->recommended_ok = recommended_result == ESP_OK;
-    const esp_err_t personal_result = _home_personal(home);
+    const esp_err_t personal_result = _home_personal(
+                                          home, credential_generation, uin);
     home->personal_ok = personal_result == ESP_OK;
-    const esp_err_t collected_result = _home_collected(home);
+    const esp_err_t collected_result = _home_collected(home, uin);
     home->collected_ok = collected_result == ESP_OK;
     if (personal_result == MUSIC_ERR_HTTP_AUTH)
     {
@@ -326,7 +345,8 @@ esp_err_t music_net_fetch_home(music_home_snapshot_t **snapshot)
     return ESP_OK;
 }
 
-esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
+esp_err_t music_net_fetch_profile(uint32_t credential_generation,
+                                  char *account_id, size_t account_id_size,
                                   char *name, size_t name_size,
                                   char *avatar, size_t avatar_size)
 {
@@ -339,19 +359,21 @@ esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
     name[0] = '\0';
     avatar[0] = '\0';
     char uin[sizeof(s_music.credential.musicid)] = {0};
-    char musickey[sizeof(s_music.credential.musickey)] = {0};
     music_login_type_t login_type = MUSIC_LOGIN_TYPE_WECHAT;
-    bool credential_valid = false;
-    if (music_service_lock() == ESP_OK)
+    if (music_service_lock() != ESP_OK)
     {
-        credential_valid = s_music.credential_valid;
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool current =
+        s_music.credential_state == MUSIC_CREDENTIAL_VALIDATED &&
+        s_music.credential_generation == credential_generation;
+    if (current)
+    {
         login_type = s_music.login_type;
         (void)snprintf(uin, sizeof(uin), "%s", s_music.credential.musicid);
-        (void)snprintf(musickey, sizeof(musickey), "%s",
-                       s_music.credential.musickey);
-        music_service_unlock();
     }
-    if (!credential_valid || uin[0] == '\0')
+    music_service_unlock();
+    if (!current || uin[0] == '\0')
     {
         return ESP_ERR_INVALID_STATE;
     }
@@ -371,21 +393,23 @@ esp_err_t music_net_fetch_profile(char *account_id, size_t account_id_size,
     }
     cJSON_AddItemToArray(vec_uin, uin_item);
     cJSON_AddNumberToObject(param, "need_profile", 1);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post_with_credentials(uin, musickey,
-        "userInfo.BaseUserInfoServer",
-        "get_user_baseinfo_v2", param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_AUTHENTICATED,
+                                         credential_generation,
+                                         "userInfo.BaseUserInfoServer",
+                                         "get_user_baseinfo_v2", param,
+                                         &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
 
-    const bool found = music_profile_parse(data, uin,
+    const bool found = music_profile_parse(result.data, uin,
                                            login_type == MUSIC_LOGIN_TYPE_QQ,
                                            name, name_size, avatar,
                                            avatar_size);
-    cJSON_Delete(root);
+    music_api_result_release(&result);
     return found ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
@@ -492,6 +516,7 @@ static uint64_t _playlist_disstid(const music_playlist_ref_t *ref)
 }
 
 static esp_err_t _music_net_fetch_playlist_once(
+    uint32_t credential_generation,
     const music_playlist_ref_t *ref,
     uint16_t offset, uint16_t count,
     music_playlist_snapshot_t **snapshot)
@@ -515,33 +540,37 @@ static esp_err_t _music_net_fetch_playlist_once(
     cJSON_AddBoolToObject(param, "userinfo", true);
     cJSON_AddBoolToObject(param, "orderlist", true);
     cJSON_AddBoolToObject(param, "onlysonglist", false);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("music.srfDissInfo.DissInfo", "CgiGetDiss",
-                                 param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_AUTHENTICATED,
+                                         credential_generation,
+                                         "music.srfDissInfo.DissInfo",
+                                         "CgiGetDiss", param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
     music_playlist_snapshot_t *playlist = music_snapshot_alloc(
             offsetof(music_playlist_snapshot_t, songs) +
             (size_t)count * sizeof(music_song_t), NULL);
     if (playlist == NULL)
     {
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         return ESP_ERR_NO_MEM;
     }
     playlist->generation = music_service_next_generation();
     playlist->playlist.ref = *ref;
-    const cJSON *dirinfo = cJSON_GetObjectItemCaseSensitive(data, "dirinfo");
-    music_json_string(data, "dissname", playlist->playlist.title,
+    const cJSON *dirinfo = cJSON_GetObjectItemCaseSensitive(result.data,
+        "dirinfo");
+    music_json_string(result.data, "dissname", playlist->playlist.title,
                       sizeof(playlist->playlist.title));
     if (playlist->playlist.title[0] == '\0')
     {
         music_json_string(dirinfo, "title", playlist->playlist.title,
                           sizeof(playlist->playlist.title));
     }
-    music_json_string(data, "diss_cover", playlist->playlist.cover_url,
+    music_json_string(result.data, "diss_cover",
+                      playlist->playlist.cover_url,
                       sizeof(playlist->playlist.cover_url));
     if (playlist->playlist.cover_url[0] == '\0')
     {
@@ -557,22 +586,24 @@ static esp_err_t _music_net_fetch_playlist_once(
         "creator");
     music_json_string(creator, "nick", playlist->playlist.creator,
                       sizeof(playlist->playlist.creator));
-    playlist->playlist.track_count = music_json_u32(data, "songnum");
+    playlist->playlist.track_count = music_json_u32(result.data, "songnum");
     if (playlist->playlist.track_count == 0U)
     {
         playlist->playlist.track_count = music_json_u32(dirinfo, "songnum");
     }
     if (playlist->playlist.track_count == 0U)
     {
-        playlist->playlist.track_count = music_json_u32(data, "songlist_size");
+        playlist->playlist.track_count = music_json_u32(result.data,
+            "songlist_size");
     }
     playlist->offset = offset;
-    playlist->total = music_json_u32(data, "total_song_num");
+    playlist->total = music_json_u32(result.data, "total_song_num");
     if (playlist->total == 0U)
     {
         playlist->total = music_json_u32(dirinfo, "songnum");
     }
-    const cJSON *songs = cJSON_GetObjectItemCaseSensitive(data, "songlist");
+    const cJSON *songs = cJSON_GetObjectItemCaseSensitive(result.data,
+        "songlist");
     if (cJSON_IsArray(songs))
     {
         const cJSON *item = NULL;
@@ -591,12 +622,13 @@ static esp_err_t _music_net_fetch_playlist_once(
     {
         playlist->total = (uint32_t)offset + playlist->count;
     }
-    cJSON_Delete(root);
+    music_api_result_release(&result);
     *snapshot = playlist;
     return ESP_OK;
 }
 
-esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
+esp_err_t music_net_fetch_playlist(uint32_t credential_generation,
+                                   const music_playlist_ref_t *ref,
                                    uint16_t offset, uint16_t count,
                                    music_playlist_snapshot_t **snapshot)
 {
@@ -609,7 +641,8 @@ esp_err_t music_net_fetch_playlist(const music_playlist_ref_t *ref,
     for (unsigned attempt = 0U; attempt < 2U; ++attempt)
     {
         music_playlist_snapshot_t *page = NULL;
-        result = _music_net_fetch_playlist_once(ref, offset, count, &page);
+        result = _music_net_fetch_playlist_once(credential_generation,
+                                                ref, offset, count, &page);
         if (result == ESP_OK && page != NULL &&
                 (page->count > 0U || page->total <= offset))
         {
@@ -656,14 +689,31 @@ static void _song_filename(const music_song_t *song, music_quality_t quality,
     *extension = suffix;
 }
 
-static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
-        music_quality_t quality,
-        char *url, size_t url_size)
+static esp_err_t _music_net_fetch_song_url_one(
+    uint32_t credential_generation, const music_song_t *song,
+    music_quality_t quality, char *url, size_t url_size)
 {
     if (song == NULL || url == NULL || url_size == 0U ||
-            song->songmid[0] == '\0' || !s_music.credential_valid)
+            song->songmid[0] == '\0')
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    char uin[sizeof(s_music.credential.musicid)] = {0};
+    if (music_service_lock() != ESP_OK)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool current =
+        s_music.credential_state == MUSIC_CREDENTIAL_VALIDATED &&
+        s_music.credential_generation == credential_generation;
+    if (current)
+    {
+        (void)snprintf(uin, sizeof(uin), "%s", s_music.credential.musicid);
+    }
+    music_service_unlock();
+    if (!current || uin[0] == '\0')
+    {
+        return ESP_ERR_INVALID_STATE;
     }
     char filename[96];
     const char *extension = NULL;
@@ -688,7 +738,7 @@ static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
     {
         cJSON_AddItemToArray(songtypes, cJSON_CreateNumber(0));
     }
-    cJSON_AddStringToObject(param, "uin", s_music.credential.musicid);
+    cJSON_AddStringToObject(param, "uin", uin);
     cJSON_AddNumberToObject(param, "loginflag", 1);
     cJSON_AddStringToObject(param, "platform", "20");
     cJSON *filenames = cJSON_AddArrayToObject(param, "filename");
@@ -696,15 +746,17 @@ static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
     {
         cJSON_AddItemToArray(filenames, cJSON_CreateString(filename));
     }
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("vkey.GetVkeyServer", "CgiGetVkey", param,
-                                 &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_AUTHENTICATED,
+                                         credential_generation,
+                                         "vkey.GetVkeyServer", "CgiGetVkey",
+                                         param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
-    const cJSON *midurlinfo = cJSON_GetObjectItemCaseSensitive(data,
+    const cJSON *midurlinfo = cJSON_GetObjectItemCaseSensitive(result.data,
         "midurlinfo");
     const cJSON *first = cJSON_IsArray(midurlinfo) ?
                          cJSON_GetArrayItem(midurlinfo, 0) : NULL;
@@ -720,38 +772,38 @@ static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
             if (strncmp(purl, "https://", 8) == 0)
             {
                 (void)snprintf(url, url_size, "%s", purl);
-                cJSON_Delete(root);
+                music_api_result_release(&result);
                 return ESP_OK;
             }
             if (strncmp(purl, "http://", 7) == 0)
             {
                 (void)snprintf(url, url_size, "https://%s", purl + 7);
-                cJSON_Delete(root);
+                music_api_result_release(&result);
                 return ESP_OK;
             }
             const char *path = purl[0] == '/' ? purl + 1 : purl;
             (void)snprintf(url, url_size,
                            "https://isure.stream.qqmusic.qq.com/%s", path);
-            cJSON_Delete(root);
+            music_api_result_release(&result);
             return ESP_OK;
         }
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         LOG_W("no play url for %s", song->songmid);
         return ESP_ERR_NOT_FOUND;
     }
     if (strncmp(purl, "https://", 8) == 0)
     {
         (void)snprintf(url, url_size, "%s", purl);
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         return ESP_OK;
     }
     if (strncmp(purl, "http://", 7) == 0)
     {
         (void)snprintf(url, url_size, "https://%s", purl + 7);
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         return ESP_OK;
     }
-    const cJSON *sip = cJSON_GetObjectItemCaseSensitive(data, "sip");
+    const cJSON *sip = cJSON_GetObjectItemCaseSensitive(result.data, "sip");
     const char *domain = NULL;
     if (cJSON_IsArray(sip))
     {
@@ -776,15 +828,16 @@ static esp_err_t _music_net_fetch_song_url_one(const music_song_t *song,
     }
     if (domain == NULL)
     {
-        cJSON_Delete(root);
+        music_api_result_release(&result);
         return ESP_ERR_INVALID_RESPONSE;
     }
     (void)snprintf(url, url_size, "%s%s", domain, purl);
-    cJSON_Delete(root);
+    music_api_result_release(&result);
     return ESP_OK;
 }
 
-esp_err_t music_net_fetch_song_url(const music_song_t *song,
+esp_err_t music_net_fetch_song_url(uint32_t credential_generation,
+                                   const music_song_t *song,
                                    music_quality_t quality,
                                    char *url, size_t url_size,
                                    music_quality_t *actual_quality)
@@ -809,8 +862,9 @@ esp_err_t music_net_fetch_song_url(const music_song_t *song,
     for (size_t index = 0U; index < attempt_count; ++index)
     {
         url[0] = '\0';
-        last_error = _music_net_fetch_song_url_one(song, attempts[index],
-            url, url_size);
+        last_error = _music_net_fetch_song_url_one(
+                         credential_generation, song, attempts[index],
+                         url, url_size);
         if (last_error == ESP_OK)
         {
             if (actual_quality != NULL)

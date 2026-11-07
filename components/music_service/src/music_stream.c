@@ -727,13 +727,14 @@ cleanup:
     }
     if (natural_end)
     {
-        music_service_stream_finished();
+        music_service_stream_finished(generation);
     }
     else if (failed && failure_reason != MUSIC_SERVICE_FAILURE_NONE &&
              !atomic_load_explicit(&s_stream.stop, memory_order_acquire) &&
              !atomic_load_explicit(&s_stream.shutdown, memory_order_acquire))
     {
-        music_service_stream_failed(failure_reason);
+        music_service_stream_failed(failure_reason,
+                                    generation);
     }
 }
 

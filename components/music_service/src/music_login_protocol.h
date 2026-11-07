@@ -69,4 +69,33 @@ bool music_login_query_value(const char *url, const char *key,
 bool music_login_form_add(char *buffer, size_t buffer_size, size_t *used,
                           const char *key, const char *value);
 
+/** @brief Whether a QQ Music business code means an expired login session. */
+bool music_login_code_is_auth_expired(int code);
+
+/**
+ * @brief Build the Web session-check URL for one loaded credential.
+ *
+ * @param output Output buffer.
+ * @param output_size Output buffer size.
+ * @param musicid QQ Music account id.
+ * @param musickey Current QQ Music session key.
+ * @return true when a complete URL was written.
+ */
+bool music_login_build_session_check_url(char *output, size_t output_size,
+        const char *musicid,
+        const char *musickey);
+
+/**
+ * @brief Build the credential cookie header used by the session check.
+ *
+ * @param output Output buffer.
+ * @param output_size Output buffer size.
+ * @param musicid QQ Music account id.
+ * @param musickey Current QQ Music session key.
+ * @return true when a complete cookie header was written.
+ */
+bool music_login_build_credential_cookie(char *output, size_t output_size,
+        const char *musicid,
+        const char *musickey);
+
 #endif /* __MUSIC_LOGIN_PROTOCOL_H__ */

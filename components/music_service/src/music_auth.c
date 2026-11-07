@@ -42,6 +42,8 @@
     "&use_customer_cb=0&state=state&display=pc"
 #define MUSIC_QR_MAX_BYTES (256U * 1024U)
 #define MUSIC_QR_POLL_MAX_BYTES (32U * 1024U)
+#define MUSIC_SESSION_CHECK_MAX_BYTES (64U * 1024U)
+#define MUSIC_SESSION_COOKIE_BYTES 1536U
 
 static void *_psram_alloc(size_t size)
 {
@@ -56,6 +58,30 @@ static void _psram_free(void *pointer)
 static bool _credential_string_ok(const char *value, size_t capacity)
 {
     return memchr(value, '\0', capacity) != NULL;
+}
+
+static bool _credential_token_ok(const char *value, size_t capacity,
+                                 bool numeric_only)
+{
+    if (!_credential_string_ok(value, capacity) || value[0] == '\0')
+    {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)value;
+            *cursor != '\0'; ++cursor)
+    {
+        if (*cursor <= 0x20U || *cursor >= 0x7FU ||
+                *cursor == ';' || *cursor == '&' || *cursor == '=' ||
+                *cursor == '\'' || *cursor == '"')
+        {
+            return false;
+        }
+        if (numeric_only && (*cursor < '0' || *cursor > '9'))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 esp_err_t music_net_load_credential(music_credential_blob_t *credential)
@@ -74,12 +100,10 @@ esp_err_t music_net_load_credential(music_credential_blob_t *credential)
     if (size != sizeof(*credential) ||
             credential->magic != MUSIC_CREDENTIAL_MAGIC ||
             credential->version != MUSIC_CREDENTIAL_VERSION ||
-            credential->musicid[0] == '\0' ||
-            credential->musickey[0] == '\0' ||
-            !_credential_string_ok(credential->musicid,
-                                   sizeof(credential->musicid)) ||
-            !_credential_string_ok(credential->musickey,
-                                   sizeof(credential->musickey)) ||
+            !_credential_token_ok(credential->musicid,
+                                  sizeof(credential->musicid), true) ||
+            !_credential_token_ok(credential->musickey,
+                                  sizeof(credential->musickey), false) ||
             !_credential_string_ok(credential->refresh_key,
                                    sizeof(credential->refresh_key)) ||
             !_credential_string_ok(credential->refresh_token,
@@ -93,8 +117,11 @@ esp_err_t music_net_load_credential(music_credential_blob_t *credential)
 
 esp_err_t music_net_save_credential(const music_credential_blob_t *credential)
 {
-    if (credential == NULL || credential->musicid[0] == '\0' ||
-            credential->musickey[0] == '\0')
+    if (credential == NULL ||
+            !_credential_token_ok(credential->musicid,
+                                  sizeof(credential->musicid), true) ||
+            !_credential_token_ok(credential->musickey,
+                                  sizeof(credential->musickey), false))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -102,15 +129,196 @@ esp_err_t music_net_save_credential(const music_credential_blob_t *credential)
                                sizeof(*credential));
 }
 
+esp_err_t music_net_save_credential_if_current(
+    const music_credential_blob_t *credential, uint32_t login_session)
+{
+    esp_err_t result = music_service_credential_lock();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    if (!music_service_login_session_current(login_session))
+    {
+        music_service_credential_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (music_service_lock() != ESP_OK)
+    {
+        music_service_credential_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool current = s_music.login_active &&
+                         s_music.login_session == login_session &&
+                         music_service_login_session_current(login_session);
+    music_service_unlock();
+    if (!current)
+    {
+        music_service_credential_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    result = music_net_save_credential(credential);
+    music_service_credential_unlock();
+    if (result == ESP_OK)
+    {
+        if (music_service_lock() == ESP_OK)
+        {
+            const bool still_current = s_music.login_active &&
+                                       s_music.login_session == login_session;
+            music_service_unlock();
+            if (!still_current)
+            {
+                /* Logout won the race after NVS write; remove the orphan. */
+                esp_err_t erase_result = music_service_credential_lock();
+                if (erase_result == ESP_OK)
+                {
+                    erase_result = nv_storage_erase_key(MUSIC_CREDENTIAL_KEY);
+                    music_service_credential_unlock();
+                }
+                if (erase_result == ESP_OK ||
+                        erase_result == ESP_ERR_NVS_NOT_FOUND)
+                {
+                    return ESP_ERR_INVALID_STATE;
+                }
+                return erase_result;
+            }
+        }
+        else
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    return result;
+}
+
 esp_err_t music_net_erase_credential(void)
 {
-    const esp_err_t result = nv_storage_erase_key(MUSIC_CREDENTIAL_KEY);
+    esp_err_t result = music_service_credential_lock();
+    if (result != ESP_OK)
+    {
+        return result;
+    }
+    result = nv_storage_erase_key(MUSIC_CREDENTIAL_KEY);
+    music_service_credential_unlock();
     if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND)
     {
         music_net_clear_session();
         return ESP_OK;
     }
     return result;
+}
+
+esp_err_t music_net_check_session(const char *musicid, const char *musickey)
+{
+    if (musicid == NULL || musicid[0] == '\0' ||
+            musickey == NULL || musickey[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t error = ESP_OK;
+    char *url = _psram_alloc(MUSIC_SERVICE_URL_BYTES);
+    char *cookie = _psram_alloc(MUSIC_SESSION_COOKIE_BYTES);
+    if (url == NULL || cookie == NULL)
+    {
+        error = ESP_ERR_NO_MEM;
+        goto done;
+    }
+    if (!music_login_build_session_check_url(url, MUSIC_SERVICE_URL_BYTES,
+            musicid, musickey) ||
+            !music_login_build_credential_cookie(cookie,
+                    MUSIC_SESSION_COOKIE_BYTES, musicid, musickey))
+    {
+        error = ESP_ERR_INVALID_SIZE;
+        goto done;
+    }
+    music_http_result_t result;
+    error = music_http_get_with_cookie_header(url, cookie, &result,
+        MUSIC_SESSION_CHECK_MAX_BYTES);
+    if (error != ESP_OK)
+    {
+        LOG_W("session check request failed: %s", esp_err_to_name(error));
+        goto done;
+    }
+    if (result.status == 401)
+    {
+        music_http_result_free(&result);
+        error = MUSIC_ERR_HTTP_AUTH;
+        goto done;
+    }
+    if (result.status == 403)
+    {
+        cJSON *root = cJSON_Parse(result.body);
+        const cJSON *code = root == NULL ? NULL :
+                            cJSON_GetObjectItemCaseSensitive(root, "code");
+        const bool explicit_auth =
+            cJSON_IsNumber(code) &&
+            music_login_code_is_auth_expired(code->valueint);
+        cJSON_Delete(root);
+        music_http_result_free(&result);
+        error = explicit_auth ? MUSIC_ERR_HTTP_AUTH :
+                ESP_ERR_INVALID_RESPONSE;
+        goto done;
+    }
+    if (result.status == 429)
+    {
+        music_http_result_free(&result);
+        error = MUSIC_ERR_HTTP_RATE_LIMIT;
+        goto done;
+    }
+    if (result.status < 200 || result.status >= 300)
+    {
+        LOG_W("session check HTTP status=%d", result.status);
+        music_http_result_free(&result);
+        error = ESP_ERR_INVALID_RESPONSE;
+        goto done;
+    }
+    cJSON *root = cJSON_Parse(result.body);
+    music_http_result_free(&result);
+    if (root == NULL)
+    {
+        error = ESP_ERR_INVALID_RESPONSE;
+        goto done;
+    }
+    const cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
+    bool has_code = false;
+    int code_value = 0;
+    if (cJSON_IsNumber(code))
+    {
+        code_value = code->valueint;
+        has_code = true;
+    }
+    else if (cJSON_IsString(code) && code->valuestring != NULL)
+    {
+        char *end = NULL;
+        const long parsed = strtol(code->valuestring, &end, 10);
+        if (end != NULL && end != code->valuestring && *end == '\0')
+        {
+            code_value = (int)parsed;
+            has_code = true;
+        }
+    }
+    cJSON_Delete(root);
+    if (!has_code)
+    {
+        error = ESP_ERR_INVALID_RESPONSE;
+    }
+    else if (code_value == 0)
+    {
+        error = ESP_OK;
+    }
+    else if (music_login_code_is_auth_expired(code_value))
+    {
+        error = MUSIC_ERR_HTTP_AUTH;
+    }
+    else
+    {
+        LOG_W("session check returned code=%d", code_value);
+        error = ESP_ERR_INVALID_RESPONSE;
+    }
+
+done:
+    _psram_free(url);
+    _psram_free(cookie);
+    return error;
 }
 
 void music_net_cancel_login(void)
@@ -189,17 +397,19 @@ static esp_err_t _exchange_qq_code(const char *code,
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddStringToObject(param, "code", code);
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("QQConnectLogin.LoginServer", "QQLogin",
-                                 param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_PUBLIC, 0U,
+                                         "QQConnectLogin.LoginServer",
+                                         "QQLogin", param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
-    const esp_err_t result = _credential_from_data(data, 2U, credential);
-    cJSON_Delete(root);
-    return result;
+    const esp_err_t parse_result = _credential_from_data(
+                                       result.data, 2U, credential);
+    music_api_result_release(&result);
+    return parse_result;
 }
 
 static esp_err_t _qq_authorize(const char *auth_url,
@@ -535,17 +745,19 @@ static esp_err_t _exchange_wechat_code(const char *code,
     }
     cJSON_AddStringToObject(param, "code", code);
     cJSON_AddStringToObject(param, "strAppid", "wx48db31d50e334801");
-    cJSON *root = NULL;
-    cJSON *data = music_api_post("music.login.LoginServer", "Login",
-                                 param, &root);
-    if (data == NULL)
+    music_api_result_t result;
+    const esp_err_t request_result = music_api_post(
+                                         MUSIC_API_SCOPE_PUBLIC, 0U,
+                                         "music.login.LoginServer", "Login",
+                                         param, &result);
+    if (request_result != ESP_OK)
     {
-        cJSON_Delete(root);
-        return music_api_last_error();
+        return request_result;
     }
-    const esp_err_t result = _credential_from_data(data, 1U, credential);
-    cJSON_Delete(root);
-    return result;
+    const esp_err_t parse_result = _credential_from_data(
+                                       result.data, 1U, credential);
+    music_api_result_release(&result);
+    return parse_result;
 }
 
 esp_err_t music_net_login_poll(music_login_type_t type,

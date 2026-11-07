@@ -100,6 +100,49 @@ static void test_form_encoding(void)
     assert(strstr(body, "&state=state") != NULL);
 }
 
+static void test_session_check_protocol(void)
+{
+    assert(music_login_code_is_auth_expired(1000));
+    assert(music_login_code_is_auth_expired(104400));
+    assert(music_login_code_is_auth_expired(104401));
+    assert(!music_login_code_is_auth_expired(0));
+    assert(!music_login_code_is_auth_expired(104604));
+
+    char url[512];
+    assert(music_login_build_session_check_url(url, sizeof(url),
+            "123456789", "Q_H_L_test_key"));
+    assert(strstr(url, "https://c6.y.qq.com/rsc/fcgi-bin/"
+                  "fcg_get_profile_homepage.fcg?") != NULL);
+    assert(strstr(url, "loginUin=123456789") != NULL);
+    assert(strstr(url, "userid=123456789") != NULL);
+    assert(strstr(url, "reqfrom=1") != NULL);
+    assert(strstr(url, "g_tk=") != NULL);
+    assert(!music_login_build_session_check_url(url, 16U,
+            "123456789", "Q_H_L_test_key"));
+    assert(!music_login_build_session_check_url(NULL, sizeof(url),
+            "123456789", "Q_H_L_test_key"));
+    assert(!music_login_build_session_check_url(url, sizeof(url),
+            "123&userid=9", "Q_H_L_test_key"));
+    assert(!music_login_build_session_check_url(url, sizeof(url),
+            "123456789", "key;qqmusic_key=bad"));
+    assert(!music_login_build_session_check_url(url, sizeof(url),
+            "123456789", "key\r\nX-Injected: 1"));
+
+    char cookie[1536];
+    assert(music_login_build_credential_cookie(cookie, sizeof(cookie),
+            "123456789", "Q_H_L_test_key"));
+    assert(strstr(cookie, "uin=123456789") != NULL);
+    assert(strstr(cookie, "qqmusic_uin=123456789") != NULL);
+    assert(strstr(cookie, "qm_keyst=Q_H_L_test_key") != NULL);
+    assert(strstr(cookie, "qqmusic_key=Q_H_L_test_key") != NULL);
+    assert(!music_login_build_credential_cookie(cookie, 16U,
+            "123456789", "Q_H_L_test_key"));
+    assert(!music_login_build_credential_cookie(cookie, sizeof(cookie),
+            "123\n456", "Q_H_L_test_key"));
+    assert(!music_login_build_credential_cookie(cookie, sizeof(cookie),
+            "123456789", "key; qqmusic_key=bad"));
+}
+
 int main(void)
 {
     test_hash33_matches_qrsig_token();
@@ -108,6 +151,7 @@ int main(void)
     test_cookie_parse();
     test_png_and_query_helpers();
     test_form_encoding();
+    test_session_check_protocol();
     printf("music_login_protocol_test: PASS\n");
     return 0;
 }

@@ -11,16 +11,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MUSIC_JSON_MAX_BYTES CONFIG_MUSIC_SERVICE_MAX_RESPONSE_BYTES
-
-static _Thread_local esp_err_t s_last_musicu_error = ESP_OK;
-
-esp_err_t music_api_last_error(void)
-{
-    return s_last_musicu_error;
-}
 
 void music_json_string(const cJSON *object, const char *key,
                        char *output, size_t output_size)
@@ -86,35 +80,102 @@ bool music_json_bool(const cJSON *object, const char *key)
     return cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint != 0);
 }
 
-static cJSON *_music_api_post(const char *module, const char *method,
-                              cJSON *param, cJSON **root_out,
-                              const char *uin, const char *musickey)
+static bool _music_api_business_code(const cJSON *item, int *output)
 {
-    if (root_out == NULL)
+    if (cJSON_IsNumber(item))
     {
-        return NULL;
+        *output = item->valueint;
+        return true;
     }
-    *root_out = NULL;
-    s_last_musicu_error = ESP_OK;
-    if (module == NULL || method == NULL || param == NULL)
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
     {
-        s_last_musicu_error = ESP_ERR_INVALID_ARG;
-        return NULL;
+        return false;
     }
-    const bool logged_in = uin != NULL && uin[0] != '\0' &&
-                           musickey != NULL && musickey[0] != '\0';
+    char *end = NULL;
+    const long value = strtol(item->valuestring, &end, 10);
+    if (end == item->valuestring || end == NULL || *end != '\0' ||
+            value < INT32_MIN || value > INT32_MAX)
+    {
+        return false;
+    }
+    *output = (int)value;
+    return true;
+}
+
+static esp_err_t _music_api_copy_credential(
+    uint32_t credential_generation,
+    char musicid[sizeof(s_music.credential.musicid)],
+    char musickey[sizeof(s_music.credential.musickey)])
+{
+    if (credential_generation == 0U || music_service_lock() != ESP_OK)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool current =
+        s_music.credential_state == MUSIC_CREDENTIAL_VALIDATED &&
+        s_music.credential_generation == credential_generation;
+    if (current)
+    {
+        (void)snprintf(musicid, sizeof(s_music.credential.musicid), "%s",
+                       s_music.credential.musicid);
+        (void)snprintf(musickey, sizeof(s_music.credential.musickey), "%s",
+                       s_music.credential.musickey);
+    }
+    music_service_unlock();
+    return current ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t music_api_post(music_api_scope_t scope,
+                         uint32_t credential_generation,
+                         const char *module, const char *method,
+                         cJSON *param, music_api_result_t *result)
+{
+    if (result == NULL)
+    {
+        cJSON_Delete(param);
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    result->error = ESP_OK;
+    result->business_code = -1;
+    result->credential_generation = credential_generation;
+    if (module == NULL || method == NULL || param == NULL ||
+            (scope != MUSIC_API_SCOPE_PUBLIC &&
+             scope != MUSIC_API_SCOPE_AUTHENTICATED))
+    {
+        cJSON_Delete(param);
+        result->error = ESP_ERR_INVALID_ARG;
+        return result->error;
+    }
+
+    char musicid[sizeof(s_music.credential.musicid)] = {0};
+    char musickey[sizeof(s_music.credential.musickey)] = {0};
+    result->credential_attached = scope == MUSIC_API_SCOPE_AUTHENTICATED;
+    if (result->credential_attached)
+    {
+        result->error = _music_api_copy_credential(
+                            credential_generation, musicid, musickey);
+        if (result->error != ESP_OK)
+        {
+            cJSON_Delete(param);
+            return result->error;
+        }
+    }
+
     cJSON *root = cJSON_CreateObject();
     cJSON *comm = cJSON_CreateObject();
     cJSON *request = cJSON_CreateObject();
     if (root == NULL || comm == NULL || request == NULL)
     {
+        cJSON_Delete(param);
         cJSON_Delete(root);
         cJSON_Delete(comm);
         cJSON_Delete(request);
-        s_last_musicu_error = ESP_ERR_NO_MEM;
-        return NULL;
+        result->error = ESP_ERR_NO_MEM;
+        return result->error;
     }
-    cJSON_AddStringToObject(comm, "uin", logged_in ? uin : "0");
+    cJSON_AddStringToObject(comm, "uin", result->credential_attached ?
+                            musicid : "0");
     cJSON_AddStringToObject(comm, "format", "json");
     cJSON_AddNumberToObject(comm, "ct", 24);
     cJSON_AddNumberToObject(comm, "cv", 0);
@@ -129,7 +190,7 @@ static cJSON *_music_api_post(const char *module, const char *method,
     {
         cJSON_AddStringToObject(comm, "tmeLoginType", "2");
     }
-    if (logged_in)
+    if (result->credential_attached)
     {
         char g_tk[24];
         (void)snprintf(g_tk, sizeof(g_tk), "%u",
@@ -147,88 +208,82 @@ static cJSON *_music_api_post(const char *module, const char *method,
     cJSON_Delete(root);
     if (body == NULL)
     {
-        s_last_musicu_error = ESP_ERR_NO_MEM;
-        return NULL;
+        result->error = ESP_ERR_NO_MEM;
+        return result->error;
     }
-    music_http_result_t result;
-    const esp_err_t error = music_http_post(
-                                "https://u.y.qq.com/cgi-bin/musicu.fcg", body, &result,
-                                MUSIC_JSON_MAX_BYTES);
+    music_http_result_t http;
+    result->error = music_http_post(
+                        "https://u.y.qq.com/cgi-bin/musicu.fcg", body, &http,
+                        MUSIC_JSON_MAX_BYTES);
     cJSON_free(body);
-    if (error != ESP_OK)
+    if (result->error != ESP_OK)
     {
-        s_last_musicu_error = error;
-        music_http_result_free(&result);
-        return NULL;
+        music_http_result_free(&http);
+        return result->error;
     }
-    if (result.status == 401 || result.status == 403)
+    if (http.status == 401 ||
+            (http.status == 403 && result->credential_attached))
     {
-        s_last_musicu_error = MUSIC_ERR_HTTP_AUTH;
-        music_http_result_free(&result);
-        return NULL;
+        result->error = MUSIC_ERR_HTTP_AUTH;
+        music_http_result_free(&http);
+        return result->error;
     }
-    if (result.status == 429)
+    if (http.status == 429)
     {
-        s_last_musicu_error = MUSIC_ERR_HTTP_RATE_LIMIT;
-        music_http_result_free(&result);
-        return NULL;
+        result->error = MUSIC_ERR_HTTP_RATE_LIMIT;
+        music_http_result_free(&http);
+        return result->error;
     }
-    if (result.status >= 400)
+    if (http.status < 200 || http.status >= 300)
     {
-        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
-        music_http_result_free(&result);
-        return NULL;
+        result->error = ESP_ERR_INVALID_RESPONSE;
+        music_http_result_free(&http);
+        return result->error;
     }
-    cJSON *response = cJSON_Parse(result.body);
-    music_http_result_free(&result);
-    if (response == NULL)
+    result->root = cJSON_Parse(http.body);
+    music_http_result_free(&http);
+    if (result->root == NULL)
     {
-        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
-        return NULL;
+        result->error = ESP_ERR_INVALID_RESPONSE;
+        return result->error;
     }
-    cJSON *response_request = cJSON_GetObjectItemCaseSensitive(response,
+    cJSON *response_request = cJSON_GetObjectItemCaseSensitive(result->root,
         "req_0");
-    cJSON *data = response_request == NULL ? NULL :
-                  cJSON_GetObjectItemCaseSensitive(response_request, "data");
-    if (data == NULL)
+    const cJSON *response_code = response_request == NULL ? NULL :
+                                 cJSON_GetObjectItemCaseSensitive(
+                                     response_request, "code");
+    result->has_business_code = _music_api_business_code(
+                                    response_code, &result->business_code);
+    if (result->credential_attached && result->has_business_code &&
+            music_login_code_is_auth_expired(result->business_code))
     {
-        const cJSON *code = response_request == NULL ? NULL :
-                            cJSON_GetObjectItemCaseSensitive(response_request,
-                                "code");
+        LOG_W("%s/%s auth expired: code=%d", module, method,
+              result->business_code);
+        result->error = MUSIC_ERR_HTTP_AUTH;
+        music_api_result_release(result);
+        return result->error;
+    }
+    result->data = response_request == NULL ? NULL :
+                   cJSON_GetObjectItemCaseSensitive(response_request, "data");
+    if (result->data == NULL)
+    {
         LOG_W("%s/%s failed: code=%d", module, method,
-              cJSON_IsNumber(code) ? code->valueint : -1);
-        cJSON_Delete(response);
-        s_last_musicu_error = ESP_ERR_INVALID_RESPONSE;
-        return NULL;
+              result->has_business_code ? result->business_code : -1);
+        result->error = ESP_ERR_INVALID_RESPONSE;
+        music_api_result_release(result);
+        return result->error;
     }
-    *root_out = response;
-    return data;
+    return ESP_OK;
 }
 
-cJSON *music_api_post(const char *module, const char *method,
-                      cJSON *param, cJSON **root_out)
+void music_api_result_release(music_api_result_t *result)
 {
-    char credential_musicid[sizeof(s_music.credential.musicid)] = {0};
-    char credential_musickey[sizeof(s_music.credential.musickey)] = {0};
-    bool credential_valid = false;
-    if (music_service_lock() == ESP_OK)
+    if (result == NULL)
     {
-        credential_valid = s_music.credential_valid;
-        (void)snprintf(credential_musicid, sizeof(credential_musicid), "%s",
-                       s_music.credential.musicid);
-        (void)snprintf(credential_musickey, sizeof(credential_musickey), "%s",
-                       s_music.credential.musickey);
-        music_service_unlock();
+        return;
     }
-    return _music_api_post(module, method, param, root_out,
-                           credential_valid ? credential_musicid : NULL,
-                           credential_valid ? credential_musickey : NULL);
-}
-
-cJSON *music_api_post_with_credentials(const char *uin, const char *musickey,
-                                       const char *module, const char *method,
-                                       cJSON *param, cJSON **root_out)
-{
-    return _music_api_post(module, method, param, root_out, uin, musickey);
+    cJSON_Delete(result->root);
+    result->root = NULL;
+    result->data = NULL;
 }
 
