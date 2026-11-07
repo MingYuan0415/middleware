@@ -469,14 +469,22 @@ static void _test_rate_limit(void)
     assert(weather_host_weather_requests(WEATHER_SERVICE_KIND_CURRENT) == 1U);
     weather_host_set_now(1061);
     assert(weather_service_request_refresh() == ESP_ERR_TIMEOUT);
-    const struct timespec delay =
-    {
-        .tv_sec = 0,
-        .tv_nsec = 10000000L,
-    };
-    (void)nanosleep(&delay, NULL);
+
+    /* The countdown remains observable, but a decrement is not a new UI
+     * state: otherwise every weather page rebuilds once per second. */
+    const struct timespec settle = {.tv_nsec = 10000000L};
+    (void)nanosleep(&settle, NULL);
+    assert(weather_service_get_status(&status) == ESP_OK);
+    const uint32_t retry_before = status.retry_after_seconds;
+    const unsigned events_before = weather_host_event_count();
+    weather_host_advance_milliseconds(1000);
+    const struct timespec tick = {.tv_sec = 1, .tv_nsec = 200000000L};
+    (void)nanosleep(&tick, NULL);
+    assert(weather_service_get_status(&status) == ESP_OK);
+    assert(status.state == WEATHER_SERVICE_STATE_RATE_LIMITED);
+    assert(status.retry_after_seconds < retry_before);
+    assert(weather_host_event_count() == events_before);
     assert(weather_host_weather_requests(WEATHER_SERVICE_KIND_CURRENT) == 1U);
-    assert(_wait_for_state(WEATHER_SERVICE_STATE_RATE_LIMITED, 1000U));
     _stop();
 }
 

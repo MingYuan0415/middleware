@@ -164,9 +164,12 @@ static bool _weather_status_set(weather_service_state_t state,
                                 uint32_t retry_after_seconds)
 {
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
+    /* retry_after_seconds is a live countdown, not a new UI state. Publishing
+     * every decrement makes every subscribed page rebuild once per second
+     * while an account limit is active. Keep the status copy current for
+     * synchronous callers, but notify only when the semantic state changes. */
     bool changed = s_weather.status.state != state ||
-                   s_weather.status.failure != failure ||
-                   s_weather.status.retry_after_seconds != retry_after_seconds;
+                   s_weather.status.failure != failure;
     s_weather.status.state = state;
     s_weather.status.failure = failure;
     s_weather.status.retry_after_seconds = retry_after_seconds;
