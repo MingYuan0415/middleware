@@ -1022,8 +1022,8 @@ static void _test_suspended_release_and_resume(void)
     assert(audio_service_deinit() == ESP_OK);
 }
 
-/* The plain setter is used by drag previews and benchmarks, so it must never
- * touch flash. */
+/* The plain setter is used by drag previews and app-managed overrides, so it
+ * must never touch flash. */
 static void _test_volume_set_does_not_persist(void)
 {
     audio_service_fakes_reset();

@@ -21,7 +21,7 @@ Public header `include/audio_service.h`:
   preempts. Release accepts only the current token/generation, a mismatch does
   not stop DMA, and a failure retains the lease for a same-generation retry.
   Kinds are RECORD (read/write), PLAYBACK (write-only), and MAINTENANCE
-  (read/write, the benchmark path).
+  (read/write, the maintenance path).
 - `audio_service_configure()`: set the PCM format while READY and without a
   lease.
 - `audio_service_suspend()` / `audio_service_resume()`: quiet the stream within
@@ -41,7 +41,7 @@ Public header `include/audio_service.h`:
   `audio_service_reset_persisted_state()`: the persisted speaker level. Storage
   belongs to this component, like every other module that owns a setting, so the
   `volume` key never leaks to a caller. The plain `set_volume()` applies only and
-  never touches flash, which keeps drag previews and benchmark overrides clean;
+  never touches flash, which keeps drag previews and app-managed overrides clean;
   `set_volume_persisted()` applies synchronously and queues one commit, for a
   settled choice. The commit never runs on the caller's task: the LVGL worker
   that settles the knob keeps its stack in PSRAM, and a flash write asserts when
@@ -100,8 +100,8 @@ Public header `include/audio_service.h`:
   RUNNING has an owner, restores the original generation when READY/ERROR has an
   owner, and starts nothing for ERROR without an owner.
 - Production `main/app_runtime_pm.c` calls suspend/resume on sleep and on
-  rollback/wake. Recording/playback, Flybirds, and the display benchmark all
-  hold the exclusive lease; a failed cleanup must retain ownership and retry and
+  rollback/wake. Recording/playback and Flybirds hold the exclusive lease; a
+  failed cleanup must retain ownership and retry and
   must not preempt a background consumer or overwrite an old handle. System
   volume/mute/PA requests are not reset by release.
 

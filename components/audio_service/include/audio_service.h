@@ -100,7 +100,7 @@ typedef enum
 {
     AUDIO_SERVICE_SESSION_RECORD = 0,  /**< Read and write, e.g. WAV capture. */
     AUDIO_SERVICE_SESSION_PLAYBACK,    /**< Write only. */
-    AUDIO_SERVICE_SESSION_MAINTENANCE, /**< Read and write, benchmark path. */
+    AUDIO_SERVICE_SESSION_MAINTENANCE, /**< Read and write, maintenance path. */
 } audio_service_session_kind_t;
 
 /** @brief Exclusive stream lease returned by audio_service_acquire(). */
@@ -215,7 +215,7 @@ esp_err_t audio_service_get_lease(audio_service_lease_t *lease);
  * @brief Set the speaker volume in the range 0..100 percent.
  *
  * The level is applied only; nothing is written to storage. Use this for
- * transient changes such as a drag preview or a benchmark override.
+ * transient changes such as a drag preview or an app-managed override.
  */
 esp_err_t audio_service_set_volume(uint8_t percent);
 
