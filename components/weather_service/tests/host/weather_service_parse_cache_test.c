@@ -76,7 +76,7 @@ static esp_err_t _parse(weather_service_kind_t kind, const char *data,
                        ESP_ERR_INVALID_SIZE :
                        weather_service_parse_weather(kind,
                            (const uint8_t *)json, (size_t)count,
-                           snapshot, changed_mask);
+                           INT64_C(1785888000), snapshot, changed_mask);
     free(json);
     return result;
 }
@@ -342,6 +342,29 @@ static void _test_weather(void)
     CHECK(snapshot.current.condition_code == 101U);
     CHECK(snapshot.current.humidity_percent == 72U);
     CHECK(snapshot.current.observed_at.epoch_seconds == 1785887400);
+    CHECK(snapshot.current.meta.fetched_at.epoch_seconds == 1785888000);
+    CHECK(snapshot.current.meta.fetched_at.offset_minutes == 0);
+    CHECK(snapshot.current.meta.updated_at.offset_minutes == 480);
+
+    weather_service_snapshot_t no_local_time = {0};
+    size_t no_local_time_size = strlen(s_envelope_prefix) + strlen(current) + 2U;
+    char *no_local_time_json = malloc(no_local_time_size);
+    CHECK(no_local_time_json != NULL);
+    if (no_local_time_json != NULL)
+    {
+        int no_local_time_count = snprintf(no_local_time_json,
+                                           no_local_time_size, "%s%s}",
+                                           s_envelope_prefix, current);
+        CHECK(no_local_time_count > 0 &&
+              (size_t)no_local_time_count < no_local_time_size);
+        CHECK(weather_service_parse_weather(
+                  WEATHER_SERVICE_KIND_CURRENT,
+                  (const uint8_t *)no_local_time_json,
+                  (size_t)no_local_time_count, 0, &no_local_time,
+                  &changed) == ESP_OK);
+        CHECK(no_local_time.current.meta.expired);
+        free(no_local_time_json);
+    }
 
     const char leap_day[] =
         "{\"observed_at\":\"2024-02-29T23:59:59Z\","
@@ -420,8 +443,8 @@ static void _test_weather(void)
         "\"location\":{},\"data\":{}}";
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)wrong_source,
-                                        strlen(wrong_source), &snapshot,
-                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+                                        strlen(wrong_source), INT64_C(1785888000),
+                                        &snapshot, &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char fractional_version[] =
         "{\"schema_version\":1.5,\"source\":{\"id\":\"qweather\"},"
@@ -433,8 +456,8 @@ static void _test_weather(void)
         "\"data\":{}}";
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)fractional_version,
-                                        strlen(fractional_version), &snapshot,
-                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+                                        strlen(fractional_version), INT64_C(1785888000),
+                                        &snapshot, &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char c1_district[] =
         "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
@@ -446,8 +469,8 @@ static void _test_weather(void)
         "\"data\":{}}";
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)c1_district,
-                                        strlen(c1_district), &snapshot,
-                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+                                        strlen(c1_district), INT64_C(1785888000),
+                                        &snapshot, &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char wrong_provider[] =
         "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
@@ -459,8 +482,8 @@ static void _test_weather(void)
         "\"data\":{}}";
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)wrong_provider,
-                                        strlen(wrong_provider), &snapshot,
-                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+                                        strlen(wrong_provider), INT64_C(1785888000),
+                                        &snapshot, &changed) == ESP_ERR_INVALID_RESPONSE);
 
     const char missing_source[] =
         "{\"schema_version\":1,\"source\":{\"id\":\"qweather\"},"
@@ -471,8 +494,8 @@ static void _test_weather(void)
         "\"data\":{}}";
     CHECK(weather_service_parse_weather(WEATHER_SERVICE_KIND_CURRENT,
                                         (const uint8_t *)missing_source,
-                                        strlen(missing_source), &snapshot,
-                                        &changed) == ESP_ERR_INVALID_RESPONSE);
+                                        strlen(missing_source), INT64_C(1785888000),
+                                        &snapshot, &changed) == ESP_ERR_INVALID_RESPONSE);
 }
 
 static void _test_weather_location_localization(void)
@@ -652,6 +675,41 @@ static uint32_t _crc32(const uint8_t *data, size_t size)
     return ~crc;
 }
 
+static void _test_cache_rejects_pre_receipt_timestamp_schema(void)
+{
+    char directory[] = "/tmp/mt-weather-version-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    weather_service_snapshot_t source = {0};
+    source.available_mask = WEATHER_SERVICE_DATA_CURRENT;
+    source.current.meta.available = true;
+    source.current.temperature_tenths_c = 312;
+    CHECK(weather_service_cache_store(directory, &source, 1U) == ESP_OK);
+
+    char path[128];
+    int count = snprintf(path, sizeof(path), "%s/weather_a.bin", directory);
+    CHECK(count > 0 && (size_t)count < sizeof(path));
+    int descriptor = open(path, O_RDWR);
+    CHECK(descriptor >= 0);
+    if (descriptor >= 0)
+    {
+        uint8_t header[24] = {0};
+        CHECK(pread(descriptor, header, sizeof(header), 0) ==
+              (ssize_t)sizeof(header));
+        header[4] = 1U;
+        header[5] = 0U;
+        CHECK(pwrite(descriptor, header, sizeof(header), 0) ==
+              (ssize_t)sizeof(header));
+        (void)close(descriptor);
+    }
+
+    weather_service_snapshot_t loaded = {0};
+    uint64_t sequence = 0U;
+    CHECK(weather_service_cache_load(directory, &loaded, &sequence) ==
+          ESP_ERR_NOT_FOUND);
+    (void)unlink(path);
+    CHECK(rmdir(directory) == 0);
+}
+
 static void _test_cache_legacy_coordinate_slots(void)
 {
     char directory[] = "/tmp/mt-weather-legacy-XXXXXX";
@@ -684,6 +742,10 @@ static void _test_cache_legacy_coordinate_slots(void)
     }
     struct stat info;
     CHECK(fstat(descriptor, &info) == 0);
+    uint8_t header[24] = {0};
+    CHECK(read(descriptor, header, sizeof(header)) == (ssize_t)sizeof(header));
+    CHECK(header[4] == 2U && header[5] == 0U);
+    CHECK(lseek(descriptor, 0, SEEK_SET) == 0);
     size_t file_size = (size_t)info.st_size;
     uint8_t *file = malloc(file_size);
     CHECK(file != NULL);
@@ -756,6 +818,7 @@ int main(void)
     _test_alert_boundaries();
     _test_cache();
     _test_cache_creates_directory();
+    _test_cache_rejects_pre_receipt_timestamp_schema();
     _test_cache_legacy_coordinate_slots();
     printf("weather service: %u checks, %u failures\n", s_checks, s_failures);
     return s_failures == 0U ? 0 : 1;

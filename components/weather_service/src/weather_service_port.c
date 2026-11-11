@@ -37,9 +37,10 @@ typedef struct weather_http_context
     bool retry_after_overflow;
 } weather_http_context_t;
 
-static atomic_uintptr_t s_active_client = (uintptr_t)NULL;
-static atomic_uint s_cancel_readers = 0U;
 static atomic_ullong s_cancel_generation = 0U;
+static portMUX_TYPE s_active_client_lock = portMUX_INITIALIZER_UNLOCKED;
+static uintptr_t s_active_client = (uintptr_t)NULL;
+static unsigned s_active_client_readers;
 
 static void _weather_port_secure_clear(void *memory, size_t size)
 {
@@ -218,6 +219,7 @@ esp_err_t weather_service_port_http_get(
     {
         return ESP_ERR_NO_MEM;
     }
+    const bool async_https = strncmp(url, "https://", 8U) == 0;
     const esp_http_client_config_t config =
     {
         .url = url,
@@ -229,6 +231,7 @@ esp_err_t weather_service_port_http_get(
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
         .keep_alive_enable = false,
+        .is_async = async_https,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL)
@@ -236,8 +239,21 @@ esp_err_t weather_service_port_http_get(
         heap_caps_free(context.body);
         return ESP_ERR_NO_MEM;
     }
-    esp_err_t error = ESP_OK;
     bool active = false;
+    taskENTER_CRITICAL(&s_active_client_lock);
+    if (s_active_client == (uintptr_t)NULL)
+    {
+        s_active_client = (uintptr_t)client;
+        active = true;
+    }
+    taskEXIT_CRITICAL(&s_active_client_lock);
+    if (!active)
+    {
+        (void)esp_http_client_cleanup(client);
+        heap_caps_free(context.body);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t error = ESP_OK;
     char authorization[320] = {0};
     if (token != NULL && token[0] != '\0')
     {
@@ -271,30 +287,31 @@ esp_err_t weather_service_port_http_get(
     }
     LOG_D("HTTP request started: limit=%u timeout_ms=%u",
           (unsigned)response_limit, (unsigned)timeout_ms);
-    atomic_store_explicit(&s_active_client, (uintptr_t)client,
-                          memory_order_release);
-    active = true;
+    const int64_t started_us = esp_timer_get_time();
+    const int64_t timeout_us = (int64_t)timeout_ms * INT64_C(1000);
+    for (;;)
+    {
+        if (cancel_generation != weather_service_port_cancel_generation())
+        {
+            error = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        error = esp_http_client_perform(client);
+        if (error != ESP_ERR_HTTP_EAGAIN)
+        {
+            break;
+        }
+        if (esp_timer_get_time() - started_us >= timeout_us)
+        {
+            error = ESP_ERR_TIMEOUT;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10U));
+    }
     if (cancel_generation != weather_service_port_cancel_generation())
     {
         error = ESP_ERR_INVALID_STATE;
     }
-    else
-    {
-        error = esp_http_client_perform(client);
-        if (cancel_generation != weather_service_port_cancel_generation())
-        {
-            error = ESP_ERR_INVALID_STATE;
-        }
-    }
-    uintptr_t expected = (uintptr_t)client;
-    (void)atomic_compare_exchange_strong_explicit(
-        &s_active_client, &expected, (uintptr_t)NULL,
-        memory_order_acq_rel, memory_order_acquire);
-    while (atomic_load_explicit(&s_cancel_readers, memory_order_acquire) != 0U)
-    {
-        taskYIELD();
-    }
-    active = false;
     if (error == ESP_OK)
     {
         result->status_code = esp_http_client_get_status_code(client);
@@ -328,15 +345,18 @@ esp_err_t weather_service_port_http_get(
 exit:
     if (active)
     {
-        uintptr_t expected = (uintptr_t)client;
-        (void)atomic_compare_exchange_strong_explicit(
-            &s_active_client, &expected, (uintptr_t)NULL,
-            memory_order_acq_rel, memory_order_acquire);
-        while (atomic_load_explicit(&s_cancel_readers,
-                                    memory_order_acquire) != 0U)
+        taskENTER_CRITICAL(&s_active_client_lock);
+        if (s_active_client == (uintptr_t)client)
         {
-            taskYIELD();
+            s_active_client = (uintptr_t)NULL;
         }
+        while (s_active_client_readers != 0U)
+        {
+            taskEXIT_CRITICAL(&s_active_client_lock);
+            taskYIELD();
+            taskENTER_CRITICAL(&s_active_client_lock);
+        }
+        taskEXIT_CRITICAL(&s_active_client_lock);
     }
     _weather_port_secure_clear(authorization, sizeof(authorization));
     esp_err_t cleanup_result = esp_http_client_cleanup(client);
@@ -373,14 +393,27 @@ uint64_t weather_service_port_cancel_generation(void)
 void weather_service_port_cancel(void)
 {
     atomic_fetch_add_explicit(&s_cancel_generation, 1U, memory_order_acq_rel);
-    atomic_fetch_add_explicit(&s_cancel_readers, 1U, memory_order_acq_rel);
-    uintptr_t value = atomic_load_explicit(&s_active_client,
-                                           memory_order_acquire);
+    uintptr_t value = (uintptr_t)NULL;
+    taskENTER_CRITICAL(&s_active_client_lock);
+    value = s_active_client;
     if (value != (uintptr_t)NULL)
     {
-        (void)esp_http_client_cancel_request((esp_http_client_handle_t)value);
+        ++s_active_client_readers;
     }
-    atomic_fetch_sub_explicit(&s_cancel_readers, 1U, memory_order_release);
+    taskEXIT_CRITICAL(&s_active_client_lock);
+    if (value != (uintptr_t)NULL)
+    {
+        const esp_err_t result = esp_http_client_cancel_request(
+                                     (esp_http_client_handle_t)value);
+        if (result != ESP_OK && result != ESP_ERR_INVALID_STATE)
+        {
+            LOG_W("HTTP request cancellation failed: %s",
+                  esp_err_to_name(result));
+        }
+        taskENTER_CRITICAL(&s_active_client_lock);
+        --s_active_client_readers;
+        taskEXIT_CRITICAL(&s_active_client_lock);
+    }
 }
 
 int64_t weather_service_port_now_seconds(void)

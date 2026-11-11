@@ -276,6 +276,15 @@ esp_err_t weather_service_suspend(uint32_t timeout_ms);
 esp_err_t weather_service_resume(uint32_t timeout_ms);
 
 /**
+ * @brief Re-evaluate cached freshness after the wall clock changes.
+ *
+ * The worker owns snapshot expiry metadata. Call this after a time-service
+ * synchronization so cached data can expire or recover without waiting for a
+ * network refresh.
+ */
+esp_err_t weather_service_notify_time_changed(void);
+
+/**
  * @brief Notify the service of the current IPv4 connectivity level.
  *
  * A false-to-true transition starts one new location session, as does a

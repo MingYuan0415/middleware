@@ -50,7 +50,9 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
         weather_service_location_t *location);
 esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                                         const uint8_t *body, size_t body_size,
-                                        weather_service_snapshot_t *snapshot, uint32_t *changed_mask);
+                                        int64_t fetched_at,
+                                        weather_service_snapshot_t *snapshot,
+                                        uint32_t *changed_mask);
 void weather_service_parse_init(void);
 
 esp_err_t weather_service_cache_load(const char *directory,

@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #define WEATHER_CACHE_MAGIC        UINT32_C(0x3157544D)
-#define WEATHER_CACHE_VERSION      1U
+#define WEATHER_CACHE_VERSION      2U
 #define WEATHER_CACHE_HEADER_BYTES 24U
 
 typedef struct weather_cache_writer

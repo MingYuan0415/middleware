@@ -1,5 +1,6 @@
 #include "weather_service.h"
 #include "weather_service_host.h"
+#include "weather_service_test_hooks.h"
 
 #include "esp_heap_caps.h"
 #include "host_freertos.h"
@@ -414,6 +415,7 @@ static void _test_location_maximum_stabilization_and_manual_bypass(void)
 {
     _start();
     weather_host_set_random(1200U);
+    weather_host_set_wall_seconds(4321);
     assert(weather_service_set_network_ready(true, UINT32_C(0x01020304)) ==
            ESP_OK);
     assert(_wait_for_retry(WEATHER_SERVICE_STATE_LOCATING, 4U, 4000U));
@@ -421,6 +423,10 @@ static void _test_location_maximum_stabilization_and_manual_bypass(void)
     assert(weather_service_request_refresh() == ESP_OK);
     assert(_wait_for_location_requests(1U, 4000U));
     assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    const weather_service_snapshot_t *snapshot = NULL;
+    assert(weather_service_snapshot_acquire(&snapshot) == ESP_OK);
+    assert(snapshot->current.meta.fetched_at.epoch_seconds == 4321);
+    weather_service_snapshot_release(snapshot);
     assert(weather_service_request_refresh() == ESP_ERR_TIMEOUT);
     _stop();
 }
@@ -591,6 +597,26 @@ static void _test_snapshot_allocation_failures(void)
     _stop();
 }
 
+static void _test_expiry_allocation_failure_backs_off(void)
+{
+    _start();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    const unsigned allocations_before = weather_host_psram_allocations();
+    weather_host_set_now(1000 + 6 * 60 * 60 + 1);
+    weather_host_exhaust_psram(true);
+    assert(weather_service_notify_time_changed() == ESP_OK);
+    assert(_wait_for_retry(WEATHER_SERVICE_STATE_ERROR, 4U, 4000U));
+    const unsigned allocations_after_failure =
+        weather_host_psram_allocations();
+    const struct timespec settle = {.tv_nsec = 20000000L};
+    (void)nanosleep(&settle, NULL);
+    assert(weather_host_psram_allocations() == allocations_after_failure);
+    assert(allocations_after_failure >= allocations_before);
+    weather_host_exhaust_psram(false);
+    _stop();
+}
+
 static void _test_monotonic_scheduling_and_expiration(void)
 {
     _start();
@@ -664,6 +690,39 @@ static void _test_monotonic_scheduling_and_expiration(void)
     assert(snapshot->hourly.meta.expired);
     assert(snapshot->daily.meta.expired);
     weather_service_snapshot_release(snapshot);
+    _stop();
+}
+
+static void _test_offline_expiration(void)
+{
+    weather_service_snapshot_t cached = {0};
+    cached.available_mask = WEATHER_SERVICE_DATA_LOCATION |
+                            WEATHER_SERVICE_DATA_CURRENT;
+    cached.location.available = true;
+    cached.location.acquired_at = 1000;
+    memcpy(cached.location.city, "Shenzhen", sizeof("Shenzhen"));
+    memcpy(cached.location.provider, "maxmind", sizeof("maxmind"));
+    cached.current.meta.available = true;
+    cached.current.meta.fetched_at.epoch_seconds = 1000;
+    weather_host_reset();
+    weather_host_set_wall_seconds(1000);
+    weather_host_set_monotonic_milliseconds(1000);
+    weather_host_set_cache_load(ESP_OK, &cached);
+    assert(weather_service_init(&s_config) == ESP_OK);
+    const struct timespec settle = {.tv_nsec = 10000000L};
+    (void)nanosleep(&settle, NULL);
+    const weather_service_snapshot_t *snapshot = NULL;
+    assert(weather_service_snapshot_acquire(&snapshot) == ESP_OK);
+    assert(!snapshot->current.meta.expired);
+    weather_service_snapshot_release(snapshot);
+
+    weather_host_set_now(1000 + 6 * 60 * 60 + 1);
+    assert(weather_service_notify_time_changed() == ESP_OK);
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_WAITING_NETWORK, 4000U));
+    assert(weather_service_snapshot_acquire(&snapshot) == ESP_OK);
+    assert(snapshot->current.meta.expired);
+    weather_service_snapshot_release(snapshot);
+    assert(weather_host_weather_requests(WEATHER_SERVICE_KIND_CURRENT) == 0U);
     _stop();
 }
 
@@ -775,6 +834,56 @@ static void _test_non_current_drift_aborts_cycle(void)
     assert(strcmp(snapshot->location.city, "Shenzhen") == 0);
     assert(strcmp(snapshot->location.location_key, "1a2b3c4d5e6f7080") == 0);
     weather_service_snapshot_release(snapshot);
+    _stop();
+}
+
+static void _test_stale_cycle_commits_nothing(void)
+{
+    _start();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    const unsigned cache_writes_before = weather_host_cache_writes();
+    const weather_service_snapshot_t *before = NULL;
+    assert(weather_service_snapshot_acquire(&before) == ESP_OK);
+    const uint64_t generation_before = before->generation;
+    const weather_service_time_t fetched_before =
+        before->current.meta.fetched_at;
+    weather_service_snapshot_release(before);
+    weather_service_test_cycle_state_t cycle_before;
+    assert(weather_service_test_get_cycle_state(&cycle_before));
+
+    weather_host_block_next_parse();
+    weather_host_set_now(1061);
+    assert(weather_service_request_refresh() == ESP_OK);
+    assert(weather_host_wait_parse_entered(4000U));
+    assert(weather_service_set_network_ready(false, 0U) == ESP_OK);
+    weather_host_release_parse();
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_WAITING_NETWORK, 4000U));
+    assert(weather_host_cache_writes() == cache_writes_before);
+    const weather_service_snapshot_t *after = NULL;
+    assert(weather_service_snapshot_acquire(&after) == ESP_OK);
+    assert(after->generation == generation_before);
+    assert(after->current.meta.fetched_at.epoch_seconds ==
+           fetched_before.epoch_seconds);
+    weather_service_snapshot_release(after);
+    weather_service_test_cycle_state_t cycle_after;
+    assert(weather_service_test_get_cycle_state(&cycle_after));
+    assert(cycle_after.lifecycle_epoch == cycle_before.lifecycle_epoch);
+    assert(cycle_after.pending_scope_session ==
+           cycle_before.pending_scope_session);
+    assert(cycle_after.pending_scope_attempted ==
+           cycle_before.pending_scope_attempted);
+    assert(cycle_after.drift_attempt == cycle_before.drift_attempt);
+    assert(cycle_after.retry_due_ms == cycle_before.retry_due_ms);
+    assert(cycle_after.cache_dirty == cycle_before.cache_dirty);
+    assert(cycle_after.last_cache_write_ms ==
+           cycle_before.last_cache_write_ms);
+
+    assert(weather_service_set_network_ready(true,
+            UINT32_C(0x05060708)) == ESP_OK);
+    assert(_wait_for_state(WEATHER_SERVICE_STATE_READY, 4000U));
+    assert(weather_host_location_requests() >= 2U);
+    assert(weather_host_cache_writes() > cache_writes_before);
     _stop();
 }
 
@@ -1217,6 +1326,151 @@ static void _test_refresh_admission_and_cache_no_mem(void)
     _stop();
 }
 
+typedef struct lifecycle_call
+{
+    bool deinit;
+    esp_err_t result;
+} lifecycle_call_t;
+
+static void *_run_lifecycle_call(void *arg)
+{
+    lifecycle_call_t *call = arg;
+    call->result = call->deinit ? weather_service_deinit(1000U) :
+                   weather_service_suspend(1000U);
+    return NULL;
+}
+
+static void _start_lifecycle_call(lifecycle_call_t *call, bool deinit,
+                                  pthread_t *thread)
+{
+    memset(call, 0, sizeof(*call));
+    call->deinit = deinit;
+    assert(pthread_create(thread, NULL, _run_lifecycle_call, call) == 0);
+}
+
+static void _test_response_parse_commit_race(void)
+{
+    _start();
+    weather_host_block_next_parse();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(weather_host_wait_parse_entered(4000U));
+    lifecycle_call_t call;
+    pthread_t lifecycle_thread;
+    _start_lifecycle_call(&call, false, &lifecycle_thread);
+    const struct timespec lifecycle_settle = {.tv_nsec = 10000000L};
+    (void)nanosleep(&lifecycle_settle, NULL);
+    weather_host_release_parse();
+    assert(pthread_join(lifecycle_thread, NULL) == 0);
+    assert(call.result == ESP_OK);
+    const struct timespec settle = {.tv_nsec = 20000000L};
+    (void)nanosleep(&settle, NULL);
+    assert(weather_host_event_count() > 0U);
+    weather_service_event_t event;
+    assert(weather_host_last_event(&event));
+    assert(event.state == WEATHER_SERVICE_STATE_SUSPENDED);
+    assert(event.changed_mask == 0U);
+    weather_service_status_snapshot_t status;
+    assert(weather_service_get_status(&status) == ESP_OK);
+    assert(status.state == WEATHER_SERVICE_STATE_SUSPENDED);
+    assert(weather_service_resume(1000U) == ESP_OK);
+    _stop();
+
+    _start();
+    weather_host_block_next_parse();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(weather_host_wait_parse_entered(4000U));
+    _start_lifecycle_call(&call, true, &lifecycle_thread);
+    (void)nanosleep(&lifecycle_settle, NULL);
+    weather_host_release_parse();
+    assert(pthread_join(lifecycle_thread, NULL) == 0);
+    assert(call.result == ESP_OK);
+    assert(host_caps_task_count() == 0U);
+}
+
+static void _test_location_completion_suspend_race(void)
+{
+    _start();
+    weather_host_block_next_location_parse();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(weather_host_wait_location_parse_entered(4000U));
+    lifecycle_call_t call;
+    pthread_t lifecycle_thread;
+    _start_lifecycle_call(&call, false, &lifecycle_thread);
+    const struct timespec settle = {.tv_nsec = 10000000L};
+    (void)nanosleep(&settle, NULL);
+    weather_host_release_parse();
+    assert(pthread_join(lifecycle_thread, NULL) == 0);
+    assert(call.result == ESP_OK);
+    assert(weather_service_resume(1000U) == ESP_OK);
+    const struct timespec post_resume = {.tv_nsec = 20000000L};
+    (void)nanosleep(&post_resume, NULL);
+    assert(weather_host_location_requests() == 1U);
+    _stop();
+}
+
+static void _test_deinit_timeout_retries_cleanup(void)
+{
+    _start();
+    weather_host_block_next_parse();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(weather_host_wait_parse_entered(4000U));
+    assert(weather_service_deinit(10U) == ESP_ERR_TIMEOUT);
+    assert(host_caps_task_count() == 1U);
+    assert(!weather_service_is_available());
+    weather_service_status_snapshot_t status;
+    assert(weather_service_get_status(&status) == ESP_ERR_INVALID_STATE);
+    assert(weather_service_request_refresh() == ESP_ERR_INVALID_STATE);
+
+    weather_host_release_parse();
+    assert(weather_service_deinit(1000U) == ESP_OK);
+    assert(host_caps_task_count() == 0U);
+    assert(!weather_service_is_available());
+}
+
+static void _test_deinit_mutex_timeout_still_stops_worker(void)
+{
+    _start();
+    assert(weather_service_test_lock_state());
+    host_task_set_tick_count_sequence(true, 1000U, 1050U);
+    assert(weather_service_deinit(50U) == ESP_ERR_TIMEOUT);
+    host_task_set_tick_count_sequence(false, 0U, 0U);
+    weather_service_test_unlock_state();
+    assert(host_caps_task_count() == 1U);
+    assert(!weather_service_is_available());
+    assert(weather_service_deinit(1000U) == ESP_OK);
+    assert(host_caps_task_count() == 0U);
+    assert(!weather_service_is_available());
+}
+
+static void _test_suspend_retry_waits_for_parse(void)
+{
+    _start();
+    weather_host_block_next_parse();
+    _connect_with_manual_refresh(UINT32_C(0x01020304));
+    assert(weather_host_wait_parse_entered(4000U));
+    assert(weather_service_suspend(10U) == ESP_ERR_TIMEOUT);
+    assert(weather_service_suspend(10U) == ESP_ERR_TIMEOUT);
+    weather_host_release_parse();
+    assert(weather_service_suspend(1000U) == ESP_OK);
+    assert(weather_service_resume(1000U) == ESP_OK);
+    _stop();
+}
+
+static void _test_deinit_uses_one_timeout_budget(void)
+{
+    _start();
+    assert(weather_service_suspend(1000U) == ESP_OK);
+    host_task_set_tick_count_sequence(true, 1000U, 1050U);
+    const size_t waits_before = host_event_group_wait_count();
+    assert(weather_service_deinit(50U) == ESP_ERR_TIMEOUT);
+    assert(host_event_group_wait_count() == waits_before + 1U);
+    assert(host_event_group_last_timeout() == 0U);
+    assert(!weather_service_is_available());
+    host_task_set_tick_count_sequence(false, 0U, 0U);
+    assert(weather_service_deinit(1000U) == ESP_OK);
+    assert(host_caps_task_count() == 0U);
+}
+
 static void _test_http_cancellation_races(void)
 {
     _start();
@@ -1259,12 +1513,15 @@ int main(void)
     _test_rate_limit();
     _test_weather_response_failures();
     _test_snapshot_allocation_failures();
+    _test_expiry_allocation_failure_backs_off();
+    _test_offline_expiration();
     _test_monotonic_scheduling_and_expiration();
     _test_weather_location_drift();
     _test_key_only_identity_change();
     _test_district_not_identity();
     _test_district_drift_by_key_only();
     _test_non_current_drift_aborts_cycle();
+    _test_stale_cycle_commits_nothing();
     _test_pending_scope_blocks_until_current();
     _test_account_limit_survives_session();
     _test_auth_freeze_survives_session();
@@ -1277,6 +1534,12 @@ int main(void)
     _test_new_session_refreshes_all_scopes();
     _test_config_validation();
     _test_refresh_admission_and_cache_no_mem();
+    _test_response_parse_commit_race();
+    _test_location_completion_suspend_race();
+    _test_deinit_timeout_retries_cleanup();
+    _test_deinit_mutex_timeout_still_stops_worker();
+    _test_suspend_retry_waits_for_parse();
+    _test_deinit_uses_one_timeout_budget();
     _test_http_cancellation_races();
     puts("weather worker host tests passed");
     return 0;

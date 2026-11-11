@@ -387,20 +387,23 @@ static bool _weather_parse_percent(const cJSON *object, const char *name,
     return true;
 }
 
-static bool _weather_parse_meta(const cJSON *root,
+static bool _weather_parse_meta(const cJSON *root, int64_t fetched_at,
                                 weather_service_dataset_meta_t *meta)
 {
     const cJSON *stale = cJSON_GetObjectItemCaseSensitive(root, "stale");
-    if (!_weather_parse_time(root, "fetched_at", &meta->fetched_at, true) ||
+    weather_service_time_t source_fetched_at = {0};
+    if (!_weather_parse_time(root, "fetched_at", &source_fetched_at, true) ||
             !_weather_parse_time(root, "updated_at", &meta->updated_at, true) ||
             !_weather_parse_time(root, "valid_until", &meta->valid_until,
                                  true) || !cJSON_IsBool(stale))
     {
         return false;
     }
+    meta->fetched_at.epoch_seconds = fetched_at;
+    meta->fetched_at.offset_minutes = 0;
     meta->available = true;
     meta->stale = cJSON_IsTrue(stale);
-    meta->expired = false;
+    meta->expired = fetched_at <= 0;
     return true;
 }
 
@@ -540,11 +543,12 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
 }
 
 static bool _weather_parse_current(const cJSON *root, const cJSON *data,
+                                   int64_t fetched_at,
                                    weather_service_snapshot_t *snapshot)
 {
     weather_service_current_t parsed = {0};
     double value = 0.0;
-    if (!_weather_parse_meta(root, &parsed.meta) ||
+    if (!_weather_parse_meta(root, fetched_at, &parsed.meta) ||
             !_weather_parse_time(data, "observed_at", &parsed.observed_at,
                                  true) ||
             !_weather_parse_number(data, "temperature_c", -100.0, 100.0,
@@ -646,6 +650,7 @@ static bool _weather_parse_hour(const cJSON *object,
 }
 
 static bool _weather_parse_hourly(const cJSON *root, const cJSON *data,
+                                  int64_t fetched_at,
                                   weather_service_snapshot_t *snapshot)
 {
     const cJSON *items = cJSON_GetObjectItemCaseSensitive(data, "hours");
@@ -655,7 +660,7 @@ static bool _weather_parse_hourly(const cJSON *root, const cJSON *data,
         return false;
     }
     weather_service_hourly_t parsed = {0};
-    if (!_weather_parse_meta(root, &parsed.meta))
+    if (!_weather_parse_meta(root, fetched_at, &parsed.meta))
     {
         return false;
     }
@@ -727,6 +732,7 @@ static bool _weather_parse_day(const cJSON *object,
 }
 
 static bool _weather_parse_daily(const cJSON *root, const cJSON *data,
+                                 int64_t fetched_at,
                                  weather_service_snapshot_t *snapshot)
 {
     const cJSON *items = cJSON_GetObjectItemCaseSensitive(data, "days");
@@ -736,7 +742,7 @@ static bool _weather_parse_daily(const cJSON *root, const cJSON *data,
         return false;
     }
     weather_service_daily_t parsed = {0};
-    if (!_weather_parse_meta(root, &parsed.meta))
+    if (!_weather_parse_meta(root, fetched_at, &parsed.meta))
     {
         return false;
     }
@@ -816,6 +822,7 @@ static bool _weather_parse_alert(const cJSON *object,
 }
 
 static esp_err_t _weather_parse_alerts(const cJSON *root, const cJSON *data,
+                                       int64_t fetched_at,
                                        weather_service_snapshot_t *snapshot)
 {
     const cJSON *items = cJSON_GetObjectItemCaseSensitive(data, "items");
@@ -838,7 +845,7 @@ static esp_err_t _weather_parse_alerts(const cJSON *root, const cJSON *data,
         return ESP_ERR_NO_MEM;
     }
     esp_err_t result = ESP_ERR_INVALID_RESPONSE;
-    if (!_weather_parse_meta(root, &parsed->meta))
+    if (!_weather_parse_meta(root, fetched_at, &parsed->meta))
     {
         goto cleanup;
     }
@@ -863,7 +870,9 @@ cleanup:
 
 esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                                         const uint8_t *body, size_t body_size,
-                                        weather_service_snapshot_t *snapshot, uint32_t *changed_mask)
+                                        int64_t fetched_at,
+                                        weather_service_snapshot_t *snapshot,
+                                        uint32_t *changed_mask)
 {
     if (kind >= WEATHER_SERVICE_KIND_COUNT || body == NULL || body_size == 0U ||
             snapshot == NULL || changed_mask == NULL)
@@ -926,20 +935,20 @@ esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
         switch (kind)
         {
         case WEATHER_SERVICE_KIND_CURRENT:
-            valid = _weather_parse_current(root, data, snapshot);
+            valid = _weather_parse_current(root, data, fetched_at, snapshot);
             mask = WEATHER_SERVICE_DATA_CURRENT;
             break;
         case WEATHER_SERVICE_KIND_ALERTS:
-            result = _weather_parse_alerts(root, data, snapshot);
+            result = _weather_parse_alerts(root, data, fetched_at, snapshot);
             valid = result == ESP_OK;
             mask = WEATHER_SERVICE_DATA_ALERTS;
             break;
         case WEATHER_SERVICE_KIND_HOURLY:
-            valid = _weather_parse_hourly(root, data, snapshot);
+            valid = _weather_parse_hourly(root, data, fetched_at, snapshot);
             mask = WEATHER_SERVICE_DATA_HOURLY;
             break;
         case WEATHER_SERVICE_KIND_DAILY:
-            valid = _weather_parse_daily(root, data, snapshot);
+            valid = _weather_parse_daily(root, data, fetched_at, snapshot);
             mask = WEATHER_SERVICE_DATA_DAILY;
             break;
         default:

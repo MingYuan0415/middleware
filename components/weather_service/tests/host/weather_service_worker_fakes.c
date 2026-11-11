@@ -39,6 +39,13 @@ static atomic_uint s_cache_writes;
 static atomic_uint s_psram_allocations;
 static atomic_ullong s_cancel_generation;
 static atomic_uint s_psram_failure_at;
+static atomic_bool s_psram_exhausted;
+static bool s_parse_block;
+static bool s_parse_entered;
+static bool s_location_parse_block;
+static bool s_location_parse_entered;
+static pthread_mutex_t s_parse_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_parse_condition = PTHREAD_COND_INITIALIZER;
 static atomic_int s_cache_load_result;
 static atomic_uint s_location_path_seen;
 static atomic_uint s_weather_path_seen[WEATHER_SERVICE_KIND_COUNT];
@@ -115,6 +122,7 @@ void weather_host_reset(void)
     atomic_store(&s_psram_allocations, 0U);
     atomic_store(&s_cancel_generation, 0U);
     atomic_store(&s_psram_failure_at, 0U);
+    atomic_store(&s_psram_exhausted, false);
     atomic_store(&s_cache_load_result, ESP_ERR_NOT_FOUND);
     atomic_store(&s_location_path_seen, 0U);
     atomic_store(&s_token_seen, 0U);
@@ -125,6 +133,12 @@ void weather_host_reset(void)
         atomic_store(&s_weather_path_seen[kind], 0U);
     }
     memset(&s_cached_snapshot, 0, sizeof(s_cached_snapshot));
+    pthread_mutex_lock(&s_parse_mutex);
+    s_parse_block = false;
+    s_parse_entered = false;
+    s_location_parse_block = false;
+    s_location_parse_entered = false;
+    pthread_mutex_unlock(&s_parse_mutex);
     pthread_mutex_lock(&s_http_mutex);
     s_http_block_next = false;
     s_http_entered = false;
@@ -335,6 +349,11 @@ void weather_host_fail_psram_after(unsigned successful_allocations)
                  current + successful_allocations + 1U);
 }
 
+void weather_host_exhaust_psram(bool exhausted)
+{
+    atomic_store(&s_psram_exhausted, exhausted);
+}
+
 void weather_host_set_cache_load(esp_err_t result,
                                  const weather_service_snapshot_t *snapshot)
 {
@@ -347,6 +366,77 @@ void weather_host_set_cache_load(esp_err_t result,
     {
         memset(&s_cached_snapshot, 0, sizeof(s_cached_snapshot));
     }
+}
+
+void weather_host_block_next_parse(void)
+{
+    pthread_mutex_lock(&s_parse_mutex);
+    s_parse_block = true;
+    s_parse_entered = false;
+    pthread_mutex_unlock(&s_parse_mutex);
+}
+
+bool weather_host_wait_parse_entered(unsigned timeout_ms)
+{
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000U);
+    deadline.tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&s_parse_mutex);
+    int wait_result = 0;
+    while (!s_parse_entered && wait_result == 0)
+    {
+        wait_result = pthread_cond_timedwait(&s_parse_condition,
+                                             &s_parse_mutex, &deadline);
+    }
+    const bool entered = s_parse_entered;
+    pthread_mutex_unlock(&s_parse_mutex);
+    return entered;
+}
+
+void weather_host_block_next_location_parse(void)
+{
+    pthread_mutex_lock(&s_parse_mutex);
+    s_location_parse_block = true;
+    s_location_parse_entered = false;
+    pthread_mutex_unlock(&s_parse_mutex);
+}
+
+bool weather_host_wait_location_parse_entered(unsigned timeout_ms)
+{
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000U);
+    deadline.tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&s_parse_mutex);
+    int wait_result = 0;
+    while (!s_location_parse_entered && wait_result == 0)
+    {
+        wait_result = pthread_cond_timedwait(&s_parse_condition,
+                                             &s_parse_mutex, &deadline);
+    }
+    const bool entered = s_location_parse_entered;
+    pthread_mutex_unlock(&s_parse_mutex);
+    return entered;
+}
+
+void weather_host_release_parse(void)
+{
+    pthread_mutex_lock(&s_parse_mutex);
+    s_parse_block = false;
+    s_location_parse_block = false;
+    pthread_cond_broadcast(&s_parse_condition);
+    pthread_mutex_unlock(&s_parse_mutex);
 }
 
 void weather_host_block_next_http(void)
@@ -387,7 +477,8 @@ void *heap_caps_calloc(size_t count, size_t size, unsigned capabilities)
     if ((capabilities & MALLOC_CAP_SPIRAM) != 0U)
     {
         unsigned allocation = atomic_fetch_add(&s_psram_allocations, 1U) + 1U;
-        if (allocation == atomic_load(&s_psram_failure_at))
+        if (allocation == atomic_load(&s_psram_failure_at) ||
+                atomic_load(&s_psram_exhausted))
         {
             return NULL;
         }
@@ -572,6 +663,17 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
 {
     (void)body;
     (void)body_size;
+    pthread_mutex_lock(&s_parse_mutex);
+    if (s_location_parse_block)
+    {
+        s_location_parse_entered = true;
+        pthread_cond_broadcast(&s_parse_condition);
+        while (s_location_parse_block)
+        {
+            pthread_cond_wait(&s_parse_condition, &s_parse_mutex);
+        }
+    }
+    pthread_mutex_unlock(&s_parse_mutex);
     *location = s_fake_location;
     location->acquired_at = acquired_at;
     location->available = true;
@@ -580,10 +682,24 @@ esp_err_t weather_service_parse_location(const uint8_t *body,
 
 esp_err_t weather_service_parse_weather(weather_service_kind_t kind,
                                         const uint8_t *body, size_t body_size,
-                                        weather_service_snapshot_t *snapshot, uint32_t *changed_mask)
+                                        int64_t fetched_at,
+                                        weather_service_snapshot_t *snapshot,
+                                        uint32_t *changed_mask)
 {
     (void)body;
     (void)body_size;
+    (void)fetched_at;
+    pthread_mutex_lock(&s_parse_mutex);
+    if (s_parse_block)
+    {
+        s_parse_entered = true;
+        pthread_cond_broadcast(&s_parse_condition);
+        while (s_parse_block)
+        {
+            pthread_cond_wait(&s_parse_condition, &s_parse_mutex);
+        }
+    }
+    pthread_mutex_unlock(&s_parse_mutex);
     if (_weather_host_consume(&s_datasets[kind].parse_failures))
     {
         return ESP_ERR_INVALID_RESPONSE;

@@ -100,9 +100,27 @@ bool weather_host_unexpected_request(void);
 /** @brief Fail one PSRAM allocation after the requested successful calls. */
 void weather_host_fail_psram_after(unsigned successful_allocations);
 
+/** @brief Make every subsequent PSRAM allocation fail until cleared. */
+void weather_host_exhaust_psram(bool exhausted);
+
 /** @brief Configure cache-load behavior and optional cached snapshot. */
 void weather_host_set_cache_load(esp_err_t result,
                                  const weather_service_snapshot_t *snapshot);
+
+/** @brief Block the next fake location parse after its response completes. */
+void weather_host_block_next_location_parse(void);
+
+/** @brief Wait until a blocked fake location parse has entered. */
+bool weather_host_wait_location_parse_entered(unsigned timeout_ms);
+
+/** @brief Block the next fake weather parse after its response completes. */
+void weather_host_block_next_parse(void);
+
+/** @brief Wait until a blocked fake parse has entered. */
+bool weather_host_wait_parse_entered(unsigned timeout_ms);
+
+/** @brief Release a parse blocked by weather_host_block_next_parse(). */
+void weather_host_release_parse(void);
 
 /** @brief Block the next fake HTTP request until cancellation. */
 void weather_host_block_next_http(void);

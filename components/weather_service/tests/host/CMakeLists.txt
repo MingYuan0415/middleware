@@ -83,6 +83,7 @@ target_include_directories(weather_service_worker_test PRIVATE
     "${WEATHER_DIR}/include"
     "${WEATHER_DIR}/src")
 target_compile_definitions(weather_service_worker_test PRIVATE
+    WEATHER_SERVICE_TESTING=1
     _DEFAULT_SOURCE
     _POSIX_C_SOURCE=200809L)
 target_compile_options(weather_service_worker_test PRIVATE
