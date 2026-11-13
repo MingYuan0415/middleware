@@ -286,8 +286,9 @@ changing Kconfig run
 
 Requires CMake 3.22+, Ninja, a C11 compiler, and pthread. Pick the affected
 component's `tests/host` suite by the impact-surface table in the root
-repository's `AGENTS.md`. One ordinary profile example is kept below; add
-ASan/TSan only for memory ownership or concurrency changes, matched to the risk.
+repository's `doc/verification.md`. One ordinary profile example is kept below;
+add ASan/TSan only for memory ownership or concurrency changes, matched to the
+risk.
 
 Run the NVS suite from this middleware submodule root:
 

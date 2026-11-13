@@ -101,7 +101,7 @@ Manager 偏好和内置 App 状态，data 挂载后由 `fs_storage_wipe_data()` 
 ## 宿主测试
 
 需要 CMake 3.22+、Ninja、C11 编译器和 pthread。按根仓库
-`AGENTS.md` 的影响面表选择对应组件的 `tests/host` 套件。以下保留一个
+`doc/verification.md` 的影响面表选择对应组件的 `tests/host` 套件。以下保留一个
 普通 profile 示例；ASan/TSan 只在内存所有权或并发改动时按风险追加。
 
 从本 middleware 子模块根目录运行 NVS 套件：
